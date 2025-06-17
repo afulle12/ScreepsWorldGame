@@ -1,0 +1,70 @@
+const roleUpgrader = {
+    run: function(creep) {
+        // Toggle between withdrawing and upgrading
+        if(creep.memory.upgrading && creep.store[RESOURCE_ENERGY] == 0) {
+            creep.memory.upgrading = false;
+            creep.say('🔄 withdraw');
+        }
+        if(!creep.memory.upgrading && creep.store.getFreeCapacity() == 0) {
+            creep.memory.upgrading = true;
+            creep.say('⚡ upgrade');
+        }
+
+        // Upgrading controller
+        if(creep.memory.upgrading) {
+            if(creep.upgradeController(creep.room.controller) == ERR_NOT_IN_RANGE) {
+                creep.moveTo(creep.room.controller, {visualizePathStyle: {stroke: '#ffffff'}});
+            }
+        }
+        // Withdrawing energy - prioritize controller link first
+        else {
+            let target = null;
+
+            // First priority: Link closest to controller with energy
+            if (creep.room.controller) {
+                const links = creep.room.find(FIND_MY_STRUCTURES, {
+                    filter: { structureType: STRUCTURE_LINK }
+                });
+
+                if (links.length > 0) {
+                    const controllerLink = creep.room.controller.pos.findClosestByRange(links);
+                    if (controllerLink && controllerLink.store[RESOURCE_ENERGY] > 0) {
+                        target = controllerLink;
+                    }
+                }
+            }
+
+            // Second priority: Storage or containers if no link energy available
+            if (!target) {
+                target = creep.pos.findClosestByPath(FIND_STRUCTURES, {
+                    filter: (structure) => 
+                        (structure.structureType == STRUCTURE_STORAGE || 
+                         structure.structureType == STRUCTURE_CONTAINER) &&
+                        structure.store[RESOURCE_ENERGY] > 0
+                });
+            }
+
+            // Third priority: Mine energy sources if no stored energy available
+            if (!target) {
+                target = creep.pos.findClosestByPath(FIND_SOURCES_ACTIVE);
+
+                if (target) {
+                    creep.say('⛏️ mining');
+                    if(creep.harvest(target) == ERR_NOT_IN_RANGE) {
+                        creep.moveTo(target, {visualizePathStyle: {stroke: '#ffaa00'}});
+                    }
+                    return; // Exit early since we're mining, not withdrawing
+                }
+            }
+
+            // Execute withdraw action if we found a target
+            if(target) {
+                if(creep.withdraw(target, RESOURCE_ENERGY) == ERR_NOT_IN_RANGE) {
+                    creep.moveTo(target, {visualizePathStyle: {stroke: '#ffaa00'}});
+                }
+            }
+        }
+    }
+};
+
+module.exports = roleUpgrader;
