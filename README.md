@@ -3,4 +3,4 @@ I used AI at every step of the way but I've had to define how I wanted the Scree
 In the beginning, I just asked the AI to set everything up which only got me so far, I had to have clear expectations for what I'm looking for and I have to debug strange and complicated problemms that come along.
 
 This game has made coding fun again! <br>
-[https://store.steampowered.com/app/464350/Screeps_World/ https://store.steampowered.com/app/464350/Screeps_World/]
+https://store.steampowered.com/app/464350/Screeps_World/
