@@ -463,37 +463,41 @@ function runCreeps() {
 function displayStatus(perRoomRoleCounts) {
     const TICK_WINDOW = 500; // 10 minutes at 4s/tick
 
-    // Calculate average body parts, average TTL, and oldest creep TTL for all creeps combined
-    let totalBodyParts = 0;
-    let totalCreeps = 0;
-    let totalTTL = 0;
-    let oldestCreepTTL = Infinity;
-
+    // Calculate per-room stats
+    const perRoomStats = {};
     for(const name in Game.creeps) {
         const creep = Game.creeps[name];
-        totalBodyParts += creep.body.length;
-        totalCreeps++;
+        const assignedRoom = creep.memory.assignedRoom || creep.room.name;  // Fallback to current room
 
+        if(!perRoomStats[assignedRoom]) {
+            perRoomStats[assignedRoom] = {
+                totalBodyParts: 0,
+                totalCreeps: 0,
+                totalTTL: 0,
+                oldestCreepTTL: Infinity
+            };
+        }
+
+        perRoomStats[assignedRoom].totalBodyParts += creep.body.length;
+        perRoomStats[assignedRoom].totalCreeps += 1;
         if(creep.ticksToLive) {
-            totalTTL += creep.ticksToLive;
-            if(creep.ticksToLive < oldestCreepTTL) {
-                oldestCreepTTL = creep.ticksToLive;
+            perRoomStats[assignedRoom].totalTTL += creep.ticksToLive;
+            if(creep.ticksToLive < perRoomStats[assignedRoom].oldestCreepTTL) {
+                perRoomStats[assignedRoom].oldestCreepTTL = creep.ticksToLive;
             }
         }
     }
 
-    const avgBodyParts = totalCreeps > 0 ? (totalBodyParts / totalCreeps).toFixed(1) : 0;
-    const avgTTL = totalCreeps > 0 ? Math.round(totalTTL / totalCreeps) : 0;
-    const oldestTTL = oldestCreepTTL === Infinity ? 0 : oldestCreepTTL;
-
-    // Display per-room counts
     console.log(`=== COLONY STATUS ===`);
     for(const roomName in perRoomRoleCounts) {
         const counts = perRoomRoleCounts[roomName];
-        console.log(`${roomName}: 🧑‍🌾 ${counts.harvester} | ⚡ ${counts.upgrader} | 🔨 ${counts.builder} | 🔭 ${counts.scout} | 🛡 ${counts.defender} | 🔋 ${counts.supplier} | 🤖 ${counts.claimbot}`);
-    }
+        const stats = perRoomStats[roomName] || { totalBodyParts: 0, totalCreeps: 0, totalTTL: 0, oldestCreepTTL: 0 };
+        const avgBodyParts = stats.totalCreeps > 0 ? (stats.totalBodyParts / stats.totalCreeps).toFixed(1) : 0;
+        const avgTTL = stats.totalCreeps > 0 ? Math.round(stats.totalTTL / stats.totalCreeps) : 0;
+        const oldestTTL = stats.oldestCreepTTL === Infinity ? 0 : stats.oldestCreepTTL;
 
-    console.log(`Global Stats: Avg Parts: ${avgBodyParts} | Avg TTL: ${avgTTL} | Oldest TTL: ${oldestTTL}`);
+        console.log(`${roomName}: 🧑‍🌾 ${counts.harvester} | ⚡ ${counts.upgrader} | 🔨 ${counts.builder} | 🔭 ${counts.scout} | 🛡 ${counts.defender} | 🔋 ${counts.supplier} | 🤖 ${counts.claimbot} | Avg Parts: ${avgBodyParts}`);
+    }
 
     // Performance tracking and display
     const perfData = getPerformanceData();
@@ -573,8 +577,8 @@ function getRoomTargets(roomName, roomData, room) {
     return {
         harvester: Math.max(2, sourcesCount), // At least 2, preferably 1 per source
         upgrader: 2,
-        builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
-        //builder: 2, //temporary
+        //builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
+        builder: 0, //temporary
         scout: 0, // Scouts can work globally
         defender: 0, // Spawn defenders as needed based on threats
         supplier: hasStorageStructures ? Math.min(3, Math.floor(sourcesCount * 1.5)) : 0 // Only spawn suppliers if storage structures exist
@@ -586,8 +590,8 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
     // Do not spawn normal creeps if a claimbot is being spawned this tick
     if (Memory.claimOrders && Memory.claimOrders.length > 0) return;
 
-    // **REMOVED SPAWN TIMER INITIALIZATION**
-    // if(!Memory.spawnTimers) Memory.spawnTimers = {};
+    // Initialize harvester spawn delay tracker
+    if(!Memory.harvesterSpawnDelay) Memory.harvesterSpawnDelay = {};
 
     // Process each owned room
     for(const roomName in Game.rooms) {
@@ -623,17 +627,6 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
             }
         }
 
-        // **REMOVED SPAWN TIMER CHECK**
-        // Initialize spawn timer for this room
-        // if(!Memory.spawnTimers[roomName]) {
-        //     Memory.spawnTimers[roomName] = { nextSpawnTime: 0 };
-        // }
-        //
-        // Check if we need to wait more time before spawning in this room
-        // if(Game.time < Memory.spawnTimers[roomName].nextSpawnTime) {
-        //     continue; // Wait until the random delay passes for this room
-        // }
-
         let roleToSpawn = null;
 
         // Priority order for spawning (defenders first, then essentials)
@@ -652,16 +645,29 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
         }
 
         if(roleToSpawn) {
+            // **NEW: Add 60 second delay for harvester spawning when energy is below 800**
+            if(roleToSpawn === 'harvester') {
+                const totalEnergy = calculateTotalEnergy();
+                if(totalEnergy < 800) {
+                    // Initialize delay tracker for this room if it doesn't exist
+                    if(!Memory.harvesterSpawnDelay[roomName]) {
+                        Memory.harvesterSpawnDelay[roomName] = { nextSpawnTime: Game.time + 60 };
+                        console.log(`Low energy (${totalEnergy} < 800) - delaying harvester spawn in ${roomName} by 60 ticks`);
+                        continue;
+                    }
+
+                    // Check if we need to wait more time before spawning harvester
+                    if(Game.time < Memory.harvesterSpawnDelay[roomName].nextSpawnTime) {
+                        continue; // Wait until the 60 tick delay passes
+                    }
+
+                    // Reset the delay tracker since we're about to spawn
+                    delete Memory.harvesterSpawnDelay[roomName];
+                }
+            }
+
             const body = getCreepBody(roleToSpawn, room.energyAvailable);
             const success = spawnCreepInRoom(roleToSpawn, body, spawn, roomName);
-
-            // **REMOVED SETTING OF SPAWN DELAY**
-            // if(success) {
-            //     // Set a random delay for the next spawn in this room (between 30-120 ticks)
-            //     const randomDelay = Math.floor(Math.random() * 91) + 30;
-            //     Memory.spawnTimers[roomName].nextSpawnTime = Game.time + randomDelay;
-            //     console.log(`Next creep in ${roomName} will spawn after a ${randomDelay} tick delay`);
-            // }
         }
     }
 }

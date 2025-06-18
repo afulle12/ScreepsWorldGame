@@ -1,17 +1,22 @@
+const DEBUG = false; // Set to false to disable console logging
+
 const roleUpgrader = {
     run: function(creep) {
         // Toggle between withdrawing and upgrading
         if(creep.memory.upgrading && creep.store[RESOURCE_ENERGY] == 0) {
             creep.memory.upgrading = false;
             creep.say('🔄 withdraw');
+            if (DEBUG) console.log(`Upgrader ${creep.name}: Switching to withdraw mode - out of energy`);
         }
         if(!creep.memory.upgrading && creep.store.getFreeCapacity() == 0) {
             creep.memory.upgrading = true;
             creep.say('⚡ upgrade');
+            if (DEBUG) console.log(`Upgrader ${creep.name}: Switching to upgrade mode - energy full`);
         }
 
         // Upgrading controller
         if(creep.memory.upgrading) {
+            if (DEBUG) console.log(`Upgrader ${creep.name}: Upgrading controller`);
             if(creep.upgradeController(creep.room.controller) == ERR_NOT_IN_RANGE) {
                 creep.moveTo(creep.room.controller, {visualizePathStyle: {stroke: '#ffffff'}});
             }
@@ -30,6 +35,7 @@ const roleUpgrader = {
                     const controllerLink = creep.room.controller.pos.findClosestByRange(links);
                     if (controllerLink && controllerLink.store[RESOURCE_ENERGY] > 0) {
                         target = controllerLink;
+                        if (DEBUG) console.log(`Upgrader ${creep.name}: Using controller link for energy (${controllerLink.store[RESOURCE_ENERGY]} energy available)`);
                     }
                 }
             }
@@ -42,6 +48,10 @@ const roleUpgrader = {
                          structure.structureType == STRUCTURE_CONTAINER) &&
                         structure.store[RESOURCE_ENERGY] > 0
                 });
+
+                if (target) {
+                    if (DEBUG) console.log(`Upgrader ${creep.name}: Using ${target.structureType} for energy (${target.store[RESOURCE_ENERGY]} energy available)`);
+                }
             }
 
             // Third priority: Mine energy sources if no stored energy available
@@ -49,6 +59,7 @@ const roleUpgrader = {
                 target = creep.pos.findClosestByPath(FIND_SOURCES_ACTIVE);
 
                 if (target) {
+                    if (DEBUG) console.log(`Upgrader ${creep.name}: No stored energy available, mining from source`);
                     creep.say('⛏️ mining');
                     if(creep.harvest(target) == ERR_NOT_IN_RANGE) {
                         creep.moveTo(target, {visualizePathStyle: {stroke: '#ffaa00'}});
@@ -62,6 +73,8 @@ const roleUpgrader = {
                 if(creep.withdraw(target, RESOURCE_ENERGY) == ERR_NOT_IN_RANGE) {
                     creep.moveTo(target, {visualizePathStyle: {stroke: '#ffaa00'}});
                 }
+            } else {
+                if (DEBUG) console.log(`Upgrader ${creep.name}: No energy sources available`);
             }
         }
     }

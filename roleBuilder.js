@@ -1,3 +1,5 @@
+const DEBUG = false; // Set to false to disable console logging
+
 const WALL_REPAIR_THRESHOLD = 100000;
 const WORK_AREA_RANGE = 10; // Builders will stick to work within this range
 const MAX_STUCK_ATTEMPTS = 5; // Max attempts before giving up on a target
@@ -8,7 +10,7 @@ const roleBuilder = {
         if(creep.memory.building && creep.store[RESOURCE_ENERGY] === 0) {
             creep.memory.building = false;
             creep.say('🔄 harvest');
-            console.log(`Builder ${creep.name}: Switching to harvest mode - out of energy`);
+            if (DEBUG) console.log(`Builder ${creep.name}: Switching to harvest mode - out of energy`);
             delete creep.memory.repairingWallId;
             delete creep.memory.buildingTargetId;
             delete creep.memory.workArea;
@@ -17,32 +19,32 @@ const roleBuilder = {
         if(!creep.memory.building && creep.store.getFreeCapacity() === 0) {
             creep.memory.building = true;
             creep.say('🚧 build');
-            console.log(`Builder ${creep.name}: Switching to building mode - energy full`);
+            if (DEBUG) console.log(`Builder ${creep.name}: Switching to building mode - energy full`);
             delete creep.memory.targetAttempts; // Clear attempt counter
         }
 
         // Building mode - find something useful to do
         if(creep.memory.building) {
-            console.log(`Builder ${creep.name}: In building mode, looking for tasks...`);
+            if (DEBUG) console.log(`Builder ${creep.name}: In building mode, looking for tasks...`);
 
             // Priority 1: Find construction sites
             const constructionSites = this.findConstructionSites(creep);
             if(constructionSites.length > 0) {
-                console.log(`Builder ${creep.name}: Found ${constructionSites.length} construction sites`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Found ${constructionSites.length} construction sites`);
                 let target = null;
 
                 // Check if we already have a valid target
                 if(creep.memory.buildingTargetId) {
                     target = Game.getObjectById(creep.memory.buildingTargetId);
                     if(!target) {
-                        console.log(`Builder ${creep.name}: Previous target no longer exists, finding new target`);
+                        if (DEBUG) console.log(`Builder ${creep.name}: Previous target no longer exists, finding new target`);
                         delete creep.memory.buildingTargetId;
                         delete creep.memory.targetAttempts;
                         target = null;
                     } else {
                         // Check if we've been stuck on this target too long
                         if(this.isStuckOnTarget(creep, 'buildingTargetId')) {
-                            console.log(`Builder ${creep.name}: Stuck on construction target, finding new target`);
+                            if (DEBUG) console.log(`Builder ${creep.name}: Stuck on construction target, finding new target`);
                             delete creep.memory.buildingTargetId;
                             delete creep.memory.targetAttempts;
                             target = null;
@@ -62,12 +64,12 @@ const roleBuilder = {
                             y: target.pos.y,
                             roomName: target.pos.roomName
                         };
-                        console.log(`Builder ${creep.name}: Found reachable construction site at ${target.pos}, setting work area`);
+                        if (DEBUG) console.log(`Builder ${creep.name}: Found reachable construction site at ${target.pos}, setting work area`);
                     }
                 }
 
                 if(target) {
-                    console.log(`Builder ${creep.name}: Building ${target.structureType} at ${target.pos}`);
+                    if (DEBUG) console.log(`Builder ${creep.name}: Building ${target.structureType} at ${target.pos}`);
                     const buildResult = creep.build(target);
                     if(buildResult == ERR_NOT_IN_RANGE) {
                         const moveResult = creep.moveTo(target, {
@@ -77,7 +79,7 @@ const roleBuilder = {
 
                         // Track if movement failed
                         if(moveResult === ERR_NO_PATH) {
-                            console.log(`Builder ${creep.name}: No path to construction site, abandoning target`);
+                            if (DEBUG) console.log(`Builder ${creep.name}: No path to construction site, abandoning target`);
                             delete creep.memory.buildingTargetId;
                             delete creep.memory.targetAttempts;
                             return; // Try again next tick
@@ -92,7 +94,7 @@ const roleBuilder = {
                         delete creep.memory.targetAttempts;
                         creep.say('🚧');
                     } else if(buildResult === ERR_INVALID_TARGET) {
-                        console.log(`Builder ${creep.name}: Invalid construction target, finding new target`);
+                        if (DEBUG) console.log(`Builder ${creep.name}: Invalid construction target, finding new target`);
                         delete creep.memory.buildingTargetId;
                         delete creep.memory.targetAttempts;
                         return;
@@ -100,7 +102,7 @@ const roleBuilder = {
                     delete creep.memory.repairingWallId;
                     return;
                 } else {
-                    console.log(`Builder ${creep.name}: No reachable construction sites found`);
+                    if (DEBUG) console.log(`Builder ${creep.name}: No reachable construction sites found`);
                 }
             }
 
@@ -116,7 +118,7 @@ const roleBuilder = {
                     structure.hits < WALL_REPAIR_THRESHOLD
             });
             if(allDamagedRamparts.length > 0) {
-                console.log(`Builder ${creep.name}: Repairing ramparts - found ${allDamagedRamparts.length} damaged ramparts`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Repairing ramparts - found ${allDamagedRamparts.length} damaged ramparts`);
                 const target = this.findReachableRepairTarget(creep, allDamagedRamparts);
                 if(target) {
                     const repairResult = creep.repair(target);
@@ -126,7 +128,7 @@ const roleBuilder = {
                             reusePath: 5
                         });
                         if(moveResult === ERR_NO_PATH) {
-                            console.log(`Builder ${creep.name}: No path to rampart, skipping`);
+                            if (DEBUG) console.log(`Builder ${creep.name}: No path to rampart, skipping`);
                             return;
                         }
                         creep.say('🛡️');
@@ -143,7 +145,7 @@ const roleBuilder = {
                 filter: (structure) => structure.structureType === STRUCTURE_CONTAINER && structure.hits < structure.hitsMax * 0.75
             });
             if(allDamagedContainers.length > 0) {
-                console.log(`Builder ${creep.name}: Repairing containers - found ${allDamagedContainers.length} damaged containers`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Repairing containers - found ${allDamagedContainers.length} damaged containers`);
                 const target = this.findReachableRepairTarget(creep, allDamagedContainers);
                 if(target) {
                     const repairResult = creep.repair(target);
@@ -153,7 +155,7 @@ const roleBuilder = {
                             reusePath: 5
                         });
                         if(moveResult === ERR_NO_PATH) {
-                            console.log(`Builder ${creep.name}: No path to container, skipping`);
+                            if (DEBUG) console.log(`Builder ${creep.name}: No path to container, skipping`);
                             return;
                         }
                         creep.say('📦');
@@ -168,7 +170,7 @@ const roleBuilder = {
                 filter: (structure) => structure.structureType === STRUCTURE_ROAD && structure.hits < structure.hitsMax * 0.75
             });
             if(allDamagedRoads.length > 0) {
-                console.log(`Builder ${creep.name}: Repairing roads - found ${allDamagedRoads.length} damaged roads`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Repairing roads - found ${allDamagedRoads.length} damaged roads`);
                 const target = this.findReachableRepairTarget(creep, allDamagedRoads);
                 if(target) {
                     const repairResult = creep.repair(target);
@@ -178,7 +180,7 @@ const roleBuilder = {
                             reusePath: 5
                         });
                         if(moveResult === ERR_NO_PATH) {
-                            console.log(`Builder ${creep.name}: No path to road, skipping`);
+                            if (DEBUG) console.log(`Builder ${creep.name}: No path to road, skipping`);
                             return;
                         }
                         creep.say('🛣️');
@@ -197,7 +199,7 @@ const roleBuilder = {
                     structure.structureType !== STRUCTURE_RAMPART
             });
             if(allDamagedStructures.length > 0) {
-                console.log(`Builder ${creep.name}: Repairing other structures - found ${allDamagedStructures.length} damaged structures`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Repairing other structures - found ${allDamagedStructures.length} damaged structures`);
                 const target = this.findReachableRepairTarget(creep, allDamagedStructures);
                 if(target) {
                     const repairResult = creep.repair(target);
@@ -207,7 +209,7 @@ const roleBuilder = {
                             reusePath: 5
                         });
                         if(moveResult === ERR_NO_PATH) {
-                            console.log(`Builder ${creep.name}: No path to structure, skipping`);
+                            if (DEBUG) console.log(`Builder ${creep.name}: No path to structure, skipping`);
                             return;
                         }
                         creep.say('🔧');
@@ -228,7 +230,7 @@ const roleBuilder = {
                 } else {
                     // Check if stuck on wall target
                     if(this.isStuckOnTarget(creep, 'repairingWallId')) {
-                        console.log(`Builder ${creep.name}: Stuck on wall target, finding new target`);
+                        if (DEBUG) console.log(`Builder ${creep.name}: Stuck on wall target, finding new target`);
                         delete creep.memory.repairingWallId;
                         delete creep.memory.targetAttempts;
                         target = null;
@@ -242,7 +244,7 @@ const roleBuilder = {
                         structure.hits < WALL_REPAIR_THRESHOLD
                 });
                 if(allWeakWalls.length > 0) {
-                    console.log(`Builder ${creep.name}: Reinforcing walls - found ${allWeakWalls.length} weak walls`);
+                    if (DEBUG) console.log(`Builder ${creep.name}: Reinforcing walls - found ${allWeakWalls.length} weak walls`);
                     target = this.findReachableWallTarget(creep, allWeakWalls);
                     if(target) {
                         creep.memory.repairingWallId = target.id;
@@ -254,7 +256,7 @@ const roleBuilder = {
                                 y: target.pos.y,
                                 roomName: target.pos.roomName
                             };
-                            console.log(`Builder ${creep.name}: Found reachable wall at ${target.pos}, setting work area`);
+                            if (DEBUG) console.log(`Builder ${creep.name}: Found reachable wall at ${target.pos}, setting work area`);
                         }
                     }
                 }
@@ -268,7 +270,7 @@ const roleBuilder = {
                     });
 
                     if(moveResult === ERR_NO_PATH) {
-                        console.log(`Builder ${creep.name}: No path to wall, abandoning target`);
+                        if (DEBUG) console.log(`Builder ${creep.name}: No path to wall, abandoning target`);
                         delete creep.memory.repairingWallId;
                         delete creep.memory.targetAttempts;
                         return;
@@ -288,7 +290,7 @@ const roleBuilder = {
             if(creep.store[RESOURCE_ENERGY] > 0) {
                 const storage = workingRoom.storage;
                 if(storage && storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                    console.log(`Builder ${creep.name}: Depositing energy to storage - no other tasks available`);
+                    if (DEBUG) console.log(`Builder ${creep.name}: Depositing energy to storage - no other tasks available`);
                     const transferResult = creep.transfer(storage, RESOURCE_ENERGY);
                     if(transferResult == ERR_NOT_IN_RANGE) {
                         creep.moveTo(storage, {
@@ -305,7 +307,7 @@ const roleBuilder = {
             // Priority 8: Upgrade controller if nothing else
             const controller = workingRoom.controller;
             if(controller) {
-                console.log(`Builder ${creep.name}: Upgrading controller - no other tasks available`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Upgrading controller - no other tasks available`);
                 const upgradeResult = creep.upgradeController(controller);
                 if(upgradeResult == ERR_NOT_IN_RANGE) {
                     creep.moveTo(controller, {
@@ -319,7 +321,7 @@ const roleBuilder = {
         }
         // Harvesting mode
         else {
-            console.log(`Builder ${creep.name}: In harvesting mode, looking for energy...`);
+            if (DEBUG) console.log(`Builder ${creep.name}: In harvesting mode, looking for energy...`);
             const harvestingRoom = this.getHarvestingRoom(creep);
 
             // First check for dropped resources
@@ -327,7 +329,7 @@ const roleBuilder = {
                 filter: resource => resource.resourceType === RESOURCE_ENERGY && resource.amount > 50
             });
             if(droppedResources.length > 0) {
-                console.log(`Builder ${creep.name}: Collecting dropped energy - found ${droppedResources.length} resources`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Collecting dropped energy - found ${droppedResources.length} resources`);
                 const closestResource = creep.pos.findClosestByPath(droppedResources);
                 if(closestResource) {
                     if(creep.pickup(closestResource) == ERR_NOT_IN_RANGE) {
@@ -355,7 +357,7 @@ const roleBuilder = {
             energySources.push(...containers);
 
             if(energySources.length > 0) {
-                console.log(`Builder ${creep.name}: Withdrawing from storage structures - found ${energySources.length} sources`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Withdrawing from storage structures - found ${energySources.length} sources`);
                 const closest = creep.pos.findClosestByPath(energySources);
                 if(closest) {
                     if(creep.withdraw(closest, RESOURCE_ENERGY) == ERR_NOT_IN_RANGE) {
@@ -372,7 +374,7 @@ const roleBuilder = {
             // Energy sources
             const sources = harvestingRoom.find(FIND_SOURCES_ACTIVE);
             if(sources.length > 0) {
-                console.log(`Builder ${creep.name}: Harvesting from energy source - found ${sources.length} active sources`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Harvesting from energy source - found ${sources.length} active sources`);
                 const source = creep.pos.findClosestByPath(sources);
                 if(source) {
                     if(creep.harvest(source) == ERR_NOT_IN_RANGE) {
@@ -384,7 +386,7 @@ const roleBuilder = {
                     }
                 }
             } else {
-                console.log(`Builder ${creep.name}: No energy sources available in room ${harvestingRoom.name}`);
+                if (DEBUG) console.log(`Builder ${creep.name}: No energy sources available in room ${harvestingRoom.name}`);
             }
         }
     },
@@ -427,12 +429,12 @@ const roleBuilder = {
             });
 
             if(workAreaSites.length > 0) {
-                console.log(`Builder ${creep.name}: Checking ${workAreaSites.length} sites in work area first`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Checking ${workAreaSites.length} sites in work area first`);
                 // Sort by progress
                 workAreaSites.sort((a, b) => (b.progress / b.progressTotal) - (a.progress / a.progressTotal));
                 for(let site of workAreaSites.slice(0, 3)) { // Try top 3 in work area
                     if(this.canReachTarget(creep, site)) {
-                        console.log(`Builder ${creep.name}: Found reachable site in work area: ${site.structureType} at ${site.pos}`);
+                        if (DEBUG) console.log(`Builder ${creep.name}: Found reachable site in work area: ${site.structureType} at ${site.pos}`);
                         return site;
                     }
                 }
@@ -440,19 +442,19 @@ const roleBuilder = {
         }
 
         // Try random sites from the full list
-        console.log(`Builder ${creep.name}: Trying random construction sites to find reachable one`);
+        if (DEBUG) console.log(`Builder ${creep.name}: Trying random construction sites to find reachable one`);
         const shuffledSites = _.shuffle(constructionSites);
         const maxTries = Math.min(5, shuffledSites.length); // Try fewer sites for performance
 
         for(let i = 0; i < maxTries; i++) {
             const site = shuffledSites[i];
             if(this.canReachTarget(creep, site)) {
-                console.log(`Builder ${creep.name}: Found reachable site: ${site.structureType} at ${site.pos}`);
+                if (DEBUG) console.log(`Builder ${creep.name}: Found reachable site: ${site.structureType} at ${site.pos}`);
                 return site;
             }
         }
 
-        console.log(`Builder ${creep.name}: No reachable construction sites found after trying ${maxTries} sites`);
+        if (DEBUG) console.log(`Builder ${creep.name}: No reachable construction sites found after trying ${maxTries} sites`);
         return null;
     },
 

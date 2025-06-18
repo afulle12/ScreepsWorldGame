@@ -1,15 +1,20 @@
+const DEBUG = false; // Set to false to disable console logging
+
 const roleHarvester = {
     run: function(creep) {
         if(!creep.memory.sourceId) {
+            if (DEBUG) console.log(`Harvester ${creep.name}: No source assigned, finding balanced source`);
             this.assignBalancedSource(creep);
         }
 
         if(creep.memory.depositing && creep.store[RESOURCE_ENERGY] === 0) {
             creep.memory.depositing = false;
             creep.memory.travelingToNewSource = false;
+            if (DEBUG) console.log(`Harvester ${creep.name}: Switching to harvest mode - out of energy`);
         }
         if(!creep.memory.depositing && creep.store.getFreeCapacity() === 0) {
             creep.memory.depositing = true;
+            if (DEBUG) console.log(`Harvester ${creep.name}: Switching to deposit mode - energy full`);
         }
 
         if(creep.memory.depositing) {
@@ -41,6 +46,9 @@ const roleHarvester = {
         if (leastAssignedSources.length > 0) {
             const pick = leastAssignedSources[Math.floor(Math.random() * leastAssignedSources.length)];
             creep.memory.sourceId = pick.source.id;
+            if (DEBUG) console.log(`Harvester ${creep.name}: Assigned to source ${pick.source.id.slice(-6)} (${pick.count} harvesters assigned)`);
+        } else {
+            if (DEBUG) console.log(`Harvester ${creep.name}: No sources available for assignment`);
         }
     },
 
@@ -75,12 +83,14 @@ const roleHarvester = {
     harvestEnergy: function(creep) {
         const source = Game.getObjectById(creep.memory.sourceId);
         if(!source) {
+            if (DEBUG) console.log(`Harvester ${creep.name}: Source ${creep.memory.sourceId} no longer exists, reassigning`);
             creep.memory.travelingToNewSource = false;
             this.assignBalancedSource(creep);
             return;
         }
         if(creep.memory.travelingToNewSource && creep.pos.inRangeTo(source, 1)) {
             creep.memory.travelingToNewSource = false;
+            if (DEBUG) console.log(`Harvester ${creep.name}: Reached new source, ready to harvest`);
         }
         if(source.energy === 0) {
             creep.say('⏳ waiting');
@@ -106,6 +116,7 @@ const roleHarvester = {
         if(depositTargets.length > 0) {
             const closest = creep.pos.findClosestByRange(depositTargets);
             if(closest) {
+                if (DEBUG) console.log(`Harvester ${creep.name}: Depositing to ${closest.structureType} at ${closest.pos}`);
                 if(creep.transfer(closest, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
                     creep.moveTo(closest, {visualizePathStyle: {stroke: '#ffffff'}});
                 }
@@ -124,11 +135,13 @@ const roleHarvester = {
         if(targets.length > 0) {
             const target = creep.pos.findClosestByPath(targets);
             if(target) {
+                if (DEBUG) console.log(`Harvester ${creep.name}: No storage/containers available, depositing to ${target.structureType}`);
                 if(creep.transfer(target, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
                     creep.moveTo(target, {visualizePathStyle: {stroke: '#ffffff'}});
                 }
             }
         } else {
+            if (DEBUG) console.log(`Harvester ${creep.name}: No deposit targets available, moving to spawn`);
             const spawn = creep.room.find(FIND_MY_SPAWNS)[0];
             if(spawn) {
                 creep.moveTo(spawn, {visualizePathStyle: {stroke: '#ffffff'}});
