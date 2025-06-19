@@ -261,6 +261,25 @@ function getPerformanceData() {
     };
 }
 
+// Format time in days, hours, and minutes
+function formatTime(totalMinutes) {
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const minutes = Math.floor(totalMinutes % 60);
+
+    if (days > 0) {
+        if (hours > 0) {
+            return `${days}d ${hours}h ${minutes}m`;
+        } else {
+            return `${days}d ${minutes}m`;
+        }
+    } else if (hours > 0) {
+        return `${hours}h ${minutes}m`;
+    } else {
+        return `${minutes}m`;
+    }
+}
+
 // Main game loop
 module.exports.loop = function() {
     if(Game.time % 20 === 0) cleanMemory();
@@ -543,8 +562,11 @@ function displayStatus(perRoomRoleCounts) {
                     const percentRemaining = 100 - newest.percent;
                     const rate = percentDelta / tickDelta; // percent per tick
                     const etaTicks = Math.ceil(percentRemaining / rate);
-                    const etaMinutes = (etaTicks * 4 / 60).toFixed(1);
-                    etaString = ` | ETA: ${etaTicks} ticks (~${etaMinutes} min)`;
+                    const etaMinutes = etaTicks * 4 / 60;
+
+                    // **NEW: Format ETA with days, hours, and minutes**
+                    const formattedTime = formatTime(etaMinutes);
+                    etaString = ` | ETA: ${etaTicks} ticks (~${formattedTime})`;
                 } else if(tickDelta >= TICK_WINDOW && percentDelta <= 0) {
                     etaString = ' | ETA: ∞ (no progress)';
                 }
@@ -577,8 +599,8 @@ function getRoomTargets(roomName, roomData, room) {
     return {
         harvester: Math.max(2, sourcesCount), // At least 2, preferably 1 per source
         upgrader: 2,
-        builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
-        //builder: 1, //temporary
+        //builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
+        builder: 2, //temporary
         scout: 0, // Scouts can work globally
         defender: 0, // Spawn defenders as needed based on threats
         supplier: hasStorageStructures ? Math.min(3, Math.floor(sourcesCount * 1.5)) : 0 // Only spawn suppliers if storage structures exist
