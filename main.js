@@ -496,7 +496,7 @@ function displayStatus(perRoomRoleCounts) {
         const avgTTL = stats.totalCreeps > 0 ? Math.round(stats.totalTTL / stats.totalCreeps) : 0;
         const oldestTTL = stats.oldestCreepTTL === Infinity ? 0 : stats.oldestCreepTTL;
 
-        console.log(`${roomName}: 🧑‍🌾 ${counts.harvester} | ⚡ ${counts.upgrader} | 🔨 ${counts.builder} | 🔭 ${counts.scout} | 🛡 ${counts.defender} | 🔋 ${counts.supplier} | 🤖 ${counts.claimbot} | Avg Parts: ${avgBodyParts}`);
+        console.log(`${roomName}: 🧑‍🌾 ${counts.harvester} | ⚡ ${counts.upgrader} | 🔨 ${counts.builder} | 🔭 ${counts.scout} | 🛡 ${counts.defender} | 🔋 ${counts.supplier} | 🤖 ${counts.claimbot} | Avg Parts: ${avgBodyParts} | Avg TTL: ${avgTTL} | Low TTL: ${oldestTTL}`);
     }
 
     // Performance tracking and display
@@ -577,8 +577,8 @@ function getRoomTargets(roomName, roomData, room) {
     return {
         harvester: Math.max(2, sourcesCount), // At least 2, preferably 1 per source
         upgrader: 2,
-        //builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
-        builder: 0, //temporary
+        builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
+        //builder: 1, //temporary
         scout: 0, // Scouts can work globally
         defender: 0, // Spawn defenders as needed based on threats
         supplier: hasStorageStructures ? Math.min(3, Math.floor(sourcesCount * 1.5)) : 0 // Only spawn suppliers if storage structures exist

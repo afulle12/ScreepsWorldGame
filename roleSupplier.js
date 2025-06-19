@@ -1,5 +1,5 @@
 // Toggle logging for supplier task table here:
-const SUPPLIER_LOGGING_ENABLED = true;
+const SUPPLIER_LOGGING_ENABLED = false;
 // Toggle logging for container categories here:
 const SUPPLIER_CONTAINER_CATEGORY_LOGGING = false;
 
