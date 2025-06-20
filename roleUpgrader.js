@@ -2,6 +2,38 @@ const DEBUG = false; // Set to false to disable console logging
 
 const roleUpgrader = {
     run: function(creep) {
+        // Check for invaders in the room
+        const hostile = creep.room.find(FIND_HOSTILE_CREEPS).length > 0;
+
+        if (hostile) {
+            // Find storage building
+            let storage = creep.pos.findClosestByPath(FIND_STRUCTURES, {
+                filter: (structure) =>
+                    structure.structureType == STRUCTURE_STORAGE
+            });
+
+            // If no storage, use spawn
+            if (!storage) {
+                storage = creep.pos.findClosestByPath(FIND_MY_STRUCTURES, {
+                    filter: (structure) =>
+                        structure.structureType == STRUCTURE_SPAWN
+                });
+            }
+
+            if (storage) {
+                // Stay next to the storage/spawn
+                if (creep.pos.getRangeTo(storage) > 1) {
+                    creep.moveTo(storage, {visualizePathStyle: {stroke: '#ff0000'}});
+                } else {
+                    creep.say('⏸️ invader');
+                }
+            } else {
+                // Nowhere to hide, just stop
+                creep.say('🚨 invader');
+            }
+            return; // Do nothing else while invader is present
+        }
+
         // Toggle between withdrawing and upgrading
         if(creep.memory.upgrading && creep.store[RESOURCE_ENERGY] == 0) {
             creep.memory.upgrading = false;

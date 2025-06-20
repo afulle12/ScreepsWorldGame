@@ -60,6 +60,8 @@ function runLinks() {
 
 // --- TOWER LOGIC ---
 function runTowers() {
+    if (!Memory.towerTargets) Memory.towerTargets = {};
+
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
         if(!room.controller || !room.controller.my) continue;
@@ -75,20 +77,68 @@ function runTowers() {
             // Filter for hostiles with HEAL parts
             const healers = hostiles.filter(c => c.body.some(part => part.type === HEAL));
 
-            // Attack the closest healer if any exist
-            if(healers.length > 0) {
-                const closestHealer = tower.pos.findClosestByRange(healers);
-                if(closestHealer) {
-                    tower.attack(closestHealer);
-                    continue;
-                }
+            // --- Tower Target Tracking Logic ---
+            // Initialize memory for this tower
+            if (!Memory.towerTargets[tower.id]) {
+                Memory.towerTargets[tower.id] = {
+                    targetId: null,
+                    lastHp: null,
+                    sameHpTicks: 0
+                };
+            }
+            const mem = Memory.towerTargets[tower.id];
+
+            // Determine target: prioritize healers, then other hostiles
+            let target = null;
+            if (healers.length > 0) {
+                // Find closest healer
+                target = tower.pos.findClosestByRange(healers);
+            } else if (hostiles.length > 0) {
+                // Find closest hostile
+                target = tower.pos.findClosestByRange(hostiles);
             }
 
-            // Otherwise, attack the closest hostile
-            const hostile = tower.pos.findClosestByRange(hostiles);
-            if(hostile) {
-                tower.attack(hostile);
+            // If we have a target, check if we should switch
+            if (target) {
+                // If new target or target changed, reset memory
+                if (mem.targetId !== target.id) {
+                    mem.targetId = target.id;
+                    mem.lastHp = target.hits;
+                    mem.sameHpTicks = 0;
+                } else {
+                    // Same target as last tick
+                    if (mem.lastHp === target.hits) {
+                        mem.sameHpTicks++;
+                    } else {
+                        mem.sameHpTicks = 0;
+                        mem.lastHp = target.hits;
+                    }
+                }
+
+                // If we've shot for 5 ticks and health hasn't changed, switch target
+                if (mem.sameHpTicks >= 5) {
+                    // Try to find a different hostile (not this one)
+                    const otherHostiles = hostiles.filter(h => h.id !== target.id);
+                    if (otherHostiles.length > 0) {
+                        const newTarget = tower.pos.findClosestByRange(otherHostiles);
+                        if (newTarget) {
+                            mem.targetId = newTarget.id;
+                            mem.lastHp = newTarget.hits;
+                            mem.sameHpTicks = 0;
+                            tower.attack(newTarget);
+                            continue;
+                        }
+                    }
+                    // If no other hostiles, just keep attacking the same target
+                }
+
+                tower.attack(target);
                 continue;
+            } else {
+                // No hostile, reset memory for this tower
+                mem.targetId = null;
+                mem.lastHp = null;
+                mem.sameHpTicks = 0;
             }
 
             // Heal friendly creeps if needed
@@ -599,8 +649,8 @@ function getRoomTargets(roomName, roomData, room) {
     return {
         harvester: Math.max(2, sourcesCount), // At least 2, preferably 1 per source
         upgrader: 2,
-        //builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
-        builder: 2, //temporary
+        builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
+        //builder: 2, //temporary
         scout: 0, // Scouts can work globally
         defender: 0, // Spawn defenders as needed based on threats
         supplier: hasStorageStructures ? Math.min(3, Math.floor(sourcesCount * 1.5)) : 0 // Only spawn suppliers if storage structures exist
