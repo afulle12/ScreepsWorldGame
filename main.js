@@ -334,10 +334,6 @@ function formatTime(totalMinutes) {
 module.exports.loop = function() {
     if(Game.time % 20 === 0) cleanMemory();
 
-    // Track performance metrics every tick
-    trackCPUUsage();
-    trackEnergyIncome();
-
     // Cache per-room role counts and room data once per tick
     const perRoomRoleCounts = getPerRoomRoleCounts();
     const roomDataCache = cacheRoomData();
@@ -358,6 +354,11 @@ module.exports.loop = function() {
     }
 
     if(Game.time % 50 === 0) visualizeExploration();
+
+    // === Moved CPU/energy tracking and status display to the end of the loop ===
+    // Track performance metrics every tick (AFTER all logic)
+    trackCPUUsage();
+    trackEnergyIncome();
 
     if(Game.time % 50 === 0) {
         displayStatus(perRoomRoleCounts);
