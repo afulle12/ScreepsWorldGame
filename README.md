@@ -1,40 +1,38 @@
-# Screeps AI Colony Manager
+# ScreepsWorldGame
 
-A personal implementation of AI-controlled colony management for [Screeps: World](https://store.steampowered.com/app/464350/Screeps_World/), the MMO strategy game for programmers.
+My evolving multi-room AI colony implementation for [Screeps: World](https://store.steampowered.com/app/464350/Screeps_World/), where JavaScript meets strategy gaming.
 
-## About This Project
+## 🎮 About
 
-This repository contains my evolving codebase for **Screeps**, where I program the AI behavior of my colony units (creeps) using JavaScript. While I've leveraged AI tools throughout development, the strategic decisions, operational rules, and priority systems are all custom-designed based on my gameplay experience.
+This repository contains the codebase that runs my Screeps colonies 24/7. While I've used AI tools to accelerate development, every strategic decision about **creep behavior**, **resource priorities**, and **expansion logic** comes from hands-on gameplay experience and debugging complex multi-creep interactions.
 
-## What is Screeps?
+## 🚀 Current Implementation
 
-Screeps is a unique MMO strategy game where you control your colony by writing JavaScript code. Your code runs 24/7 on game servers, managing everything from resource harvesting to territorial expansion and combat.
+### Core Systems
 
-## Development Journey
+#### **Creep Roles** (7 specialized types)
+- **🧑‍🌾 Harvesters**: Energy collection with source-specific assignments
+- **⚡ Upgraders**: Controller progression with room targeting
+- **🔨 Builders**: Construction site management
+- **🔭 Scouts**: Automated exploration and room analysis
+- **🛡️ Defenders**: Combat units with ranged attack capabilities
+- **🔋 Suppliers**: Energy logistics between storage structures
+- **🤖 Claimbots**: Room expansion units
 
-- **Initial Setup**: Started with AI-assisted boilerplate code to understand the basics
-- **Custom Strategy**: Developed my own rules for creep behavior, resource management, and colony priorities
-- **Problem Solving**: Debugging complex interactions between multiple creeps and game mechanics
-- **Continuous Evolution**: Code evolves as I discover new strategies and optimize existing ones
+#### **Defense & Infrastructure**
+- **Tower Logic**: Smart targeting system that prioritizes healers and switches targets when damage stalls
+- **Link Network**: Automated energy transfer between storage and controller links
+- **Road Tracking**: Monitors road usage to identify inefficient paths
 
-## Key Features
+#### **Performance & Analytics**
+- **CPU Tracking**: Rolling average CPU usage monitoring
+- **Energy Income**: Real-time energy generation rate calculations
+- **Progress ETAs**: Controller upgrade time estimates with day/hour/minute formatting
+- **Per-Room Management**: Independent spawn queues and creep counts for each room
 
-- Automated resource harvesting and management
-- Dynamic creep role assignment
-- Colony expansion logic
-- Defense mechanisms
-- *[Add more specific features as you implement them]*
-
-## Why This Repository?
-
-- **Backup**: Cloud storage for my colony's "brain"
-- **Portfolio**: Demonstrates problem-solving and JavaScript skills
-- **Learning**: Track my progress and coding improvements over time
-
-## Personal Note
-
-This game has **made coding fun again!** There's something incredibly satisfying about watching your code come to life as creeps scurry around following your instructions, building and defending your colony while you sleep.
-
----
-
-*Note: This is an active project that evolves with my gameplay. Expect frequent updates and experimental features.*
+### Development Approach
+- Started with AI-generated boilerplate to understand Screeps API
+- Defined custom operational rules and priority systems
+- Implemented emergency modes (e.g., spawning crippled harvesters when energy-critical)
+- Added 60-tick spawn delays to prevent energy depletion
+- Continuously refining based on colony performance
