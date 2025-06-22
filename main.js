@@ -6,6 +6,8 @@ const roleScout = require('roleScout');
 const roleDefender = require('roleDefender');
 const roleSupplier = require('roleSupplier');
 const roleClaimbot = require('roleClaimbot');
+const roadTracker = require('roadTracker');
+
 
 // Constants for body parts
 const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
@@ -357,6 +359,11 @@ module.exports.loop = function() {
 
     // === Moved CPU/energy tracking and status display to the end of the loop ===
     // Track performance metrics every tick (AFTER all logic)
+    roadTracker.trackRoadVisits();
+    roadTracker.visualizeUntraveledRoads();
+    // Example: get array of untraveled roads for a room
+    // const untraveled = roadTracker.getUntraveledRoads('W1N1');
+
     trackCPUUsage();
     trackEnergyIncome();
 
