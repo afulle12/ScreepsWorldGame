@@ -15,6 +15,17 @@ const CRIPPLED_HARVESTER = [WORK, CARRY, MOVE];
 const CARRY_ONLY = [CARRY, MOVE];
 const SCOUT_BODY = [MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE];
 
+// --- CPU PROFILING HELPER ---
+if (!Memory.cpuProfile) Memory.cpuProfile = {};
+function profileSection(name, fn) {
+    const start = Game.cpu.getUsed();
+    fn();
+    const used = Game.cpu.getUsed() - start;
+    if (!Memory.cpuProfile[name]) Memory.cpuProfile[name] = [];
+    Memory.cpuProfile[name].push(used);
+    if (Memory.cpuProfile[name].length > 50) Memory.cpuProfile[name].shift();
+}
+
 // --- LINK LOGIC ---
 function runLinks() {
     for(const roomName in Game.rooms) {
@@ -336,39 +347,56 @@ module.exports.loop = function() {
     if(Game.time % 20 === 0) cleanMemory();
 
     // Cache per-room role counts and room data once per tick
-    const perRoomRoleCounts = getPerRoomRoleCounts();
-    const roomDataCache = cacheRoomData();
+    let perRoomRoleCounts, roomDataCache;
+    profileSection('getPerRoomRoleCounts', () => {
+        perRoomRoleCounts = getPerRoomRoleCounts();
+    });
+    profileSection('cacheRoomData', () => {
+        roomDataCache = cacheRoomData();
+    });
 
     // --- Run tower logic here ---
-    runTowers();
+    profileSection('runTowers', runTowers);
 
     // --- Run link logic here ---
-    runLinks();
+    profileSection('runLinks', runLinks);
 
-    runCreeps();
+    profileSection('runCreeps', runCreeps);
 
     // --- CLAIMBOT SPAWN LOGIC ---
-    manageClaimbotSpawns();
+    profileSection('manageClaimbotSpawns', manageClaimbotSpawns);
 
     if(needsNewCreeps(perRoomRoleCounts) || Game.time % 10 === 0) {
-        manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache);
+        profileSection('manageSpawnsPerRoom', () => {
+            manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache);
+        });
     }
 
-    if(Game.time % 50 === 0) visualizeExploration();
+    if(Game.time % 50 === 0) profileSection('visualizeExploration', visualizeExploration);
 
     // === Moved CPU/energy tracking and status display to the end of the loop ===
     // Track performance metrics every tick (AFTER all logic)
-    roadTracker.trackRoadVisits();
-    roadTracker.visualizeUntraveledRoads();
-    // Example: get array of untraveled roads for a room
-    // const untraveled = roadTracker.getUntraveledRoads('W1N1');
+    profileSection('roadTracker.trackRoadVisits', () => {
+        roadTracker.trackRoadVisits();
+    });
+    profileSection('roadTracker.visualizeUntraveledRoads', () => {
+        roadTracker.visualizeUntraveledRoads();
+    });
 
-    trackCPUUsage();
-    trackEnergyIncome();
+    profileSection('trackCPUUsage', trackCPUUsage);
+    profileSection('trackEnergyIncome', trackEnergyIncome);
 
     if(Game.time % 50 === 0) {
-        displayStatus(perRoomRoleCounts);
-        suggestExpansion();
+        profileSection('displayStatus', () => {
+            displayStatus(perRoomRoleCounts);
+        });
+        profileSection('suggestExpansion', suggestExpansion);
+
+        // Log average CPU usage for each section
+        for (const key in Memory.cpuProfile) {
+            const avg = Memory.cpuProfile[key].reduce((a, b) => a + b, 0) / Memory.cpuProfile[key].length;
+            console.log(`CPU Profile: ${key} avg: ${avg.toFixed(2)}`);
+        }
     }
 }
 
@@ -524,6 +552,8 @@ function runCreeps() {
         if(role === 'scout' && Game.time % 5 !== 0) continue;
         if((role === 'builder' || role === 'upgrader') && Game.time % 3 !== 0) continue;
 
+        // Profile each role's run function
+        const cpuBefore = Game.cpu.getUsed();
         switch(role) {
             case 'harvester':
                 roleHarvester.run(creep);
@@ -549,6 +579,21 @@ function runCreeps() {
             default:
                 creep.memory.role = 'harvester';
                 break;
+        }
+        const cpuAfter = Game.cpu.getUsed();
+        // Aggregate per-role CPU usage (optional, comment out if too verbose)
+        if (!Memory.cpuProfileCreeps) Memory.cpuProfileCreeps = {};
+        if (!Memory.cpuProfileCreeps[role]) Memory.cpuProfileCreeps[role] = [];
+        Memory.cpuProfileCreeps[role].push(cpuAfter - cpuBefore);
+        if (Memory.cpuProfileCreeps[role].length > 50) Memory.cpuProfileCreeps[role].shift();
+    }
+
+    // Log per-role creep CPU usage every 50 ticks
+    if (Game.time % 50 === 0 && Memory.cpuProfileCreeps) {
+        for (const role in Memory.cpuProfileCreeps) {
+            const arr = Memory.cpuProfileCreeps[role];
+            const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+            console.log(`Creep Role CPU: ${role} avg: ${avg.toFixed(2)}`);
         }
     }
 }
