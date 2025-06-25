@@ -111,6 +111,12 @@ const roleBuilder = {
             // Get the current working room
             const workingRoom = this.getWorkingRoom(creep);
 
+            // Only work in owned rooms
+            if (!workingRoom) {
+                if (DEBUG) console.log(`Builder ${creep.name}: No owned room to work in, idling`);
+                return;
+            }
+
             // Priority 2: Repair damaged ramparts (prioritize work area)
             const allDamagedRamparts = workingRoom.find(FIND_STRUCTURES, {
                 filter: (structure) => 
@@ -323,6 +329,12 @@ const roleBuilder = {
         else {
             if (DEBUG) console.log(`Builder ${creep.name}: In harvesting mode, looking for energy...`);
             const harvestingRoom = this.getHarvestingRoom(creep);
+
+            // Only harvest in owned rooms
+            if (!harvestingRoom) {
+                if (DEBUG) console.log(`Builder ${creep.name}: No owned room to harvest in, idling`);
+                return;
+            }
 
             // First check for dropped resources
             const droppedResources = harvestingRoom.find(FIND_DROPPED_RESOURCES, {
@@ -564,16 +576,18 @@ const roleBuilder = {
         return path.length > 0;
     },
 
-    // Find construction sites across assigned room and current room
+    // Find construction sites across assigned room and current room, but only in owned rooms
     findConstructionSites: function(creep) {
         let constructionSites = [];
 
-        // Always check current room
-        constructionSites.push(...creep.room.find(FIND_CONSTRUCTION_SITES));
+        // Only add sites from rooms you own
+        if (creep.room.controller && creep.room.controller.my) {
+            constructionSites.push(...creep.room.find(FIND_CONSTRUCTION_SITES));
+        }
 
-        // Check assigned room if different from current room
+        // Check assigned room if different from current room and owned
         const assignedRoom = creep.memory.assignedRoom;
-        if(assignedRoom && assignedRoom !== creep.room.name && Game.rooms[assignedRoom]) {
+        if(assignedRoom && assignedRoom !== creep.room.name && Game.rooms[assignedRoom] && Game.rooms[assignedRoom].controller && Game.rooms[assignedRoom].controller.my) {
             constructionSites.push(...Game.rooms[assignedRoom].find(FIND_CONSTRUCTION_SITES));
         }
 
@@ -590,35 +604,40 @@ const roleBuilder = {
         return constructionSites;
     },
 
-    // Get the room where the creep should do repair/building work
+    // Get the room where the creep should do repair/building work, only if owned
     getWorkingRoom: function(creep) {
-        // Prefer assigned room if it exists and has visibility
+        // Prefer assigned room if it exists and has visibility and is owned
         const assignedRoom = creep.memory.assignedRoom;
         if(assignedRoom && Game.rooms[assignedRoom] && Game.rooms[assignedRoom].controller && Game.rooms[assignedRoom].controller.my) {
             return Game.rooms[assignedRoom];
         }
 
-        // Fall back to current room
-        return creep.room;
-    },
-
-    // Get the room where the creep should harvest energy
-    getHarvestingRoom: function(creep) {
-        // For harvesting, prefer current room if it has sources
-        if(creep.room.find(FIND_SOURCES_ACTIVE).length > 0 || 
-           creep.room.storage || 
-           creep.room.find(FIND_STRUCTURES, {filter: s => s.structureType === STRUCTURE_CONTAINER && s.store[RESOURCE_ENERGY] > 0}).length > 0) {
+        // Only return current room if owned
+        if (creep.room.controller && creep.room.controller.my) {
             return creep.room;
         }
 
-        // Otherwise try assigned room
+        // If not owned, return null (handle this in run)
+        return null;
+    },
+
+    // Get the room where the creep should harvest energy, only if owned
+    getHarvestingRoom: function(creep) {
+        // Only harvest in owned rooms
+        if (creep.room.controller && creep.room.controller.my &&
+            (creep.room.find(FIND_SOURCES_ACTIVE).length > 0 || 
+             creep.room.storage || 
+             creep.room.find(FIND_STRUCTURES, {filter: s => s.structureType === STRUCTURE_CONTAINER && s.store[RESOURCE_ENERGY] > 0}).length > 0)) {
+            return creep.room;
+        }
+
         const assignedRoom = creep.memory.assignedRoom;
-        if(assignedRoom && Game.rooms[assignedRoom]) {
+        if(assignedRoom && Game.rooms[assignedRoom] && Game.rooms[assignedRoom].controller && Game.rooms[assignedRoom].controller.my) {
             return Game.rooms[assignedRoom];
         }
 
-        // Fall back to current room
-        return creep.room;
+        // No owned room to harvest in
+        return null;
     }
 };
 

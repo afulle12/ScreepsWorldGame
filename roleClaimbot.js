@@ -1,4 +1,4 @@
-const enableLogging = false;  // Set to false to disable logging
+const enableLogging = true;  // Set to false to disable logging
 
 module.exports = {
     run: function(creep) {

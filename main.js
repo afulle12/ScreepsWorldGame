@@ -8,7 +8,6 @@ const roleSupplier = require('roleSupplier');
 const roleClaimbot = require('roleClaimbot');
 const roadTracker = require('roadTracker');
 
-
 // Constants for body parts
 const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
 const BASIC_DEFENDER = [TOUGH, MOVE, RANGED_ATTACK];
@@ -378,28 +377,46 @@ function manageClaimbotSpawns() {
     if (!Memory.claimOrders) Memory.claimOrders = [];
     if (Memory.claimOrders.length === 0) return;
 
-    // Only spawn if we don't already have a claimbot for this room
     const claimOrder = Memory.claimOrders[0];
+    // Only spawn if we don't already have a claimbot for this room
     const existing = _.find(Game.creeps, c => c.memory.role === 'claimbot' && c.memory.targetRoom === claimOrder.room);
     if (existing) return;
 
-    // Find an available spawn
-    const spawn = Object.values(Game.spawns).find(s => !s.spawning);
-    if (!spawn) return;
+    // Find the closest owned room with an idle spawn
+    let closestSpawn = null;
+    let closestDistance = Infinity;
+    for (const roomName in Game.rooms) {
+        const room = Game.rooms[roomName];
+        if (!room.controller || !room.controller.my) continue;
+        const spawn = room.find(FIND_MY_STRUCTURES, {
+            filter: { structureType: STRUCTURE_SPAWN }
+        })[0];
+        if (!spawn || spawn.spawning) continue;
+        const distance = Game.map.getRoomLinearDistance(roomName, claimOrder.room);
+        if (distance < closestDistance) {
+            closestDistance = distance;
+            closestSpawn = spawn;
+        }
+    }
+    if (!closestSpawn) return;
 
     // You may want to add more MOVE if the target room is far away
     const claimBody = [CLAIM, ATTACK, MOVE, MOVE, MOVE];
 
-    const result = spawn.spawnCreep(claimBody, 'claimbot' + Game.time, {
+    const cost = bodyCost(claimBody);
+    const availableEnergy = closestSpawn.room.energyAvailable;
+
+    const result = closestSpawn.spawnCreep(claimBody, 'claimbot' + Game.time, {
         memory: { role: 'claimbot', targetRoom: claimOrder.room }
     });
     if (result === OK) {
-        console.log(`Spawning claimbot for ${claimOrder.room}`);
+        console.log(`Spawning claimbot for ${claimOrder.room} | Cost: ${cost} | Energy before: ${availableEnergy}`);
         Memory.claimOrders.shift();
     } else {
         console.log(`Failed to spawn claimbot: ${result}`);
     }
 }
+
 
 // Clean memory only occasionally
 function cleanMemory() {
@@ -657,8 +674,8 @@ function getRoomTargets(roomName, roomData, room) {
     return {
         harvester: Math.max(2, sourcesCount), // At least 2, preferably 1 per source
         upgrader: 2,
-        builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
-        //builder: 2, //temporary
+        //builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
+        builder: 2, //temporary
         scout: 0, // Scouts can work globally
         defender: 0, // Spawn defenders as needed based on threats
         supplier: hasStorageStructures ? Math.min(3, Math.floor(sourcesCount * 1.5)) : 0 // Only spawn suppliers if storage structures exist
@@ -836,6 +853,34 @@ function getCreepBody(role, energy) {
     }
 }
 
+// Helper: Calculate the cost of a creep body
+function bodyCost(body) {
+    const BODYPART_COST = {
+        move: 50,
+        work: 100,
+        attack: 80,
+        carry: 50,
+        heal: 250,
+        ranged_attack: 150,
+        tough: 10,
+        claim: 600
+    };
+    let cost = 0;
+    for(const part of body) {
+        // part can be a string or a constant, so get .toLowerCase()
+        let type = typeof part === 'string' ? part.toLowerCase() : part;
+        // If it's a constant, get its string name
+        if(typeof type !== 'string' && type in BODYPART_COST) {
+            cost += BODYPART_COST[type];
+        } else if(typeof type === 'string' && BODYPART_COST[type]) {
+            cost += BODYPART_COST[type];
+        } else if(typeof part === 'number' && BODYPART_COST[part]) {
+            cost += BODYPART_COST[part];
+        }
+    }
+    return cost;
+}
+
 // Spawn a new creep in a specific room, with room assignment
 function spawnCreepInRoom(role, body, spawn, roomName) {
     const newName = role + '_' + roomName + '_' + Game.time;
@@ -851,13 +896,16 @@ function spawnCreepInRoom(role, body, spawn, roomName) {
         memory.targetRoom = roomName;
     }
 
+    const availableEnergy = spawn.room.energyAvailable;
+    const cost = bodyCost(body);
+
     const result = spawn.spawnCreep(body, newName, { memory: memory });
 
     if(result === OK) {
-        console.log(`Spawning ${role} in ${roomName} with ${body.length} parts`);
+        console.log(`Spawning ${role} in ${roomName} with ${body.length} parts | Cost: ${cost} | Energy before: ${availableEnergy}`);
         return true;
     } else {
-        console.log(`Failed to spawn ${role} in ${roomName}: ${result} (energy: ${spawn.room.energyAvailable})`);
+        console.log(`Failed to spawn ${role} in ${roomName}: ${result} (energy: ${availableEnergy}, cost: ${cost})`);
         return false;
     }
 }
