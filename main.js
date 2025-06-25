@@ -372,7 +372,6 @@ module.exports.loop = function() {
         });
     }
 
-    if(Game.time % 50 === 0) profileSection('visualizeExploration', visualizeExploration);
 
     // === Moved CPU/energy tracking and status display to the end of the loop ===
     // Track performance metrics every tick (AFTER all logic)
@@ -952,51 +951,6 @@ function spawnCreepInRoom(role, body, spawn, roomName) {
     } else {
         console.log(`Failed to spawn ${role} in ${roomName}: ${result} (energy: ${availableEnergy}, cost: ${cost})`);
         return false;
-    }
-}
-
-// Visualize exploration data
-function visualizeExploration() {
-    if(!Memory.exploration || !Memory.exploration.rooms) return;
-
-    for(const roomName in Game.rooms) {
-        const room = Game.rooms[roomName];
-        const visual = room.visual;
-
-        const exits = Game.map.describeExits(roomName);
-        const exitCoords = {
-            [FIND_EXIT_TOP]: {x: 25, y: 5},
-            [FIND_EXIT_RIGHT]: {x: 45, y: 25},
-            [FIND_EXIT_BOTTOM]: {x: 25, y: 45},
-            [FIND_EXIT_LEFT]: {x: 5, y: 25}
-        };
-
-        for(const dir in exits) {
-            const neighborName = exits[dir];
-            const neighborData = Memory.exploration.rooms[neighborName];
-
-            if(neighborData) {
-                const pos = exitCoords[dir];
-                let color = 'white';
-                let text = neighborName;
-
-                if(neighborData.hostile) {
-                    color = 'red';
-                    text += ' ⚠️';
-                }
-
-                if(neighborData.controller && neighborData.controller.owner) {
-                    color = 'purple';
-                    text += ' 👑';
-                }
-
-                if(neighborData.sources.length > 0) {
-                    text += ` ⚡${neighborData.sources.length}`;
-                }
-
-                visual.text(text, pos.x, pos.y, {color: color, fontSize: 7});
-            }
-        }
     }
 }
 

@@ -1,6 +1,6 @@
 // roadTracker.js
 
-const ROAD_TRACKING_ACTIVE = true;
+const ROAD_TRACKING_ACTIVE = false;
 const TRACKING_DURATION = 2000; // Number of ticks to track
 const LOG_INTERVAL = 10;      // How often to log status
 const OVERUSED_THRESHOLD = 10; // Visits needed to mark a no-structure square as overused
