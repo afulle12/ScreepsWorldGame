@@ -1,3 +1,7 @@
+// === CPU USAGE LOGGING TOGGLE VARIABLES ===
+const ENABLE_CPU_LOGGING = true;      // Set to false to disable ALL CPU profiling/logging
+const DISABLE_CPU_CONSOLE = true;    // Set to true to disable only CPU-related console.log output
+
 // Import role modules
 const roleHarvester = require('roleHarvester');
 const roleUpgrader = require('roleUpgrader');
@@ -16,8 +20,12 @@ const CARRY_ONLY = [CARRY, MOVE];
 const SCOUT_BODY = [MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE];
 
 // --- CPU PROFILING HELPER ---
-if (!Memory.cpuProfile) Memory.cpuProfile = {};
+if (ENABLE_CPU_LOGGING && !Memory.cpuProfile) Memory.cpuProfile = {};
 function profileSection(name, fn) {
+    if (!ENABLE_CPU_LOGGING) {
+        fn();
+        return;
+    }
     const start = Game.cpu.getUsed();
     fn();
     const used = Game.cpu.getUsed() - start;
@@ -239,6 +247,7 @@ function calculateTotalEnergy() {
 
 // Track CPU usage over time
 function trackCPUUsage() {
+    if (!ENABLE_CPU_LOGGING) return;
     if(!Memory.cpuStats) {
         Memory.cpuStats = {
             history: [],
@@ -306,7 +315,7 @@ function trackEnergyIncome() {
 // Get performance data for display
 function getPerformanceData() {
     const cpuUsed = Game.cpu.getUsed();
-    const cpuAverage = Memory.cpuStats ? Memory.cpuStats.average : 0;
+    const cpuAverage = (ENABLE_CPU_LOGGING && Memory.cpuStats) ? Memory.cpuStats.average : 0;
     const cpuLimit = Game.cpu.limit;
     const cpuPercent = ((cpuUsed / cpuLimit) * 100).toFixed(1);
 
@@ -372,7 +381,6 @@ module.exports.loop = function() {
         });
     }
 
-
     // === Moved CPU/energy tracking and status display to the end of the loop ===
     // Track performance metrics every tick (AFTER all logic)
     profileSection('roadTracker.trackRoadVisits', () => {
@@ -382,7 +390,7 @@ module.exports.loop = function() {
         roadTracker.visualizeUntraveledRoads();
     });
 
-    profileSection('trackCPUUsage', trackCPUUsage);
+    if (ENABLE_CPU_LOGGING) profileSection('trackCPUUsage', trackCPUUsage);
     profileSection('trackEnergyIncome', trackEnergyIncome);
 
     if(Game.time % 50 === 0) {
@@ -392,9 +400,11 @@ module.exports.loop = function() {
         profileSection('suggestExpansion', suggestExpansion);
 
         // Log average CPU usage for each section
-        for (const key in Memory.cpuProfile) {
-            const avg = Memory.cpuProfile[key].reduce((a, b) => a + b, 0) / Memory.cpuProfile[key].length;
-            console.log(`CPU Profile: ${key} avg: ${avg.toFixed(2)}`);
+        if (ENABLE_CPU_LOGGING && !DISABLE_CPU_CONSOLE) {
+            for (const key in Memory.cpuProfile) {
+                const avg = Memory.cpuProfile[key].reduce((a, b) => a + b, 0) / Memory.cpuProfile[key].length;
+                console.log(`CPU Profile: ${key} avg: ${avg.toFixed(2)}`);
+            }
         }
     }
 }
@@ -552,7 +562,8 @@ function runCreeps() {
         if((role === 'builder' || role === 'upgrader') && Game.time % 3 !== 0) continue;
 
         // Profile each role's run function
-        const cpuBefore = Game.cpu.getUsed();
+        let cpuBefore, cpuAfter;
+        if (ENABLE_CPU_LOGGING) cpuBefore = Game.cpu.getUsed();
         switch(role) {
             case 'harvester':
                 roleHarvester.run(creep);
@@ -579,16 +590,18 @@ function runCreeps() {
                 creep.memory.role = 'harvester';
                 break;
         }
-        const cpuAfter = Game.cpu.getUsed();
-        // Aggregate per-role CPU usage (optional, comment out if too verbose)
-        if (!Memory.cpuProfileCreeps) Memory.cpuProfileCreeps = {};
-        if (!Memory.cpuProfileCreeps[role]) Memory.cpuProfileCreeps[role] = [];
-        Memory.cpuProfileCreeps[role].push(cpuAfter - cpuBefore);
-        if (Memory.cpuProfileCreeps[role].length > 50) Memory.cpuProfileCreeps[role].shift();
+        if (ENABLE_CPU_LOGGING) {
+            cpuAfter = Game.cpu.getUsed();
+            // Aggregate per-role CPU usage (optional, comment out if too verbose)
+            if (!Memory.cpuProfileCreeps) Memory.cpuProfileCreeps = {};
+            if (!Memory.cpuProfileCreeps[role]) Memory.cpuProfileCreeps[role] = [];
+            Memory.cpuProfileCreeps[role].push(cpuAfter - cpuBefore);
+            if (Memory.cpuProfileCreeps[role].length > 50) Memory.cpuProfileCreeps[role].shift();
+        }
     }
 
     // Log per-role creep CPU usage every 50 ticks
-    if (Game.time % 50 === 0 && Memory.cpuProfileCreeps) {
+    if (Game.time % 50 === 0 && ENABLE_CPU_LOGGING && Memory.cpuProfileCreeps && !DISABLE_CPU_CONSOLE) {
         for (const role in Memory.cpuProfileCreeps) {
             const arr = Memory.cpuProfileCreeps[role];
             const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
@@ -641,7 +654,9 @@ function displayStatus(perRoomRoleCounts) {
     const perfData = getPerformanceData();
     const currentEnergy = calculateTotalEnergy();
     console.log(`💰 Total Energy: ${currentEnergy} | ⛏️ Income: ${perfData.energyIncome}/tick (last ${perfData.trackingTicks} ticks)`);
-    console.log(`🖥️ CPU: ${perfData.cpuUsed}/${perfData.cpuLimit} (${perfData.cpuPercent}%) | Avg: ${perfData.cpuAverage}`);
+    if (!ENABLE_CPU_LOGGING || !DISABLE_CPU_CONSOLE) {
+        console.log(`🖥️ CPU: ${perfData.cpuUsed}/${perfData.cpuLimit} (${perfData.cpuPercent}%) | Avg: ${perfData.cpuAverage}`);
+    }
 
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
