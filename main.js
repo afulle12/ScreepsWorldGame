@@ -718,11 +718,11 @@ function getRoomTargets(roomName, roomData, room) {
     return {
         harvester: Math.max(1, sourcesCount), // At least 1 or 1 per source
         upgrader: Math.max(1, sourcesCount),
-        builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
-        //builder: 2, //temporary
+        //builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
+        builder: 1, //temporary
         scout: 0, // Scouts can work globally
         defender: 0, // Spawn defenders as needed based on threats
-        supplier: hasStorageStructures ? Math.min(2, Math.floor(sourcesCount * 1.5)) : 0 // Only spawn suppliers if storage structures exist
+        supplier: hasStorageStructures ? (sourcesCount + 1) : 0 // Only spawn suppliers if storage structures exist
     };
 }
 
