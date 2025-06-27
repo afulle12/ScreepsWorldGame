@@ -430,25 +430,46 @@ module.exports = {
                 sourceObject = primaryObject;
                 if (!taskStillExistsInList || !sourceObject || !deliveryObject) {
                     creep.memory.assignment = null;
+                    creep.memory.state = 'idle';
+                    creep.memory.idleTicks = 1;
+                    creep.cancelOrder('move');
                 } else if (sourceObject.store && sourceObject.store.getUsedCapacity(RESOURCE_ENERGY) === 0 && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
                     creep.memory.assignment = null;
+                    creep.memory.state = 'idle';
+                    creep.memory.idleTicks = 1;
+                    creep.cancelOrder('move');
                 } else if (deliveryObject.store && deliveryObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
                     creep.memory.assignment = null;
+                    creep.memory.state = 'idle';
+                    creep.memory.idleTicks = 1;
+                    creep.cancelOrder('move');
                 }
             } else if (assignment.type === 'container_empty' || assignment.type === 'container_drain') {
                 deliveryObject = Game.getObjectById(assignment.targetId || assignment.transferTargetId);
                 sourceObject = primaryObject;
                 if (!taskStillExistsInList || !sourceObject || !deliveryObject) {
                     creep.memory.assignment = null;
+                    creep.memory.state = 'idle';
+                    creep.memory.idleTicks = 1;
+                    creep.cancelOrder('move');
                 } else if (sourceObject.store.getUsedCapacity(RESOURCE_ENERGY) === 0 && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
                     creep.memory.assignment = null;
+                    creep.memory.state = 'idle';
+                    creep.memory.idleTicks = 1;
+                    creep.cancelOrder('move');
                 } else if (deliveryObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
                     creep.memory.assignment = null;
+                    creep.memory.state = 'idle';
+                    creep.memory.idleTicks = 1;
+                    creep.cancelOrder('move');
                 }
             } else {
                 deliveryObject = primaryObject;
                 if (!taskStillExistsInList || !deliveryObject || (deliveryObject.store && deliveryObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0)) {
                     creep.memory.assignment = null;
+                    creep.memory.state = 'idle';
+                    creep.memory.idleTicks = 1;
+                    creep.cancelOrder('move');
                 }
             }
         }
@@ -540,9 +561,16 @@ module.exports = {
         }
 
         // --- STATE MACHINE ---
-        // Add idle state if not present
-        if (!creep.memory.state) creep.memory.state = 'fetching';
-        let assignment = creep.memory.assignment; // Re-fetch from memory after potential validation changes
+        let assignment = creep.memory.assignment;
+
+        // Initialize state based on assignment status
+        if (!creep.memory.state) {
+            if (!assignment || !assignment.taskId) {
+                creep.memory.state = 'idle';
+            } else {
+                creep.memory.state = assignment.needsEnergy ? 'fetching' : 'delivering';
+            }
+        }
 
         // --- IDLE STATE ---
         if ((!assignment || !assignment.taskId) && (!creep.memory.state || creep.memory.state === 'idle')) {
@@ -550,6 +578,8 @@ module.exports = {
             if (creep.memory.state !== 'idle') {
                 creep.memory.state = 'idle';
                 creep.memory.idleTicks = 1;
+                // Explicitly cancel any existing movement orders
+                creep.cancelOrder('move');
             } else {
                 creep.memory.idleTicks = (creep.memory.idleTicks || 0) + 1;
             }
@@ -560,7 +590,8 @@ module.exports = {
                 creep.memory.idleTicks = 0;
                 // Continue to fetching/delivering logic below
             } else if (creep.memory.idleTicks < 3) {
-                // Stay stationary for idle ticks
+                // Stay stationary for idle ticks - cancel movement each tick to be sure
+                creep.cancelOrder('move');
                 return;
             } else {
                 // After 3 ticks, reset idleTicks and check for new assignment next tick
@@ -610,6 +641,9 @@ module.exports = {
                 if (sourceToWithdraw) {
                     if (!sourceToWithdraw || sourceToWithdraw.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
                         creep.memory.assignment = null;
+                        creep.memory.state = 'idle';
+                        creep.memory.idleTicks = 1;
+                        creep.cancelOrder('move');
                         return;
                     }
                     if (creep.withdraw(sourceToWithdraw, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
@@ -681,20 +715,18 @@ module.exports = {
                 creep.memory.state = 'fetching';
                 if (assignment && assignment.type !== 'container_balance') {
                     creep.memory.assignment = null;
+                    creep.memory.state = 'idle';
+                    creep.memory.idleTicks = 1;
+                    creep.cancelOrder('move');
                 }
                 return;
             }
 
             if (!assignment || !assignment.taskId) {
-                if (creep.room.storage && creep.room.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                    if (creep.transfer(creep.room.storage, RESOURCE_ENERGY) == ERR_NOT_IN_RANGE) creep.moveTo(creep.room.storage, { visualizePathStyle: { stroke: '#ffffff' } });
-                } else {
-                    let anyNonFull = creep.pos.findClosestByRange(FIND_MY_STRUCTURES, {
-                        filter: (s) => (s.structureType == STRUCTURE_EXTENSION || s.structureType == STRUCTURE_SPAWN || s.structureType == STRUCTURE_TOWER) && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-                    });
-                    if (anyNonFull) { if (creep.transfer(anyNonFull, RESOURCE_ENERGY) == ERR_NOT_IN_RANGE) creep.moveTo(anyNonFull, { visualizePathStyle: { stroke: '#ffffff' } }); }
-                    else { const spawns = creep.room.find(FIND_MY_STRUCTURES, { filter: s => s.structureType === STRUCTURE_SPAWN }); if (spawns.length > 0) creep.moveTo(spawns[0], { visualizePathStyle: { stroke: '#888888' }, range: 2 });}
-                }
+                // IMMEDIATELY transition to idle instead of continuing delivery logic
+                creep.memory.state = 'idle';
+                creep.memory.idleTicks = 1;
+                creep.cancelOrder('move');
                 return;
             }
 
@@ -713,11 +745,20 @@ module.exports = {
                     let newTower = creep.pos.findClosestByRange(availableTowers);
                     creep.memory.assignment.targetId = newTower.id;
                     deliverTargetObject = newTower;
-                } else { creep.memory.assignment = null; return; }
+                } else { 
+                    creep.memory.assignment = null; 
+                    creep.memory.state = 'idle';
+                    creep.memory.idleTicks = 1;
+                    creep.cancelOrder('move');
+                    return; 
+                }
             }
 
             if (!deliverTargetObject || (deliverTargetObject.store && deliverTargetObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0)) {
                 creep.memory.assignment = null;
+                creep.memory.state = 'idle';
+                creep.memory.idleTicks = 1;
+                creep.cancelOrder('move');
                 return;
             }
 
@@ -727,6 +768,9 @@ module.exports = {
             } else if (transferResult === OK) {
                 if (deliverTargetObject.store && deliverTargetObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
                     creep.memory.assignment = null;
+                    creep.memory.state = 'idle';
+                    creep.memory.idleTicks = 1;
+                    creep.cancelOrder('move');
                 }
             }
             return;
