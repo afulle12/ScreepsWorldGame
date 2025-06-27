@@ -1,6 +1,6 @@
 // === CPU USAGE LOGGING TOGGLE VARIABLES ===
-const ENABLE_CPU_LOGGING = true;      // Set to false to disable ALL CPU profiling/logging
-const DISABLE_CPU_CONSOLE = true;    // Set to true to disable only CPU-related console.log output
+const ENABLE_CPU_LOGGING = false;      // Set to false to disable ALL CPU profiling/logging
+const DISABLE_CPU_CONSOLE = false;    // Set to true to disable only CPU-related console.log output
 
 // Import role modules
 const roleHarvester = require('roleHarvester');
@@ -32,6 +32,21 @@ function profileSection(name, fn) {
     if (!Memory.cpuProfile[name]) Memory.cpuProfile[name] = [];
     Memory.cpuProfile[name].push(used);
     if (Memory.cpuProfile[name].length > 50) Memory.cpuProfile[name].shift();
+    // Track last used tick for cleanup
+    if (!Memory.cpuProfileLastUsed) Memory.cpuProfileLastUsed = {};
+    Memory.cpuProfileLastUsed[name] = Game.time;
+}
+
+// --- CPU PROFILE MEMORY CLEANUP ---
+function cleanCpuProfileMemory(maxAge = 5000) {
+    if (!Memory.cpuProfileLastUsed) return;
+    const now = Game.time;
+    for (const key in Memory.cpuProfileLastUsed) {
+        if (now - Memory.cpuProfileLastUsed[key] > maxAge) {
+            delete Memory.cpuProfile[key];
+            delete Memory.cpuProfileLastUsed[key];
+        }
+    }
 }
 
 // --- LINK LOGIC ---
@@ -354,6 +369,7 @@ function formatTime(totalMinutes) {
 // Main game loop
 module.exports.loop = function() {
     if(Game.time % 20 === 0) cleanMemory();
+    if(Game.time % 1000 === 0) cleanCpuProfileMemory();
 
     // Cache per-room role counts and room data once per tick
     let perRoomRoleCounts, roomDataCache;
@@ -397,7 +413,6 @@ module.exports.loop = function() {
         profileSection('displayStatus', () => {
             displayStatus(perRoomRoleCounts);
         });
-        profileSection('suggestExpansion', suggestExpansion);
 
         // Log average CPU usage for each section
         if (ENABLE_CPU_LOGGING && !DISABLE_CPU_CONSOLE) {
@@ -714,12 +729,12 @@ function displayStatus(perRoomRoleCounts) {
     }
 }
 
-// NEW: Get room-specific targets based on room characteristics
+//Get room-specific targets based on room characteristics
 function getRoomTargets(roomName, roomData, room) {
     const sourcesCount = roomData.sources ? roomData.sources.length : 2;
     const constructionSitesCount = roomData.constructionSitesCount || 0;
 
-    // **Check if containers or storage exist in the room**
+    // Check if containers or storage exist in the room
     const containers = room.find(FIND_STRUCTURES, {
         filter: { structureType: STRUCTURE_CONTAINER }
     });
@@ -729,17 +744,23 @@ function getRoomTargets(roomName, roomData, room) {
 
     const hasStorageStructures = containers.length > 0 || storage.length > 0;
 
-    // Base targets adjusted for room characteristics
+    // Check if there's at least one tower in the room
+    const towers = room.find(FIND_MY_STRUCTURES, {
+        filter: { structureType: STRUCTURE_TOWER }
+    });
+    const hasTower = towers.length > 0;
+
     return {
-        harvester: Math.max(1, sourcesCount), // At least 1 or 1 per source
+        harvester: Math.max(1, sourcesCount),
         upgrader: Math.max(1, sourcesCount),
-        //builder: constructionSitesCount > 0 ? 1 : 0, // Only spawn builders if there's work
-        builder: 1, //temporary
-        scout: 0, // Scouts can work globally
-        defender: 0, // Spawn defenders as needed based on threats
-        supplier: hasStorageStructures ? (sourcesCount + 1) : 0 // Only spawn suppliers if storage structures exist
+        // NEW LOGIC:
+        builder: (constructionSitesCount > 0 || !hasTower) ? 1 : 0,
+        scout: 0,
+        defender: 0,
+        supplier: hasStorageStructures ? (sourcesCount + 1) : 0
     };
 }
+
 
 // Manage spawning per room - COMPLETELY REWRITTEN FOR MULTI-ROOM
 function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
@@ -966,38 +987,5 @@ function spawnCreepInRoom(role, body, spawn, roomName) {
     } else {
         console.log(`Failed to spawn ${role} in ${roomName}: ${result} (energy: ${availableEnergy}, cost: ${cost})`);
         return false;
-    }
-}
-
-// Suggest room expansion based on scout data
-function suggestExpansion() {
-    if(!Memory.exploration || !Memory.exploration.rooms) return;
-
-    let bestRoom = null;
-    let bestScore = -Infinity;
-
-    for(const roomName in Memory.exploration.rooms) {
-        const roomData = Memory.exploration.rooms[roomName];
-        if(roomData.hostile || (roomData.controller && roomData.controller.owner)) continue;
-
-        let score = 0;
-        score += roomData.sources.length * 10;
-        score += roomData.minerals.length * 5;
-
-        for(const myRoomName in Game.rooms) {
-            if(Game.rooms[myRoomName].controller && Game.rooms[myRoomName].controller.my) {
-                const distance = Game.map.getRoomLinearDistance(myRoomName, roomName);
-                score -= distance * 5;
-            }
-        }
-
-        if(score > bestScore) {
-            bestScore = score;
-            bestRoom = roomName;
-        }
-    }
-
-    if(bestRoom) {
-        console.log(`Recommended expansion: ${bestRoom} (Score: ${bestScore})`);
     }
 }

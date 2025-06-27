@@ -409,10 +409,10 @@ module.exports = {
                         required: required
                     };
                     // If needs energy, force fetching state
-                    if (needsEnergy) {
-                        creep.memory.state = 'fetching';
-                        return;
-                    }
+                    creep.memory.state = needsEnergy ? 'fetching' : 'delivering';
+                    // Reset idle ticks if coming from idle
+                    creep.memory.idleTicks = 0;
+                    return;
                 } else {
                     creep.memory.assignment = null;
                 }
@@ -451,6 +451,30 @@ module.exports = {
                     creep.memory.assignment = null;
                 }
             }
+        }
+
+        // --- SAY TASK STATUS (ADDED) ---
+        {
+            let sayText = '';
+            let assignment = creep.memory.assignment;
+            if (!assignment || !assignment.taskId) {
+                sayText = 'idle';
+            } else {
+                let shortId = assignment.taskId ? assignment.taskId.slice(-4) : '';
+                let state = creep.memory.state || '';
+                let taskType = assignment.type || '';
+                // Compose a short status string
+                if (state === 'fetching') {
+                    sayText = '🔄 ' + (taskType[0] ? taskType[0].toUpperCase() : '') + taskType.slice(1, 3) + ' ' + shortId;
+                } else if (state === 'delivering') {
+                    sayText = '🚚 ' + (taskType[0] ? taskType[0].toUpperCase() : '') + taskType.slice(1, 3) + ' ' + shortId;
+                } else if (state === 'idle') {
+                    sayText = 'idle';
+                } else {
+                    sayText = state;
+                }
+            }
+            creep.say(sayText, true);
         }
 
         // DISPLAY SUPPLIER TASK TABLE
@@ -516,8 +540,35 @@ module.exports = {
         }
 
         // --- STATE MACHINE ---
+        // Add idle state if not present
         if (!creep.memory.state) creep.memory.state = 'fetching';
         let assignment = creep.memory.assignment; // Re-fetch from memory after potential validation changes
+
+        // --- IDLE STATE ---
+        if ((!assignment || !assignment.taskId) && (!creep.memory.state || creep.memory.state === 'idle')) {
+            // If just entered idle, initialize counter
+            if (creep.memory.state !== 'idle') {
+                creep.memory.state = 'idle';
+                creep.memory.idleTicks = 1;
+            } else {
+                creep.memory.idleTicks = (creep.memory.idleTicks || 0) + 1;
+            }
+
+            // If a new assignment appeared, break idle immediately
+            if (assignment && assignment.taskId) {
+                creep.memory.state = 'fetching';
+                creep.memory.idleTicks = 0;
+                // Continue to fetching/delivering logic below
+            } else if (creep.memory.idleTicks < 3) {
+                // Stay stationary for idle ticks
+                return;
+            } else {
+                // After 3 ticks, reset idleTicks and check for new assignment next tick
+                creep.memory.idleTicks = 0;
+                // Remain idle if no assignment, or will be assigned next tick
+                return;
+            }
+        }
 
         // --- FETCHING ---
         if (creep.memory.state === 'fetching') {
