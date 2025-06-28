@@ -12,185 +12,6 @@ const roleSupplier = require('roleSupplier');
 const roleClaimbot = require('roleClaimbot');
 const roadTracker = require('roadTracker');
 
-// === ENERGY TRANSFER LOGIC ===
-// Console commands for interactive energy transfer between rooms with storage
-global.transfer = function() {
-    const myRooms = _.filter(Game.rooms, r => r.controller && r.controller.my);
-    const storages = [];
-    for (const room of myRooms) {
-        const storage = room.storage;
-        if (storage) {
-            storages.push({
-                roomName: room.name,
-                storage: storage,
-                amount: storage.store[RESOURCE_ENERGY],
-                capacity: storage.store.getCapacity(RESOURCE_ENERGY)
-            });
-        }
-    }
-    if (storages.length < 2) {
-        console.log('❌ Not enough rooms with storage to transfer energy.');
-        return;
-    }
-    console.log('Transfer from:');
-    storages.forEach((s, i) => {
-        console.log(`${i + 1}: Room ${s.roomName} Storage (${s.amount} / ${s.capacity})`);
-    });
-    global._transferState = {
-        step: 1,
-        storages: storages
-    };
-    console.log('Type: transferFrom(<number>) to select the source room.');
-};
-
-global.transferFrom = function(idx) {
-    if (!global._transferState || global._transferState.step !== 1) {
-        console.log('❌ Please start with transfer');
-        return;
-    }
-    const storages = global._transferState.storages;
-    idx = Number(idx) - 1;
-    if (idx < 0 || idx >= storages.length) {
-        console.log('❌ Invalid room selection.');
-        global._transferState = undefined;
-        return;
-    }
-    global._transferState.sourceIdx = idx;
-    global._transferState.step = 2;
-    console.log('What room do you want to transfer to?');
-    storages.forEach((s, i) => {
-        if (i !== idx) {
-            console.log(`${i + 1}: Room ${s.roomName}`);
-        }
-    });
-    console.log('Type: transferTo(<number>) to select the target room.');
-};
-
-global.transferTo = function(idx) {
-    if (!global._transferState || global._transferState.step !== 2) {
-        console.log('❌ Please select a source room first.');
-        return;
-    }
-    const storages = global._transferState.storages;
-    idx = Number(idx) - 1;
-    if (idx < 0 || idx >= storages.length || idx === global._transferState.sourceIdx) {
-        console.log('❌ Invalid target room selection.');
-        global._transferState = undefined;
-        return;
-    }
-    global._transferState.targetIdx = idx;
-    global._transferState.step = 3;
-    const source = storages[global._transferState.sourceIdx];
-    const target = storages[global._transferState.targetIdx];
-    console.log(`How much energy do you want to transfer?`);
-    console.log(`Available in source: ${source.amount}`);
-    console.log(`Free capacity in target: ${target.capacity - target.amount}`);
-    console.log('Type: transferAmount(<amount>)');
-};
-
-global.transferAmount = function(amount) {
-    if (!global._transferState || global._transferState.step !== 3) {
-        console.log('❌ Please select source and target rooms first.');
-        return;
-    }
-    amount = Number(amount);
-    const { storages, sourceIdx, targetIdx } = global._transferState;
-    const source = storages[sourceIdx];
-    const target = storages[targetIdx];
-    if (amount > source.amount) {
-        console.log(`❌ Not enough energy in source. Has: ${source.amount}`);
-        global._transferState = undefined;
-        return;
-    }
-    if (amount > (target.capacity - target.amount)) {
-        console.log(`❌ Not enough storage capacity in target. Has: ${target.capacity - target.amount}`);
-        global._transferState = undefined;
-        return;
-    }
-    if (amount <= 0) {
-        console.log('❌ Amount must be positive.');
-        global._transferState = undefined;
-        return;
-    }
-    global._transferState.amount = amount;
-    global._transferState.step = 4;
-    console.log(`Transfer ${amount} from ${source.roomName} to ${target.roomName}?`);
-    console.log('Type: transferConfirm("Y") to confirm, or anything else to cancel.');
-};
-
-global.transferConfirm = function(answer) {
-    if (!global._transferState || global._transferState.step !== 4) {
-        console.log('❌ Please go through the transfer steps first.');
-        return;
-    }
-    if (answer !== 'Y') {
-        console.log('❌ Transfer cancelled.');
-        global._transferState = undefined;
-        return;
-    }
-    const { storages, sourceIdx, targetIdx, amount } = global._transferState;
-    const sourceRoom = storages[sourceIdx].roomName;
-    const targetRoom = storages[targetIdx].roomName;
-    if (!Memory.energyTransfers) Memory.energyTransfers = [];
-    Memory.energyTransfers.push({
-        from: sourceRoom,
-        to: targetRoom,
-        amount: amount,
-        status: 'pending'
-    });
-    console.log(`✅ Transfer order placed: ${amount} from ${sourceRoom} to ${targetRoom}.`);
-    global._transferState = undefined;
-};
-
-// Called each tick to process pending energy transfers (spawns supplier creeps)
-function processEnergyTransfers() {
-    if (!Memory.energyTransfers) return;
-    for (const transfer of Memory.energyTransfers) {
-        if (transfer.status !== 'pending') continue;
-        // Already assigned supplier?
-        if (transfer.supplierName && Game.creeps[transfer.supplierName]) {
-            const creep = Game.creeps[transfer.supplierName];
-            if (creep.memory.transferTask && creep.memory.transferTask.status === 'complete') {
-                transfer.status = 'complete';
-                console.log(`✅ Transfer complete: ${transfer.amount} from ${transfer.from} to ${transfer.to}`);
-            }
-            continue;
-        }
-        // Try to spawn a supplier in the source room
-        const room = Game.rooms[transfer.from];
-        if (!room) {
-            console.log(`❌ Source room ${transfer.from} not visible.`);
-            continue;
-        }
-        const spawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
-        if (spawns.length === 0) {
-            console.log(`❌ No available spawns in ${transfer.from}.`);
-            continue;
-        }
-        const spawn = spawns[0];
-        const body = [CARRY, CARRY, MOVE, MOVE];
-        const name = `transferer_${Game.time}`;
-        const result = spawn.spawnCreep(body, name, {
-            memory: {
-                role: 'supplier',
-                transferTask: {
-                    from: transfer.from,
-                    to: transfer.to,
-                    amount: transfer.amount,
-                    status: 'inprogress'
-                }
-            }
-        });
-        if (result === OK) {
-            transfer.supplierName = name;
-            console.log(`🚚 Spawned supplier ${name} in ${transfer.from} for transfer.`);
-        } else {
-            console.log(`❌ Failed to spawn supplier: ${result}`);
-        }
-    }
-}
-// === END ENERGY TRANSFER LOGIC ===
-
 // Constants for body parts
 const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
 const BASIC_DEFENDER = [TOUGH, MOVE, RANGED_ATTACK];
@@ -542,7 +363,7 @@ function formatTime(totalMinutes) {
 // Main game loop
 module.exports.loop = function() {
     // === ENERGY TRANSFER LOGIC ===
-    processEnergyTransfers();
+    //processEnergyTransfers();
     // === END ENERGY TRANSFER LOGIC ===
 
     if(Game.time % 20 === 0) cleanMemory();
@@ -830,8 +651,15 @@ function displayStatus(perRoomRoleCounts) {
 
 // === BUILDER JOB COUNT HELPER ===
 function countBuilderJobs(room) {
+    // Check if the room has a tower
+    const hasTower = room.find(FIND_MY_STRUCTURES, {
+        filter: { structureType: STRUCTURE_TOWER }
+    }).length > 0;
+
     let total = 0;
     for (let prio of PRIORITIES) {
+        // If there's a tower, only count construction jobs (type === 'build')
+        if (hasTower && prio.type !== 'build') continue;
         let targets = prio.targetFinder
             ? prio.targetFinder(room)
             : room.find(FIND_STRUCTURES, { filter: prio.filter });
@@ -860,9 +688,27 @@ function getRoomTargets(roomName, roomData, room) {
     if (builderJobs > 0) {
         builderTarget = 1 + Math.floor((builderJobs - 1) / 10);
     }
+
+    // --- UPGRADER SCALING LOGIC ---
+    let upgraderTarget = Math.max(1, sourcesCount);
+    let storedEnergy = 0;
+    if (storage.length > 0) {
+        storedEnergy = storage[0].store[RESOURCE_ENERGY] || 0;
+    }
+    if (storedEnergy > 950000) {
+        upgraderTarget += 8;
+    } else if (storedEnergy > 900000) {
+        upgraderTarget += 4;
+    } else if (storedEnergy > 750000) {
+        upgraderTarget += 2;
+    } else if (storedEnergy > 600000) {
+        upgraderTarget += 1;
+    }
+    // --- END UPGRADER SCALING LOGIC ---
+
     return {
         harvester: Math.max(1, sourcesCount),
-        upgrader: Math.max(1, sourcesCount),
+        upgrader: upgraderTarget,
         builder: builderTarget,
         scout: 0,
         defender: 0,
@@ -937,16 +783,16 @@ function getCreepBody(role, energy) {
         harvester: {
             300: BASIC_HARVESTER,
             400: [WORK, WORK, WORK, CARRY, MOVE],
-            550: [WORK, WORK, WORK, CARRY, WORK, MOVE],
-            800: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE]
+            550: [WORK, WORK, WORK, CARRY, WORK, MOVE, MOVE],
+            800: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE]
         },
         upgrader: {
-            300: [WORK, CARRY, MOVE],
-            400: [WORK, WORK, CARRY, CARRY, MOVE],
-            550: [WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
-            800: [WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
-            1200: [WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
-            1800: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE]
+            200: [WORK, CARRY, MOVE],
+            300: [WORK, WORK, CARRY, CARRY, MOVE],
+            500: [WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
+            600: [WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
+            800: [WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
+            1100: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE]
         },
         builder: {
             300: [WORK, WORK, CARRY, MOVE],
@@ -962,10 +808,10 @@ function getCreepBody(role, energy) {
             1200: [TOUGH, TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE, MOVE, MOVE]
         },
         supplier: {
-            300: [CARRY, CARRY, MOVE, MOVE],
-            400: [CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
-            550: [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
-            800: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+            200: [CARRY, CARRY, MOVE, MOVE],
+            300: [CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
+            400: [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
+            600: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
             900: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
             1000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
         },

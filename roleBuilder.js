@@ -88,6 +88,7 @@ function buildJobQueue(room) {
                 need: prio.need ? prio.need(t) : '',
                 urgency: prio.urgency ? prio.urgency(t) : 0,
                 assigned: [],
+                structureType: t.structureType || (t.structureType === undefined && t.structureType), // for construction sites
             });
         }
     }
@@ -282,8 +283,38 @@ const roleBuilder = {
                     needsUnassign = true;
                 }
             }
+
+            // === WALL BUILDERS: Assign each builder to a different wall site ===
+            function assignWallBuildJob() {
+                // Find all build jobs for walls
+                let wallBuildJobs = jobs.filter(j =>
+                    j.type === 'build' &&
+                    Game.getObjectById(j.id) &&
+                    Game.getObjectById(j.id).structureType === STRUCTURE_WALL
+                );
+                // Find unassigned wall jobs
+                let unassignedWallJobs = wallBuildJobs.filter(j => (assignments[j.id] || []).length === 0);
+                if (unassignedWallJobs.length > 0) {
+                    return unassignedWallJobs[0];
+                }
+                // If all wall sites are assigned, allow doubling up
+                if (wallBuildJobs.length > 0) {
+                    // Find wall with the fewest builders
+                    return _.min(wallBuildJobs, j => (assignments[j.id] || []).length);
+                }
+                return null;
+            }
+
             if (!task || !task.targetId || !(assignments[task.targetId] || []).includes(creep.name) || needsUnassign) {
-                let myJob = jobs.find(j => !(assignments[j.id] || []).includes(creep.name));
+                let myJob = null;
+                // Prefer wall build jobs if available and not already assigned to this creep
+                let wallBuildJob = assignWallBuildJob();
+                if (wallBuildJob) {
+                    myJob = wallBuildJob;
+                } else {
+                    // Otherwise, assign the first available job not already assigned to this creep
+                    myJob = jobs.find(j => !(assignments[j.id] || []).includes(creep.name));
+                }
                 if (myJob) {
                     creep.memory.task = {
                         type: myJob.type,

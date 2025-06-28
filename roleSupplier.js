@@ -8,81 +8,6 @@ const HYBRID_MAX = 1250;
 
 module.exports = {
     run: function(creep) {
-        // === ENERGY TRANSFER TASK LOGIC (for inter-room transfer) ===
-        if (creep.memory.transferTask) {
-            const task = creep.memory.transferTask;
-            const sourceRoom = Game.rooms[task.from];
-            const targetRoom = Game.rooms[task.to];
-            const sourceStorage = sourceRoom && sourceRoom.storage;
-            // Use targetId if present, otherwise fallback to storage
-            let targetObj = null;
-            if (task.targetId) {
-                targetObj = Game.getObjectById(task.targetId);
-            } else {
-                targetObj = targetRoom && targetRoom.storage;
-            }
-            if (!sourceStorage || !targetObj) {
-                creep.memory.transferTask.status = 'failed';
-                return;
-            }
-
-            if (creep.memory._transferState === undefined) creep.memory._transferState = 0;
-
-            if (creep.memory._transferState === 0) {
-                if (creep.store.getFreeCapacity() === 0 || task.amount <= 0) {
-                    creep.memory._transferState = 1;
-                } else {
-                    if (creep.room.name !== task.from) {
-                        creep.moveTo(sourceStorage, { visualizePathStyle: { stroke: '#ffaa00' } });
-                    } else {
-                        const withdrawAmount = Math.min(creep.store.getFreeCapacity(), task.amount, sourceStorage.store[RESOURCE_ENERGY]);
-                        if (withdrawAmount > 0) {
-                            const result = creep.withdraw(sourceStorage, RESOURCE_ENERGY, withdrawAmount);
-                            if (result === ERR_NOT_IN_RANGE) {
-                                creep.moveTo(sourceStorage, { visualizePathStyle: { stroke: '#ffaa00' } });
-                            }
-                        }
-                    }
-                }
-            } else if (creep.memory._transferState === 1) {
-                if (creep.store[RESOURCE_ENERGY] === 0) {
-                    if (task.amount > 0) {
-                        creep.memory._transferState = 0;
-                    } else {
-                        creep.memory.transferTask.status = 'complete';
-                    }
-                } else {
-                    if (creep.room.name !== task.to) {
-                        creep.moveTo(targetObj, { visualizePathStyle: { stroke: '#ffffff' } });
-                    } else {
-                        const transferAmount = Math.min(
-                            creep.store[RESOURCE_ENERGY],
-                            task.amount,
-                            targetObj.store.getFreeCapacity(RESOURCE_ENERGY)
-                        );
-                        if (transferAmount > 0) {
-                            const result = creep.transfer(targetObj, RESOURCE_ENERGY, transferAmount);
-                            if (result === OK) {
-                                task.amount -= transferAmount;
-                                if (task.amount <= 0) {
-                                    creep.memory.transferTask.status = 'complete';
-                                }
-                            } else if (result === ERR_NOT_IN_RANGE) {
-                                creep.moveTo(targetObj, { visualizePathStyle: { stroke: '#ffffff' } });
-                            } else if (result === ERR_FULL) {
-                                creep.memory.transferTask.status = 'complete';
-                            }
-                        } else {
-                            creep.memory.transferTask.status = 'complete';
-                        }
-                    }
-                }
-            }
-            creep.say('🔄 Xfer', true);
-            return;
-        }
-        // === END ENERGY TRANSFER TASK LOGIC ===
-
         // --- CONSTANTS ---
         const TASK_PRIORITIES = [
             { type: 'spawn', filter: s => s.structureType === STRUCTURE_SPAWN && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0 },
@@ -364,31 +289,39 @@ module.exports = {
             }
 
             // 3. Recipient containers: keep full
+            // --- MODIFIED LOGIC: Only use recipient containers as sources if no donor or hybrid has energy ---
+            // Check if any donor or hybrid has energy available
+            let donorOrHybridHasEnergy = donors.some(d => d.store.getUsedCapacity(RESOURCE_ENERGY) > 0) ||
+                                         hybrids.some(h => h.store.getUsedCapacity(RESOURCE_ENERGY) > HYBRID_MIN);
+
             for (let recipient of recipients) {
                 let recipientEnergy = recipient.store.getUsedCapacity(RESOURCE_ENERGY);
                 let recipientCapacity = recipient.store.getCapacity(RESOURCE_ENERGY);
                 if (recipientEnergy < recipientCapacity) {
-                    // Pull from storage or hybrids (if above HYBRID_MIN)
                     let sources = [];
-                    if (creep.room.storage && creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-                        sources.push({
-                            id: creep.room.storage.id,
-                            type: 'storage',
-                            obj: creep.room.storage,
-                            available: creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY)
-                        });
-                    }
-                    for (let hybrid of hybrids) {
-                        let hybridEnergy = hybrid.store.getUsedCapacity(RESOURCE_ENERGY);
-                        if (hybridEnergy > HYBRID_MIN) {
+                    if (!donorOrHybridHasEnergy) {
+                        // Only use storage and hybrids as sources if no donor/hybrid has energy
+                        if (creep.room.storage && creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
                             sources.push({
-                                id: hybrid.id,
-                                type: 'hybrid',
-                                obj: hybrid,
-                                available: hybridEnergy - HYBRID_MIN
+                                id: creep.room.storage.id,
+                                type: 'storage',
+                                obj: creep.room.storage,
+                                available: creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY)
                             });
                         }
+                        for (let hybrid of hybrids) {
+                            let hybridEnergy = hybrid.store.getUsedCapacity(RESOURCE_ENERGY);
+                            if (hybridEnergy > HYBRID_MIN) {
+                                sources.push({
+                                    id: hybrid.id,
+                                    type: 'hybrid',
+                                    obj: hybrid,
+                                    available: hybridEnergy - HYBRID_MIN
+                                });
+                            }
+                        }
                     }
+                    // (Do NOT add recipient containers as sources)
                     for (let source of sources) {
                         let amount = Math.min(recipientCapacity - recipientEnergy, source.available, recipient.store.getFreeCapacity(RESOURCE_ENERGY));
                         if (amount > 0) {
@@ -505,17 +438,17 @@ module.exports = {
                 if (!taskStillExistsInList || !sourceObject || !deliveryObject) {
                     creep.memory.assignment = null;
                     creep.memory.state = 'idle';
-                    creep.memory.idleTicks = 1;
+                    //creep.memory.idleTicks = 1;
                     creep.cancelOrder('move');
                 } else if (sourceObject.store && sourceObject.store.getUsedCapacity(RESOURCE_ENERGY) === 0 && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
                     creep.memory.assignment = null;
                     creep.memory.state = 'idle';
-                    creep.memory.idleTicks = 1;
+                    //creep.memory.idleTicks = 1;
                     creep.cancelOrder('move');
                 } else if (deliveryObject.store && deliveryObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
                     creep.memory.assignment = null;
                     creep.memory.state = 'idle';
-                    creep.memory.idleTicks = 1;
+                    //creep.memory.idleTicks = 1;
                     creep.cancelOrder('move');
                 }
             } else if (assignment.type === 'container_empty' || assignment.type === 'container_drain') {
