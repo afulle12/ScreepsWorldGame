@@ -12,12 +12,261 @@ const roleSupplier = require('roleSupplier');
 const roleClaimbot = require('roleClaimbot');
 const roadTracker = require('roadTracker');
 
+// === ENERGY TRANSFER LOGIC ===
+// Console commands for interactive energy transfer between rooms with storage
+global.transfer = function() {
+    const myRooms = _.filter(Game.rooms, r => r.controller && r.controller.my);
+    const storages = [];
+    for (const room of myRooms) {
+        const storage = room.storage;
+        if (storage) {
+            storages.push({
+                roomName: room.name,
+                storage: storage,
+                amount: storage.store[RESOURCE_ENERGY],
+                capacity: storage.store.getCapacity(RESOURCE_ENERGY)
+            });
+        }
+    }
+    if (storages.length < 2) {
+        console.log('❌ Not enough rooms with storage to transfer energy.');
+        return;
+    }
+    console.log('Transfer from:');
+    storages.forEach((s, i) => {
+        console.log(`${i + 1}: Room ${s.roomName} Storage (${s.amount} / ${s.capacity})`);
+    });
+    global._transferState = {
+        step: 1,
+        storages: storages
+    };
+    console.log('Type: transferFrom(<number>) to select the source room.');
+};
+
+global.transferFrom = function(idx) {
+    if (!global._transferState || global._transferState.step !== 1) {
+        console.log('❌ Please start with transfer');
+        return;
+    }
+    const storages = global._transferState.storages;
+    idx = Number(idx) - 1;
+    if (idx < 0 || idx >= storages.length) {
+        console.log('❌ Invalid room selection.');
+        global._transferState = undefined;
+        return;
+    }
+    global._transferState.sourceIdx = idx;
+    global._transferState.step = 2;
+    console.log('What room do you want to transfer to?');
+    storages.forEach((s, i) => {
+        if (i !== idx) {
+            console.log(`${i + 1}: Room ${s.roomName}`);
+        }
+    });
+    console.log('Type: transferTo(<number>) to select the target room.');
+};
+
+global.transferTo = function(idx) {
+    if (!global._transferState || global._transferState.step !== 2) {
+        console.log('❌ Please select a source room first.');
+        return;
+    }
+    const storages = global._transferState.storages;
+    idx = Number(idx) - 1;
+    if (idx < 0 || idx >= storages.length || idx === global._transferState.sourceIdx) {
+        console.log('❌ Invalid target room selection.');
+        global._transferState = undefined;
+        return;
+    }
+    global._transferState.targetIdx = idx;
+    global._transferState.step = 3;
+    const source = storages[global._transferState.sourceIdx];
+    const target = storages[global._transferState.targetIdx];
+    console.log(`How much energy do you want to transfer?`);
+    console.log(`Available in source: ${source.amount}`);
+    console.log(`Free capacity in target: ${target.capacity - target.amount}`);
+    console.log('Type: transferAmount(<amount>)');
+};
+
+global.transferAmount = function(amount) {
+    if (!global._transferState || global._transferState.step !== 3) {
+        console.log('❌ Please select source and target rooms first.');
+        return;
+    }
+    amount = Number(amount);
+    const { storages, sourceIdx, targetIdx } = global._transferState;
+    const source = storages[sourceIdx];
+    const target = storages[targetIdx];
+    if (amount > source.amount) {
+        console.log(`❌ Not enough energy in source. Has: ${source.amount}`);
+        global._transferState = undefined;
+        return;
+    }
+    if (amount > (target.capacity - target.amount)) {
+        console.log(`❌ Not enough storage capacity in target. Has: ${target.capacity - target.amount}`);
+        global._transferState = undefined;
+        return;
+    }
+    if (amount <= 0) {
+        console.log('❌ Amount must be positive.');
+        global._transferState = undefined;
+        return;
+    }
+    global._transferState.amount = amount;
+    global._transferState.step = 4;
+    console.log(`Transfer ${amount} from ${source.roomName} to ${target.roomName}?`);
+    console.log('Type: transferConfirm("Y") to confirm, or anything else to cancel.');
+};
+
+global.transferConfirm = function(answer) {
+    if (!global._transferState || global._transferState.step !== 4) {
+        console.log('❌ Please go through the transfer steps first.');
+        return;
+    }
+    if (answer !== 'Y') {
+        console.log('❌ Transfer cancelled.');
+        global._transferState = undefined;
+        return;
+    }
+    const { storages, sourceIdx, targetIdx, amount } = global._transferState;
+    const sourceRoom = storages[sourceIdx].roomName;
+    const targetRoom = storages[targetIdx].roomName;
+    if (!Memory.energyTransfers) Memory.energyTransfers = [];
+    Memory.energyTransfers.push({
+        from: sourceRoom,
+        to: targetRoom,
+        amount: amount,
+        status: 'pending'
+    });
+    console.log(`✅ Transfer order placed: ${amount} from ${sourceRoom} to ${targetRoom}.`);
+    global._transferState = undefined;
+};
+
+// Called each tick to process pending energy transfers (spawns supplier creeps)
+function processEnergyTransfers() {
+    if (!Memory.energyTransfers) return;
+    for (const transfer of Memory.energyTransfers) {
+        if (transfer.status !== 'pending') continue;
+        // Already assigned supplier?
+        if (transfer.supplierName && Game.creeps[transfer.supplierName]) {
+            const creep = Game.creeps[transfer.supplierName];
+            if (creep.memory.transferTask && creep.memory.transferTask.status === 'complete') {
+                transfer.status = 'complete';
+                console.log(`✅ Transfer complete: ${transfer.amount} from ${transfer.from} to ${transfer.to}`);
+            }
+            continue;
+        }
+        // Try to spawn a supplier in the source room
+        const room = Game.rooms[transfer.from];
+        if (!room) {
+            console.log(`❌ Source room ${transfer.from} not visible.`);
+            continue;
+        }
+        const spawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
+        if (spawns.length === 0) {
+            console.log(`❌ No available spawns in ${transfer.from}.`);
+            continue;
+        }
+        const spawn = spawns[0];
+        const body = [CARRY, CARRY, MOVE, MOVE];
+        const name = `transferer_${Game.time}`;
+        const result = spawn.spawnCreep(body, name, {
+            memory: {
+                role: 'supplier',
+                transferTask: {
+                    from: transfer.from,
+                    to: transfer.to,
+                    amount: transfer.amount,
+                    status: 'inprogress'
+                }
+            }
+        });
+        if (result === OK) {
+            transfer.supplierName = name;
+            console.log(`🚚 Spawned supplier ${name} in ${transfer.from} for transfer.`);
+        } else {
+            console.log(`❌ Failed to spawn supplier: ${result}`);
+        }
+    }
+}
+// === END ENERGY TRANSFER LOGIC ===
+
 // Constants for body parts
 const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
 const BASIC_DEFENDER = [TOUGH, MOVE, RANGED_ATTACK];
 const CRIPPLED_HARVESTER = [WORK, CARRY, MOVE];
 const CARRY_ONLY = [CARRY, MOVE];
 const SCOUT_BODY = [MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE];
+
+// --- BUILDER PRIORITIES (copied from roleBuilder) ---
+const PRIORITIES = [
+    {
+        type: 'repair',
+        filter: s =>
+            (s.structureType !== STRUCTURE_CONTAINER &&
+             s.structureType !== STRUCTURE_WALL &&
+             s.structureType !== STRUCTURE_RAMPART) &&
+            (s.hits / s.hitsMax < 0.25) &&
+            s.hits < s.hitsMax,
+        label: 'Repair <25%',
+        need: s => `${s.hits}/${s.hitsMax}`,
+        urgency: s => s.hits,
+    },
+    {
+        type: 'build',
+        filter: s => true,
+        targetFinder: room => room.find(FIND_CONSTRUCTION_SITES),
+        label: 'Build',
+        need: s => `${s.progress}/${s.progressTotal}`,
+        urgency: s => -s.progress,
+    },
+    {
+        type: 'repair',
+        filter: s => s.structureType === STRUCTURE_CONTAINER && s.hits / s.hitsMax < 0.75 && s.hits < s.hitsMax,
+        label: 'Repair Container <75%',
+        need: s => `${s.hits}/${s.hitsMax}`,
+        urgency: s => s.hits,
+    },
+    {
+        type: 'repair',
+        filter: s =>
+            s.structureType === STRUCTURE_ROAD &&
+            (s.hits / s.hitsMax < 0.75) &&
+            (s.hits / s.hitsMax >= 0.25) &&
+            s.hits < s.hitsMax,
+        label: 'Repair Road <75%',
+        need: s => `${s.hits}/${s.hitsMax}`,
+        urgency: s => s.hits,
+    },
+    {
+        type: 'repair',
+        filter: s =>
+            ![STRUCTURE_ROAD, STRUCTURE_CONTAINER, STRUCTURE_WALL, STRUCTURE_RAMPART].includes(s.structureType) &&
+            (s.hits / s.hitsMax < 0.75) &&
+            (s.hits / s.hitsMax >= 0.25) &&
+            s.hits < s.hitsMax,
+        label: 'Repair Other <75%',
+        need: s => `${s.hits}/${s.hitsMax}`,
+        urgency: s => s.hits,
+    },
+    {
+        type: 'reinforce',
+        filter: s =>
+            (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) &&
+            s.hits < 20000,
+        label: 'Reinforce <20k',
+        need: s => `${s.hits}/20000`,
+        urgency: s => s.hits,
+    },
+    {
+        type: 'collect',
+        filter: r => r.amount > 50,
+        targetFinder: room => room.find(FIND_DROPPED_RESOURCES, { filter: r => r.resourceType === RESOURCE_ENERGY && r.amount > 50 }),
+        label: 'Collect >50',
+        need: r => `${r.amount}`,
+        urgency: r => -r.amount,
+    },
+];
 
 // --- CPU PROFILING HELPER ---
 if (ENABLE_CPU_LOGGING && !Memory.cpuProfile) Memory.cpuProfile = {};
@@ -32,7 +281,6 @@ function profileSection(name, fn) {
     if (!Memory.cpuProfile[name]) Memory.cpuProfile[name] = [];
     Memory.cpuProfile[name].push(used);
     if (Memory.cpuProfile[name].length > 50) Memory.cpuProfile[name].shift();
-    // Track last used tick for cleanup
     if (!Memory.cpuProfileLastUsed) Memory.cpuProfileLastUsed = {};
     Memory.cpuProfileLastUsed[name] = Game.time;
 }
@@ -54,36 +302,21 @@ function runLinks() {
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
         if(!room.controller || !room.controller.my) continue;
-
-        // Find all links in the room
         const links = room.find(FIND_MY_STRUCTURES, {
             filter: { structureType: STRUCTURE_LINK }
         });
-
-        if(links.length < 2) continue; // Need at least 2 links to transfer
-
-        // Find storage in the room
+        if(links.length < 2) continue;
         const storage = room.find(FIND_MY_STRUCTURES, {
             filter: { structureType: STRUCTURE_STORAGE }
         })[0];
-
         if(!storage || !room.controller) continue;
-
-        // Find link closest to storage
         const storageLink = storage.pos.findClosestByRange(links);
-
-        // Find link closest to controller
         const controllerLink = room.controller.pos.findClosestByRange(links);
-
-        // Transfer energy from storage link to controller link
         if(storageLink && controllerLink &&
            storageLink.id !== controllerLink.id &&
            storageLink.cooldown === 0) {
-
-            // Only transfer if storage link has energy and controller link is below 400 energy
             if(storageLink.store[RESOURCE_ENERGY] > 0 &&
                controllerLink.store[RESOURCE_ENERGY] < 400) {
-
                 const result = storageLink.transferEnergy(controllerLink);
                 if(result === OK) {
                     console.log(`Link transfer: ${storageLink.pos} -> ${controllerLink.pos} in ${roomName}`);
@@ -96,24 +329,15 @@ function runLinks() {
 // --- TOWER LOGIC ---
 function runTowers() {
     if (!Memory.towerTargets) Memory.towerTargets = {};
-
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
         if(!room.controller || !room.controller.my) continue;
-
         const towers = room.find(FIND_MY_STRUCTURES, {
             filter: { structureType: STRUCTURE_TOWER }
         });
-
         for(const tower of towers) {
-            // Find all hostile creeps
             const hostiles = room.find(FIND_HOSTILE_CREEPS);
-
-            // Filter for hostiles with HEAL parts
             const healers = hostiles.filter(c => c.body.some(part => part.type === HEAL));
-
-            // --- Tower Target Tracking Logic ---
-            // Initialize memory for this tower
             if (!Memory.towerTargets[tower.id]) {
                 Memory.towerTargets[tower.id] = {
                     targetId: null,
@@ -122,26 +346,18 @@ function runTowers() {
                 };
             }
             const mem = Memory.towerTargets[tower.id];
-
-            // Determine target: prioritize healers, then other hostiles
             let target = null;
             if (healers.length > 0) {
-                // Find closest healer
                 target = tower.pos.findClosestByRange(healers);
             } else if (hostiles.length > 0) {
-                // Find closest hostile
                 target = tower.pos.findClosestByRange(hostiles);
             }
-
-            // If we have a target, check if we should switch
             if (target) {
-                // If new target or target changed, reset memory
                 if (mem.targetId !== target.id) {
                     mem.targetId = target.id;
                     mem.lastHp = target.hits;
                     mem.sameHpTicks = 0;
                 } else {
-                    // Same target as last tick
                     if (mem.lastHp === target.hits) {
                         mem.sameHpTicks++;
                     } else {
@@ -149,10 +365,7 @@ function runTowers() {
                         mem.lastHp = target.hits;
                     }
                 }
-
-                // If we've shot for 5 ticks and health hasn't changed, switch target
                 if (mem.sameHpTicks >= 5) {
-                    // Try to find a different hostile (not this one)
                     const otherHostiles = hostiles.filter(h => h.id !== target.id);
                     if (otherHostiles.length > 0) {
                         const newTarget = tower.pos.findClosestByRange(otherHostiles);
@@ -164,19 +377,14 @@ function runTowers() {
                             continue;
                         }
                     }
-                    // If no other hostiles, just keep attacking the same target
                 }
-
                 tower.attack(target);
                 continue;
             } else {
-                // No hostile, reset memory for this tower
                 mem.targetId = null;
                 mem.lastHp = null;
                 mem.sameHpTicks = 0;
             }
-
-            // Heal friendly creeps if needed
             const injured = tower.pos.findClosestByRange(FIND_MY_CREEPS, {
                 filter: c => c.hits < c.hitsMax
             });
@@ -184,8 +392,6 @@ function runTowers() {
                 tower.heal(injured);
                 continue;
             }
-
-            // Repair structures (excluding walls/ramparts)
             const damaged = tower.pos.findClosestByRange(FIND_STRUCTURES, {
                 filter: s =>
                     s.hits < s.hitsMax &&
@@ -196,8 +402,6 @@ function runTowers() {
                 tower.repair(damaged);
                 continue;
             }
-
-            // Repair walls/ramparts only if below 20,000,000 HP and tower has >77% energy (lowest priority)
             const energyReserve = tower.store.getCapacity(RESOURCE_ENERGY) * 0.77;
             if(tower.store[RESOURCE_ENERGY] > energyReserve) {
                 const damagedWalls = room.find(FIND_STRUCTURES, {
@@ -205,9 +409,7 @@ function runTowers() {
                         (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) &&
                         s.hits < 20000000
                 });
-
                 if(damagedWalls.length > 0) {
-                    // Sort by lowest health first
                     const mostDamagedWall = damagedWalls.sort((a, b) => a.hits - b.hits)[0];
                     tower.repair(mostDamagedWall);
                 }
@@ -219,36 +421,27 @@ function runTowers() {
 // Calculate total energy across all storage structures
 function calculateTotalEnergy() {
     let totalEnergy = 0;
-
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
         if(!room.controller || !room.controller.my) continue;
-
-        // Get energy from spawn
         const spawns = room.find(FIND_MY_STRUCTURES, {
             filter: { structureType: STRUCTURE_SPAWN }
         });
         for(const spawn of spawns) {
             totalEnergy += spawn.store[RESOURCE_ENERGY] || 0;
         }
-
-        // Get energy from extensions
         const extensions = room.find(FIND_MY_STRUCTURES, {
             filter: { structureType: STRUCTURE_EXTENSION }
         });
         for(const extension of extensions) {
             totalEnergy += extension.store[RESOURCE_ENERGY] || 0;
         }
-
-        // Get energy from storage
         const storages = room.find(FIND_MY_STRUCTURES, {
             filter: { structureType: STRUCTURE_STORAGE }
         });
         for(const storage of storages) {
             totalEnergy += storage.store[RESOURCE_ENERGY] || 0;
         }
-
-        // Get energy from containers
         const containers = room.find(FIND_STRUCTURES, {
             filter: { structureType: STRUCTURE_CONTAINER }
         });
@@ -256,7 +449,6 @@ function calculateTotalEnergy() {
             totalEnergy += container.store[RESOURCE_ENERGY] || 0;
         }
     }
-
     return totalEnergy;
 }
 
@@ -269,16 +461,11 @@ function trackCPUUsage() {
             average: 0
         };
     }
-
     const cpuUsed = Game.cpu.getUsed();
     Memory.cpuStats.history.push(cpuUsed);
-
-    // Keep only last 50 ticks for average calculation
     if(Memory.cpuStats.history.length > 50) {
         Memory.cpuStats.history.shift();
     }
-
-    // Calculate rolling average
     Memory.cpuStats.average = Memory.cpuStats.history.reduce((sum, cpu) => sum + cpu, 0) / Memory.cpuStats.history.length;
 }
 
@@ -291,11 +478,8 @@ function trackEnergyIncome() {
             averageIncome: 0
         };
     }
-
     const currentEnergy = calculateTotalEnergy();
     const currentTick = Game.time;
-
-    // Calculate income since last tick if we have previous data
     let incomeThisTick = 0;
     if(Memory.energyIncomeTracker.history.length > 0) {
         const lastEntry = Memory.energyIncomeTracker.history[Memory.energyIncomeTracker.history.length - 1];
@@ -303,27 +487,19 @@ function trackEnergyIncome() {
         incomeThisTick = energyIncrease;
         Memory.energyIncomeTracker.totalIncome += incomeThisTick;
     }
-
-    // Add current data to history
     Memory.energyIncomeTracker.history.push({
         tick: currentTick,
         energy: currentEnergy,
         incomeThisTick: incomeThisTick
     });
-
-    // Remove entries older than 100 ticks and update total
     while(Memory.energyIncomeTracker.history.length > 0 &&
           currentTick - Memory.energyIncomeTracker.history[0].tick > 100) {
         const removedEntry = Memory.energyIncomeTracker.history.shift();
         Memory.energyIncomeTracker.totalIncome -= removedEntry.incomeThisTick || 0;
     }
-
-    // Calculate average income over the tracking period
     const trackingTicks = Memory.energyIncomeTracker.history.length;
     Memory.energyIncomeTracker.averageIncome = trackingTicks > 0 ?
         Memory.energyIncomeTracker.totalIncome / trackingTicks : 0;
-
-    // Ensure totalIncome doesn't go negative
     Memory.energyIncomeTracker.totalIncome = Math.max(0, Memory.energyIncomeTracker.totalIncome);
 }
 
@@ -333,10 +509,8 @@ function getPerformanceData() {
     const cpuAverage = (ENABLE_CPU_LOGGING && Memory.cpuStats) ? Memory.cpuStats.average : 0;
     const cpuLimit = Game.cpu.limit;
     const cpuPercent = ((cpuUsed / cpuLimit) * 100).toFixed(1);
-
     const energyIncome = Memory.energyIncomeTracker ? Memory.energyIncomeTracker.averageIncome : 0;
     const trackingTicks = Memory.energyIncomeTracker ? Memory.energyIncomeTracker.history.length : 0;
-
     return {
         cpuUsed: Math.round(cpuUsed),
         cpuAverage: Math.round(cpuAverage),
@@ -352,7 +526,6 @@ function formatTime(totalMinutes) {
     const days = Math.floor(totalMinutes / (24 * 60));
     const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
     const minutes = Math.floor(totalMinutes % 60);
-
     if (days > 0) {
         if (hours > 0) {
             return `${days}d ${hours}h ${minutes}m`;
@@ -368,10 +541,12 @@ function formatTime(totalMinutes) {
 
 // Main game loop
 module.exports.loop = function() {
+    // === ENERGY TRANSFER LOGIC ===
+    processEnergyTransfers();
+    // === END ENERGY TRANSFER LOGIC ===
+
     if(Game.time % 20 === 0) cleanMemory();
     if(Game.time % 1000 === 0) cleanCpuProfileMemory();
-
-    // Cache per-room role counts and room data once per tick
     let perRoomRoleCounts, roomDataCache;
     profileSection('getPerRoomRoleCounts', () => {
         perRoomRoleCounts = getPerRoomRoleCounts();
@@ -379,42 +554,27 @@ module.exports.loop = function() {
     profileSection('cacheRoomData', () => {
         roomDataCache = cacheRoomData();
     });
-
-    // --- Run tower logic here ---
     profileSection('runTowers', runTowers);
-
-    // --- Run link logic here ---
     profileSection('runLinks', runLinks);
-
     profileSection('runCreeps', runCreeps);
-
-    // --- CLAIMBOT SPAWN LOGIC ---
     profileSection('manageClaimbotSpawns', manageClaimbotSpawns);
-
     if(needsNewCreeps(perRoomRoleCounts) || Game.time % 10 === 0) {
         profileSection('manageSpawnsPerRoom', () => {
             manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache);
         });
     }
-
-    // === Moved CPU/energy tracking and status display to the end of the loop ===
-    // Track performance metrics every tick (AFTER all logic)
     profileSection('roadTracker.trackRoadVisits', () => {
         roadTracker.trackRoadVisits();
     });
     profileSection('roadTracker.visualizeUntraveledRoads', () => {
         roadTracker.visualizeUntraveledRoads();
     });
-
     if (ENABLE_CPU_LOGGING) profileSection('trackCPUUsage', trackCPUUsage);
     profileSection('trackEnergyIncome', trackEnergyIncome);
-
     if(Game.time % 50 === 0) {
         profileSection('displayStatus', () => {
             displayStatus(perRoomRoleCounts);
         });
-
-        // Log average CPU usage for each section
         if (ENABLE_CPU_LOGGING && !DISABLE_CPU_CONSOLE) {
             for (const key in Memory.cpuProfile) {
                 const avg = Memory.cpuProfile[key].reduce((a, b) => a + b, 0) / Memory.cpuProfile[key].length;
@@ -428,13 +588,9 @@ module.exports.loop = function() {
 function manageClaimbotSpawns() {
     if (!Memory.claimOrders) Memory.claimOrders = [];
     if (Memory.claimOrders.length === 0) return;
-
     const claimOrder = Memory.claimOrders[0];
-    // Only spawn if we don't already have a claimbot for this room
     const existing = _.find(Game.creeps, c => c.memory.role === 'claimbot' && c.memory.targetRoom === claimOrder.room);
     if (existing) return;
-
-    // Find the closest owned room with an idle spawn
     let closestSpawn = null;
     let closestDistance = Infinity;
     for (const roomName in Game.rooms) {
@@ -451,13 +607,9 @@ function manageClaimbotSpawns() {
         }
     }
     if (!closestSpawn) return;
-
-    // You may want to add more MOVE if the target room is far away
     const claimBody = [CLAIM, ATTACK, MOVE, MOVE, MOVE];
-
     const cost = bodyCost(claimBody);
     const availableEnergy = closestSpawn.room.energyAvailable;
-
     const result = closestSpawn.spawnCreep(claimBody, 'claimbot' + Game.time, {
         memory: { role: 'claimbot', targetRoom: claimOrder.room }
     });
@@ -469,7 +621,6 @@ function manageClaimbotSpawns() {
     }
 }
 
-
 // Clean memory only occasionally
 function cleanMemory() {
     for(const name in Memory.creeps) {
@@ -480,8 +631,6 @@ function cleanMemory() {
 // Cache per-room role counts - NEW MULTI-ROOM VERSION
 function getPerRoomRoleCounts() {
     const perRoomCounts = {};
-
-    // Initialize counts for all owned rooms
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
         if(room.controller && room.controller.my) {
@@ -491,34 +640,23 @@ function getPerRoomRoleCounts() {
             };
         }
     }
-
-    // Count creeps assigned to each room
     for(const name in Game.creeps) {
         const creep = Game.creeps[name];
         const role = creep.memory.role;
-
-        // Determine which room this creep is assigned to
         let assignedRoom = creep.room.name;
-
-        // Check if creep has a specific room assignment
         if(creep.memory.assignedRoom) {
             assignedRoom = creep.memory.assignedRoom;
         }
-        // For harvesters, check if they have a specific source room
         else if(creep.memory.sourceRoom) {
             assignedRoom = creep.memory.sourceRoom;
         }
-        // For upgraders, check if they have a specific target room
         else if(creep.memory.targetRoom) {
             assignedRoom = creep.memory.targetRoom;
         }
-
-        // Only count if it's an owned room and valid role
         if(perRoomCounts[assignedRoom] && perRoomCounts[assignedRoom][role] !== undefined) {
             perRoomCounts[assignedRoom][role]++;
         }
     }
-
     return perRoomCounts;
 }
 
@@ -526,21 +664,15 @@ function getPerRoomRoleCounts() {
 function cacheRoomData() {
     if(!Memory.roomData) Memory.roomData = {};
     const cache = {};
-
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
         if(!room.controller || !room.controller.my) continue;
-
-        // Only update cache occasionally unless it doesn't exist
         const shouldUpdate = !Memory.roomData[roomName] || Game.time % 100 === 0;
-
         if(shouldUpdate) {
             if(!Memory.roomData[roomName]) Memory.roomData[roomName] = {};
             const sources = room.find(FIND_SOURCES);
             Memory.roomData[roomName].sources = sources.map(s => s.id);
             Memory.roomData[roomName].constructionSitesCount = room.find(FIND_CONSTRUCTION_SITES).length;
-
-            // Calculate room energy capacity for spawn prioritization
             Memory.roomData[roomName].energyCapacity = room.energyCapacityAvailable;
             Memory.roomData[roomName].energyAvailable = room.energyAvailable;
         }
@@ -555,11 +687,7 @@ function needsNewCreeps(perRoomRoleCounts) {
         const counts = perRoomRoleCounts[roomName];
         const totalCreeps = counts.harvester + counts.upgrader + counts.builder +
                            counts.scout + counts.defender + counts.supplier;
-
-        // Emergency check - any room with no harvesters needs immediate attention
         if(counts.harvester === 0) return true;
-
-        // Any room with very few total creeps needs attention
         if(totalCreeps < 3) return true;
     }
     return false;
@@ -570,13 +698,9 @@ function runCreeps() {
     for(const name in Game.creeps) {
         const creep = Game.creeps[name];
         if(creep.spawning) continue;
-
-        // Throttle less critical roles
         const role = creep.memory.role;
         if(role === 'scout' && Game.time % 5 !== 0) continue;
         if((role === 'builder' || role === 'upgrader') && Game.time % 3 !== 0) continue;
-
-        // Profile each role's run function
         let cpuBefore, cpuAfter;
         if (ENABLE_CPU_LOGGING) cpuBefore = Game.cpu.getUsed();
         switch(role) {
@@ -607,15 +731,12 @@ function runCreeps() {
         }
         if (ENABLE_CPU_LOGGING) {
             cpuAfter = Game.cpu.getUsed();
-            // Aggregate per-role CPU usage (optional, comment out if too verbose)
             if (!Memory.cpuProfileCreeps) Memory.cpuProfileCreeps = {};
             if (!Memory.cpuProfileCreeps[role]) Memory.cpuProfileCreeps[role] = [];
             Memory.cpuProfileCreeps[role].push(cpuAfter - cpuBefore);
             if (Memory.cpuProfileCreeps[role].length > 50) Memory.cpuProfileCreeps[role].shift();
         }
     }
-
-    // Log per-role creep CPU usage every 50 ticks
     if (Game.time % 50 === 0 && ENABLE_CPU_LOGGING && Memory.cpuProfileCreeps && !DISABLE_CPU_CONSOLE) {
         for (const role in Memory.cpuProfileCreeps) {
             const arr = Memory.cpuProfileCreeps[role];
@@ -627,14 +748,11 @@ function runCreeps() {
 
 // Display colony status - UPDATED FOR PER-ROOM DISPLAY
 function displayStatus(perRoomRoleCounts) {
-    const TICK_WINDOW = 500; // 10 minutes at 4s/tick
-
-    // Calculate per-room stats
+    const TICK_WINDOW = 500;
     const perRoomStats = {};
     for(const name in Game.creeps) {
         const creep = Game.creeps[name];
-        const assignedRoom = creep.memory.assignedRoom || creep.room.name;  // Fallback to current room
-
+        const assignedRoom = creep.memory.assignedRoom || creep.room.name;
         if(!perRoomStats[assignedRoom]) {
             perRoomStats[assignedRoom] = {
                 totalBodyParts: 0,
@@ -643,7 +761,6 @@ function displayStatus(perRoomRoleCounts) {
                 oldestCreepTTL: Infinity
             };
         }
-
         perRoomStats[assignedRoom].totalBodyParts += creep.body.length;
         perRoomStats[assignedRoom].totalCreeps += 1;
         if(creep.ticksToLive) {
@@ -653,54 +770,39 @@ function displayStatus(perRoomRoleCounts) {
             }
         }
     }
-
     console.log(`=== COLONY STATUS ===`);
     for(const roomName in perRoomRoleCounts) {
         const counts = perRoomRoleCounts[roomName];
-        const stats = perRoomStats[roomName] || { totalBodyParts: 0, totalCreeps: 0, totalTTL: 0, oldestCreepTTL: 0 };
+        const stats = perRoomStats[roomName] || { totalBodyParts: 0, totalCreeps: 0, oldestCreepTTL: 0, totalTTL: 0 };
         const avgBodyParts = stats.totalCreeps > 0 ? (stats.totalBodyParts / stats.totalCreeps).toFixed(1) : 0;
         const avgTTL = stats.totalCreeps > 0 ? Math.round(stats.totalTTL / stats.totalCreeps) : 0;
         const oldestTTL = stats.oldestCreepTTL === Infinity ? 0 : stats.oldestCreepTTL;
-
         console.log(`${roomName}: 🧑‍🌾 ${counts.harvester} | ⚡ ${counts.upgrader} | 🔨 ${counts.builder} | 🔭 ${counts.scout} | 🛡 ${counts.defender} | 🔋 ${counts.supplier} | 🤖 ${counts.claimbot} | Avg Parts: ${avgBodyParts} | Avg TTL: ${avgTTL} | Low TTL: ${oldestTTL}`);
     }
-
-    // Performance tracking and display
     const perfData = getPerformanceData();
     const currentEnergy = calculateTotalEnergy();
     console.log(`💰 Total Energy: ${currentEnergy} | ⛏️ Income: ${perfData.energyIncome}/tick (last ${perfData.trackingTicks} ticks)`);
     if (!ENABLE_CPU_LOGGING || !DISABLE_CPU_CONSOLE) {
         console.log(`🖥️ CPU: ${perfData.cpuUsed}/${perfData.cpuLimit} (${perfData.cpuPercent}%) | Avg: ${perfData.cpuAverage}`);
     }
-
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
         if(room.controller && room.controller.my) {
             const percent = (room.controller.progress / room.controller.progressTotal * 100);
             const progress = percent.toFixed(1);
             const energyPercent = (room.energyAvailable / room.energyCapacityAvailable * 100).toFixed(1);
-
-            // --- Reliable ETA Calculation over 10 minutes (TICK_WINDOW) ---
             if(!Memory.progressTracker) Memory.progressTracker = {};
             if(!Memory.progressTracker[roomName]) Memory.progressTracker[roomName] = {};
             const tracker = Memory.progressTracker[roomName];
-
-            // Reset if controller level changes
             if(tracker.level !== room.controller.level) {
                 tracker.level = room.controller.level;
                 tracker.history = [{ tick: Game.time, percent: percent }];
             }
             if(!tracker.history) tracker.history = [];
-
-            // Add current sample
             tracker.history.push({ tick: Game.time, percent: percent });
-
-            // Remove samples older than TICK_WINDOW
             while(tracker.history.length > 0 && tracker.history[0].tick < Game.time - TICK_WINDOW) {
                 tracker.history.shift();
             }
-
-            // Use the oldest sample in the window for ETA
             let etaString = '';
             if(tracker.history.length > 1) {
                 const oldest = tracker.history[0];
@@ -709,18 +811,15 @@ function displayStatus(perRoomRoleCounts) {
                 const percentDelta = newest.percent - oldest.percent;
                 if(tickDelta >= TICK_WINDOW && percentDelta > 0) {
                     const percentRemaining = 100 - newest.percent;
-                    const rate = percentDelta / tickDelta; // percent per tick
+                    const rate = percentDelta / tickDelta;
                     const etaTicks = Math.ceil(percentRemaining / rate);
                     const etaMinutes = etaTicks * 4 / 60;
-
-                    // **NEW: Format ETA with days, hours, and minutes**
                     const formattedTime = formatTime(etaMinutes);
                     etaString = ` | ETA: ${etaTicks} ticks (~${formattedTime})`;
                 } else if(tickDelta >= TICK_WINDOW && percentDelta <= 0) {
                     etaString = ' | ETA: ∞ (no progress)';
                 }
             }
-
             console.log(`Room ${roomName}: RCL ${room.controller.level} - Progress: ${progress}% | Energy: ${room.energyAvailable}/${room.energyCapacityAvailable} (${energyPercent}%)${etaString}`);
         }
     }
@@ -729,84 +828,75 @@ function displayStatus(perRoomRoleCounts) {
     }
 }
 
+// === BUILDER JOB COUNT HELPER ===
+function countBuilderJobs(room) {
+    let total = 0;
+    for (let prio of PRIORITIES) {
+        let targets = prio.targetFinder
+            ? prio.targetFinder(room)
+            : room.find(FIND_STRUCTURES, { filter: prio.filter });
+        total += targets.length;
+    }
+    return total;
+}
+
 //Get room-specific targets based on room characteristics
 function getRoomTargets(roomName, roomData, room) {
     const sourcesCount = roomData.sources ? roomData.sources.length : 2;
     const constructionSitesCount = roomData.constructionSitesCount || 0;
-
-    // Check if containers or storage exist in the room
     const containers = room.find(FIND_STRUCTURES, {
         filter: { structureType: STRUCTURE_CONTAINER }
     });
     const storage = room.find(FIND_MY_STRUCTURES, {
         filter: { structureType: STRUCTURE_STORAGE }
     });
-
     const hasStorageStructures = containers.length > 0 || storage.length > 0;
-
-    // Check if there's at least one tower in the room
     const towers = room.find(FIND_MY_STRUCTURES, {
         filter: { structureType: STRUCTURE_TOWER }
     });
     const hasTower = towers.length > 0;
-
+    let builderJobs = countBuilderJobs(room);
+    let builderTarget = 0;
+    if (builderJobs > 0) {
+        builderTarget = 1 + Math.floor((builderJobs - 1) / 10);
+    }
     return {
         harvester: Math.max(1, sourcesCount),
         upgrader: Math.max(1, sourcesCount),
-        // NEW LOGIC:
-        builder: (constructionSitesCount > 0 || !hasTower) ? 1 : 0,
+        builder: builderTarget,
         scout: 0,
         defender: 0,
         supplier: hasStorageStructures ? (sourcesCount + 1) : 0
     };
 }
 
-
 // Manage spawning per room - COMPLETELY REWRITTEN FOR MULTI-ROOM
 function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
-    // Do not spawn normal creeps if a claimbot is being spawned this tick
     if (Memory.claimOrders && Memory.claimOrders.length > 0) return;
-
-    // Initialize harvester spawn delay tracker
     if(!Memory.harvesterSpawnDelay) Memory.harvesterSpawnDelay = {};
-
-    // Process each owned room
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
         if(!room.controller || !room.controller.my) continue;
-
-        // Find spawn in this room
         const spawn = room.find(FIND_MY_STRUCTURES, {
             filter: { structureType: STRUCTURE_SPAWN }
         })[0];
-
         if(!spawn || spawn.spawning) continue;
-
         const roomData = roomDataCache[roomName] || {};
         const roleCounts = perRoomRoleCounts[roomName] || {};
-        const roomTargets = getRoomTargets(roomName, roomData, room); // Pass room object
-
-        // EMERGENCY MODE - if no harvesters in this room, build one immediately
+        const roomTargets = getRoomTargets(roomName, roomData, room);
         if(roleCounts.harvester === 0) {
             console.log(`EMERGENCY MODE in ${roomName}!!!`);
-            let body = [];
-            if(room.energyAvailable >= 200) {
-                body = BASIC_HARVESTER;
-            } else if(room.energyAvailable >= 150) {
-                body = CRIPPLED_HARVESTER;
-            }
-            if(body.length > 0) {
+            const body = getCreepBody('harvester', room.energyAvailable);
+            if (body && body.length > 0 && bodyCost(body) <= room.energyAvailable) {
                 spawnCreepInRoom('harvester', body, spawn, roomName);
-                continue; // Skip to next room
+                continue;
             } else {
-                console.log(`Not enough energy in ${roomName} to spawn even a crippled harvester!`);
+                console.log(`Not enough energy in ${roomName} to spawn a harvester!`);
                 continue;
             }
         }
 
         let roleToSpawn = null;
-
-        // Priority order for spawning (defenders first, then essentials)
         if(roleCounts.defender < roomTargets.defender) {
             roleToSpawn = 'defender';
         } else if(roleCounts.harvester < roomTargets.harvester) {
@@ -820,29 +910,21 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
         } else if(roleCounts.scout < roomTargets.scout) {
             roleToSpawn = 'scout';
         }
-
         if(roleToSpawn) {
-            // **NEW: Add 60 second delay for harvester spawning when energy is below 800**
             if(roleToSpawn === 'harvester') {
                 const totalEnergy = calculateTotalEnergy();
                 if(totalEnergy < 800) {
-                    // Initialize delay tracker for this room if it doesn't exist
                     if(!Memory.harvesterSpawnDelay[roomName]) {
                         Memory.harvesterSpawnDelay[roomName] = { nextSpawnTime: Game.time + 60 };
                         console.log(`Low energy (${totalEnergy} < 800) - delaying harvester spawn in ${roomName} by 60 ticks`);
                         continue;
                     }
-
-                    // Check if we need to wait more time before spawning harvester
                     if(Game.time < Memory.harvesterSpawnDelay[roomName].nextSpawnTime) {
-                        continue; // Wait until the 60 tick delay passes
+                        continue;
                     }
-
-                    // Reset the delay tracker since we're about to spawn
                     delete Memory.harvesterSpawnDelay[roomName];
                 }
             }
-
             const body = getCreepBody(roleToSpawn, room.energyAvailable);
             const success = spawnCreepInRoom(roleToSpawn, body, spawn, roomName);
         }
@@ -851,7 +933,6 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
 
 // Get appropriate body based on role and energy
 function getCreepBody(role, energy) {
-    // Define body configurations for different energy levels by role
     const bodyConfigs = {
         harvester: {
             300: BASIC_HARVESTER,
@@ -867,7 +948,6 @@ function getCreepBody(role, energy) {
             1200: [WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
             1800: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE]
         },
-
         builder: {
             300: [WORK, WORK, CARRY, MOVE],
             400: [WORK, WORK, WORK, CARRY, MOVE],
@@ -875,7 +955,6 @@ function getCreepBody(role, energy) {
             800: [WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE],
             1200: [WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE]
         },
-
         defender: {
             300: BASIC_DEFENDER,
             550: [TOUGH, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE],
@@ -894,33 +973,21 @@ function getCreepBody(role, energy) {
             300: SCOUT_BODY
         }
     };
-
-    // Special case handling
     if (role === 'scout') {
         return SCOUT_BODY;
     }
-
-    // For low energy and common roles (preserving original behavior)
     if (energy <= 300 && role !== 'defender' && role !== 'supplier') {
         return BASIC_HARVESTER;
     }
-
-    // Get the appropriate body configuration based on role and energy
     if (bodyConfigs[role]) {
         return getBestBody(bodyConfigs[role], energy);
     }
-
-    // Default to harvester for unknown roles
     return getBestBody(bodyConfigs.harvester, energy);
-
-    // Helper function to select the best body based on available energy
     function getBestBody(bodyTiers, availableEnergy) {
         const tiers = Object.keys(bodyTiers)
             .map(Number)
             .sort((a, b) => a - b);
-
         let bestTier = tiers[0];
-
         for (const tier of tiers) {
             if (availableEnergy >= tier) {
                 bestTier = tier;
@@ -928,7 +995,6 @@ function getCreepBody(role, energy) {
                 break;
             }
         }
-
         return bodyTiers[bestTier];
     }
 }
@@ -947,9 +1013,7 @@ function bodyCost(body) {
     };
     let cost = 0;
     for(const part of body) {
-        // part can be a string or a constant, so get .toLowerCase()
         let type = typeof part === 'string' ? part.toLowerCase() : part;
-        // If it's a constant, get its string name
         if(typeof type !== 'string' && type in BODYPART_COST) {
             cost += BODYPART_COST[type];
         } else if(typeof type === 'string' && BODYPART_COST[type]) {
@@ -968,19 +1032,14 @@ function spawnCreepInRoom(role, body, spawn, roomName) {
         role: role,
         assignedRoom: roomName
     };
-
-    // Add role-specific memory assignments
     if(role === 'harvester') {
         memory.sourceRoom = roomName;
     } else if(role === 'upgrader') {
         memory.targetRoom = roomName;
     }
-
     const availableEnergy = spawn.room.energyAvailable;
     const cost = bodyCost(body);
-
     const result = spawn.spawnCreep(body, newName, { memory: memory });
-
     if(result === OK) {
         console.log(`Spawning ${role} in ${roomName} with ${body.length} parts | Cost: ${cost} | Energy before: ${availableEnergy}`);
         return true;
