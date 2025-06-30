@@ -324,6 +324,41 @@ function trackEnergyIncome() {
     Memory.energyIncomeTracker.totalIncome = Math.max(0, Memory.energyIncomeTracker.totalIncome);
 }
 
+// Reset kill counter daily
+function handleKillCounterReset() {
+    if (!Memory.stats) {
+        Memory.stats = { kills: 0 };
+    }
+    // Get the current date in UTC (e.g., "2025-06-29")
+    const todayUTC = new Date().toISOString().slice(0, 10);
+
+    if (Memory.stats.killResetDate !== todayUTC) {
+        Memory.stats.kills = 0;
+        Memory.stats.killResetDate = todayUTC;
+        console.log('Daily kill counter has been reset.');
+    }
+}
+
+// Track kills from events
+function trackKills() {
+    // Ensure stats and kills property exist
+    if (!Memory.stats) Memory.stats = {};
+    if (Memory.stats.kills === undefined) Memory.stats.kills = 0;
+
+    // Check if Game.events is an array before iterating to prevent errors
+    if (Array.isArray(Game.events)) {
+        for (const event of Game.events) {
+            if (event.event === EVENT_OBJECT_DESTROYED) {
+                // Check if the destroyed object was a creep and not one of our own.
+                // The 'object' property is only available if we had vision of the creep.
+                if (event.data && event.data.type === 'creep' && event.data.object && event.data.object.my === false) {
+                    Memory.stats.kills++;
+                }
+            }
+        }
+    }
+}
+
 // Get performance data for display
 function getPerformanceData() {
     const cpuUsed = Game.cpu.getUsed();
@@ -362,6 +397,13 @@ function formatTime(totalMinutes) {
 
 // Main game loop
 module.exports.loop = function() {
+    // Initialize stats memory if it doesn't exist
+    if (!Memory.stats) Memory.stats = {};
+
+    // Handle daily kill counter reset and track kills
+    handleKillCounterReset();
+    trackKills();
+
     // === ENERGY TRANSFER LOGIC ===
     //processEnergyTransfers();
     // === END ENERGY TRANSFER LOGIC ===
@@ -603,6 +645,7 @@ function displayStatus(perRoomRoleCounts) {
     const perfData = getPerformanceData();
     const currentEnergy = calculateTotalEnergy();
     console.log(`💰 Total Energy: ${currentEnergy} | ⛏️ Income: ${perfData.energyIncome}/tick (last ${perfData.trackingTicks} ticks)`);
+    console.log(`⚔️ Kills Today: ${Memory.stats.kills || 0}`);
     if (!ENABLE_CPU_LOGGING || !DISABLE_CPU_CONSOLE) {
         console.log(`🖥️ CPU: ${perfData.cpuUsed}/${perfData.cpuLimit} (${perfData.cpuPercent}%) | Avg: ${perfData.cpuAverage}`);
     }
