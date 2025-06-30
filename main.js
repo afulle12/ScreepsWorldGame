@@ -17,7 +17,7 @@ const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
 const BASIC_DEFENDER = [TOUGH, MOVE, RANGED_ATTACK];
 const CRIPPLED_HARVESTER = [WORK, CARRY, MOVE];
 const CARRY_ONLY = [CARRY, MOVE];
-const SCOUT_BODY = [MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE];
+const SCOUT_BODY = [MOVE, MOVE, MOVE, MOVE, MOVE];
 
 // --- BUILDER PRIORITIES (copied from roleBuilder) ---
 const PRIORITIES = [
@@ -345,19 +345,27 @@ function trackKills() {
     if (!Memory.stats) Memory.stats = {};
     if (Memory.stats.kills === undefined) Memory.stats.kills = 0;
 
-    // Check if Game.events is an array before iterating to prevent errors
+    // Check if Game.events is an array before iterating
     if (Array.isArray(Game.events)) {
         for (const event of Game.events) {
+            // We are only interested in object destruction events
             if (event.event === EVENT_OBJECT_DESTROYED) {
-                // Check if the destroyed object was a creep and not one of our own.
-                // The 'object' property is only available if we had vision of the creep.
-                if (event.data && event.data.type === 'creep' && event.data.object && event.data.object.my === false) {
-                    Memory.stats.kills++;
+                // Check if the object was destroyed by one of our creeps or structures.
+                // The 'destroyerId' is the ID of the object that landed the final blow.
+                const destroyer = Game.getObjectById(event.data.destroyerId);
+
+                // If the destroyer exists and the 'my' property is true, it's our kill.
+                if (destroyer && destroyer.my) {
+                    // Optional: You can also confirm the destroyed object was a creep.
+                    if (event.data.type === 'creep') {
+                        Memory.stats.kills++;
+                    }
                 }
             }
         }
     }
 }
+
 
 // Get performance data for display
 function getPerformanceData() {
@@ -403,6 +411,7 @@ module.exports.loop = function() {
     // Handle daily kill counter reset and track kills
     handleKillCounterReset();
     trackKills();
+    roleScout.handleDeadCreeps();
 
     // === ENERGY TRANSFER LOGIC ===
     //processEnergyTransfers();
