@@ -56,7 +56,7 @@ const PRIORITIES = [
         type: 'reinforce',
         filter: s =>
             (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) &&
-            s.hits < 20000,
+            s.hits < 100000,
         label: 'Reinforce <20k',
         need: s => `${s.hits}/20000`,
         urgency: s => s.hits,

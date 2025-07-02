@@ -2,7 +2,7 @@ const roleScout = {
     /**
      * Spawns a scout with a specific mission to check if a room is visitable.
      * Can be called from the Screeps console.
-     * Example: require('roleScout').orderCheckRoom('W1N1', 'W2N2')
+     * Example: require('roleScout').orderCheckRoom('E2N46', 'W2N2')
      * @param {string} spawnRoomName - The name of the room with a spawn to create the scout.
      * @param {string} destinationRoomName - The name of the room to send the scout to.
      */
@@ -248,31 +248,62 @@ const roleScout = {
     },
 
     travelToRoom: function(creep, targetRoomName) {
-        const route = Game.map.findRoute(creep.room.name, targetRoomName, {
-            routeCallback: (roomName) => {
-                if (this.isRoomDangerous(roomName)) return Infinity;
-                return 1;
-            }
-        });
-
-        if (route === ERR_NO_PATH || route.length === 0) {
-            if (creep.memory.task !== 'checkRoom') {
-                console.log(`❌ Scout ${creep.name} found no safe path to ${targetRoomName}, reassigning target.`);
-                this.assignTargetRoom(creep);
-            }
-            return ERR_NO_PATH;
-        }
-
-        const exit = creep.pos.findClosestByPath(route[0].exit);
-        if (exit) {
-            creep.moveTo(exit, {
-                visualizePathStyle: { stroke: '#55aaff' },
-                reusePath: 10,
+        // Check if we have a valid, cached route
+        if (!creep.memory.route || creep.memory.routeTarget !== targetRoomName) {
+            console.log(`🗺️ Scout ${creep.name} calculating new route to ${targetRoomName}`);
+            const route = Game.map.findRoute(creep.room.name, targetRoomName, {
+                routeCallback: (roomName) => {
+                    if (this.isRoomDangerous(roomName)) {
+                        return Infinity; // Avoid dangerous rooms
+                    }
+                    return 1;
+                }
             });
-            creep.say('🔭');
+    
+            if (route === ERR_NO_PATH || route.length === 0) {
+                console.log(`❌ Scout ${creep.name} found no safe path to ${targetRoomName}, reassigning target.`);
+                if (creep.memory.task !== 'checkRoom') {
+                    this.assignTargetRoom(creep);
+                }
+                return ERR_NO_PATH;
+            }
+    
+            // Cache the route and the target it was for
+            creep.memory.route = route;
+            creep.memory.routeTarget = targetRoomName;
         }
-        return OK;
+    
+        // Follow the cached route
+        const currentRoom = creep.room.name;
+        const route = creep.memory.route;
+    
+        // Check if we have arrived at the next room in our route
+        if (route.length > 0 && currentRoom === route[0].room) {
+            // We've made it to the next room, so remove it from the route plan.
+            route.shift();
+        }
+    
+        // If there are still rooms to travel through, move to the next exit
+        if (route.length > 0) {
+            const exit = creep.pos.findClosestByPath(route[0].exit);
+            if (exit) {
+                creep.moveTo(exit, {
+                    visualizePathStyle: { stroke: '#55aaff' },
+                    reusePath: 5, // A smaller reusePath is often better for inter-room travel
+                    ignoreCreeps: true // Helps prevent getting stuck on other creeps at the exit
+                });
+                creep.say('🔭' + route[0].room);
+            }
+            return OK;
+        } else {
+            // Route is empty, which means we should be at our destination.
+            // Clear the cached route information.
+            delete creep.memory.route;
+            delete creep.memory.routeTarget;
+            return OK; // Let the main 'run' logic handle arrival.
+        }
     },
+
 
     assignTargetRoom: function(creep) {
         const exits = Game.map.describeExits(creep.room.name);

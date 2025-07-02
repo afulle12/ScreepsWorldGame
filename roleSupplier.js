@@ -57,7 +57,6 @@ module.exports = {
             }
             Memory.containerLabels[creep.room.name] = { tick: Game.time, labels: labels };
 
-            // --- LOGGING CONTAINER CATEGORIES ---
             if (SUPPLIER_CONTAINER_CATEGORY_LOGGING) {
                 let log = `\n🏷️ Container Categories for room ${creep.room.name} (Tick ${Game.time}):\n`;
                 log += `Donors: ${donors.length ? donors.map(c => c.id.slice(-6)).join(', ') : 'none'}\n`;
@@ -68,7 +67,6 @@ module.exports = {
         }
         const containerLabels = Memory.containerLabels[creep.room.name].labels;
 
-        // Get all suppliers in the current room and calculate current task assignments
         const allRoomSuppliers = _.filter(Game.creeps, c => c.memory.role === 'supplier' && c.room.name === creep.room.name);
         let assignedCounts = {};
         for (let sCreep of allRoomSuppliers) {
@@ -80,11 +78,9 @@ module.exports = {
 
         // --- TASK DISCOVERY ---
         if (!Memory.supplierTasks) Memory.supplierTasks = {};
-
         if (!Memory.supplierTasks[creep.room.name] || Memory.supplierTasks[creep.room.name].tick !== Game.time) {
             let tasks = [];
 
-            // Standard structure priorities (except link, which is handled below)
             for (let p = 0; p < TASK_PRIORITIES.length; p++) {
                 if (TASK_PRIORITIES[p].type === 'link') continue;
                 let structs = creep.room.find(FIND_STRUCTURES, { filter: TASK_PRIORITIES[p].filter });
@@ -101,9 +97,6 @@ module.exports = {
                     break;
                 }
             }
-
-            // --- LINK FILLING LOGIC ---
-            // Only fill links that are near storage or spawn (within 2 squares)
             const links = creep.room.find(FIND_STRUCTURES, {
                 filter: s =>
                     s.structureType === STRUCTURE_LINK &&
@@ -115,16 +108,9 @@ module.exports = {
             });
             for (let link of links) {
                 tasks.push({
-                    id: link.id,
-                    type: 'link',
-                    pos: link.pos,
-                    need: link.store.getFreeCapacity(RESOURCE_ENERGY),
-                    assigned: 0,
-                    maxAssign: 1
+                    id: link.id, type: 'link', pos: link.pos, need: link.store.getFreeCapacity(RESOURCE_ENERGY), assigned: 0, maxAssign: 1
                 });
             }
-
-            // --- CONTAINER BALANCING LOGIC ---
             const containers = creep.room.find(FIND_STRUCTURES, { filter: s => s.structureType === STRUCTURE_CONTAINER });
             let donors = [], hybrids = [], recipients = [];
             for (let c of containers) {
@@ -132,61 +118,42 @@ module.exports = {
                 else if (containerLabels[c.id] === 'hybrid') hybrids.push(c);
                 else if (containerLabels[c.id] === 'recipient') recipients.push(c);
             }
-
             // 1. Donor containers: should be empty
             for (let donor of donors) {
                 let donorEnergy = donor.store.getUsedCapacity(RESOURCE_ENERGY);
                 if (donorEnergy > 0) {
-                    // Try to move energy to hybrids (if below HYBRID_MIN) or recipients (if not full), else to storage
                     let targets = [];
-                    // Hybrids needing energy
                     for (let hybrid of hybrids) {
                         let hybridEnergy = hybrid.store.getUsedCapacity(RESOURCE_ENERGY);
                         if (hybridEnergy < HYBRID_MIN) {
                             targets.push({
-                                id: hybrid.id,
-                                type: 'hybrid',
-                                obj: hybrid,
-                                need: Math.min(HYBRID_MIN - hybridEnergy, donorEnergy, hybrid.store.getFreeCapacity(RESOURCE_ENERGY))
+                                id: hybrid.id, type: 'hybrid', obj: hybrid, need: Math.min(HYBRID_MIN - hybridEnergy, donorEnergy, hybrid.store.getFreeCapacity(RESOURCE_ENERGY))
                             });
                         }
                     }
-                    // Recipients needing energy
                     for (let recipient of recipients) {
                         let recipientEnergy = recipient.store.getUsedCapacity(RESOURCE_ENERGY);
                         let recipientCapacity = recipient.store.getCapacity(RESOURCE_ENERGY);
                         if (recipientEnergy < recipientCapacity) {
                             targets.push({
-                                id: recipient.id,
-                                type: 'recipient',
-                                obj: recipient,
-                                need: Math.min(recipientCapacity - recipientEnergy, donorEnergy, recipient.store.getFreeCapacity(RESOURCE_ENERGY))
+                                id: recipient.id, type: 'recipient', obj: recipient, need: Math.min(recipientCapacity - recipientEnergy, donorEnergy, recipient.store.getFreeCapacity(RESOURCE_ENERGY))
                             });
                         }
                     }
-                    // If no hybrid/recipient needs energy, send to storage
                     if (targets.length === 0 && creep.room.storage && creep.room.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
                         targets.push({
-                            id: creep.room.storage.id,
-                            type: 'storage',
-                            obj: creep.room.storage,
-                            need: Math.min(donorEnergy, creep.room.storage.store.getFreeCapacity(RESOURCE_ENERGY))
+                            id: creep.room.storage.id, type: 'storage', obj: creep.room.storage, need: Math.min(donorEnergy, creep.room.storage.store.getFreeCapacity(RESOURCE_ENERGY))
                         });
                     }
-                    // If no storage, use container_drain (to tower)
                     if (targets.length === 0 && !creep.room.storage) {
                         const towers = creep.room.find(FIND_STRUCTURES, { filter: s => s.structureType === STRUCTURE_TOWER && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0 });
                         if (towers.length > 0) {
                             let closestTower = donor.pos.findClosestByRange(towers);
                             targets.push({
-                                id: closestTower.id,
-                                type: 'container_drain',
-                                obj: closestTower,
-                                need: Math.min(donorEnergy, closestTower.store.getFreeCapacity(RESOURCE_ENERGY))
+                                id: closestTower.id, type: 'container_drain', obj: closestTower, need: Math.min(donorEnergy, closestTower.store.getFreeCapacity(RESOURCE_ENERGY))
                             });
                         }
                     }
-                    // Create tasks for each target
                     for (let target of targets) {
                         tasks.push({
                             id: donor.id,
@@ -194,165 +161,102 @@ module.exports = {
                             pos: donor.pos,
                             need: target.need,
                             assigned: 0,
-                            maxAssign: 1,
+                            maxAssign: 5, // MODIFIED: Allow multiple suppliers to be assigned to a single donor container
                             transferTargetId: target.id,
                             transferTargetPos: target.obj.pos
                         });
                     }
                 }
             }
-
-            // 2. Hybrid containers: keep between HYBRID_MIN and HYBRID_MAX
             for (let hybrid of hybrids) {
                 let hybridEnergy = hybrid.store.getUsedCapacity(RESOURCE_ENERGY);
-                // If too much energy, move to storage or recipient/hybrid containers needing energy
                 if (hybridEnergy > HYBRID_MAX) {
                     let excess = hybridEnergy - HYBRID_MAX;
                     let targets = [];
-                    // Recipients needing energy
                     for (let recipient of recipients) {
                         let recipientEnergy = recipient.store.getUsedCapacity(RESOURCE_ENERGY);
                         let recipientCapacity = recipient.store.getCapacity(RESOURCE_ENERGY);
                         if (recipientEnergy < recipientCapacity) {
                             targets.push({
-                                id: recipient.id,
-                                type: 'recipient',
-                                obj: recipient,
-                                need: Math.min(recipientCapacity - recipientEnergy, excess, recipient.store.getFreeCapacity(RESOURCE_ENERGY))
+                                id: recipient.id, type: 'recipient', obj: recipient, need: Math.min(recipientCapacity - recipientEnergy, excess, recipient.store.getFreeCapacity(RESOURCE_ENERGY))
                             });
                         }
                     }
-                    // Hybrids below HYBRID_MIN
                     for (let otherHybrid of hybrids) {
                         if (otherHybrid.id === hybrid.id) continue;
                         let otherHybridEnergy = otherHybrid.store.getUsedCapacity(RESOURCE_ENERGY);
                         if (otherHybridEnergy < HYBRID_MIN) {
                             targets.push({
-                                id: otherHybrid.id,
-                                type: 'hybrid',
-                                obj: otherHybrid,
-                                need: Math.min(HYBRID_MIN - otherHybridEnergy, excess, otherHybrid.store.getFreeCapacity(RESOURCE_ENERGY))
+                                id: otherHybrid.id, type: 'hybrid', obj: otherHybrid, need: Math.min(HYBRID_MIN - otherHybridEnergy, excess, otherHybrid.store.getFreeCapacity(RESOURCE_ENERGY))
                             });
                         }
                     }
-                    // If no hybrid/recipient needs energy, send to storage
                     if (targets.length === 0 && creep.room.storage && creep.room.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
                         targets.push({
-                            id: creep.room.storage.id,
-                            type: 'storage',
-                            obj: creep.room.storage,
-                            need: Math.min(excess, creep.room.storage.store.getFreeCapacity(RESOURCE_ENERGY))
+                            id: creep.room.storage.id, type: 'storage', obj: creep.room.storage, need: Math.min(excess, creep.room.storage.store.getFreeCapacity(RESOURCE_ENERGY))
                         });
                     }
-                    // If no storage, use container_drain (to tower)
                     if (targets.length === 0 && !creep.room.storage) {
                         const towers = creep.room.find(FIND_STRUCTURES, { filter: s => s.structureType === STRUCTURE_TOWER && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0 });
                         if (towers.length > 0) {
                             let closestTower = hybrid.pos.findClosestByRange(towers);
                             targets.push({
-                                id: closestTower.id,
-                                type: 'container_drain',
-                                obj: closestTower,
-                                need: Math.min(excess, closestTower.store.getFreeCapacity(RESOURCE_ENERGY))
+                                id: closestTower.id, type: 'container_drain', obj: closestTower, need: Math.min(excess, closestTower.store.getFreeCapacity(RESOURCE_ENERGY))
                             });
                         }
                     }
                     for (let target of targets) {
                         tasks.push({
-                            id: hybrid.id,
-                            type: target.type === 'container_drain' ? 'container_drain' : 'container_balance',
-                            pos: hybrid.pos,
-                            need: target.need,
-                            assigned: 0,
-                            maxAssign: 1,
-                            transferTargetId: target.id,
-                            transferTargetPos: target.obj.pos
+                            id: hybrid.id, type: target.type === 'container_drain' ? 'container_drain' : 'container_balance', pos: hybrid.pos, need: target.need, assigned: 0, maxAssign: 1, transferTargetId: target.id, transferTargetPos: target.obj.pos
                         });
                     }
                 }
-                // If too little energy, pull from storage (if available)
                 else if (hybridEnergy < HYBRID_MIN && creep.room.storage && creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
                     let amount = Math.min(HYBRID_MIN - hybridEnergy, hybrid.store.getFreeCapacity(RESOURCE_ENERGY), creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY));
                     if (amount > 0) {
                         tasks.push({
-                            id: creep.room.storage.id,
-                            type: 'container_balance',
-                            pos: creep.room.storage.pos,
-                            need: amount,
-                            assigned: 0,
-                            maxAssign: 1,
-                            transferTargetId: hybrid.id,
-                            transferTargetPos: hybrid.pos
+                            id: creep.room.storage.id, type: 'container_balance', pos: creep.room.storage.pos, need: amount, assigned: 0, maxAssign: 1, transferTargetId: hybrid.id, transferTargetPos: hybrid.pos
                         });
                     }
                 }
             }
-
-            // 3. Recipient containers: keep full
-            // --- MODIFIED LOGIC: Only use recipient containers as sources if no donor or hybrid has energy ---
-            // Check if any donor or hybrid has energy available
-            let donorOrHybridHasEnergy = donors.some(d => d.store.getUsedCapacity(RESOURCE_ENERGY) > 0) ||
-                                         hybrids.some(h => h.store.getUsedCapacity(RESOURCE_ENERGY) > HYBRID_MIN);
-
+            let donorOrHybridHasEnergy = donors.some(d => d.store.getUsedCapacity(RESOURCE_ENERGY) > 0) || hybrids.some(h => h.store.getUsedCapacity(RESOURCE_ENERGY) > HYBRID_MIN);
             for (let recipient of recipients) {
                 let recipientEnergy = recipient.store.getUsedCapacity(RESOURCE_ENERGY);
                 let recipientCapacity = recipient.store.getCapacity(RESOURCE_ENERGY);
                 if (recipientEnergy < recipientCapacity) {
                     let sources = [];
                     if (!donorOrHybridHasEnergy) {
-                        // Only use storage and hybrids as sources if no donor/hybrid has energy
                         if (creep.room.storage && creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
                             sources.push({
-                                id: creep.room.storage.id,
-                                type: 'storage',
-                                obj: creep.room.storage,
-                                available: creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY)
+                                id: creep.room.storage.id, type: 'storage', obj: creep.room.storage, available: creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY)
                             });
                         }
                         for (let hybrid of hybrids) {
                             let hybridEnergy = hybrid.store.getUsedCapacity(RESOURCE_ENERGY);
                             if (hybridEnergy > HYBRID_MIN) {
                                 sources.push({
-                                    id: hybrid.id,
-                                    type: 'hybrid',
-                                    obj: hybrid,
-                                    available: hybridEnergy - HYBRID_MIN
+                                    id: hybrid.id, type: 'hybrid', obj: hybrid, available: hybridEnergy - HYBRID_MIN
                                 });
                             }
                         }
                     }
-                    // (Do NOT add recipient containers as sources)
                     for (let source of sources) {
                         let amount = Math.min(recipientCapacity - recipientEnergy, source.available, recipient.store.getFreeCapacity(RESOURCE_ENERGY));
                         if (amount > 0) {
                             tasks.push({
-                                id: source.id,
-                                type: 'container_balance',
-                                pos: source.obj.pos,
-                                need: amount,
-                                assigned: 0,
-                                maxAssign: 1,
-                                transferTargetId: recipient.id,
-                                transferTargetPos: recipient.pos
+                                id: source.id, type: 'container_balance', pos: source.obj.pos, need: amount, assigned: 0, maxAssign: 1, transferTargetId: recipient.id, transferTargetPos: recipient.pos
                             });
                         }
                     }
                 }
             }
-
-            // 4. Container emptying to storage (if above 0 and not a donor, hybrid, or recipient task)
             for (let c of containers) {
                 if (containerLabels[c.id] && (containerLabels[c.id] === 'donor' || containerLabels[c.id] === 'hybrid' || containerLabels[c.id] === 'recipient')) continue;
                 let amount = c.store.getUsedCapacity(RESOURCE_ENERGY);
                 if (amount > 0 && creep.room.storage && creep.room.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
                     tasks.push({
-                        id: c.id,
-                        type: 'container_empty',
-                        pos: c.pos,
-                        need: amount,
-                        assigned: 0,
-                        maxAssign: 1,
-                        targetId: creep.room.storage.id
+                        id: c.id, type: 'container_empty', pos: c.pos, need: amount, assigned: 0, maxAssign: 1, targetId: creep.room.storage.id
                     });
                 }
             }
@@ -360,12 +264,24 @@ module.exports = {
             tasks = _.sortBy(tasks, t => getTaskPriorityValue(t.type));
             Memory.supplierTasks[creep.room.name] = { tick: Game.time, tasks: tasks };
         }
+        const tasks = Memory.supplierTasks[creep.room.name].tasks;
 
-        // --- SUPPLIER ASSIGNMENT ---
-        let tasks = Memory.supplierTasks[creep.room.name].tasks;
+        // --- REFACTORED LOGIC FLOW ---
 
-        // --- MODIFIED: On assignment, check if we have enough energy to deliver ---
-        if (!creep.memory.assignment || !creep.memory.assignment.taskId) {
+        // 1. VALIDATE CURRENT ASSIGNMENT
+        if (creep.memory.assignment) {
+            let assignment = creep.memory.assignment;
+            let taskStillExists = tasks.some(t => t.id === assignment.taskId && t.type === assignment.type);
+            let primaryObject = Game.getObjectById(assignment.taskId);
+            let targetObject = assignment.transferTargetId ? Game.getObjectById(assignment.transferTargetId) : primaryObject;
+
+            if (!taskStillExists || !primaryObject || !targetObject || (targetObject.store && targetObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0)) {
+                creep.memory.assignment = null; // Invalidate task
+            }
+        }
+
+        // 2. FIND NEW ASSIGNMENT IF NEEDED
+        if (!creep.memory.assignment) {
             let potentialTasks = [];
             let currentHighestPriorityValue = Infinity;
 
@@ -379,133 +295,104 @@ module.exports = {
                     potentialTasks = [task];
                 } else if (taskPriorityValue === currentHighestPriorityValue) {
                     potentialTasks.push(task);
-                } else if (taskPriorityValue > currentHighestPriorityValue) {
-                    break;
                 }
             }
 
             if (potentialTasks.length > 0) {
-                let bestTask = _.min(potentialTasks, t => creep.pos.getRangeTo(t.pos));
+                let bestTask = creep.pos.findClosestByRange(potentialTasks.map(t => ({...t, pos: new RoomPosition(t.pos.x, t.pos.y, t.pos.roomName)})));
                 if (bestTask) {
-                    // If this is a delivery-type task, check if we have enough energy to deliver
-                    let needsEnergy = false;
-                    let required = bestTask.need || 0;
-                    // For container_balance, container_empty, container_drain, storage, etc.
-                    if (
-                        bestTask.type === 'container_balance' ||
-                        bestTask.type === 'container_empty' ||
-                        bestTask.type === 'container_drain' ||
-                        bestTask.type === 'storage' ||
-                        bestTask.type === 'spawn' ||
-                        bestTask.type === 'extension' ||
-                        bestTask.type === 'tower' ||
-                        bestTask.type === 'link'
-                    ) {
-                        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) < required) {
-                            needsEnergy = true;
-                        }
-                    }
-                    // Assign the task
                     creep.memory.assignment = {
                         taskId: bestTask.id,
                         type: bestTask.type,
-                        sourceId: bestTask.sourceId,
-                        targetId: bestTask.targetId,
                         transferTargetId: bestTask.transferTargetId,
-                        needsEnergy: needsEnergy,
-                        required: required
                     };
-                    // If needs energy, force fetching state
-                    creep.memory.state = needsEnergy ? 'fetching' : 'delivering';
-                    // Reset idle ticks if coming from idle
-                    creep.memory.idleTicks = 0;
-                    return;
-                } else {
-                    creep.memory.assignment = null;
+                    // Determine initial state based on carry capacity
+                    const isWithdrawTask = bestTask.type.startsWith('container');
+                    if (isWithdrawTask || creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+                        creep.memory.state = 'fetching';
+                    } else {
+                        creep.memory.state = 'delivering';
+                    }
                 }
-            } else {
+            }
+        }
+
+        // 3. EXECUTE ACTION BASED ON STATE
+        if (creep.memory.assignment) {
+            // State transition logic
+            if (creep.memory.state === 'fetching' && creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
+                creep.memory.state = 'delivering';
+            }
+            if (creep.memory.state === 'delivering' && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+                // Finished delivering, clear assignment to get a new one next tick
                 creep.memory.assignment = null;
+                // We return here to allow re-assignment logic to run fresh on the next tick
+                return;
             }
-        } else { // Validate existing assignment
-            let assignment = creep.memory.assignment;
-            let taskStillExistsInList = tasks.find(t => t.id === assignment.taskId && t.type === assignment.type);
-            let primaryObject = Game.getObjectById(assignment.taskId);
-            let deliveryObject, sourceObject;
 
-            if (assignment.type === 'container_balance') {
-                deliveryObject = Game.getObjectById(assignment.transferTargetId);
-                sourceObject = primaryObject;
-                if (!taskStillExistsInList || !sourceObject || !deliveryObject) {
-                    creep.memory.assignment = null;
-                    creep.memory.state = 'idle';
-                    //creep.memory.idleTicks = 1;
-                    creep.cancelOrder('move');
-                } else if (sourceObject.store && sourceObject.store.getUsedCapacity(RESOURCE_ENERGY) === 0 && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-                    creep.memory.assignment = null;
-                    creep.memory.state = 'idle';
-                    //creep.memory.idleTicks = 1;
-                    creep.cancelOrder('move');
-                } else if (deliveryObject.store && deliveryObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
-                    creep.memory.assignment = null;
-                    creep.memory.state = 'idle';
-                    //creep.memory.idleTicks = 1;
-                    creep.cancelOrder('move');
+            // Action logic
+            if (creep.memory.state === 'fetching') {
+                creep.say('🔄 fetch');
+                let assignment = creep.memory.assignment;
+                let sourceObject;
+
+                // For balance/empty tasks, the source is the primary task object
+                if (assignment.type === 'container_balance' || assignment.type === 'container_empty' || assignment.type === 'container_drain') {
+                    sourceObject = Game.getObjectById(assignment.taskId);
+                } else { // For fill tasks, find the most convenient source
+                    sourceObject = creep.pos.findClosestByRange(FIND_STRUCTURES, {
+                        filter: s => (s.structureType === STRUCTURE_STORAGE || s.structureType === STRUCTURE_CONTAINER) && s.store.getUsedCapacity(RESOURCE_ENERGY) > 0
+                    });
                 }
-            } else if (assignment.type === 'container_empty' || assignment.type === 'container_drain') {
-                deliveryObject = Game.getObjectById(assignment.targetId || assignment.transferTargetId);
-                sourceObject = primaryObject;
-                if (!taskStillExistsInList || !sourceObject || !deliveryObject) {
-                    creep.memory.assignment = null;
-                    creep.memory.state = 'idle';
-                    creep.memory.idleTicks = 1;
-                    creep.cancelOrder('move');
-                } else if (sourceObject.store.getUsedCapacity(RESOURCE_ENERGY) === 0 && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-                    creep.memory.assignment = null;
-                    creep.memory.state = 'idle';
-                    creep.memory.idleTicks = 1;
-                    creep.cancelOrder('move');
-                } else if (deliveryObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
-                    creep.memory.assignment = null;
-                    creep.memory.state = 'idle';
-                    creep.memory.idleTicks = 1;
-                    creep.cancelOrder('move');
+
+                if (sourceObject) {
+                    if (creep.withdraw(sourceObject, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
+                        creep.moveTo(sourceObject, { visualizePathStyle: { stroke: '#ffaa00' } });
+                    }
                 }
-            } else {
-                deliveryObject = primaryObject;
-                if (!taskStillExistsInList || !deliveryObject || (deliveryObject.store && deliveryObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0)) {
-                    creep.memory.assignment = null;
-                    creep.memory.state = 'idle';
-                    creep.memory.idleTicks = 1;
-                    creep.cancelOrder('move');
-                }
+                // If no sourceObject, the creep will wait, which is acceptable.
             }
-        }
+            else if (creep.memory.state === 'delivering') {
+                creep.say('🚚 deliver');
+                let assignment = creep.memory.assignment;
+                let deliverTargetObject;
 
-        // --- SAY TASK STATUS (ADDED) ---
-        {
-            let sayText = '';
-            let assignment = creep.memory.assignment;
-            if (!assignment || !assignment.taskId) {
-                sayText = 'idle';
-            } else {
-                let shortId = assignment.taskId ? assignment.taskId.slice(-4) : '';
-                let state = creep.memory.state || '';
-                let taskType = assignment.type || '';
-                // Compose a short status string
-                if (state === 'fetching') {
-                    sayText = '🔄 ' + (taskType[0] ? taskType[0].toUpperCase() : '') + taskType.slice(1, 3) + ' ' + shortId;
-                } else if (state === 'delivering') {
-                    sayText = '🚚 ' + (taskType[0] ? taskType[0].toUpperCase() : '') + taskType.slice(1, 3) + ' ' + shortId;
-                } else if (state === 'idle') {
-                    sayText = 'idle';
+                if (assignment.transferTargetId) {
+                    deliverTargetObject = Game.getObjectById(assignment.transferTargetId);
                 } else {
-                    sayText = state;
+                    deliverTargetObject = Game.getObjectById(assignment.taskId);
+                }
+
+                if (deliverTargetObject) {
+                    const transferResult = creep.transfer(deliverTargetObject, RESOURCE_ENERGY);
+                    if (transferResult === ERR_NOT_IN_RANGE) {
+                        creep.moveTo(deliverTargetObject, { visualizePathStyle: { stroke: '#ffffff' } });
+                    } else if (transferResult === OK || transferResult === ERR_FULL) {
+                        // If target becomes full, clear assignment to find a new task
+                        creep.memory.assignment = null;
+                    }
+                } else {
+                    // Target is gone, invalidate assignment
+                    creep.memory.assignment = null;
                 }
             }
-            creep.say(sayText, true);
+        } else {
+            // 4. TRUE IDLE BEHAVIOR (RALLY)
+            creep.say('💤 idle');
+            let rallyPoint = creep.room.storage;
+            if (!rallyPoint) {
+                const spawns = creep.room.find(FIND_MY_STRUCTURES, { filter: s => s.structureType === STRUCTURE_SPAWN });
+                if (spawns.length > 0) {
+                    rallyPoint = spawns[0];
+                }
+            }
+
+            if (rallyPoint && !creep.pos.inRangeTo(rallyPoint, 3)) {
+                creep.moveTo(rallyPoint, { visualizePathStyle: { stroke: '#888888', opacity: 0.5, lineStyle: 'dashed' }, range: 3 });
+            }
         }
 
-        // DISPLAY SUPPLIER TASK TABLE
+        // --- LOGGING ---
         if (SUPPLIER_LOGGING_ENABLED && allRoomSuppliers[0] === creep && Game.time % 5 === 0) {
             let assignmentMap = {};
             allRoomSuppliers.forEach(s => {
@@ -565,222 +452,6 @@ module.exports = {
                 });
                 console.log('└──────────────────────┴────────┴──────┴──────┴─────────┴─────────────────────┴───────────┴─────────────┘');
             } else { console.log(`🚚 ${creep.room.name}: No supplier tasks available`); }
-        }
-
-        // --- STATE MACHINE ---
-        let assignment = creep.memory.assignment;
-
-        // Initialize state based on assignment status
-        if (!creep.memory.state) {
-            if (!assignment || !assignment.taskId) {
-                creep.memory.state = 'idle';
-            } else {
-                creep.memory.state = assignment.needsEnergy ? 'fetching' : 'delivering';
-            }
-        }
-
-        // --- IDLE STATE ---
-        if ((!assignment || !assignment.taskId) && (!creep.memory.state || creep.memory.state === 'idle')) {
-            // If just entered idle, initialize counter
-            if (creep.memory.state !== 'idle') {
-                creep.memory.state = 'idle';
-                creep.memory.idleTicks = 1;
-                // Explicitly cancel any existing movement orders
-                creep.cancelOrder('move');
-            } else {
-                creep.memory.idleTicks = (creep.memory.idleTicks || 0) + 1;
-            }
-
-            // If a new assignment appeared, break idle immediately
-            if (assignment && assignment.taskId) {
-                creep.memory.state = 'fetching';
-                creep.memory.idleTicks = 0;
-                // Continue to fetching/delivering logic below
-            } else if (creep.memory.idleTicks < 3) {
-                // Stay stationary for idle ticks - cancel movement each tick to be sure
-                creep.cancelOrder('move');
-                return;
-            } else {
-                // After 3 ticks, reset idleTicks and check for new assignment next tick
-                creep.memory.idleTicks = 0;
-                // Remain idle if no assignment, or will be assigned next tick
-                return;
-            }
-        }
-
-        // --- FETCHING ---
-        if (creep.memory.state === 'fetching') {
-            // If we have an assignment and it requires energy, and we have enough, go to delivering
-            if (
-                assignment &&
-                assignment.needsEnergy &&
-                creep.store.getUsedCapacity(RESOURCE_ENERGY) >= (assignment.required || 0)
-            ) {
-                creep.memory.state = 'delivering';
-            }
-            // If full or have enough for assignment, deliver
-            else if (
-                creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0 ||
-                (assignment && assignment.required && creep.store.getUsedCapacity(RESOURCE_ENERGY) >= assignment.required)
-            ) {
-                creep.memory.state = 'delivering';
-            } else {
-                let sourceToWithdraw = null;
-                if (assignment) {
-                    if (assignment.type === 'container_balance' || assignment.type === 'container_empty' || assignment.type === 'container_drain') {
-                        sourceToWithdraw = Game.getObjectById(assignment.taskId);
-                    }
-                    // For link, fetch from storage or container, NOT the link itself
-                    else if (assignment.type === 'link') {
-                        if (creep.room.storage && creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-                            sourceToWithdraw = creep.room.storage;
-                        } else {
-                            let containers = creep.room.find(FIND_STRUCTURES, {
-                                filter: s => s.structureType === STRUCTURE_CONTAINER && s.store.getUsedCapacity(RESOURCE_ENERGY) > 0
-                            });
-                            if (containers.length > 0) {
-                                sourceToWithdraw = creep.pos.findClosestByRange(containers);
-                            }
-                        }
-                    }
-                }
-
-                if (sourceToWithdraw) {
-                    if (!sourceToWithdraw || sourceToWithdraw.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-                        creep.memory.assignment = null;
-                        creep.memory.state = 'idle';
-                        creep.memory.idleTicks = 1;
-                        creep.cancelOrder('move');
-                        return;
-                    }
-                    if (creep.withdraw(sourceToWithdraw, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
-                        creep.moveTo(sourceToWithdraw, { visualizePathStyle: { stroke: '#ffaa00' } });
-                    }
-                    return;
-                }
-
-                if (creep.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                    let generalContainers = creep.room.find(FIND_STRUCTURES, {
-                        filter: s => s.structureType === STRUCTURE_CONTAINER && s.store.getUsedCapacity(RESOURCE_ENERGY) > 0 &&
-                                     (!tasks.some(t => t.type === 'container_balance' && t.id === s.id && (assignedCounts[t.id] || 0) > 0))
-                    });
-
-                    let supplierFetchTargets = {};
-                    allRoomSuppliers.forEach(s => {
-                        if (s.memory.assignment && s.id !== creep.id) {
-                            let fetchSourceId = null;
-                            if (s.memory.assignment.type === 'container_empty' || s.memory.assignment.type === 'container_drain') {
-                                fetchSourceId = s.memory.assignment.taskId;
-                            } else if (s.memory.assignment.type === 'container_balance') {
-                                fetchSourceId = s.memory.assignment.taskId;
-                            } else if (s.memory.state === 'fetching' && s.memory.targetId) {
-                                let targetObj = Game.getObjectById(s.memory.targetId);
-                                if (targetObj && targetObj.structureType === STRUCTURE_CONTAINER) {
-                                   fetchSourceId = s.memory.targetId;
-                                }
-                            }
-                            if (fetchSourceId) {
-                                supplierFetchTargets[fetchSourceId] = (supplierFetchTargets[fetchSourceId] || 0) + 1;
-                            }
-                        }
-                    });
-
-                    generalContainers = generalContainers.filter(container => {
-                        let energyAmount = container.store.getUsedCapacity(RESOURCE_ENERGY);
-                        let currentTargeters = supplierFetchTargets[container.id] || 0;
-                        if (energyAmount < 250 && currentTargeters >= 1) {
-                            return false;
-                        }
-                        return true;
-                    });
-
-                    let generalStorage = (creep.room.storage && creep.room.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) ? [creep.room.storage] : [];
-                    let generalDropped = creep.room.find(FIND_DROPPED_RESOURCES, {
-                        filter: r => r.resourceType === RESOURCE_ENERGY && r.amount > Math.min(50, creep.store.getFreeCapacity(RESOURCE_ENERGY))
-                    });
-                    let fetchOrder = [...generalDropped, ...generalContainers, ...generalStorage];
-                    let fetchTarget = creep.pos.findClosestByRange(fetchOrder.filter(s => s));
-
-                    if (fetchTarget) {
-                        if (fetchTarget.amount) { if (creep.pickup(fetchTarget) === ERR_NOT_IN_RANGE) creep.moveTo(fetchTarget, { visualizePathStyle: { stroke: '#ffaa00' } }); }
-                        else { if (creep.withdraw(fetchTarget, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) creep.moveTo(fetchTarget, { visualizePathStyle: { stroke: '#ffaa00' } }); }
-                    } else {
-                        const spawns = creep.room.find(FIND_MY_STRUCTURES, { filter: s => s.structureType === STRUCTURE_SPAWN });
-                        if (spawns.length > 0) creep.moveTo(spawns[0], { visualizePathStyle: { stroke: '#888888' }, range: 2 });
-                        else if (creep.room.storage) creep.moveTo(creep.room.storage, { visualizePathStyle: { stroke: '#888888' }, range: 2 });
-                    }
-                } else {
-                    creep.memory.state = 'delivering';
-                }
-                return;
-            }
-        }
-
-        // --- DELIVERING ---
-        if (creep.memory.state === 'delivering') {
-            if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-                creep.memory.state = 'fetching';
-                if (assignment && assignment.type !== 'container_balance') {
-                    creep.memory.assignment = null;
-                    creep.memory.state = 'idle';
-                    creep.memory.idleTicks = 1;
-                    creep.cancelOrder('move');
-                }
-                return;
-            }
-
-            if (!assignment || !assignment.taskId) {
-                // IMMEDIATELY transition to idle instead of continuing delivery logic
-                creep.memory.state = 'idle';
-                creep.memory.idleTicks = 1;
-                creep.cancelOrder('move');
-                return;
-            }
-
-            let deliverTargetObject;
-            if (assignment.type === 'container_balance') {
-                deliverTargetObject = Game.getObjectById(assignment.transferTargetId);
-            } else if (assignment.type === 'container_empty' || assignment.type === 'container_drain') {
-                deliverTargetObject = Game.getObjectById(assignment.targetId || assignment.transferTargetId);
-            } else {
-                deliverTargetObject = Game.getObjectById(assignment.taskId);
-            }
-
-            if (assignment.type === 'container_drain' && deliverTargetObject && deliverTargetObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
-                const availableTowers = creep.room.find(FIND_STRUCTURES, { filter: s => s.structureType === STRUCTURE_TOWER && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0 });
-                if (availableTowers.length > 0) {
-                    let newTower = creep.pos.findClosestByRange(availableTowers);
-                    creep.memory.assignment.targetId = newTower.id;
-                    deliverTargetObject = newTower;
-                } else { 
-                    creep.memory.assignment = null; 
-                    creep.memory.state = 'idle';
-                    creep.memory.idleTicks = 1;
-                    creep.cancelOrder('move');
-                    return; 
-                }
-            }
-
-            if (!deliverTargetObject || (deliverTargetObject.store && deliverTargetObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0)) {
-                creep.memory.assignment = null;
-                creep.memory.state = 'idle';
-                creep.memory.idleTicks = 1;
-                creep.cancelOrder('move');
-                return;
-            }
-
-            const transferResult = creep.transfer(deliverTargetObject, RESOURCE_ENERGY);
-            if (transferResult === ERR_NOT_IN_RANGE) {
-                creep.moveTo(deliverTargetObject, { visualizePathStyle: { stroke: (assignment.type === 'container_drain' ? '#ff9900' : '#ffffff') } });
-            } else if (transferResult === OK) {
-                if (deliverTargetObject.store && deliverTargetObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
-                    creep.memory.assignment = null;
-                    creep.memory.state = 'idle';
-                    creep.memory.idleTicks = 1;
-                    creep.cancelOrder('move');
-                }
-            }
-            return;
         }
     }
 };

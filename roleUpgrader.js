@@ -1,6 +1,7 @@
 const DEBUG = false; // Set to false to disable console logging
 
 const roleUpgrader = {
+    /** @param {Creep} creep **/
     run: function(creep) {
         // Check for invaders in the room
         const hostile = creep.room.find(FIND_HOSTILE_CREEPS).length > 0;
@@ -8,105 +9,133 @@ const roleUpgrader = {
         if (hostile) {
             // Find storage building
             let storage = creep.pos.findClosestByPath(FIND_STRUCTURES, {
-                filter: (structure) =>
-                    structure.structureType == STRUCTURE_STORAGE
+                filter: (s) => s.structureType == STRUCTURE_STORAGE
             });
 
             // If no storage, use spawn
             if (!storage) {
                 storage = creep.pos.findClosestByPath(FIND_MY_STRUCTURES, {
-                    filter: (structure) =>
-                        structure.structureType == STRUCTURE_SPAWN
+                    filter: (s) => s.structureType == STRUCTURE_SPAWN
                 });
             }
 
             if (storage) {
                 // Stay next to the storage/spawn
                 if (creep.pos.getRangeTo(storage) > 1) {
-                    creep.moveTo(storage, {visualizePathStyle: {stroke: '#ff0000'}});
+                    // OPTIMIZATION: Reuse path to save CPU
+                    creep.moveTo(storage, { visualizePathStyle: { stroke: '#ff0000' }, reusePath: 5 });
                 } else {
                     creep.say('⏸️ invader');
                 }
             } else {
-                // Nowhere to hide, just stop
                 creep.say('🚨 invader');
             }
             return; // Do nothing else while invader is present
         }
 
-        // Toggle between withdrawing and upgrading
-        if(creep.memory.upgrading && creep.store[RESOURCE_ENERGY] == 0) {
+        // State switching: Preserve targetId to remember last source
+        if (creep.memory.upgrading && creep.store[RESOURCE_ENERGY] == 0) {
             creep.memory.upgrading = false;
             creep.say('🔄 withdraw');
-            if (DEBUG) console.log(`Upgrader ${creep.name}: Switching to withdraw mode - out of energy`);
+            if (DEBUG) console.log(`Upgrader ${creep.name}: Switching to withdraw mode`);
         }
-        if(!creep.memory.upgrading && creep.store.getFreeCapacity() == 0) {
+        if (!creep.memory.upgrading && creep.store.getFreeCapacity() == 0) {
             creep.memory.upgrading = true;
+            // TargetId is for an energy source, so it's irrelevant for upgrading,
+            // but we preserve it for the next withdraw cycle.
             creep.say('⚡ upgrade');
-            if (DEBUG) console.log(`Upgrader ${creep.name}: Switching to upgrade mode - energy full`);
+            if (DEBUG) console.log(`Upgrader ${creep.name}: Switching to upgrade mode`);
         }
 
-        // Upgrading controller
-        if(creep.memory.upgrading) {
+        // If in upgrading state
+        if (creep.memory.upgrading) {
             if (DEBUG) console.log(`Upgrader ${creep.name}: Upgrading controller`);
-            if(creep.upgradeController(creep.room.controller) == ERR_NOT_IN_RANGE) {
-                creep.moveTo(creep.room.controller, {visualizePathStyle: {stroke: '#ffffff'}});
+            if (creep.upgradeController(creep.room.controller) == ERR_NOT_IN_RANGE) {
+                // OPTIMIZATION: Reuse path to save CPU
+                creep.moveTo(creep.room.controller, { visualizePathStyle: { stroke: '#ffffff' }, reusePath: 5 });
             }
         }
-        // Withdrawing energy - prioritize controller link first
+        // If in withdrawing state
         else {
-            let target = null;
+            // Reset target every 100 ticks to find a potentially closer source
+            if (creep.memory.searchCooldown === undefined) {
+                creep.memory.searchCooldown = Game.time;
+            }
+            if (Game.time - creep.memory.searchCooldown >= 20) {
+                creep.memory.targetId = null;
+                creep.memory.waitStart = undefined; // Also reset waiting state
+                creep.memory.searchCooldown = Game.time;
+                if (DEBUG) console.log(`Upgrader ${creep.name}: 100-tick reset. Searching for new source.`);
+            }
 
-            // First priority: Link closest to controller with energy
-            if (creep.room.controller) {
-                const links = creep.room.find(FIND_MY_STRUCTURES, {
-                    filter: { structureType: STRUCTURE_LINK }
+            let target = Game.getObjectById(creep.memory.targetId);
+
+            // If the stored target is empty, wait for it to be refilled.
+            if (target && target.store && target.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+                // Initialize wait timer if it doesn't exist
+                if (creep.memory.waitStart === undefined) {
+                    creep.memory.waitStart = Game.time;
+                    if (DEBUG) console.log(`Upgrader ${creep.name}: Source ${target.id} is empty. Waiting.`);
+                }
+
+                // Check if 21 ticks have passed
+                if (Game.time - creep.memory.waitStart < 21) {
+                    creep.say('⏳ Waiting');
+                    return; // Stay put and wait for the next tick.
+                } else {
+                    // Wait time is over, forget the target and find a new one.
+                    if (DEBUG) console.log(`Upgrader ${creep.name}: Wait timeout. Finding new source.`);
+                    creep.memory.targetId = null;
+                    creep.memory.waitStart = undefined;
+                    target = null; // Ensure the find logic below runs
+                }
+            }
+
+            // If the target is valid and has energy, we are no longer waiting.
+            if (target && target.store && target.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                creep.memory.waitStart = undefined;
+            }
+
+            // Find a new target if one is needed (due to reset, timeout, or initialization)
+            if (!target) {
+                if (DEBUG) console.log(`Upgrader ${creep.name}: Finding new energy source by distance.`);
+
+                // Find the closest structure with energy (Link, Storage, or Container)
+                let newTarget = creep.pos.findClosestByPath(FIND_STRUCTURES, {
+                    filter: (s) =>
+                        (s.structureType == STRUCTURE_LINK ||
+                         s.structureType == STRUCTURE_STORAGE ||
+                         s.structureType == STRUCTURE_CONTAINER) &&
+                        s.store.getUsedCapacity(RESOURCE_ENERGY) > 0
                 });
 
-                if (links.length > 0) {
-                    const controllerLink = creep.room.controller.pos.findClosestByRange(links);
-                    if (controllerLink && controllerLink.store[RESOURCE_ENERGY] > 0) {
-                        target = controllerLink;
-                        if (DEBUG) console.log(`Upgrader ${creep.name}: Using controller link for energy (${controllerLink.store[RESOURCE_ENERGY]} energy available)`);
+                if (newTarget) {
+                    creep.memory.targetId = newTarget.id;
+                    target = newTarget;
+                    if (DEBUG) console.log(`Upgrader ${creep.name}: New target set to ${target.structureType} (${target.id})`);
+                }
+                // Fallback to harvesting if no stored energy is available
+                else {
+                    let source = creep.pos.findClosestByPath(FIND_SOURCES_ACTIVE);
+                    if (source) {
+                        creep.say('⛏️ mining');
+                        if (creep.harvest(source) == ERR_NOT_IN_RANGE) {
+                            // OPTIMIZATION: Reuse path to save CPU
+                            creep.moveTo(source, { visualizePathStyle: { stroke: '#ffaa00' }, reusePath: 5 });
+                        }
                     }
+                    return; // Exit early since we are harvesting, not withdrawing
                 }
             }
 
-            // Second priority: Storage or containers if no link energy available
-            if (!target) {
-                target = creep.pos.findClosestByPath(FIND_STRUCTURES, {
-                    filter: (structure) => 
-                        (structure.structureType == STRUCTURE_STORAGE || 
-                         structure.structureType == STRUCTURE_CONTAINER) &&
-                        structure.store[RESOURCE_ENERGY] > 0
-                });
-
-                if (target) {
-                    if (DEBUG) console.log(`Upgrader ${creep.name}: Using ${target.structureType} for energy (${target.store[RESOURCE_ENERGY]} energy available)`);
-                }
-            }
-
-            // Third priority: Mine energy sources if no stored energy available
-            if (!target) {
-                target = creep.pos.findClosestByPath(FIND_SOURCES_ACTIVE);
-
-                if (target) {
-                    if (DEBUG) console.log(`Upgrader ${creep.name}: No stored energy available, mining from source`);
-                    creep.say('⛏️ mining');
-                    if(creep.harvest(target) == ERR_NOT_IN_RANGE) {
-                        creep.moveTo(target, {visualizePathStyle: {stroke: '#ffaa00'}});
-                    }
-                    return; // Exit early since we're mining, not withdrawing
-                }
-            }
-
-            // Execute withdraw action if we found a target
-            if(target) {
-                if(creep.withdraw(target, RESOURCE_ENERGY) == ERR_NOT_IN_RANGE) {
-                    creep.moveTo(target, {visualizePathStyle: {stroke: '#ffaa00'}});
+            // Execute withdraw action if we have a valid target
+            if (target) {
+                if (creep.withdraw(target, RESOURCE_ENERGY) == ERR_NOT_IN_RANGE) {
+                    // OPTIMIZATION: Reuse path to save CPU
+                    creep.moveTo(target, { visualizePathStyle: { stroke: '#ffaa00' }, reusePath: 5 });
                 }
             } else {
-                if (DEBUG) console.log(`Upgrader ${creep.name}: No energy sources available`);
+                if (DEBUG) console.log(`Upgrader ${creep.name}: No energy sources available.`);
             }
         }
     }

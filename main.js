@@ -11,6 +11,7 @@ const roleDefender = require('roleDefender');
 const roleSupplier = require('roleSupplier');
 const roleClaimbot = require('roleClaimbot');
 const roadTracker = require('roadTracker');
+const iff = require('iff');
 
 // Constants for body parts
 const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
@@ -137,7 +138,7 @@ function runLinks() {
            storageLink.id !== controllerLink.id &&
            storageLink.cooldown === 0) {
             if(storageLink.store[RESOURCE_ENERGY] > 0 &&
-               controllerLink.store[RESOURCE_ENERGY] < 400) {
+               controllerLink.store[RESOURCE_ENERGY] < 500) {
                 const result = storageLink.transferEnergy(controllerLink);
                 if(result === OK) {
                     console.log(`Link transfer: ${storageLink.pos} -> ${controllerLink.pos} in ${roomName}`);
@@ -157,7 +158,10 @@ function runTowers() {
             filter: { structureType: STRUCTURE_TOWER }
         });
         for(const tower of towers) {
-            const hostiles = room.find(FIND_HOSTILE_CREEPS);
+            // <<< MODIFIED HERE to use the IFF module to filter hostiles
+            const hostiles = room.find(FIND_HOSTILE_CREEPS, {
+                filter: creep => iff.isHostileCreep(creep)
+            });
             const healers = hostiles.filter(c => c.body.some(part => part.type === HEAL));
             if (!Memory.towerTargets[tower.id]) {
                 Memory.towerTargets[tower.id] = {
@@ -224,11 +228,11 @@ function runTowers() {
                 continue;
             }
             const energyReserve = tower.store.getCapacity(RESOURCE_ENERGY) * 0.77;
-            if(tower.store[RESOURCE_ENERGY] > energyReserve) {
+            if(tower.store[RESOURCE_ENERGY] > energyReserve && Game.time % 5 === 0) {
                 const damagedWalls = room.find(FIND_STRUCTURES, {
                     filter: s =>
                         (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) &&
-                        s.hits < 20000000
+                        s.hits < 2000000
                 });
                 if(damagedWalls.length > 0) {
                     const mostDamagedWall = damagedWalls.sort((a, b) => a.hits - b.hits)[0];
@@ -239,36 +243,34 @@ function runTowers() {
     }
 }
 
-// Calculate total energy across all storage structures
+// OPTIMIZED: Calculate total energy using cached structure IDs
 function calculateTotalEnergy() {
     let totalEnergy = 0;
-    for(const roomName in Game.rooms) {
-        const room = Game.rooms[roomName];
-        if(!room.controller || !room.controller.my) continue;
-        const spawns = room.find(FIND_MY_STRUCTURES, {
-            filter: { structureType: STRUCTURE_SPAWN }
-        });
-        for(const spawn of spawns) {
-            totalEnergy += spawn.store[RESOURCE_ENERGY] || 0;
+    if (!Memory.roomData) return 0; // Safety check if cache doesn't exist
+
+    for (const roomName in Memory.roomData) {
+        const roomCache = Memory.roomData[roomName];
+        if (!roomCache) continue;
+
+        // Combine all cached IDs into a single array for iteration
+        const allIds = [
+            ...(roomCache.spawnIds || []),
+            ...(roomCache.extensionIds || []),
+            ...(roomCache.containerIds || []),
+        ];
+        if (roomCache.storageId) {
+            allIds.push(roomCache.storageId);
         }
-        const extensions = room.find(FIND_MY_STRUCTURES, {
-            filter: { structureType: STRUCTURE_EXTENSION }
-        });
-        for(const extension of extensions) {
-            totalEnergy += extension.store[RESOURCE_ENERGY] || 0;
-        }
-        const storages = room.find(FIND_MY_STRUCTURES, {
-            filter: { structureType: STRUCTURE_STORAGE }
-        });
-        for(const storage of storages) {
-            totalEnergy += storage.store[RESOURCE_ENERGY] || 0;
-        }
-        const containers = room.find(FIND_STRUCTURES, {
-            filter: { structureType: STRUCTURE_CONTAINER }
-        });
-        for(const container of containers) {
-            totalEnergy += container.store[RESOURCE_ENERGY] || 0;
-        }
+
+        // Iterate through IDs, get the object, and sum the energy
+        totalEnergy += allIds.reduce((sum, id) => {
+            const structure = Game.getObjectById(id);
+            // Check if structure exists and has a store property
+            if (structure && structure.store) {
+                return sum + structure.store.getUsedCapacity(RESOURCE_ENERGY);
+            }
+            return sum;
+        }, 0);
     }
     return totalEnergy;
 }
@@ -329,7 +331,7 @@ function handleKillCounterReset() {
     if (!Memory.stats) {
         Memory.stats = { kills: 0 };
     }
-    // Get the current date in UTC (e.g., "2025-06-29")
+    // Get the current date in UTC (e.g., "2025-06-30")
     const todayUTC = new Date().toISOString().slice(0, 10);
 
     if (Memory.stats.killResetDate !== todayUTC) {
@@ -532,7 +534,7 @@ function getPerRoomRoleCounts() {
     return perRoomCounts;
 }
 
-// Cache room data to memory to avoid repeated find() calls
+// OPTIMIZED: Cache room data to memory to avoid repeated find() calls
 function cacheRoomData() {
     if(!Memory.roomData) Memory.roomData = {};
     const cache = {};
@@ -542,11 +544,25 @@ function cacheRoomData() {
         const shouldUpdate = !Memory.roomData[roomName] || Game.time % 100 === 0;
         if(shouldUpdate) {
             if(!Memory.roomData[roomName]) Memory.roomData[roomName] = {};
+            const roomMemory = Memory.roomData[roomName];
+
+            // Cache basic info
             const sources = room.find(FIND_SOURCES);
-            Memory.roomData[roomName].sources = sources.map(s => s.id);
-            Memory.roomData[roomName].constructionSitesCount = room.find(FIND_CONSTRUCTION_SITES).length;
-            Memory.roomData[roomName].energyCapacity = room.energyCapacityAvailable;
-            Memory.roomData[roomName].energyAvailable = room.energyAvailable;
+            roomMemory.sources = sources.map(s => s.id);
+            roomMemory.constructionSitesCount = room.find(FIND_CONSTRUCTION_SITES).length;
+            roomMemory.energyCapacity = room.energyCapacityAvailable;
+            roomMemory.energyAvailable = room.energyAvailable;
+
+            // OPTIMIZATION: Cache IDs of all energy-holding structures
+            roomMemory.spawnIds = room.find(FIND_MY_SPAWNS).map(s => s.id);
+            roomMemory.extensionIds = room.find(FIND_MY_STRUCTURES, {
+                filter: { structureType: STRUCTURE_EXTENSION }
+            }).map(s => s.id);
+            const storage = room.storage; // room.storage is a cheap shortcut
+            roomMemory.storageId = storage ? storage.id : null;
+            roomMemory.containerIds = room.find(FIND_STRUCTURES, {
+                filter: { structureType: STRUCTURE_CONTAINER }
+            }).map(s => s.id);
         }
         cache[roomName] = Memory.roomData[roomName];
     }
@@ -571,8 +587,8 @@ function runCreeps() {
         const creep = Game.creeps[name];
         if(creep.spawning) continue;
         const role = creep.memory.role;
-        if(role === 'scout' && Game.time % 5 !== 0) continue;
-        if((role === 'builder' || role === 'upgrader') && Game.time % 3 !== 0) continue;
+        //if(role === 'scout') continue;
+        //if((role === 'builder' || role === 'upgrader')) continue;
         let cpuBefore, cpuAfter;
         if (ENABLE_CPU_LOGGING) cpuBefore = Game.cpu.getUsed();
         switch(role) {
@@ -764,7 +780,7 @@ function getRoomTargets(roomName, roomData, room) {
         builder: builderTarget,
         scout: 0,
         defender: 0,
-        supplier: hasStorageStructures ? (sourcesCount + 1) : 0
+        supplier: hasStorageStructures ? (sourcesCount + 2) : 0
     };
 }
 
@@ -836,15 +852,16 @@ function getCreepBody(role, energy) {
             300: BASIC_HARVESTER,
             400: [WORK, WORK, WORK, CARRY, MOVE],
             550: [WORK, WORK, WORK, CARRY, WORK, MOVE, MOVE],
-            800: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE]
+            800: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE],
+            950: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE]
         },
         upgrader: {
             200: [WORK, CARRY, MOVE],
             300: [WORK, WORK, CARRY, CARRY, MOVE],
             500: [WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
             600: [WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
-            800: [WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
-            1100: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE]
+            800: [WORK, WORK, WORK, WORK, WORK, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE],
+            //1100: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE]
         },
         builder: {
             300: [WORK, WORK, CARRY, MOVE],
@@ -864,8 +881,8 @@ function getCreepBody(role, energy) {
             300: [CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
             400: [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
             600: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-            900: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-            1000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
+            //900: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+            //1000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
         },
         scout: {
             300: SCOUT_BODY
