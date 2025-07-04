@@ -6,8 +6,25 @@ const SUPPLIER_CONTAINER_CATEGORY_LOGGING = false;
 const HYBRID_MIN = 750;
 const HYBRID_MAX = 1250;
 
-module.exports = {
+const roleSupplier = {
+    /** @param {Creep} creep **/
     run: function(creep) {
+        // --- ANTI-STUCK LOGIC ---
+        if (creep.memory.lastPos && creep.pos.isEqualTo(creep.memory.lastPos.x, creep.memory.lastPos.y)) {
+            creep.memory.stuckCount = (creep.memory.stuckCount || 0) + 1;
+        } else {
+            creep.memory.stuckCount = 0;
+        }
+        creep.memory.lastPos = { x: creep.pos.x, y: creep.pos.y };
+
+        let moveOpts = { reusePath: 5, ignoreCreeps: true };
+        if (creep.memory.stuckCount >= 3) {
+            moveOpts.reusePath = 0;
+            moveOpts.ignoreCreeps = false;
+            creep.say('🔄 unstuck');
+            creep.memory.stuckCount = 0;
+        }
+
         // --- CONSTANTS ---
         const TASK_PRIORITIES = [
             { type: 'spawn', filter: s => s.structureType === STRUCTURE_SPAWN && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0 },
@@ -21,6 +38,8 @@ module.exports = {
             if (taskType === 'spawn') return 1;
             if (taskType === 'extension') return 2;
             if (taskType === 'tower') return 3;
+            if (taskType === 'link_fill') return 3.4;
+            if (taskType === 'link_drain') return 3.4;
             if (taskType === 'link') return 3.5;
             if (taskType === 'container_balance') return 3.6;
             if (taskType === 'container_empty') return 4;
@@ -48,7 +67,7 @@ module.exports = {
                 let label;
                 if (isDonor && !isRecipient) label = 'donor';
                 else if (!isDonor && isRecipient) label = 'recipient';
-                else label = 'hybrid'; // (neither or both)
+                else label = 'hybrid';
 
                 labels[c.id] = label;
                 if (label === 'donor') donors.push(c);
@@ -87,9 +106,8 @@ module.exports = {
                 for (let s of structs) {
                     let need = s.store.getFreeCapacity(RESOURCE_ENERGY);
                     if (need > 0) {
-                        let maxAssign = 1;
                         tasks.push({
-                            id: s.id, type: TASK_PRIORITIES[p].type, pos: s.pos, need: need, assigned: 0, maxAssign: maxAssign
+                            id: s.id, type: TASK_PRIORITIES[p].type, pos: s.pos, need: need, assigned: 0, maxAssign: 1
                         });
                     }
                 }
@@ -97,20 +115,61 @@ module.exports = {
                     break;
                 }
             }
-            const links = creep.room.find(FIND_STRUCTURES, {
-                filter: s =>
-                    s.structureType === STRUCTURE_LINK &&
-                    s.store.getFreeCapacity(RESOURCE_ENERGY) > 0 &&
-                    (
-                        (creep.room.storage && s.pos.getRangeTo(creep.room.storage.pos) <= 2) ||
-                        creep.room.find(FIND_MY_STRUCTURES, { filter: sp => sp.structureType === STRUCTURE_SPAWN && s.pos.getRangeTo(sp.pos) <= 2 }).length > 0
-                    )
-            });
-            for (let link of links) {
-                tasks.push({
-                    id: link.id, type: 'link', pos: link.pos, need: link.store.getFreeCapacity(RESOURCE_ENERGY), assigned: 0, maxAssign: 1
+
+            // --- NEW: Conditional Link Logic ---
+            if (creep.room.storage) {
+                const storageLinks = creep.room.find(FIND_STRUCTURES, {
+                    filter: s => s.structureType === STRUCTURE_LINK && s.pos.inRangeTo(creep.room.storage.pos, 3)
                 });
+
+                // If storage links exist, ONLY manage them. Do not create generic fill tasks for other links.
+                if (storageLinks.length > 0) {
+                    for (const link of storageLinks) {
+                        const linkEnergy = link.store[RESOURCE_ENERGY];
+                        const LINK_FILL_THRESHOLD = 150;
+                        const LINK_DRAIN_THRESHOLD = 475;
+
+                        if (linkEnergy < LINK_FILL_THRESHOLD && creep.room.storage.store[RESOURCE_ENERGY] > 0) {
+                            const amountNeeded = Math.min(LINK_DRAIN_THRESHOLD - linkEnergy, creep.room.storage.store[RESOURCE_ENERGY], link.store.getFreeCapacity(RESOURCE_ENERGY));
+                            if (amountNeeded > 0) {
+                                tasks.push({
+                                    id: creep.room.storage.id, type: 'link_fill', pos: creep.room.storage.pos, need: amountNeeded, assigned: 0, maxAssign: 1, transferTargetId: link.id, transferTargetPos: link.pos
+                                });
+                            }
+                        }
+                        else if (linkEnergy > LINK_DRAIN_THRESHOLD) {
+                            const amountToMove = Math.min(linkEnergy - LINK_FILL_THRESHOLD, creep.room.storage.store.getFreeCapacity(RESOURCE_ENERGY));
+                            if (amountToMove > 0) {
+                                tasks.push({
+                                    id: link.id, type: 'link_drain', pos: link.pos, need: amountToMove, assigned: 0, maxAssign: 1, transferTargetId: creep.room.storage.id, transferTargetPos: creep.room.storage.pos
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    // Fallback: No storage links exist, so fill any link that needs energy.
+                    const allLinks = creep.room.find(FIND_STRUCTURES, {
+                        filter: s => s.structureType === STRUCTURE_LINK && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+                    });
+                    for (let link of allLinks) {
+                        tasks.push({
+                            id: link.id, type: 'link', pos: link.pos, need: link.store.getFreeCapacity(RESOURCE_ENERGY), assigned: 0, maxAssign: 1
+                        });
+                    }
+                }
+            } else {
+                // Fallback: No storage exists, so fill any link that needs energy.
+                const allLinks = creep.room.find(FIND_STRUCTURES, {
+                    filter: s => s.structureType === STRUCTURE_LINK && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+                });
+                for (let link of allLinks) {
+                    tasks.push({
+                        id: link.id, type: 'link', pos: link.pos, need: link.store.getFreeCapacity(RESOURCE_ENERGY), assigned: 0, maxAssign: 1
+                    });
+                }
             }
+
+            // ... (rest of container logic is unchanged)
             const containers = creep.room.find(FIND_STRUCTURES, { filter: s => s.structureType === STRUCTURE_CONTAINER });
             let donors = [], hybrids = [], recipients = [];
             for (let c of containers) {
@@ -118,7 +177,6 @@ module.exports = {
                 else if (containerLabels[c.id] === 'hybrid') hybrids.push(c);
                 else if (containerLabels[c.id] === 'recipient') recipients.push(c);
             }
-            // 1. Donor containers: should be empty
             for (let donor of donors) {
                 let donorEnergy = donor.store.getUsedCapacity(RESOURCE_ENERGY);
                 if (donorEnergy > 0) {
@@ -161,7 +219,7 @@ module.exports = {
                             pos: donor.pos,
                             need: target.need,
                             assigned: 0,
-                            maxAssign: 5, // MODIFIED: Allow multiple suppliers to be assigned to a single donor container
+                            maxAssign: 5,
                             transferTargetId: target.id,
                             transferTargetPos: target.obj.pos
                         });
@@ -275,8 +333,8 @@ module.exports = {
             let primaryObject = Game.getObjectById(assignment.taskId);
             let targetObject = assignment.transferTargetId ? Game.getObjectById(assignment.transferTargetId) : primaryObject;
 
-            if (!taskStillExists || !primaryObject || !targetObject || (targetObject.store && targetObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0)) {
-                creep.memory.assignment = null; // Invalidate task
+            if (!taskStillExists || !primaryObject || !targetObject || (targetObject.store && targetObject.store.getFreeCapacity(RESOURCE_ENERGY) === 0 && assignment.type !== 'link_drain')) {
+                creep.memory.assignment = null;
             }
         }
 
@@ -305,9 +363,9 @@ module.exports = {
                         taskId: bestTask.id,
                         type: bestTask.type,
                         transferTargetId: bestTask.transferTargetId,
+                        amount: bestTask.need
                     };
-                    // Determine initial state based on carry capacity
-                    const isWithdrawTask = bestTask.type.startsWith('container');
+                    const isWithdrawTask = bestTask.type.startsWith('container') || bestTask.type === 'link_drain';
                     if (isWithdrawTask || creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
                         creep.memory.state = 'fetching';
                     } else {
@@ -319,38 +377,37 @@ module.exports = {
 
         // 3. EXECUTE ACTION BASED ON STATE
         if (creep.memory.assignment) {
-            // State transition logic
             if (creep.memory.state === 'fetching' && creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
                 creep.memory.state = 'delivering';
             }
             if (creep.memory.state === 'delivering' && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-                // Finished delivering, clear assignment to get a new one next tick
                 creep.memory.assignment = null;
-                // We return here to allow re-assignment logic to run fresh on the next tick
                 return;
             }
 
-            // Action logic
             if (creep.memory.state === 'fetching') {
                 creep.say('🔄 fetch');
                 let assignment = creep.memory.assignment;
                 let sourceObject;
 
-                // For balance/empty tasks, the source is the primary task object
-                if (assignment.type === 'container_balance' || assignment.type === 'container_empty' || assignment.type === 'container_drain') {
+                if (assignment.type.startsWith('container') || assignment.type === 'link_drain') {
                     sourceObject = Game.getObjectById(assignment.taskId);
-                } else { // For fill tasks, find the most convenient source
+                } else {
                     sourceObject = creep.pos.findClosestByRange(FIND_STRUCTURES, {
                         filter: s => (s.structureType === STRUCTURE_STORAGE || s.structureType === STRUCTURE_CONTAINER) && s.store.getUsedCapacity(RESOURCE_ENERGY) > 0
                     });
                 }
 
                 if (sourceObject) {
-                    if (creep.withdraw(sourceObject, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
-                        creep.moveTo(sourceObject, { visualizePathStyle: { stroke: '#ffaa00' } });
+                    let amountToWithdraw = undefined;
+                    if (assignment.type === 'link_drain' && assignment.amount) {
+                        amountToWithdraw = Math.min(assignment.amount, creep.store.getFreeCapacity(RESOURCE_ENERGY));
+                    }
+
+                    if (creep.withdraw(sourceObject, RESOURCE_ENERGY, amountToWithdraw) === ERR_NOT_IN_RANGE) {
+                        creep.moveTo(sourceObject, { ...moveOpts, visualizePathStyle: { stroke: '#ffaa00' } });
                     }
                 }
-                // If no sourceObject, the creep will wait, which is acceptable.
             }
             else if (creep.memory.state === 'delivering') {
                 creep.say('🚚 deliver');
@@ -364,33 +421,23 @@ module.exports = {
                 }
 
                 if (deliverTargetObject) {
-                    const transferResult = creep.transfer(deliverTargetObject, RESOURCE_ENERGY);
+                    let amountToTransfer = undefined;
+                    if (assignment.type === 'link_fill' && assignment.amount) {
+                        amountToTransfer = Math.min(assignment.amount, creep.store[RESOURCE_ENERGY]);
+                    }
+
+                    const transferResult = creep.transfer(deliverTargetObject, RESOURCE_ENERGY, amountToTransfer);
                     if (transferResult === ERR_NOT_IN_RANGE) {
-                        creep.moveTo(deliverTargetObject, { visualizePathStyle: { stroke: '#ffffff' } });
+                        creep.moveTo(deliverTargetObject, { ...moveOpts, visualizePathStyle: { stroke: '#ffffff' } });
                     } else if (transferResult === OK || transferResult === ERR_FULL) {
-                        // If target becomes full, clear assignment to find a new task
                         creep.memory.assignment = null;
                     }
                 } else {
-                    // Target is gone, invalidate assignment
                     creep.memory.assignment = null;
                 }
             }
-        } else {
-            // 4. TRUE IDLE BEHAVIOR (RALLY)
-            creep.say('💤 idle');
-            let rallyPoint = creep.room.storage;
-            if (!rallyPoint) {
-                const spawns = creep.room.find(FIND_MY_STRUCTURES, { filter: s => s.structureType === STRUCTURE_SPAWN });
-                if (spawns.length > 0) {
-                    rallyPoint = spawns[0];
-                }
-            }
-
-            if (rallyPoint && !creep.pos.inRangeTo(rallyPoint, 3)) {
-                creep.moveTo(rallyPoint, { visualizePathStyle: { stroke: '#888888', opacity: 0.5, lineStyle: 'dashed' }, range: 3 });
-            }
         }
+        // IDLE BEHAVIOR REMOVED
 
         // --- LOGGING ---
         if (SUPPLIER_LOGGING_ENABLED && allRoomSuppliers[0] === creep && Game.time % 5 === 0) {
@@ -412,9 +459,17 @@ module.exports = {
                 let supplierNames = assignedSuppliers.length > 0 ? assignedSuppliers.join(',') : 'none';
                 let sourceInfo = 'auto'; let destInfo = '---';
 
-                if (task.type === 'container_balance') {
-                    sourceInfo = 'src:' + task.id.slice(-4);
-                    destInfo = 'dst:' + (task.transferTargetId ? task.transferTargetId.slice(-4) : 'ERR');
+                if (task.type === 'container_balance' || task.type === 'link_fill' || task.type === 'link_drain') {
+                    let srcObj = Game.getObjectById(task.id);
+                    let dstObj = Game.getObjectById(task.transferTargetId);
+                    if (srcObj) {
+                        let srcType = srcObj.structureType.substring(0, 4);
+                        sourceInfo = `${srcType}:${task.id.slice(-4)}`;
+                    } else { sourceInfo = 'ERR'; }
+                    if (dstObj) {
+                        let dstType = dstObj.structureType.substring(0, 4);
+                        destInfo = `${dstType}:${task.transferTargetId.slice(-4)}`;
+                    } else { destInfo = 'ERR'; }
                 } else if (task.sourceId) {
                     let srcObj = Game.getObjectById(task.sourceId);
                     if (srcObj) sourceInfo = (srcObj.structureType === STRUCTURE_STORAGE ? 'stor' : 'cont:' + task.sourceId.slice(-4)); else sourceInfo = 'ERR';
@@ -455,3 +510,5 @@ module.exports = {
         }
     }
 };
+
+module.exports = roleSupplier;

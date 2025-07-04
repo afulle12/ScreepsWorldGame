@@ -120,33 +120,100 @@ function cleanCpuProfileMemory(maxAge = 5000) {
 }
 
 // --- LINK LOGIC ---
+// --- LINK LOGIC ---
 function runLinks() {
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
-        if(!room.controller || !room.controller.my) continue;
-        const links = room.find(FIND_MY_STRUCTURES, {
+        // Ensure the room is ours and has a controller
+        if(!room.controller || !room.controller.my) {
+            continue;
+        }
+
+        // Find all links in the room
+        const allLinks = room.find(FIND_MY_STRUCTURES, {
             filter: { structureType: STRUCTURE_LINK }
         });
-        if(links.length < 2) continue;
-        const storage = room.find(FIND_MY_STRUCTURES, {
-            filter: { structureType: STRUCTURE_STORAGE }
-        })[0];
-        if(!storage || !room.controller) continue;
-        const storageLink = storage.pos.findClosestByRange(links);
-        const controllerLink = room.controller.pos.findClosestByRange(links);
-        if(storageLink && controllerLink &&
-           storageLink.id !== controllerLink.id &&
-           storageLink.cooldown === 0) {
-            if(storageLink.store[RESOURCE_ENERGY] > 0 &&
-               controllerLink.store[RESOURCE_ENERGY] < 500) {
-                const result = storageLink.transferEnergy(controllerLink);
-                if(result === OK) {
-                    console.log(`Link transfer: ${storageLink.pos} -> ${controllerLink.pos} in ${roomName}`);
+
+        // Need at least two links to do anything
+        if(allLinks.length < 2) {
+            continue;
+        }
+
+        // --- Classify Links ---
+        const sources = room.find(FIND_SOURCES);
+        const storage = room.storage;
+        const controller = room.controller;
+
+        const recipientLinks = [];
+        const sendingLinks = [];
+
+        // Recipient links only receive energy. They are classified first and excluded from sending.
+        // A link is a "Recipient" if it's within 5 squares of the controller.
+        for (const link of allLinks) {
+            if (controller && link.pos.inRangeTo(controller, 5)) {
+                recipientLinks.push(link);
+            } else {
+                sendingLinks.push(link);
+            }
+        }
+
+        // From the remaining (non-recipient) links, classify donor and storage links.
+        // A link can be both a donor and a storage link.
+        // A "Storage Link" is within 3 squares of storage.
+        const storageLinks = sendingLinks.filter(l => storage && l.pos.inRangeTo(storage, 3));
+        // A "Donor Link" is within 3 squares of an energy source.
+        const donorLinks = sendingLinks.filter(l => sources.some(s => l.pos.inRangeTo(s, 3)));
+
+        // --- Transfer Logic ---
+
+        // Priority 1: Storage Links -> Recipient Links
+        // This is a high-priority transfer to keep the controller's upgrader fed.
+        for (const storageLink of storageLinks) {
+            // Skip if on cooldown or empty
+            if (storageLink.cooldown > 0 || storageLink.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+                continue;
+            }
+
+            // Find a recipient that is below the 400 energy threshold.
+            const targetRecipient = recipientLinks.find(r => r.store.getUsedCapacity(RESOURCE_ENERGY) < 400);
+
+            if (targetRecipient) {
+                const result = storageLink.transferEnergy(targetRecipient);
+                if (result === OK) {
+                    // This link has acted, so we continue to the next storage link.
+                    // Its cooldown will prevent it from acting again in the donor logic below.
+                    continue;
+                }
+            }
+        }
+
+        // Priority 2: Donor Links -> Storage or Recipient Links
+        // This moves energy from sources to the link with the lowest energy level.
+        for (const donorLink of donorLinks) {
+            // Check cooldown again in case a storage link was also a donor link and already acted.
+            // Also check if the link has enough energy to trigger a transfer.
+            if (donorLink.cooldown > 0 || donorLink.store[RESOURCE_ENERGY] <= 400) {
+                continue;
+            }
+
+            // Potential targets are all storage and recipient links.
+            let potentialTargets = [...storageLinks, ...recipientLinks];
+
+            // A link cannot send to itself.
+            potentialTargets = potentialTargets.filter(l => l.id !== donorLink.id);
+
+            if (potentialTargets.length > 0) {
+                // Find the target with the least amount of energy.
+                const target = _.min(potentialTargets, l => l.store[RESOURCE_ENERGY]);
+
+                if (target && target.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                    donorLink.transferEnergy(target);
                 }
             }
         }
     }
 }
+
 
 // --- TOWER LOGIC ---
 function runTowers() {
@@ -776,11 +843,12 @@ function getRoomTargets(roomName, roomData, room) {
 
     return {
         harvester: Math.max(1, sourcesCount),
-        upgrader: upgraderTarget,
+        upgrader: 1, //upgraderTarget,
         builder: builderTarget,
         scout: 0,
         defender: 0,
-        supplier: hasStorageStructures ? (sourcesCount + 2) : 0
+        supplier: hasStorageStructures ? 1 : 0
+        //supplier: hasStorageStructures ? (sourcesCount) : 0
     };
 }
 
@@ -861,7 +929,8 @@ function getCreepBody(role, energy) {
             500: [WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
             600: [WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
             800: [WORK, WORK, WORK, WORK, WORK, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE],
-            //1100: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE]
+            1100: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE],
+            1350: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE]
         },
         builder: {
             300: [WORK, WORK, CARRY, MOVE],
@@ -881,8 +950,8 @@ function getCreepBody(role, energy) {
             300: [CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
             400: [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
             600: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-            //900: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-            //1000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
+            900: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+            1000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
         },
         scout: {
             300: SCOUT_BODY

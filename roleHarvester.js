@@ -85,7 +85,7 @@ const roleHarvester = {
         }
     },
 
-    /** OPTIMIZED: Deposits energy using a cached target. **/
+    /** MODIFIED & OPTIMIZED: Deposits energy, prioritizing nearby links first. **/
     depositEnergy: function(creep) {
         // OPTIMIZATION: Use a cached target ID
         let target = Game.getObjectById(creep.memory.targetId);
@@ -93,14 +93,28 @@ const roleHarvester = {
         // Find a new target only if the cached one is invalid or full
         if (!target || target.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
             if (DEBUG) console.log(`Harvester ${creep.name}: Finding new deposit target.`);
+            let newTarget = null;
+            const source = Game.getObjectById(creep.memory.sourceId);
 
-            // Priority 1: Storage or Containers
-            let newTarget = creep.pos.findClosestByPath(FIND_STRUCTURES, {
-                filter: s => (s.structureType === STRUCTURE_STORAGE || s.structureType === STRUCTURE_CONTAINER) &&
-                             s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-            });
+            // Priority 1: Links within 3 squares of the assigned source
+            if (source) {
+                const nearbyLinks = source.pos.findInRange(FIND_STRUCTURES, 3, {
+                    filter: s => s.structureType === STRUCTURE_LINK && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+                });
+                if (nearbyLinks.length > 0) {
+                    newTarget = creep.pos.findClosestByPath(nearbyLinks);
+                }
+            }
 
-            // Priority 2: Spawns or Extensions (if no storage/containers)
+            // Priority 2: Storage or Containers (if no suitable link found)
+            if (!newTarget) {
+                newTarget = creep.pos.findClosestByPath(FIND_STRUCTURES, {
+                    filter: s => (s.structureType === STRUCTURE_STORAGE || s.structureType === STRUCTURE_CONTAINER) &&
+                                 s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+                });
+            }
+
+            // Priority 3: Spawns or Extensions (if no storage/containers/links)
             if (!newTarget) {
                 newTarget = creep.pos.findClosestByPath(FIND_STRUCTURES, {
                     filter: s => (s.structureType === STRUCTURE_EXTENSION || s.structureType === STRUCTURE_SPAWN) &&
