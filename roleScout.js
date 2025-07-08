@@ -1,7 +1,23 @@
+// =================================================================================================
+// |                                                                                               |
+// |                                     HOW TO USE THIS SCOUT                                     |
+// |                                                                                               |
+// | 1. To spawn a scout and send it to a specific room to start exploring:                        |
+// |    require('roleScout').orderExplore('W1N8'); // (Target Room Name)                           |
+// |                                                                                               |
+// | 2. To order a scout for a specific mission (e.g., check if a path is clear):                  |
+// |    require('roleScout').orderCheckRoom('E2N47', 'E5N47'); // (From, To)                        |
+// |                                                                                               |
+// | 3. To spawn a "fire-and-forget" autonomous scout that explores on its own:                    |
+// |    require('roleScout').orderAutonomousScout();                                               |
+// |                                                                                               |
+// =================================================================================================
+
 // =================================================================
 // CONFIGURATION
 // =================================================================
 const DETAILED_LOGGING = true; // Set to false to disable verbose scout console logs.
+const FRIENDLY_PLAYERS = ['tarenty', 'Player1', 'AnotherFriend']; // Add friendly usernames here
 // =================================================================
 
 /**
@@ -16,106 +32,194 @@ const log = (message) => {
 
 const roleScout = {
     /**
+     * Spawns a scout to explore a destination, automatically finding the best spawn room.
+     * Example: require('roleScout').orderExplore('W1N8')
+     * @param {string} destinationRoomName - The name of the room to send the scout to.
+     */
+    orderExplore: function(destinationRoomName) {
+        // ... (this function is unchanged)
+        if (!destinationRoomName) {
+            return 'Error: destinationRoomName is required.';
+        }
+        let bestSpawnRoom = null;
+        let minDistance = Infinity;
+        for (const roomName in Game.rooms) {
+            const room = Game.rooms[roomName];
+            if (room.controller && room.controller.my) {
+                const spawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
+                if (spawns.length > 0) {
+                    const distance = Game.map.getRoomLinearDistance(roomName, destinationRoomName);
+                    if (distance < minDistance) {
+                        minDistance = distance;
+                        bestSpawnRoom = room;
+                    }
+                }
+            }
+        }
+        if (!bestSpawnRoom) {
+            const message = `❌ Error: No available spawn found in any of your rooms to start exploration mission to ${destinationRoomName}.`;
+            console.log(message);
+            return message;
+        }
+        const spawn = bestSpawnRoom.find(FIND_MY_SPAWNS, { filter: s => !s.spawning })[0];
+        const newName = `Scout_${destinationRoomName}_${Game.time % 1000}`;
+        const body = [MOVE];
+        const memory = {
+            role: 'scout',
+            targetRoom: destinationRoomName
+        };
+        const result = spawn.spawnCreep(body, newName, { memory: memory });
+        if (result === OK) {
+            const message = `✅ Spawning scout '${newName}' from ${bestSpawnRoom.name} to explore ${destinationRoomName}.`;
+            console.log(message);
+            return message;
+        } else {
+            const errorMessage = `❌ Failed to spawn scout from ${bestSpawnRoom.name}. Error code: ${result}`;
+            console.log(errorMessage);
+            return errorMessage;
+        }
+    },
+
+    /**
      * Spawns a scout with a specific mission to check if a room is visitable.
-     * Can be called from the Screeps console.
      * Example: require('roleScout').orderCheckRoom('E2N46', 'W2N2')
      * @param {string} spawnRoomName - The name of the room with a spawn to create the scout.
      * @param {string} destinationRoomName - The name of the room to send the scout to.
      */
     orderCheckRoom: function(spawnRoomName, destinationRoomName) {
+        // ... (this function is unchanged)
         if (!spawnRoomName || !destinationRoomName) {
             return 'Error: Both spawnRoomName and destinationRoomName are required.';
         }
-
         const spawnRoom = Game.rooms[spawnRoomName];
         if (!spawnRoom) {
             return `Error: No vision in spawn room ${spawnRoomName}.`;
         }
-
         const spawns = spawnRoom.find(FIND_MY_SPAWNS, {
             filter: s => !s.spawning
         });
         if (!spawns.length) {
             return `Error: No available spawn in room ${spawnRoomName}.`;
         }
-
         const spawn = spawns[0];
         const newName = `VisCheck_${destinationRoomName}_${Game.time % 1000}`;
         const body = [MOVE];
         const memory = {
             role: 'scout',
-            task: 'checkRoom', // Special task identifier
+            task: 'checkRoom',
             destinationRoom: destinationRoomName,
             spawnRoom: spawnRoomName
         };
-
         const result = spawn.spawnCreep(body, newName, { memory: memory });
-
         if (result === OK) {
             const message = `✅ Spawning scout '${newName}' from ${spawnRoomName} to check room ${destinationRoomName}.`;
-            console.log(message); // Always log this user-initiated action
+            console.log(message);
             return message;
         } else {
             const errorMessage = `❌ Failed to spawn scout. Error code: ${result}`;
-            console.log(errorMessage); // Always log errors
+            console.log(errorMessage);
             return errorMessage;
         }
     },
 
     /**
-     * Checks for dead creeps and handles their last wishes, sending detailed failure notifications.
-     * This should be called from your main loop in `main.js`.
+     * <<< NEW: Spawns a scout that explores autonomously without a specific destination. >>>
+     * Example: require('roleScout').orderAutonomousScout()
      */
+    orderAutonomousScout: function() {
+        let spawn = null;
+        // Find any available spawn in any of your rooms
+        for (const roomName in Game.rooms) {
+            const room = Game.rooms[roomName];
+            if (room.controller && room.controller.my) {
+                const availableSpawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
+                if (availableSpawns.length > 0) {
+                    spawn = availableSpawns[0];
+                    break; // Found one, no need to keep looking
+                }
+            }
+        }
+
+        if (!spawn) {
+            const message = `❌ Error: No available spawn found in any of your rooms to launch an autonomous scout.`;
+            console.log(message);
+            return message;
+        }
+
+        const newName = `AutoScout_${Game.time % 1000}`;
+        const body = [MOVE];
+        const memory = {
+            role: 'scout',
+            task: 'autonomous', // A specific task name for clarity
+            homeRoom: spawn.room.name
+            // No targetRoom is set; the scout will find its own on the first tick.
+        };
+
+        const result = spawn.spawnCreep(body, newName, { memory: memory });
+
+        if (result === OK) {
+            const message = `✅ Spawning autonomous scout '${newName}' from ${spawn.room.name}.`;
+            console.log(message);
+            return message;
+        } else {
+            const errorMessage = `❌ Failed to spawn autonomous scout from ${spawn.room.name}. Error code: ${result}`;
+            console.log(errorMessage);
+            return errorMessage;
+        }
+    },
+
+    // ... (The rest of the file is unchanged) ...
     handleDeadCreeps: function() {
         for (const name in Memory.creeps) {
             if (!Game.creeps[name]) {
                 const memory = Memory.creeps[name];
-
                 if (memory.role === 'scout' && memory.task === 'checkRoom' && !memory.notificationSent) {
                     const deathRoom = memory.lastAttackedIn || memory.lastRoom || 'an unknown room';
                     const cause = memory.causeOfDeath || 'unknown reasons';
-
                     const message = `❌ Mission Failed: Scout [${name}] died in room ${deathRoom} (Cause: ${cause}) before reaching its destination of ${memory.destinationRoom}.`;
                     Game.notify(message, 0);
-                    console.log(message); // Always log critical failures
+                    console.log(message);
                 }
-
                 delete Memory.creeps[name];
             }
         }
     },
-
-    /**
-     * Main logic loop for all scouts.
-     * @param {Creep} creep
-     */
     run: function(creep) {
         if (creep.spawning) return;
-
+        if (creep.memory.fleeing) {
+            if (creep.room.name === creep.memory.previousRoom || !creep.memory.previousRoom) {
+                log(`✅ Scout ${creep.name} successfully fled. Looking for new target.`);
+                delete creep.memory.fleeing;
+                this.assignTargetRoom(creep);
+            } else {
+                creep.say('😱 RUN!');
+                creep.moveTo(new RoomPosition(25, 25, creep.memory.previousRoom));
+                return;
+            }
+        }
         if (creep.memory.task === 'checkRoom') {
             this.runCheckRoomTask(creep);
             return;
         }
-
-        this.checkForAttack(creep);
-
+        if (this.checkForDanger(creep)) {
+            return;
+        }
         if(!Memory.exploration) Memory.exploration = {};
         if(!Memory.exploration.rooms) Memory.exploration.rooms = {};
         if(!Memory.ownedRooms) Memory.ownedRooms = [];
         if(!Memory.dangerousRooms) Memory.dangerousRooms = {};
-
         if(!creep.memory.targetRoom) {
             this.assignTargetRoom(creep);
         }
-
         if(creep.memory.lastRoom !== creep.room.name) {
+            creep.memory.previousRoom = creep.memory.lastRoom;
             creep.memory.roomScanned = false;
             creep.memory.lastRoom = creep.room.name;
+            delete creep.memory.route;
             if(!creep.memory.visitedRooms) creep.memory.visitedRooms = {};
             creep.memory.visitedRooms[creep.room.name] = Game.time;
             log(`🔍 Scout ${creep.name} entered room ${creep.room.name} (target: ${creep.memory.targetRoom})`);
         }
-
         if(creep.room.name !== creep.memory.targetRoom) {
             this.travelToRoom(creep, creep.memory.targetRoom);
         } else {
@@ -125,19 +229,13 @@ const roleScout = {
             this.assignTargetRoom(creep);
         }
     },
-
-    /**
-     * Logic for a scout assigned the 'checkRoom' task.
-     * @param {Creep} creep
-     */
     runCheckRoomTask: function(creep) {
         const destination = creep.memory.destinationRoom;
-
         if (creep.room.name === destination) {
             if (!creep.memory.notificationSent) {
                 const message = `✅ Scout [${creep.name}] has successfully reached the destination room: ${destination}. The room is visitable.`;
                 Game.notify(message, 0);
-                console.log(message); // Always log mission success
+                console.log(message);
                 creep.memory.notificationSent = true;
                 creep.say('✅ Done!');
             }
@@ -148,7 +246,7 @@ const roleScout = {
                 if (!creep.memory.notificationSent) {
                     const message = `❌ Mission Failed: Scout [${creep.name}] could not find a safe path to ${destination}.`;
                     Game.notify(message, 0);
-                    console.log(message); // Always log mission failure
+                    console.log(message);
                     creep.memory.notificationSent = true;
                 }
                 creep.say('🚫 Path');
@@ -156,43 +254,39 @@ const roleScout = {
             }
         }
     },
-
     idle: function(creep) {
         const idlePosition = new RoomPosition(48, 48, creep.room.name);
         if (!creep.pos.isEqualTo(idlePosition)) {
-            creep.moveTo(idlePosition, { visualizePathStyle: { stroke: '#cccccc' } });
+            creep.moveTo(idlePosition);
         }
     },
-
-    checkForAttack: function(creep) {
-        if(creep.hits < creep.hitsMax) {
-            if(!creep.memory.lastHits || creep.memory.lastHits > creep.hits) {
-                const damageTaken = creep.memory.lastHits - creep.hits;
-                console.log(`🚨 SCOUT UNDER ATTACK! ${creep.name} in room ${creep.room.name} - Health: ${creep.hits}/${creep.hitsMax} (Damage: ${damageTaken})`);
-                creep.say('💀 HELP!');
-                creep.memory.lastAttackedIn = creep.room.name;
-                const isTowerAttack = damageTaken >= 150;
-                if(isTowerAttack) {
-                    this.markRoomAsDangerous(creep.room.name, 'tower_attack', true);
-                    console.log(`🏰 TOWER ATTACK DETECTED! Permanently marking room ${creep.room.name} as dangerous!`);
-                    creep.say('🏰 TOWER!');
-                    creep.memory.causeOfDeath = 'Hostile Tower';
-                } else {
-                    creep.memory.causeOfDeath = 'Hostile Creep/Trap';
-                }
-            }
+    checkForDanger: function(creep) {
+        const room = creep.room;
+        if (room.controller && room.controller.owner && FRIENDLY_PLAYERS.includes(room.controller.owner.username)) {
+            log(`Scout ${creep.name} in friendly room ${creep.room.name} owned by ${room.controller.owner.username}. Not fleeing.`);
+            return false;
         }
-        if(!creep.memory.towerCheckDone) {
-            const towers = creep.room.find(FIND_HOSTILE_STRUCTURES, { filter: (s) => s.structureType === STRUCTURE_TOWER });
-            if(towers.length > 0) {
-                this.markRoomAsDangerous(creep.room.name, 'hostile_towers', true);
-                console.log(`🏰 HOSTILE TOWERS DETECTED! Permanently marking room ${creep.room.name} as dangerous!`);
-            }
-            creep.memory.towerCheckDone = true;
+        const towers = room.find(FIND_HOSTILE_STRUCTURES, { filter: (s) => s.structureType === STRUCTURE_TOWER });
+        if (towers.length > 0) {
+            this.markRoomAsDangerous(creep.room.name, 'hostile_towers', true);
+            creep.memory.fleeing = true;
+            delete creep.memory.targetRoom;
+            log(`🏰 HOSTILE TOWERS DETECTED! Scout ${creep.name} is fleeing from ${creep.room.name}!`);
+            return true;
+        }
+        if (creep.hits < creep.hitsMax && (!creep.memory.lastHits || creep.memory.lastHits > creep.hits)) {
+            const damageTaken = (creep.memory.lastHits || creep.hitsMax) - creep.hits;
+            console.log(`🚨 SCOUT UNDER ATTACK! ${creep.name} in room ${creep.room.name} - Health: ${creep.hits}/${creep.hitsMax} (Damage: ${damageTaken})`);
+            creep.memory.lastAttackedIn = creep.room.name;
+            this.markRoomAsDangerous(creep.room.name, 'hostile_creeps', false);
+            creep.memory.fleeing = true;
+            delete creep.memory.targetRoom;
+            log(`⚔️ HOSTILES DETECTED! Scout ${creep.name} is fleeing from ${creep.room.name}!`);
+            return true;
         }
         creep.memory.lastHits = creep.hits;
+        return false;
     },
-
     markRoomAsDangerous: function(roomName, reason, permanent) {
         if(!Memory.dangerousRooms) Memory.dangerousRooms = {};
         const cooldownTime = permanent ? 999999999 : 50000;
@@ -203,7 +297,6 @@ const roleScout = {
             console.log(`⏰ Avoiding room ${roomName} for ${cooldownTime} ticks due to ${reason}`);
         }
     },
-
     isRoomDangerous: function(roomName) {
         if(!Memory.dangerousRooms || !Memory.dangerousRooms[roomName]) return false;
         const dangerData = Memory.dangerousRooms[roomName];
@@ -215,7 +308,6 @@ const roleScout = {
         }
         return true;
     },
-
     clearDangerousRoom: function(roomName) {
         if(Memory.dangerousRooms && Memory.dangerousRooms[roomName]) {
             delete Memory.dangerousRooms[roomName];
@@ -224,7 +316,6 @@ const roleScout = {
         }
         return false;
     },
-
     listDangerousRooms: function() {
         if(!Memory.dangerousRooms || Object.keys(Memory.dangerousRooms).length === 0) {
             console.log("No dangerous rooms tracked.");
@@ -237,7 +328,6 @@ const roleScout = {
             console.log(`${roomName}: ${data.reason} - ${status}`);
         }
     },
-
     showScoutStatus: function() {
         console.log("=== SCOUT STATUS ===");
         for(const creepName in Game.creeps) {
@@ -249,94 +339,69 @@ const roleScout = {
             }
         }
     },
-
     travelToRoom: function(creep, targetRoomName) {
-        if (!creep.memory.route || creep.memory.routeTarget !== targetRoomName) {
-            log(`🗺️ Scout ${creep.name} calculating new route to ${targetRoomName}`);
-            const route = Game.map.findRoute(creep.room.name, targetRoomName, {
-                routeCallback: (roomName) => {
-                    if (roomName === targetRoomName) return 1;
-                    if (this.isRoomDangerous(roomName)) return Infinity;
-                    return 1;
-                }
-            });
-
-            if (route === ERR_NO_PATH || route.length === 0) {
-                console.log(`❌ Scout ${creep.name} found no safe path to ${targetRoomName}, reassigning target.`);
-                if (creep.memory.task !== 'checkRoom') {
+        if (!creep.memory.route) {
+            let attempts = 0;
+            while (attempts < 5) {
+                const route = Game.map.findRoute(creep.room.name, targetRoomName, {
+                    routeCallback: (roomName) => {
+                        if (this.isRoomDangerous(roomName)) return Infinity;
+                        if (creep.memory.routeBlacklist && creep.memory.routeBlacklist[roomName]) {
+                            return Infinity;
+                        }
+                        return 1;
+                    }
+                });
+                if (route === ERR_NO_PATH || route.length === 0) {
+                    console.log(`❌ Scout ${creep.name} found no safe path to ${targetRoomName}.`);
                     this.assignTargetRoom(creep);
+                    return ERR_NO_PATH;
                 }
-                return ERR_NO_PATH;
+                if (route[0].room === creep.memory.previousRoom) {
+                    log(`Pathfinding loop detected! Scout wants to go from ${creep.room.name} back to ${creep.memory.previousRoom}.`);
+                    if (!creep.memory.routeBlacklist) creep.memory.routeBlacklist = {};
+                    creep.memory.routeBlacklist[route[0].room] = true;
+                    log(`Temporarily blacklisting ${route[0].room} and recalculating.`);
+                    attempts++;
+                    continue;
+                }
+                creep.memory.route = route;
+                creep.memory.routeTarget = targetRoomName;
+                break;
             }
-
-            creep.memory.route = route;
-            creep.memory.routeTarget = targetRoomName;
         }
-
-        const currentRoom = creep.room.name;
         const route = creep.memory.route;
-
-        if (route.length > 0 && currentRoom === route[0].room) {
-            route.shift();
-        }
-
-        if (route.length > 0) {
+        if (route && route.length > 0) {
             const exit = creep.pos.findClosestByPath(route[0].exit);
             if (exit) {
-                if (creep.pos.isNearTo(exit)) {
-                    creep.moveTo(exit);
-                } else {
-                    let stagingPos = exit;
-                    if (exit.x === 0) stagingPos = new RoomPosition(1, exit.y, creep.room.name);
-                    else if (exit.x === 49) stagingPos = new RoomPosition(48, exit.y, creep.room.name);
-                    else if (exit.y === 0) stagingPos = new RoomPosition(exit.x, 1, creep.room.name);
-                    else if (exit.y === 49) stagingPos = new RoomPosition(exit.x, 48, creep.room.name);
-
-                    creep.moveTo(stagingPos, {
-                        visualizePathStyle: { stroke: '#55aaff' },
-                        reusePath: 10,
-                        ignoreCreeps: true,
-                        costCallback: function(roomName, costMatrix) {
-                            if (roomName !== creep.room.name) return;
-                            let cm = costMatrix.clone();
-                            for (let i = 0; i < 50; i++) {
-                                if (cm.get(i, 0) === 0) cm.set(i, 0, 10);
-                                if (cm.get(i, 49) === 0) cm.set(i, 49, 10);
-                                if (cm.get(0, i) === 0) cm.set(0, i, 10);
-                                if (cm.get(49, i) === 0) cm.set(49, i, 10);
-                            }
-                            return cm;
-                        },
-                    });
-                }
+                creep.moveTo(exit, {
+                    reusePath: 10,
+                    ignoreCreeps: true
+                });
                 creep.say('🔭' + route[0].room);
             }
             return OK;
         } else {
             delete creep.memory.route;
-            delete creep.memory.routeTarget;
             return OK;
         }
     },
-
     assignTargetRoom: function(creep) {
+        delete creep.memory.routeBlacklist;
+        delete creep.memory.route;
         const exits = Game.map.describeExits(creep.room.name);
         if(!exits) return;
-
         if(!creep.memory.visitedRooms) creep.memory.visitedRooms = {};
-
         const candidateRooms = [];
         for(const dir in exits) {
             const roomName = exits[dir];
-            const isOwned = Memory.ownedRooms.includes(roomName);
+            if (Game.rooms[roomName] && Game.rooms[roomName].controller && Game.rooms[roomName].controller.my) continue;
             const recentlyVisited = creep.memory.visitedRooms[roomName] && (Game.time - creep.memory.visitedRooms[roomName] < 500);
             const isDangerous = this.isRoomDangerous(roomName);
-
-            if(!isOwned && !recentlyVisited && !isDangerous) {
+            if(!recentlyVisited && !isDangerous) {
                 candidateRooms.push(roomName);
             }
         }
-
         if(candidateRooms.length > 0) {
             const targetRoom = candidateRooms[Math.floor(Math.random() * candidateRooms.length)];
             creep.memory.targetRoom = targetRoom;
@@ -344,12 +409,11 @@ const roleScout = {
             log(`🆕 Scout ${creep.name} assigned NEW target: ${targetRoom}`);
             return;
         }
-
         let oldestVisit = Game.time;
         let oldestRoom = null;
         for(const dir in exits) {
             const roomName = exits[dir];
-            if(!Memory.ownedRooms.includes(roomName) && !this.isRoomDangerous(roomName)) {
+            if(!this.isRoomDangerous(roomName)) {
                 const lastVisit = creep.memory.visitedRooms[roomName] || 0;
                 if(lastVisit < oldestVisit) {
                     oldestVisit = lastVisit;
@@ -357,7 +421,6 @@ const roleScout = {
                 }
             }
         }
-
         if(oldestRoom) {
             creep.memory.targetRoom = oldestRoom;
             creep.say('🔄' + oldestRoom);
@@ -365,10 +428,9 @@ const roleScout = {
         } else {
             creep.memory.targetRoom = creep.room.name;
             creep.say('🏠 SAFE');
-            console.log(`⚠️ Scout ${creep.name} has no safe rooms to explore, staying put.`); // Always log this warning
+            console.log(`⚠️ Scout ${creep.name} has no safe rooms to explore, staying put.`);
         }
     },
-
     gatherIntelligence: function(creep) {
         if (creep.memory.roomScanned) return;
         const room = creep.room;
@@ -388,9 +450,18 @@ const roleScout = {
         Memory.exploration.rooms[roomName].exits = Game.map.describeExits(roomName);
         const hostiles = room.find(FIND_HOSTILE_CREEPS);
         Memory.exploration.rooms[roomName].hostile = hostiles.length > 0;
-        creep.memory.roomScanned = true;
         let ownerInfo = (room.controller && room.controller.owner) ? ` (owned by ${room.controller.owner.username})` : '';
         log(`📊 Scout ${creep.name} scanned ${roomName}: ${room.find(FIND_SOURCES).length} sources, ${room.find(FIND_MINERALS).length} minerals, ${hostiles.length} hostiles${ownerInfo}`);
+        if (!Memory.rooms) { Memory.rooms = {}; }
+        const remoteHarvestIntel = {
+            sources: room.find(FIND_SOURCES).map(s => s.id),
+            owner: room.controller ? (room.controller.owner ? room.controller.owner.username : null) : null,
+            reservation: room.controller ? room.controller.reservation : null,
+            lastScouted: Game.time
+        };
+        Memory.rooms[roomName] = remoteHarvestIntel;
+        log(`[Remote Harvest] Saved intel for ${roomName}.`);
+        creep.memory.roomScanned = true;
     }
 };
 

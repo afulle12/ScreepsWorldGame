@@ -2,7 +2,8 @@
 // Identify Friend or Foe logic, used for towers and monitoring hostiles.
 
 const IFF_WHITELIST = [
-    'tarenty'
+    'tarenty',
+    'TimelessTacticianEon'
     // Add more player usernames to whitelist here.
 ];
 

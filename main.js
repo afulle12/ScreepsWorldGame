@@ -1,8 +1,8 @@
 // === CPU USAGE LOGGING TOGGLE VARIABLES ===
-const ENABLE_CPU_LOGGING = false;      // Set to false to disable ALL CPU profiling/logging
-const DISABLE_CPU_CONSOLE = false;    // Set to true to disable only CPU-related console.log output
+const ENABLE_CPU_LOGGING = true;
+const DISABLE_CPU_CONSOLE = true;
 
-// Import role modules
+// --- ROLE & UTILITY IMPORTS ---
 const roleHarvester = require('roleHarvester');
 const roleUpgrader = require('roleUpgrader');
 const roleBuilder = require('roleBuilder');
@@ -10,17 +10,17 @@ const roleScout = require('roleScout');
 const roleDefender = require('roleDefender');
 const roleSupplier = require('roleSupplier');
 const roleClaimbot = require('roleClaimbot');
+const roleRemoteHarvester = require('roleRemoteHarvesters');
+const roleAttacker = require('roleAttacker');
 const roadTracker = require('roadTracker');
 const iff = require('iff');
 
-// Constants for body parts
+// --- CONSTANTS ---
 const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
 const BASIC_DEFENDER = [TOUGH, MOVE, RANGED_ATTACK];
-const CRIPPLED_HARVESTER = [WORK, CARRY, MOVE];
-const CARRY_ONLY = [CARRY, MOVE];
 const SCOUT_BODY = [MOVE, MOVE, MOVE, MOVE, MOVE];
+const MAX_REMOTE_SOURCES_PER_ROOM = 3;
 
-// --- BUILDER PRIORITIES (copied from roleBuilder) ---
 const PRIORITIES = [
     {
         type: 'repair',
@@ -90,7 +90,41 @@ const PRIORITIES = [
     },
 ];
 
-// --- CPU PROFILING HELPER ---
+// =================================================================
+// === ALL HELPER FUNCTIONS & CONSOLE COMMANDS ARE DEFINED HERE ===
+// =================================================================
+
+// --- CONSOLE COMMANDS ---
+global.orderAttack = function(targetRoom, count) {
+    if (!targetRoom || !count || count <= 0) {
+        return `[Attack] Invalid order. Use global.orderAttack('roomName', creepCount).`;
+    }
+    if (!Memory.attackOrders) {
+        Memory.attackOrders = [];
+    }
+    Memory.attackOrders.push({ targetRoom: targetRoom, count: count });
+    return `[Attack] Order placed for ${count} attackers to be sent to ${targetRoom}.`;
+};
+
+global.assignAttackTarget = function(roomName, targetId) {
+    if (!roomName || !targetId) {
+        return `[Attack] Invalid command. Use global.assignAttackTarget('roomName', 'targetId').`;
+    }
+    const attackersInRoom = _.filter(Game.creeps, c => c.memory.role === 'attacker' && c.memory.targetRoom === roomName);
+    if (attackersInRoom.length === 0) {
+        return `[Attack] No attackers found for room ${roomName}.`;
+    }
+    let assignedCount = 0;
+    for (const creep of attackersInRoom) {
+        creep.memory.assignedTargetId = targetId;
+        assignedCount++;
+    }
+    return `[Attack] Assigned target ${targetId} to ${assignedCount} attackers in room ${roomName}.`;
+};
+
+
+
+// --- CPU PROFILING ---
 if (ENABLE_CPU_LOGGING && !Memory.cpuProfile) Memory.cpuProfile = {};
 function profileSection(name, fn) {
     if (!ENABLE_CPU_LOGGING) {
@@ -107,7 +141,6 @@ function profileSection(name, fn) {
     Memory.cpuProfileLastUsed[name] = Game.time;
 }
 
-// --- CPU PROFILE MEMORY CLEANUP ---
 function cleanCpuProfileMemory(maxAge = 5000) {
     if (!Memory.cpuProfileLastUsed) return;
     const now = Game.time;
@@ -119,36 +152,25 @@ function cleanCpuProfileMemory(maxAge = 5000) {
     }
 }
 
-// --- LINK LOGIC ---
-// --- LINK LOGIC ---
+
+// --- STRUCTURE LOGIC ---
 function runLinks() {
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
-        // Ensure the room is ours and has a controller
         if(!room.controller || !room.controller.my) {
             continue;
         }
-
-        // Find all links in the room
         const allLinks = room.find(FIND_MY_STRUCTURES, {
             filter: { structureType: STRUCTURE_LINK }
         });
-
-        // Need at least two links to do anything
         if(allLinks.length < 2) {
             continue;
         }
-
-        // --- Classify Links ---
         const sources = room.find(FIND_SOURCES);
         const storage = room.storage;
         const controller = room.controller;
-
         const recipientLinks = [];
         const sendingLinks = [];
-
-        // Recipient links only receive energy. They are classified first and excluded from sending.
-        // A link is a "Recipient" if it's within 5 squares of the controller.
         for (const link of allLinks) {
             if (controller && link.pos.inRangeTo(controller, 5)) {
                 recipientLinks.push(link);
@@ -156,56 +178,28 @@ function runLinks() {
                 sendingLinks.push(link);
             }
         }
-
-        // From the remaining (non-recipient) links, classify donor and storage links.
-        // A link can be both a donor and a storage link.
-        // A "Storage Link" is within 3 squares of storage.
         const storageLinks = sendingLinks.filter(l => storage && l.pos.inRangeTo(storage, 3));
-        // A "Donor Link" is within 3 squares of an energy source.
         const donorLinks = sendingLinks.filter(l => sources.some(s => l.pos.inRangeTo(s, 3)));
-
-        // --- Transfer Logic ---
-
-        // Priority 1: Storage Links -> Recipient Links
-        // This is a high-priority transfer to keep the controller's upgrader fed.
         for (const storageLink of storageLinks) {
-            // Skip if on cooldown or empty
             if (storageLink.cooldown > 0 || storageLink.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
                 continue;
             }
-
-            // Find a recipient that is below the 400 energy threshold.
             const targetRecipient = recipientLinks.find(r => r.store.getUsedCapacity(RESOURCE_ENERGY) < 400);
-
             if (targetRecipient) {
                 const result = storageLink.transferEnergy(targetRecipient);
                 if (result === OK) {
-                    // This link has acted, so we continue to the next storage link.
-                    // Its cooldown will prevent it from acting again in the donor logic below.
                     continue;
                 }
             }
         }
-
-        // Priority 2: Donor Links -> Storage or Recipient Links
-        // This moves energy from sources to the link with the lowest energy level.
         for (const donorLink of donorLinks) {
-            // Check cooldown again in case a storage link was also a donor link and already acted.
-            // Also check if the link has enough energy to trigger a transfer.
             if (donorLink.cooldown > 0 || donorLink.store[RESOURCE_ENERGY] <= 400) {
                 continue;
             }
-
-            // Potential targets are all storage and recipient links.
             let potentialTargets = [...storageLinks, ...recipientLinks];
-
-            // A link cannot send to itself.
             potentialTargets = potentialTargets.filter(l => l.id !== donorLink.id);
-
             if (potentialTargets.length > 0) {
-                // Find the target with the least amount of energy.
                 const target = _.min(potentialTargets, l => l.store[RESOURCE_ENERGY]);
-
                 if (target && target.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
                     donorLink.transferEnergy(target);
                 }
@@ -214,8 +208,6 @@ function runLinks() {
     }
 }
 
-
-// --- TOWER LOGIC ---
 function runTowers() {
     if (!Memory.towerTargets) Memory.towerTargets = {};
     for(const roomName in Game.rooms) {
@@ -225,7 +217,6 @@ function runTowers() {
             filter: { structureType: STRUCTURE_TOWER }
         });
         for(const tower of towers) {
-            // <<< MODIFIED HERE to use the IFF module to filter hostiles
             const hostiles = room.find(FIND_HOSTILE_CREEPS, {
                 filter: creep => iff.isHostileCreep(creep)
             });
@@ -310,222 +301,47 @@ function runTowers() {
     }
 }
 
-// OPTIMIZED: Calculate total energy using cached structure IDs
-function calculateTotalEnergy() {
-    let totalEnergy = 0;
-    if (!Memory.roomData) return 0; // Safety check if cache doesn't exist
 
-    for (const roomName in Memory.roomData) {
-        const roomCache = Memory.roomData[roomName];
-        if (!roomCache) continue;
+// --- SPAWN MANAGEMENT ---
+function manageAttackerSpawns() {
+    if (!Memory.attackOrders || Memory.attackOrders.length === 0) return;
+    const order = Memory.attackOrders[0];
+    const targetRoom = order.targetRoom;
+    const requiredCount = order.count;
+    const existingAttackers = _.filter(Game.creeps, c => c.memory.role === 'attacker' && c.memory.targetRoom === targetRoom);
 
-        // Combine all cached IDs into a single array for iteration
-        const allIds = [
-            ...(roomCache.spawnIds || []),
-            ...(roomCache.extensionIds || []),
-            ...(roomCache.containerIds || []),
-        ];
-        if (roomCache.storageId) {
-            allIds.push(roomCache.storageId);
-        }
-
-        // Iterate through IDs, get the object, and sum the energy
-        totalEnergy += allIds.reduce((sum, id) => {
-            const structure = Game.getObjectById(id);
-            // Check if structure exists and has a store property
-            if (structure && structure.store) {
-                return sum + structure.store.getUsedCapacity(RESOURCE_ENERGY);
-            }
-            return sum;
-        }, 0);
+    if (existingAttackers.length >= requiredCount) {
+        console.log(`[Attack] Attack order for ${targetRoom} is fulfilled. Removing order.`);
+        Memory.attackOrders.shift();
+        return;
     }
-    return totalEnergy;
-}
 
-// Track CPU usage over time
-function trackCPUUsage() {
-    if (!ENABLE_CPU_LOGGING) return;
-    if(!Memory.cpuStats) {
-        Memory.cpuStats = {
-            history: [],
-            average: 0
-        };
-    }
-    const cpuUsed = Game.cpu.getUsed();
-    Memory.cpuStats.history.push(cpuUsed);
-    if(Memory.cpuStats.history.length > 50) {
-        Memory.cpuStats.history.shift();
-    }
-    Memory.cpuStats.average = Memory.cpuStats.history.reduce((sum, cpu) => sum + cpu, 0) / Memory.cpuStats.history.length;
-}
-
-// Track energy income rate over time
-function trackEnergyIncome() {
-    if(!Memory.energyIncomeTracker) {
-        Memory.energyIncomeTracker = {
-            history: [],
-            totalIncome: 0,
-            averageIncome: 0
-        };
-    }
-    const currentEnergy = calculateTotalEnergy();
-    const currentTick = Game.time;
-    let incomeThisTick = 0;
-    if(Memory.energyIncomeTracker.history.length > 0) {
-        const lastEntry = Memory.energyIncomeTracker.history[Memory.energyIncomeTracker.history.length - 1];
-        const energyIncrease = Math.max(0, currentEnergy - lastEntry.energy);
-        incomeThisTick = energyIncrease;
-        Memory.energyIncomeTracker.totalIncome += incomeThisTick;
-    }
-    Memory.energyIncomeTracker.history.push({
-        tick: currentTick,
-        energy: currentEnergy,
-        incomeThisTick: incomeThisTick
-    });
-    while(Memory.energyIncomeTracker.history.length > 0 &&
-          currentTick - Memory.energyIncomeTracker.history[0].tick > 100) {
-        const removedEntry = Memory.energyIncomeTracker.history.shift();
-        Memory.energyIncomeTracker.totalIncome -= removedEntry.incomeThisTick || 0;
-    }
-    const trackingTicks = Memory.energyIncomeTracker.history.length;
-    Memory.energyIncomeTracker.averageIncome = trackingTicks > 0 ?
-        Memory.energyIncomeTracker.totalIncome / trackingTicks : 0;
-    Memory.energyIncomeTracker.totalIncome = Math.max(0, Memory.energyIncomeTracker.totalIncome);
-}
-
-// Reset kill counter daily
-function handleKillCounterReset() {
-    if (!Memory.stats) {
-        Memory.stats = { kills: 0 };
-    }
-    // Get the current date in UTC (e.g., "2025-06-30")
-    const todayUTC = new Date().toISOString().slice(0, 10);
-
-    if (Memory.stats.killResetDate !== todayUTC) {
-        Memory.stats.kills = 0;
-        Memory.stats.killResetDate = todayUTC;
-        console.log('Daily kill counter has been reset.');
-    }
-}
-
-// Track kills from events
-function trackKills() {
-    // Ensure stats and kills property exist
-    if (!Memory.stats) Memory.stats = {};
-    if (Memory.stats.kills === undefined) Memory.stats.kills = 0;
-
-    // Check if Game.events is an array before iterating
-    if (Array.isArray(Game.events)) {
-        for (const event of Game.events) {
-            // We are only interested in object destruction events
-            if (event.event === EVENT_OBJECT_DESTROYED) {
-                // Check if the object was destroyed by one of our creeps or structures.
-                // The 'destroyerId' is the ID of the object that landed the final blow.
-                const destroyer = Game.getObjectById(event.data.destroyerId);
-
-                // If the destroyer exists and the 'my' property is true, it's our kill.
-                if (destroyer && destroyer.my) {
-                    // Optional: You can also confirm the destroyed object was a creep.
-                    if (event.data.type === 'creep') {
-                        Memory.stats.kills++;
-                    }
-                }
-            }
+    let bestSpawn = null;
+    let minDistance = Infinity;
+    for (const roomName in Game.rooms) {
+        const room = Game.rooms[roomName];
+        if (!room.controller || !room.controller.my) continue;
+        const spawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
+        if (spawns.length === 0) continue;
+        const distance = Game.map.getRoomLinearDistance(roomName, targetRoom);
+        if (distance < minDistance) {
+            minDistance = distance;
+            bestSpawn = spawns[0];
         }
     }
-}
 
+    if (!bestSpawn) return;
+    const body = getCreepBody('attacker', bestSpawn.room.energyAvailable);
+    if (!body || bodyCost(body) > bestSpawn.room.energyAvailable) return;
 
-// Get performance data for display
-function getPerformanceData() {
-    const cpuUsed = Game.cpu.getUsed();
-    const cpuAverage = (ENABLE_CPU_LOGGING && Memory.cpuStats) ? Memory.cpuStats.average : 0;
-    const cpuLimit = Game.cpu.limit;
-    const cpuPercent = ((cpuUsed / cpuLimit) * 100).toFixed(1);
-    const energyIncome = Memory.energyIncomeTracker ? Memory.energyIncomeTracker.averageIncome : 0;
-    const trackingTicks = Memory.energyIncomeTracker ? Memory.energyIncomeTracker.history.length : 0;
-    return {
-        cpuUsed: Math.round(cpuUsed),
-        cpuAverage: Math.round(cpuAverage),
-        cpuPercent: cpuPercent,
-        cpuLimit: cpuLimit,
-        energyIncome: energyIncome.toFixed(2),
-        trackingTicks: trackingTicks
-    };
-}
-
-// Format time in days, hours, and minutes
-function formatTime(totalMinutes) {
-    const days = Math.floor(totalMinutes / (24 * 60));
-    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
-    const minutes = Math.floor(totalMinutes % 60);
-    if (days > 0) {
-        if (hours > 0) {
-            return `${days}d ${hours}h ${minutes}m`;
-        } else {
-            return `${days}d ${minutes}m`;
-        }
-    } else if (hours > 0) {
-        return `${hours}h ${minutes}m`;
-    } else {
-        return `${minutes}m`;
+    const newName = `Attacker_${targetRoom}_${Game.time % 1000}`;
+    const memory = { role: 'attacker', targetRoom: targetRoom, homeRoom: bestSpawn.room.name };
+    const result = bestSpawn.spawnCreep(body, newName, { memory: memory });
+    if (result === OK) {
+        console.log(`[Attack] Spawning '${newName}' from ${bestSpawn.room.name} for mission to ${targetRoom}.`);
     }
 }
 
-// Main game loop
-module.exports.loop = function() {
-    // Initialize stats memory if it doesn't exist
-    if (!Memory.stats) Memory.stats = {};
-
-    // Handle daily kill counter reset and track kills
-    handleKillCounterReset();
-    trackKills();
-    roleScout.handleDeadCreeps();
-
-    // === ENERGY TRANSFER LOGIC ===
-    //processEnergyTransfers();
-    // === END ENERGY TRANSFER LOGIC ===
-
-    if(Game.time % 20 === 0) cleanMemory();
-    if(Game.time % 1000 === 0) cleanCpuProfileMemory();
-    let perRoomRoleCounts, roomDataCache;
-    profileSection('getPerRoomRoleCounts', () => {
-        perRoomRoleCounts = getPerRoomRoleCounts();
-    });
-    profileSection('cacheRoomData', () => {
-        roomDataCache = cacheRoomData();
-    });
-    profileSection('runTowers', runTowers);
-    profileSection('runLinks', runLinks);
-    profileSection('runCreeps', runCreeps);
-    profileSection('manageClaimbotSpawns', manageClaimbotSpawns);
-    if(needsNewCreeps(perRoomRoleCounts) || Game.time % 10 === 0) {
-        profileSection('manageSpawnsPerRoom', () => {
-            manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache);
-        });
-    }
-    profileSection('roadTracker.trackRoadVisits', () => {
-        roadTracker.trackRoadVisits();
-    });
-    profileSection('roadTracker.visualizeUntraveledRoads', () => {
-        roadTracker.visualizeUntraveledRoads();
-    });
-    if (ENABLE_CPU_LOGGING) profileSection('trackCPUUsage', trackCPUUsage);
-    profileSection('trackEnergyIncome', trackEnergyIncome);
-    if(Game.time % 50 === 0) {
-        profileSection('displayStatus', () => {
-            displayStatus(perRoomRoleCounts);
-        });
-        if (ENABLE_CPU_LOGGING && !DISABLE_CPU_CONSOLE) {
-            for (const key in Memory.cpuProfile) {
-                const avg = Memory.cpuProfile[key].reduce((a, b) => a + b, 0) / Memory.cpuProfile[key].length;
-                console.log(`CPU Profile: ${key} avg: ${avg.toFixed(2)}`);
-            }
-        }
-    }
-}
-
-// --- CLAIMBOT SPAWN LOGIC ---
 function manageClaimbotSpawns() {
     if (!Memory.claimOrders) Memory.claimOrders = [];
     if (Memory.claimOrders.length === 0) return;
@@ -562,127 +378,200 @@ function manageClaimbotSpawns() {
     }
 }
 
-// Clean memory only occasionally
-function cleanMemory() {
-    for(const name in Memory.creeps) {
-        if(!Game.creeps[name]) delete Memory.creeps[name];
+/**
+ * Manages the spawning of remote harvesters using a "source-centric" approach.
+ * This function finds all unassigned, safe sources and assigns each one to the
+ * closest available home room, ensuring globally optimal assignments.
+ *
+ * It runs periodically to avoid high CPU usage.
+ */
+function manageRemoteHarvesters() {
+    // Run this logic only once every 100 ticks to save CPU.
+    if (Game.time % 100 !== 0) {
+        return;
+    }
+
+    console.log(`[Remote Harvest] Starting source-centric assignment scan at tick ${Game.time}...`);
+
+    // --- Pre-computation and Setup ---
+    const MY_USERNAME = 'tarenty'; // Replace with your username if needed
+    const MAX_REMOTE_SOURCES_PER_ROOM = 2; // Define your limit here
+    const roleRemoteHarvester = require('roleRemoteHarvesters');
+    const roleScout = require('roleScout');
+
+    // --- FIX #1: Check for the new getBody function instead of the old BODY property ---
+    if (!roleRemoteHarvester || !roleRemoteHarvester.getBody) {
+        console.log('[Remote Harvest] Error: roleRemoteHarvesters module or its getBody function is not available.');
+        return;
+    }
+    if (!Memory.rooms) {
+        console.log('[Remote Harvest] Memory.rooms is not initialized. No scout data available.');
+        return;
+    }
+
+    const myOwnedRooms = _.filter(Game.rooms, r => r.controller && r.controller.my);
+    if (myOwnedRooms.length === 0) {
+        return; // No rooms to spawn from.
+    }
+
+    // --- Logic continues as before ---
+    const assignedSourceIds = new Set(
+        _.map(
+            _.filter(Game.creeps, c => c.memory.role === 'remoteHarvester' && c.memory.sourceId),
+            c => c.memory.sourceId
+        )
+    );
+
+    let allUnassignedSources = [];
+    for (const remoteRoomName in Memory.rooms) {
+        const roomIntel = Memory.rooms[remoteRoomName];
+        if (roomIntel.owner === MY_USERNAME ||
+            (roomIntel.owner && roomIntel.owner !== MY_USERNAME) ||
+            (roomIntel.reservation && roomIntel.reservation.username !== MY_USERNAME) ||
+            roleScout.isRoomDangerous(remoteRoomName) ||
+            !roomIntel.sources || roomIntel.sources.length === 0) {
+            continue;
+        }
+        for (const sourceId of roomIntel.sources) {
+            if (!assignedSourceIds.has(sourceId)) {
+                allUnassignedSources.push({
+                    sourceId: sourceId,
+                    remoteRoomName: remoteRoomName
+                });
+            }
+        }
+    }
+
+    if (allUnassignedSources.length === 0) {
+        console.log('[Remote Harvest] No new unassigned sources found.');
+        return;
+    }
+    console.log(`[Remote Harvest] Found ${allUnassignedSources.length} unassigned sources to evaluate.`);
+
+    const roomWorkload = _.countBy(Game.creeps, c => {
+        if (c.memory.role === 'remoteHarvester') return c.memory.homeRoom;
+    });
+
+    for (const targetSource of allUnassignedSources) {
+        const bestHomeRoom = _.min(myOwnedRooms, homeRoom => {
+            const currentLoad = roomWorkload[homeRoom.name] || 0;
+            if (currentLoad >= MAX_REMOTE_SOURCES_PER_ROOM) {
+                return Infinity;
+            }
+            return Game.map.getRoomLinearDistance(homeRoom.name, targetSource.remoteRoomName);
+        });
+
+        if (bestHomeRoom && isFinite(bestHomeRoom.id)) {
+            const spawns = bestHomeRoom.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
+            if (spawns.length > 0) {
+                const spawn = spawns[0];
+                const newName = `RemHarv_${targetSource.remoteRoomName}_${Game.time % 1000}`;
+
+                // --- FIX #2: Call the new getBody function with the room's available energy ---
+                const body = roleRemoteHarvester.getBody(bestHomeRoom.energyAvailable);
+
+                if (body) {
+                    const memory = {
+                        role: 'remoteHarvester',
+                        targetRoom: targetSource.remoteRoomName,
+                        homeRoom: bestHomeRoom.name,
+                        sourceId: targetSource.sourceId,
+                        working: false
+                    };
+
+                    const result = spawn.spawnCreep(body, newName, { memory: memory });
+                    if (result === OK) {
+                        console.log(`[Remote Harvest] ✅ Spawning '${newName}' from ${bestHomeRoom.name}.`);
+                        roomWorkload[bestHomeRoom.name] = (roomWorkload[bestHomeRoom.name] || 0) + 1;
+                    }
+                } else {
+                     console.log(`[Remote Harvest] ⚠️ Not enough energy in ${bestHomeRoom.name} to spawn even the smallest remote harvester.`);
+                }
+            }
+        }
     }
 }
 
-// Cache per-room role counts - NEW MULTI-ROOM VERSION
-function getPerRoomRoleCounts() {
-    const perRoomCounts = {};
-    for(const roomName in Game.rooms) {
-        const room = Game.rooms[roomName];
-        if(room.controller && room.controller.my) {
-            perRoomCounts[roomName] = {
-                harvester: 0, upgrader: 0, builder: 0, scout: 0,
-                defender: 0, supplier: 0, claimbot: 0
-            };
-        }
-    }
-    for(const name in Game.creeps) {
-        const creep = Game.creeps[name];
-        const role = creep.memory.role;
-        let assignedRoom = creep.room.name;
-        if(creep.memory.assignedRoom) {
-            assignedRoom = creep.memory.assignedRoom;
-        }
-        else if(creep.memory.sourceRoom) {
-            assignedRoom = creep.memory.sourceRoom;
-        }
-        else if(creep.memory.targetRoom) {
-            assignedRoom = creep.memory.targetRoom;
-        }
-        if(perRoomCounts[assignedRoom] && perRoomCounts[assignedRoom][role] !== undefined) {
-            perRoomCounts[assignedRoom][role]++;
-        }
-    }
-    return perRoomCounts;
-}
 
-// OPTIMIZED: Cache room data to memory to avoid repeated find() calls
-function cacheRoomData() {
-    if(!Memory.roomData) Memory.roomData = {};
-    const cache = {};
+function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
+    if (Memory.claimOrders && Memory.claimOrders.length > 0) return;
+    if(!Memory.harvesterSpawnDelay) Memory.harvesterSpawnDelay = {};
     for(const roomName in Game.rooms) {
         const room = Game.rooms[roomName];
         if(!room.controller || !room.controller.my) continue;
-        const shouldUpdate = !Memory.roomData[roomName] || Game.time % 100 === 0;
-        if(shouldUpdate) {
-            if(!Memory.roomData[roomName]) Memory.roomData[roomName] = {};
-            const roomMemory = Memory.roomData[roomName];
-
-            // Cache basic info
-            const sources = room.find(FIND_SOURCES);
-            roomMemory.sources = sources.map(s => s.id);
-            roomMemory.constructionSitesCount = room.find(FIND_CONSTRUCTION_SITES).length;
-            roomMemory.energyCapacity = room.energyCapacityAvailable;
-            roomMemory.energyAvailable = room.energyAvailable;
-
-            // OPTIMIZATION: Cache IDs of all energy-holding structures
-            roomMemory.spawnIds = room.find(FIND_MY_SPAWNS).map(s => s.id);
-            roomMemory.extensionIds = room.find(FIND_MY_STRUCTURES, {
-                filter: { structureType: STRUCTURE_EXTENSION }
-            }).map(s => s.id);
-            const storage = room.storage; // room.storage is a cheap shortcut
-            roomMemory.storageId = storage ? storage.id : null;
-            roomMemory.containerIds = room.find(FIND_STRUCTURES, {
-                filter: { structureType: STRUCTURE_CONTAINER }
-            }).map(s => s.id);
+        const spawn = room.find(FIND_MY_STRUCTURES, {
+            filter: { structureType: STRUCTURE_SPAWN }
+        })[0];
+        if(!spawn || spawn.spawning) continue;
+        const roomData = roomDataCache[roomName] || {};
+        const roleCounts = perRoomRoleCounts[roomName] || {};
+        const roomTargets = getRoomTargets(roomName, roomData, room);
+        if(roleCounts.harvester === 0) {
+            console.log(`EMERGENCY MODE in ${roomName}!!!`);
+            const body = getCreepBody('harvester', room.energyAvailable);
+            if (body && body.length > 0 && bodyCost(body) <= room.energyAvailable) {
+                spawnCreepInRoom('harvester', body, spawn, roomName);
+                continue;
+            } else {
+                console.log(`Not enough energy in ${roomName} to spawn a harvester!`);
+                continue;
+            }
         }
-        cache[roomName] = Memory.roomData[roomName];
+        let roleToSpawn = null;
+        if(roleCounts.defender < roomTargets.defender) {
+            roleToSpawn = 'defender';
+        } else if(roleCounts.harvester < roomTargets.harvester) {
+            roleToSpawn = 'harvester';
+        } else if(roleCounts.supplier < roomTargets.supplier) {
+            roleToSpawn = 'supplier';
+        } else if(roleCounts.upgrader < roomTargets.upgrader) {
+            roleToSpawn = 'upgrader';
+        } else if(roleCounts.builder < roomTargets.builder) {
+            roleToSpawn = 'builder';
+        } else if(roleCounts.scout < roomTargets.scout) {
+            roleToSpawn = 'scout';
+        }
+        if(roleToSpawn) {
+            if(roleToSpawn === 'harvester') {
+                const totalEnergy = calculateTotalEnergy();
+                if(totalEnergy < 800) {
+                    if(!Memory.harvesterSpawnDelay[roomName]) {
+                        Memory.harvesterSpawnDelay[roomName] = { nextSpawnTime: Game.time + 60 };
+                        console.log(`Low energy (${totalEnergy} < 800) - delaying harvester spawn in ${roomName} by 60 ticks`);
+                        continue;
+                    }
+                    if(Game.time < Memory.harvesterSpawnDelay[roomName].nextSpawnTime) {
+                        continue;
+                    }
+                    delete Memory.harvesterSpawnDelay[roomName];
+                }
+            }
+            const body = getCreepBody(roleToSpawn, room.energyAvailable);
+            spawnCreepInRoom(roleToSpawn, body, spawn, roomName);
+        }
     }
-    return cache;
 }
 
-// Check if any room needs new creeps - UPDATED FOR MULTI-ROOM
-function needsNewCreeps(perRoomRoleCounts) {
-    for(const roomName in perRoomRoleCounts) {
-        const counts = perRoomRoleCounts[roomName];
-        const totalCreeps = counts.harvester + counts.upgrader + counts.builder +
-                           counts.scout + counts.defender + counts.supplier;
-        if(counts.harvester === 0) return true;
-        if(totalCreeps < 3) return true;
-    }
-    return false;
-}
 
-// Run each creep's role behavior
+// --- CREEP MANAGEMENT ---
 function runCreeps() {
-    for(const name in Game.creeps) {
+    for (const name in Game.creeps) {
         const creep = Game.creeps[name];
-        if(creep.spawning) continue;
+        if (creep.spawning) continue;
         const role = creep.memory.role;
-        //if(role === 'scout') continue;
-        //if((role === 'builder' || role === 'upgrader')) continue;
         let cpuBefore, cpuAfter;
         if (ENABLE_CPU_LOGGING) cpuBefore = Game.cpu.getUsed();
-        switch(role) {
-            case 'harvester':
-                roleHarvester.run(creep);
-                break;
-            case 'upgrader':
-                roleUpgrader.run(creep);
-                break;
-            case 'builder':
-                roleBuilder.run(creep);
-                break;
-            case 'scout':
-                roleScout.run(creep);
-                break;
-            case 'defender':
-                roleDefender.run(creep);
-                break;
-            case 'supplier':
-                roleSupplier.run(creep);
-                break;
-            case 'claimbot':
-                roleClaimbot.run(creep);
-                break;
-            default:
-                creep.memory.role = 'harvester';
-                break;
+        switch (role) {
+            case 'harvester': roleHarvester.run(creep); break;
+            case 'upgrader': roleUpgrader.run(creep); break;
+            case 'builder': roleBuilder.run(creep); break;
+            case 'scout': roleScout.run(creep); break;
+            case 'defender': roleDefender.run(creep); break;
+            case 'supplier': roleSupplier.run(creep); break;
+            case 'claimbot': roleClaimbot.run(creep); break;
+            case 'remoteHarvester': roleRemoteHarvester.run(creep); break;
+            case 'attacker': roleAttacker.run(creep); break;
+            default: creep.memory.role = 'harvester'; break;
         }
         if (ENABLE_CPU_LOGGING) {
             cpuAfter = Game.cpu.getUsed();
@@ -701,13 +590,242 @@ function runCreeps() {
     }
 }
 
-// Display colony status - UPDATED FOR PER-ROOM DISPLAY
+
+// --- HELPER & UTILITY FUNCTIONS ---
+function bodyCost(body) {
+    const BODYPART_COST = {
+        move: 50, work: 100, attack: 80, carry: 50, heal: 250,
+        ranged_attack: 150, tough: 10, claim: 600
+    };
+    return body.reduce((cost, part) => cost + BODYPART_COST[part], 0);
+}
+
+function getCreepBody(role, energy) {
+    const bodyConfigs = {
+        harvester: {
+            300: BASIC_HARVESTER,
+            400: [WORK, WORK, WORK, CARRY, MOVE],
+            550: [WORK, WORK, WORK, CARRY, WORK, MOVE, MOVE],
+            800: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE],
+            950: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE]
+        },
+        upgrader: {
+            200: [WORK, CARRY, MOVE],
+            300: [WORK, WORK, CARRY, CARRY, MOVE],
+            500: [WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
+            600: [WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
+            800: [WORK, WORK, WORK, WORK, WORK, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE],
+            1100: [WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
+            1350: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE]
+        },
+        builder: {
+            300: [WORK, WORK, CARRY, MOVE],
+            400: [WORK, WORK, WORK, CARRY, MOVE],
+            550: [WORK, WORK, WORK, CARRY, MOVE, MOVE],
+            800: [WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE],
+            1200: [WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE]
+        },
+        defender: {
+            300: BASIC_DEFENDER,
+            550: [TOUGH, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE],
+            800: [TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE, MOVE],
+            1200: [TOUGH, TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE, MOVE, MOVE]
+        },
+        supplier: {
+            200: [CARRY, CARRY, MOVE, MOVE],
+            300: [CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
+            400: [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
+            600: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+            900: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+            1000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
+        },
+        scout: {
+            300: SCOUT_BODY
+        },
+        attacker: {
+            360: [TOUGH, TOUGH, MOVE, MOVE, ATTACK, ATTACK],
+            600: [TOUGH, TOUGH, TOUGH, TOUGH, MOVE, MOVE, MOVE, MOVE, ATTACK, ATTACK, ATTACK, ATTACK],
+            1080: [TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, ATTACK, ATTACK, ATTACK, ATTACK, ATTACK, ATTACK, ATTACK, ATTACK]
+        }
+    };
+    if (role === 'scout') {
+        return SCOUT_BODY;
+    }
+    if (energy <= 300 && role !== 'defender' && role !== 'supplier' && role !== 'attacker') {
+        return BASIC_HARVESTER;
+    }
+    if (bodyConfigs[role]) {
+        return getBestBody(bodyConfigs[role], energy);
+    }
+    return getBestBody(bodyConfigs.harvester, energy);
+
+    function getBestBody(bodyTiers, availableEnergy) {
+        const tiers = Object.keys(bodyTiers).map(Number).sort((a, b) => a - b);
+        let bestTier = tiers[0];
+        for (const tier of tiers) {
+            if (availableEnergy >= tier) {
+                bestTier = tier;
+            } else {
+                break;
+            }
+        }
+        return bodyTiers[bestTier];
+    }
+}
+
+function spawnCreepInRoom(role, body, spawn, roomName) {
+    const newName = role + '_' + roomName + '_' + Game.time;
+    const memory = {
+        role: role,
+        assignedRoom: roomName
+    };
+    const availableEnergy = spawn.room.energyAvailable;
+    const cost = bodyCost(body);
+    const result = spawn.spawnCreep(body, newName, { memory: memory });
+    if(result === OK) {
+        console.log(`Spawning ${role} in ${roomName} with ${body.length} parts | Cost: ${cost} | Energy before: ${availableEnergy}`);
+        return true;
+    } else {
+        if (result !== ERR_BUSY) {
+            console.log(`Failed to spawn ${role} in ${roomName}: ${result} (energy: ${availableEnergy}, cost: ${cost})`);
+        }
+        return false;
+    }
+}
+
+function getRoomTargets(roomName, roomData, room) {
+    const sourcesCount = roomData.sources ? roomData.sources.length : 2;
+    const constructionSitesCount = roomData.constructionSitesCount || 0;
+    const containers = room.find(FIND_STRUCTURES, {
+        filter: { structureType: STRUCTURE_CONTAINER }
+    });
+    const storage = room.find(FIND_MY_STRUCTURES, {
+        filter: { structureType: STRUCTURE_STORAGE }
+    });
+    const hasStorageStructures = containers.length > 0 || storage.length > 0;
+    const towers = room.find(FIND_MY_STRUCTURES, {
+        filter: { structureType: STRUCTURE_TOWER }
+    });
+    const hasTower = towers.length > 0;
+    let builderJobs = countBuilderJobs(room);
+    let builderTarget = 0;
+    if (builderJobs > 0) {
+        builderTarget = 1 + Math.floor((builderJobs - 1) / 10);
+    }
+    let upgraderTarget = 1;
+    let storedEnergy = 0;
+    if (storage.length > 0) {
+        storedEnergy = storage[0].store[RESOURCE_ENERGY] || 0;
+    }
+    if (storedEnergy > 950000) {
+        upgraderTarget += 8;
+    } else if (storedEnergy > 900000) {
+        upgraderTarget += 4;
+    } else if (storedEnergy > 750000) {
+        upgraderTarget += 2;
+    } else if (storedEnergy > 600000) {
+        upgraderTarget += 1;
+    } else {
+        upgraderTarget += 0
+    }
+    return {
+        harvester: Math.max(1, sourcesCount),
+        upgrader: upgraderTarget,
+        builder: builderTarget,
+        scout: 0,
+        defender: 0,
+        supplier: hasStorageStructures ? 1 : 0
+    };
+}
+
+function cleanMemory() { for (const name in Memory.creeps) { if (!Game.creeps[name]) delete Memory.creeps[name]; } }
+
+function getPerRoomRoleCounts() {
+    const perRoomCounts = {};
+    for(const roomName in Game.rooms) {
+        const room = Game.rooms[roomName];
+        if(room.controller && room.controller.my) {
+            perRoomCounts[roomName] = {
+                harvester: 0, upgrader: 0, builder: 0, scout: 0,
+                defender: 0, supplier: 0, claimbot: 0, remoteHarvester: 0, attacker: 0
+            };
+        }
+    }
+    for(const name in Game.creeps) {
+        const creep = Game.creeps[name];
+        const role = creep.memory.role;
+        const assignedRoom = creep.memory.homeRoom || creep.memory.assignedRoom || creep.room.name;
+
+        if(perRoomCounts[assignedRoom] && perRoomCounts[assignedRoom][role] !== undefined) {
+            perRoomCounts[assignedRoom][role]++;
+        }
+    }
+    return perRoomCounts;
+}
+
+function cacheRoomData() {
+    if(!Memory.roomData) Memory.roomData = {};
+    const cache = {};
+    for(const roomName in Game.rooms) {
+        const room = Game.rooms[roomName];
+        if(!room.controller || !room.controller.my) continue;
+        const shouldUpdate = !Memory.roomData[roomName] || Game.time % 100 === 0;
+        if(shouldUpdate) {
+            if(!Memory.roomData[roomName]) Memory.roomData[roomName] = {};
+            const roomMemory = Memory.roomData[roomName];
+            const sources = room.find(FIND_SOURCES);
+            roomMemory.sources = sources.map(s => s.id);
+            roomMemory.constructionSitesCount = room.find(FIND_CONSTRUCTION_SITES).length;
+            roomMemory.energyCapacity = room.energyCapacityAvailable;
+            roomMemory.energyAvailable = room.energyAvailable;
+            roomMemory.spawnIds = room.find(FIND_MY_SPAWNS).map(s => s.id);
+            roomMemory.extensionIds = room.find(FIND_MY_STRUCTURES, {
+                filter: { structureType: STRUCTURE_EXTENSION }
+            }).map(s => s.id);
+            const storage = room.storage;
+            roomMemory.storageId = storage ? storage.id : null;
+            roomMemory.containerIds = room.find(FIND_STRUCTURES, {
+                filter: { structureType: STRUCTURE_CONTAINER }
+            }).map(s => s.id);
+        }
+        cache[roomName] = Memory.roomData[roomName];
+    }
+    return cache;
+}
+
+function needsNewCreeps(perRoomRoleCounts) {
+    for(const roomName in perRoomRoleCounts) {
+        const counts = perRoomRoleCounts[roomName];
+        const totalCreeps = Object.values(counts).reduce((sum, count) => sum + count, 0);
+        if(counts.harvester === 0) return true;
+        if(totalCreeps < 3) return true;
+    }
+    return false;
+}
+
+function countBuilderJobs(room) {
+    const hasTower = room.find(FIND_MY_STRUCTURES, {
+        filter: { structureType: STRUCTURE_TOWER }
+    }).length > 0;
+    let total = 0;
+    for (let prio of PRIORITIES) {
+        if (hasTower && prio.type !== 'build') continue;
+        let targets = prio.targetFinder
+            ? prio.targetFinder(room)
+            : room.find(FIND_STRUCTURES, { filter: prio.filter });
+        total += targets.length;
+    }
+    return total;
+}
+
+
+// --- STATUS & TRACKING FUNCTIONS ---
 function displayStatus(perRoomRoleCounts) {
     const TICK_WINDOW = 500;
     const perRoomStats = {};
     for(const name in Game.creeps) {
         const creep = Game.creeps[name];
-        const assignedRoom = creep.memory.assignedRoom || creep.room.name;
+        const assignedRoom = creep.memory.homeRoom || creep.memory.assignedRoom || creep.room.name;
         if(!perRoomStats[assignedRoom]) {
             perRoomStats[assignedRoom] = {
                 totalBodyParts: 0,
@@ -731,8 +849,7 @@ function displayStatus(perRoomRoleCounts) {
         const stats = perRoomStats[roomName] || { totalBodyParts: 0, totalCreeps: 0, oldestCreepTTL: 0, totalTTL: 0 };
         const avgBodyParts = stats.totalCreeps > 0 ? (stats.totalBodyParts / stats.totalCreeps).toFixed(1) : 0;
         const avgTTL = stats.totalCreeps > 0 ? Math.round(stats.totalTTL / stats.totalCreeps) : 0;
-        const oldestTTL = stats.oldestCreepTTL === Infinity ? 0 : stats.oldestCreepTTL;
-        console.log(`${roomName}: 🧑‍🌾 ${counts.harvester} | ⚡ ${counts.upgrader} | 🔨 ${counts.builder} | 🔭 ${counts.scout} | 🛡 ${counts.defender} | 🔋 ${counts.supplier} | 🤖 ${counts.claimbot} | Avg Parts: ${avgBodyParts} | Avg TTL: ${avgTTL} | Low TTL: ${oldestTTL}`);
+        console.log(`${roomName}: 🧑‍🌾${counts.harvester} ✈️${counts.remoteHarvester} ⚡${counts.upgrader} 🔨${counts.builder} 🔭${counts.scout} 🛡${counts.defender} ⚔️${counts.attacker} 🔋${counts.supplier} | Avg Parts: ${avgBodyParts} | Avg TTL: ${avgTTL}`);
     }
     const perfData = getPerformanceData();
     const currentEnergy = calculateTotalEnergy();
@@ -784,251 +901,194 @@ function displayStatus(perRoomRoleCounts) {
     }
 }
 
-// === BUILDER JOB COUNT HELPER ===
-function countBuilderJobs(room) {
-    // Check if the room has a tower
-    const hasTower = room.find(FIND_MY_STRUCTURES, {
-        filter: { structureType: STRUCTURE_TOWER }
-    }).length > 0;
-
-    let total = 0;
-    for (let prio of PRIORITIES) {
-        // If there's a tower, only count construction jobs (type === 'build')
-        if (hasTower && prio.type !== 'build') continue;
-        let targets = prio.targetFinder
-            ? prio.targetFinder(room)
-            : room.find(FIND_STRUCTURES, { filter: prio.filter });
-        total += targets.length;
-    }
-    return total;
-}
-
-//Get room-specific targets based on room characteristics
-function getRoomTargets(roomName, roomData, room) {
-    const sourcesCount = roomData.sources ? roomData.sources.length : 2;
-    const constructionSitesCount = roomData.constructionSitesCount || 0;
-    const containers = room.find(FIND_STRUCTURES, {
-        filter: { structureType: STRUCTURE_CONTAINER }
-    });
-    const storage = room.find(FIND_MY_STRUCTURES, {
-        filter: { structureType: STRUCTURE_STORAGE }
-    });
-    const hasStorageStructures = containers.length > 0 || storage.length > 0;
-    const towers = room.find(FIND_MY_STRUCTURES, {
-        filter: { structureType: STRUCTURE_TOWER }
-    });
-    const hasTower = towers.length > 0;
-    let builderJobs = countBuilderJobs(room);
-    let builderTarget = 0;
-    if (builderJobs > 0) {
-        builderTarget = 1 + Math.floor((builderJobs - 1) / 10);
-    }
-
-    // --- UPGRADER SCALING LOGIC ---
-    let upgraderTarget = Math.max(1, sourcesCount);
-    let storedEnergy = 0;
-    if (storage.length > 0) {
-        storedEnergy = storage[0].store[RESOURCE_ENERGY] || 0;
-    }
-    if (storedEnergy > 950000) {
-        upgraderTarget += 8;
-    } else if (storedEnergy > 900000) {
-        upgraderTarget += 4;
-    } else if (storedEnergy > 750000) {
-        upgraderTarget += 2;
-    } else if (storedEnergy > 600000) {
-        upgraderTarget += 1;
-    }
-    // --- END UPGRADER SCALING LOGIC ---
-
-    return {
-        harvester: Math.max(1, sourcesCount),
-        upgrader: 1, //upgraderTarget,
-        builder: builderTarget,
-        scout: 0,
-        defender: 0,
-        supplier: hasStorageStructures ? 1 : 0
-        //supplier: hasStorageStructures ? (sourcesCount) : 0
-    };
-}
-
-// Manage spawning per room - COMPLETELY REWRITTEN FOR MULTI-ROOM
-function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
-    if (Memory.claimOrders && Memory.claimOrders.length > 0) return;
-    if(!Memory.harvesterSpawnDelay) Memory.harvesterSpawnDelay = {};
-    for(const roomName in Game.rooms) {
-        const room = Game.rooms[roomName];
-        if(!room.controller || !room.controller.my) continue;
-        const spawn = room.find(FIND_MY_STRUCTURES, {
-            filter: { structureType: STRUCTURE_SPAWN }
-        })[0];
-        if(!spawn || spawn.spawning) continue;
-        const roomData = roomDataCache[roomName] || {};
-        const roleCounts = perRoomRoleCounts[roomName] || {};
-        const roomTargets = getRoomTargets(roomName, roomData, room);
-        if(roleCounts.harvester === 0) {
-            console.log(`EMERGENCY MODE in ${roomName}!!!`);
-            const body = getCreepBody('harvester', room.energyAvailable);
-            if (body && body.length > 0 && bodyCost(body) <= room.energyAvailable) {
-                spawnCreepInRoom('harvester', body, spawn, roomName);
-                continue;
-            } else {
-                console.log(`Not enough energy in ${roomName} to spawn a harvester!`);
-                continue;
-            }
-        }
-
-        let roleToSpawn = null;
-        if(roleCounts.defender < roomTargets.defender) {
-            roleToSpawn = 'defender';
-        } else if(roleCounts.harvester < roomTargets.harvester) {
-            roleToSpawn = 'harvester';
-        } else if(roleCounts.supplier < roomTargets.supplier) {
-            roleToSpawn = 'supplier';
-        } else if(roleCounts.upgrader < roomTargets.upgrader) {
-            roleToSpawn = 'upgrader';
-        } else if(roleCounts.builder < roomTargets.builder) {
-            roleToSpawn = 'builder';
-        } else if(roleCounts.scout < roomTargets.scout) {
-            roleToSpawn = 'scout';
-        }
-        if(roleToSpawn) {
-            if(roleToSpawn === 'harvester') {
-                const totalEnergy = calculateTotalEnergy();
-                if(totalEnergy < 800) {
-                    if(!Memory.harvesterSpawnDelay[roomName]) {
-                        Memory.harvesterSpawnDelay[roomName] = { nextSpawnTime: Game.time + 60 };
-                        console.log(`Low energy (${totalEnergy} < 800) - delaying harvester spawn in ${roomName} by 60 ticks`);
-                        continue;
+function trackKills() {
+    if (!Memory.stats) Memory.stats = {};
+    if (Memory.stats.kills === undefined) Memory.stats.kills = 0;
+    if (Array.isArray(Game.events)) {
+        for (const event of Game.events) {
+            if (event.event === EVENT_OBJECT_DESTROYED) {
+                const destroyer = Game.getObjectById(event.data.destroyerId);
+                if (destroyer && destroyer.my) {
+                    if (event.data.type === 'creep') {
+                        Memory.stats.kills++;
                     }
-                    if(Game.time < Memory.harvesterSpawnDelay[roomName].nextSpawnTime) {
-                        continue;
-                    }
-                    delete Memory.harvesterSpawnDelay[roomName];
                 }
             }
-            const body = getCreepBody(roleToSpawn, room.energyAvailable);
-            const success = spawnCreepInRoom(roleToSpawn, body, spawn, roomName);
         }
     }
 }
 
-// Get appropriate body based on role and energy
-function getCreepBody(role, energy) {
-    const bodyConfigs = {
-        harvester: {
-            300: BASIC_HARVESTER,
-            400: [WORK, WORK, WORK, CARRY, MOVE],
-            550: [WORK, WORK, WORK, CARRY, WORK, MOVE, MOVE],
-            800: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE],
-            950: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE]
-        },
-        upgrader: {
-            200: [WORK, CARRY, MOVE],
-            300: [WORK, WORK, CARRY, CARRY, MOVE],
-            500: [WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
-            600: [WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
-            800: [WORK, WORK, WORK, WORK, WORK, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE],
-            1100: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE],
-            1350: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE]
-        },
-        builder: {
-            300: [WORK, WORK, CARRY, MOVE],
-            400: [WORK, WORK, WORK, CARRY, MOVE],
-            550: [WORK, WORK, WORK, CARRY, MOVE, MOVE],
-            800: [WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE],
-            1200: [WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE]
-        },
-        defender: {
-            300: BASIC_DEFENDER,
-            550: [TOUGH, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE],
-            800: [TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE, MOVE],
-            1200: [TOUGH, TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE, MOVE, MOVE]
-        },
-        supplier: {
-            200: [CARRY, CARRY, MOVE, MOVE],
-            300: [CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
-            400: [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
-            600: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-            900: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-            1000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
-        },
-        scout: {
-            300: SCOUT_BODY
+function handleKillCounterReset() {
+    if (!Memory.stats) {
+        Memory.stats = { kills: 0 };
+    }
+    const todayUTC = new Date().toISOString().slice(0, 10);
+    if (Memory.stats.killResetDate !== todayUTC) {
+        Memory.stats.kills = 0;
+        Memory.stats.killResetDate = todayUTC;
+        console.log('Daily kill counter has been reset.');
+    }
+}
+
+function trackEnergyIncome() {
+    if(!Memory.energyIncomeTracker) {
+        Memory.energyIncomeTracker = {
+            history: [],
+            totalIncome: 0,
+            averageIncome: 0
+        };
+    }
+    const currentEnergy = calculateTotalEnergy();
+    const currentTick = Game.time;
+    let incomeThisTick = 0;
+    if(Memory.energyIncomeTracker.history.length > 0) {
+        const lastEntry = Memory.energyIncomeTracker.history[Memory.energyIncomeTracker.history.length - 1];
+        const energyIncrease = Math.max(0, currentEnergy - lastEntry.energy);
+        incomeThisTick = energyIncrease;
+        Memory.energyIncomeTracker.totalIncome += incomeThisTick;
+    }
+    Memory.energyIncomeTracker.history.push({
+        tick: currentTick,
+        energy: currentEnergy,
+        incomeThisTick: incomeThisTick
+    });
+    while(Memory.energyIncomeTracker.history.length > 0 &&
+          currentTick - Memory.energyIncomeTracker.history[0].tick > 100) {
+        const removedEntry = Memory.energyIncomeTracker.history.shift();
+        Memory.energyIncomeTracker.totalIncome -= removedEntry.incomeThisTick || 0;
+    }
+    const trackingTicks = Memory.energyIncomeTracker.history.length;
+    Memory.energyIncomeTracker.averageIncome = trackingTicks > 0 ?
+        Memory.energyIncomeTracker.totalIncome / trackingTicks : 0;
+    Memory.energyIncomeTracker.totalIncome = Math.max(0, Memory.energyIncomeTracker.totalIncome);
+}
+
+function calculateTotalEnergy() {
+    let totalEnergy = 0;
+    if (!Memory.roomData) return 0;
+    for (const roomName in Memory.roomData) {
+        const roomCache = Memory.roomData[roomName];
+        if (!roomCache) continue;
+        const allIds = [
+            ...(roomCache.spawnIds || []),
+            ...(roomCache.extensionIds || []),
+            ...(roomCache.containerIds || []),
+        ];
+        if (roomCache.storageId) {
+            allIds.push(roomCache.storageId);
         }
+        totalEnergy += allIds.reduce((sum, id) => {
+            const structure = Game.getObjectById(id);
+            if (structure && structure.store) {
+                return sum + structure.store.getUsedCapacity(RESOURCE_ENERGY);
+            }
+            return sum;
+        }, 0);
+    }
+    return totalEnergy;
+}
+
+function getPerformanceData() {
+    const cpuUsed = Game.cpu.getUsed();
+    const cpuAverage = (ENABLE_CPU_LOGGING && Memory.cpuStats) ? Memory.cpuStats.average : 0;
+    const cpuLimit = Game.cpu.limit;
+    const cpuPercent = ((cpuUsed / cpuLimit) * 100).toFixed(1);
+    const energyIncome = Memory.energyIncomeTracker ? Memory.energyIncomeTracker.averageIncome : 0;
+    const trackingTicks = Memory.energyIncomeTracker ? Memory.energyIncomeTracker.history.length : 0;
+    return {
+        cpuUsed: Math.round(cpuUsed),
+        cpuAverage: Math.round(cpuAverage),
+        cpuPercent: cpuPercent,
+        cpuLimit: cpuLimit,
+        energyIncome: energyIncome.toFixed(2),
+        trackingTicks: trackingTicks
     };
-    if (role === 'scout') {
-        return SCOUT_BODY;
+}
+
+function formatTime(totalMinutes) {
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const minutes = Math.floor(totalMinutes % 60);
+    if (days > 0) {
+        if (hours > 0) {
+            return `${days}d ${hours}h ${minutes}m`;
+        } else {
+            return `${days}d ${minutes}m`;
+        }
+    } else if (hours > 0) {
+        return `${hours}h ${minutes}m`;
+    } else {
+        return `${minutes}m`;
     }
-    if (energy <= 300 && role !== 'defender' && role !== 'supplier') {
-        return BASIC_HARVESTER;
+}
+
+function trackCPUUsage() {
+    if (!ENABLE_CPU_LOGGING) return;
+    if(!Memory.cpuStats) {
+        Memory.cpuStats = {
+            history: [],
+            average: 0
+        };
     }
-    if (bodyConfigs[role]) {
-        return getBestBody(bodyConfigs[role], energy);
+    const cpuUsed = Game.cpu.getUsed();
+    Memory.cpuStats.history.push(cpuUsed);
+    if(Memory.cpuStats.history.length > 50) {
+        Memory.cpuStats.history.shift();
     }
-    return getBestBody(bodyConfigs.harvester, energy);
-    function getBestBody(bodyTiers, availableEnergy) {
-        const tiers = Object.keys(bodyTiers)
-            .map(Number)
-            .sort((a, b) => a - b);
-        let bestTier = tiers[0];
-        for (const tier of tiers) {
-            if (availableEnergy >= tier) {
-                bestTier = tier;
-            } else {
-                break;
+    Memory.cpuStats.average = Memory.cpuStats.history.reduce((sum, cpu) => sum + cpu, 0) / Memory.cpuStats.history.length;
+}
+
+
+// =================================================================
+// ========================= MAIN GAME LOOP ========================
+// =================================================================
+
+module.exports.loop = function() {
+    // --- MEMORY & SYSTEM MANAGEMENT ---
+    if (!Memory.stats) Memory.stats = {};
+    handleKillCounterReset();
+    roleScout.handleDeadCreeps();
+    if (Game.time % 20 === 0) cleanMemory();
+    if (Game.time % 1000 === 0) cleanCpuProfileMemory();
+
+    // --- CACHING ---
+    const perRoomRoleCounts = getPerRoomRoleCounts();
+    const roomDataCache = cacheRoomData();
+
+    // --- STRUCTURES ---
+    profileSection('runTowers', runTowers);
+    profileSection('runLinks', runLinks);
+
+    // --- CREEP SPAWNING & MANAGEMENT ---
+    profileSection('manageClaimbotSpawns', manageClaimbotSpawns);
+    profileSection('manageAttackerSpawns', manageAttackerSpawns);
+    if (Game.time % 100 === 0) { // Changed from 50 to 100 to match function's internal check
+        profileSection('manageRemoteHarvesters', manageRemoteHarvesters);
+    }
+    if (needsNewCreeps(perRoomRoleCounts) || Game.time % 10 === 0) {
+        profileSection('manageSpawnsPerRoom', () => {
+            manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache);
+        });
+    }
+
+    // --- CREEP ACTIONS ---
+    profileSection('runCreeps', runCreeps);
+
+    // --- TRACKING & VISUALS ---
+    profileSection('roadTracker.trackRoadVisits', roadTracker.trackRoadVisits);
+    profileSection('roadTracker.visualizeUntraveledRoads', roadTracker.visualizeUntraveledRoads);
+    if (ENABLE_CPU_LOGGING) profileSection('trackCPUUsage', trackCPUUsage);
+    profileSection('trackEnergyIncome', trackEnergyIncome);
+    profileSection('trackKills', trackKills);
+
+    // --- STATUS DISPLAY (RUNS LESS OFTEN) ---
+    if (Game.time % 50 === 0) {
+        profileSection('displayStatus', () => displayStatus(perRoomRoleCounts));
+        if (ENABLE_CPU_LOGGING && !DISABLE_CPU_CONSOLE) {
+            for (const key in Memory.cpuProfile) {
+                const avg = Memory.cpuProfile[key].reduce((a, b) => a + b, 0) / Memory.cpuProfile[key].length;
+                console.log(`CPU Profile: ${key} avg: ${avg.toFixed(2)}`);
             }
         }
-        return bodyTiers[bestTier];
     }
-}
-
-// Helper: Calculate the cost of a creep body
-function bodyCost(body) {
-    const BODYPART_COST = {
-        move: 50,
-        work: 100,
-        attack: 80,
-        carry: 50,
-        heal: 250,
-        ranged_attack: 150,
-        tough: 10,
-        claim: 600
-    };
-    let cost = 0;
-    for(const part of body) {
-        let type = typeof part === 'string' ? part.toLowerCase() : part;
-        if(typeof type !== 'string' && type in BODYPART_COST) {
-            cost += BODYPART_COST[type];
-        } else if(typeof type === 'string' && BODYPART_COST[type]) {
-            cost += BODYPART_COST[type];
-        } else if(typeof part === 'number' && BODYPART_COST[part]) {
-            cost += BODYPART_COST[part];
-        }
-    }
-    return cost;
-}
-
-// Spawn a new creep in a specific room, with room assignment
-function spawnCreepInRoom(role, body, spawn, roomName) {
-    const newName = role + '_' + roomName + '_' + Game.time;
-    const memory = {
-        role: role,
-        assignedRoom: roomName
-    };
-    if(role === 'harvester') {
-        memory.sourceRoom = roomName;
-    } else if(role === 'upgrader') {
-        memory.targetRoom = roomName;
-    }
-    const availableEnergy = spawn.room.energyAvailable;
-    const cost = bodyCost(body);
-    const result = spawn.spawnCreep(body, newName, { memory: memory });
-    if(result === OK) {
-        console.log(`Spawning ${role} in ${roomName} with ${body.length} parts | Cost: ${cost} | Energy before: ${availableEnergy}`);
-        return true;
-    } else {
-        console.log(`Failed to spawn ${role} in ${roomName}: ${result} (energy: ${availableEnergy}, cost: ${cost})`);
-        return false;
-    }
-}
+};
