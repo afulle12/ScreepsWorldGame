@@ -1,5 +1,5 @@
 // === CPU USAGE LOGGING TOGGLE VARIABLES ===
-const ENABLE_CPU_LOGGING = true;
+const ENABLE_CPU_LOGGING = false;
 const DISABLE_CPU_CONSOLE = true;
 
 // --- ROLE & UTILITY IMPORTS ---
@@ -734,7 +734,7 @@ function getRoomTargets(roomName, roomData, room) {
         builder: builderTarget,
         scout: 0,
         defender: 0,
-        supplier: hasStorageStructures ? 1 : 0
+        supplier: hasStorageStructures ? 2 : 0
     };
 }
 

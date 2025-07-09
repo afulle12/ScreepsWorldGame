@@ -52,7 +52,7 @@ const roleUpgrader = {
             if (DEBUG) console.log(`Upgrader ${creep.name}: Upgrading controller`);
             if (creep.upgradeController(creep.room.controller) == ERR_NOT_IN_RANGE) {
                 // OPTIMIZATION: Reuse path to save CPU
-                creep.moveTo(creep.room.controller, { visualizePathStyle: { stroke: '#ffffff' }, reusePath: 5 });
+                creep.moveTo(creep.room.controller, { visualizePathStyle: false, reusePath: 5 });
             }
         }
         // If in withdrawing state
