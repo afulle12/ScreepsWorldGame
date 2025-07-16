@@ -13,6 +13,7 @@ const roleHarvester = {
         if (creep.memory.depositing && creep.store[RESOURCE_ENERGY] === 0) {
             creep.memory.depositing = false;
             creep.memory.targetId = null; // Clear deposit target
+            delete creep.memory.lastSearchTick; // Clear search timer when switching to harvest
             if (DEBUG) console.log(`Harvester ${creep.name}: Switching to harvest mode.`);
         }
         if (!creep.memory.depositing && creep.store.getFreeCapacity() === 0) {
@@ -85,14 +86,33 @@ const roleHarvester = {
         }
     },
 
-    /** MODIFIED & OPTIMIZED: Deposits energy, prioritizing nearby links first. **/
+    /**
+     * MODIFIED & OPTIMIZED: Deposits energy, using a cached target that refreshes periodically.
+     * @param {Creep} creep
+     */
     depositEnergy: function(creep) {
-        // OPTIMIZATION: Use a cached target ID
         let target = Game.getObjectById(creep.memory.targetId);
+        let shouldSearch = false;
 
-        // Find a new target only if the cached one is invalid or full
+        // Condition 1: The cached target is invalid (doesn't exist or is full).
         if (!target || target.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
-            if (DEBUG) console.log(`Harvester ${creep.name}: Finding new deposit target.`);
+            shouldSearch = true;
+            if (DEBUG && target) console.log(`Harvester ${creep.name}: Target is full, forcing a new search.`);
+        }
+
+        // Condition 2: It's time for a periodic refresh (every 5 ticks).
+        // This allows the creep to find a better/closer target if one becomes available.
+        if (!creep.memory.lastSearchTick || (Game.time - creep.memory.lastSearchTick) >= 5) {
+            shouldSearch = true;
+        }
+
+        // --- Perform the expensive search only if necessary ---
+        if (shouldSearch) {
+            if (DEBUG) console.log(`Harvester ${creep.name}: Searching for a new deposit target.`);
+
+            // Update the search timer *before* searching to prevent searching every tick if no target is found.
+            creep.memory.lastSearchTick = Game.time;
+
             let newTarget = null;
             const source = Game.getObjectById(creep.memory.sourceId);
 
@@ -106,7 +126,7 @@ const roleHarvester = {
                 }
             }
 
-            // Priority 2: Storage or Containers (if no suitable link found)
+            // Priority 2: Storage or Containers
             if (!newTarget) {
                 newTarget = creep.pos.findClosestByPath(FIND_STRUCTURES, {
                     filter: s => (s.structureType === STRUCTURE_STORAGE || s.structureType === STRUCTURE_CONTAINER) &&
@@ -114,7 +134,7 @@ const roleHarvester = {
                 });
             }
 
-            // Priority 3: Spawns or Extensions (if no storage/containers/links)
+            // Priority 3: Spawns or Extensions
             if (!newTarget) {
                 newTarget = creep.pos.findClosestByPath(FIND_STRUCTURES, {
                     filter: s => (s.structureType === STRUCTURE_EXTENSION || s.structureType === STRUCTURE_SPAWN) &&
@@ -124,24 +144,23 @@ const roleHarvester = {
 
             if (newTarget) {
                 creep.memory.targetId = newTarget.id;
-                target = newTarget;
+                target = newTarget; // Use the new target immediately
                 if (DEBUG) console.log(`Harvester ${creep.name}: New target set to ${target.structureType} (${target.id})`);
+            } else {
+                // If no target was found, clear the old one
+                delete creep.memory.targetId;
             }
         }
 
-        // If we have a valid target, transfer energy
+        // --- Act based on the final target (either cached or newly found) ---
         if (target) {
             if (creep.transfer(target, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
-                // OPTIMIZATION: Reuse path to save CPU
-                creep.moveTo(target, { visualizePathStyle: { stroke: '#ffffff' }, reusePath: 5 });
+                creep.moveTo(target, { visualizePathStyle: false, reusePath: 5 });
             }
         } else {
-            // If no targets, move to a resting position (e.g., near spawn) to avoid blocking paths
+            // If no targets, rest.
             if (DEBUG) console.log(`Harvester ${creep.name}: No deposit targets, resting.`);
-            const spawn = creep.room.find(FIND_MY_SPAWNS)[0];
-            if (spawn) {
-                creep.moveTo(spawn, { visualizePathStyle: { stroke: '#ffffff' }, reusePath: 5 });
-            }
+            creep.say('Idle');
         }
     }
 };
