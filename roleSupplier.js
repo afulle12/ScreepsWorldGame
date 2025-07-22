@@ -2,6 +2,9 @@
 const SUPPLIER_LOGGING_ENABLED = false;
 const SUPPLIER_CONTAINER_CATEGORY_LOGGING = false;
 
+// Toggle to enable or disable the supplier role
+const SUPPLIER_ENABLED = true;  // Set to false to disable
+
 // --- CONFIGURABLE HYBRID CONTAINER RANGES ---
 const HYBRID_MIN = 750;
 const HYBRID_MAX = 1250;
@@ -9,6 +12,13 @@ const HYBRID_MAX = 1250;
 const roleSupplier = {
   /** @param {Creep} creep **/
   run: function(creep) {
+    if (!SUPPLIER_ENABLED) {
+      if (Game.time % 5 === 0) {
+        creep.say('Supplier disabled');
+      }
+      return;  // Do not execute further logic
+    }
+
     // --- SINGLE-TICK CACHE INITIALIZATION ---
     // This replaces the expensive Memory-based cache with a fast global cache.
     // The global object is cleared each tick, making it ideal for this purpose.

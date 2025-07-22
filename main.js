@@ -16,12 +16,17 @@ const roleExtractor = require('roleExtractor');
 const iff = require('iff');
 const roleScavenger = require('roleScavenger');
 const roleThief = require('roleThief');
+const squad = require('squadModule');
+const roleTowerDrain = require('roleTowerDrain');
+
+
 
 // --- CONSTANTS ---
 const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
 const BASIC_DEFENDER   = [TOUGH, MOVE, RANGED_ATTACK];
 const SCOUT_BODY       = [MOVE, MOVE, MOVE, MOVE, MOVE];
 const SCAVENGER_BODY = [MOVE, CARRY, CARRY, MOVE];
+const TOWER_DRAIN_BODY = [TOUGH, TOUGH, TOUGH, TOUGH, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, HEAL, HEAL, HEAL, HEAL, MOVE];
 
 const MAX_REMOTE_SOURCES_PER_ROOM = 3;
 
@@ -143,16 +148,133 @@ global.cancelThiefOrder = function(targetRoom) {
     }
 };
 
-global.orderAttack = function(targetRoom, count) {
-  if (!targetRoom || !count || count <= 0) {
-    return `[Attack] Invalid order. Use global.orderAttack('roomName', creepCount).`;
-  }
-  if (!Memory.attackOrders) {
-    Memory.attackOrders = [];
-  }
-  Memory.attackOrders.push({ targetRoom: targetRoom, count: count });
-  return `[Attack] Order placed for ${count} attackers to be sent to ${targetRoom}.`;
+global.orderTowerDrain = function(homeRoom, targetRoom, count) {
+    if (!Game.rooms[homeRoom] || !Game.rooms[homeRoom].controller || !Game.rooms[homeRoom].controller.my) {
+        return `[TowerDrain] Invalid home room: ${homeRoom}. Must be a room you own.`;
+    }
+    if (!targetRoom || !count || count <= 0) {
+        return `[TowerDrain] Invalid order. Use: orderTowerDrain('homeRoomName', 'targetRoomName', creepCount)`;
+    }
+    if (!Memory.towerDrainOrders) {
+        Memory.towerDrainOrders = [];
+    }
+    const existingOrder = Memory.towerDrainOrders.find(o => o.targetRoom === targetRoom && o.homeRoom === homeRoom);
+    if (existingOrder) {
+        return `[TowerDrain] An operation against ${targetRoom} from ${homeRoom} is already active.`;
+    }
+
+    Memory.towerDrainOrders.push({
+        homeRoom: homeRoom,
+        targetRoom: targetRoom,
+        count: parseInt(count, 10)
+    });
+    return `[TowerDrain] Order placed for ${count} tower drain bots to drain ${targetRoom} from ${homeRoom}.`;
 };
+
+global.cancelTowerDrainOrder = function(homeRoom, targetRoom) {
+    if (!homeRoom || !targetRoom) {
+        return `[TowerDrain] Invalid command. Use: cancelTowerDrainOrder('homeRoomName', 'targetRoomName')`;
+    }
+    if (!Memory.towerDrainOrders || Memory.towerDrainOrders.length === 0) {
+        return `[TowerDrain] No active tower drain orders to cancel.`;
+    }
+
+    const orderIndex = Memory.towerDrainOrders.findIndex(o => o.targetRoom === targetRoom && o.homeRoom === homeRoom);
+
+    if (orderIndex > -1) {
+        Memory.towerDrainOrders.splice(orderIndex, 1);
+        return `[TowerDrain] Operation against ${targetRoom} from ${homeRoom} has been cancelled.`;
+    } else {
+        return `[TowerDrain] No active operation found for ${homeRoom} -> ${targetRoom}.`;
+    }
+};
+
+
+// Add this to your main.js or wherever your global functions are defined
+global.orderAttack = function(targetRoom, count, rallyRoom = null) {
+  if (!targetRoom || !count || count <= 0) {
+    return `[Attack] Invalid command. Use: orderAttack('targetRoom', count, 'rallyRoom')`;
+  }
+
+  // If no rally room specified, use the closest room to target
+  if (!rallyRoom) {
+    let minDistance = Infinity;
+    for (const roomName in Game.rooms) {
+      const room = Game.rooms[roomName];
+      if (!room.controller || !room.controller.my) continue;
+      const distance = Game.map.getRoomLinearDistance(roomName, targetRoom);
+      if (distance < minDistance) {
+        minDistance = distance;
+        rallyRoom = roomName;
+      }
+    }
+  }
+
+  // Validate rally room
+  if (!Game.rooms[rallyRoom] || !Game.rooms[rallyRoom].controller || !Game.rooms[rallyRoom].controller.my) {
+    return `[Attack] Invalid rally room: ${rallyRoom}. Must be a room you control.`;
+  }
+
+  if (!Memory.attackOrders) Memory.attackOrders = [];
+
+  const existingOrder = Memory.attackOrders.find(o => o.targetRoom === targetRoom);
+  if (existingOrder) {
+    return `[Attack] Attack order for ${targetRoom} already exists!`;
+  }
+
+  const rallyPoint = findRallyPointInRoom(Game.rooms[rallyRoom]);
+
+  Memory.attackOrders.push({
+    targetRoom: targetRoom,
+    rallyRoom: rallyRoom,
+    count: count,
+    spawned: 0,
+    startTime: Game.time,
+    rallyPoint: rallyPoint,
+    rallyPhase: 'spawning' // spawning -> rallying -> attacking
+  });
+
+  console.log(`[Attack] Order created: ${count} attackers to attack ${targetRoom}, rally in ${rallyRoom}`);
+  return `[Attack] Order created: ${count} attackers to attack ${targetRoom}, rally in ${rallyRoom}`;
+};
+
+function findRallyPointInRoom(room) {
+  const spawns = room.find(FIND_MY_SPAWNS);
+  const sources = room.find(FIND_SOURCES);
+
+  const candidatePoints = [
+    {x: 15, y: 15}, {x: 35, y: 15}, {x: 15, y: 35}, {x: 35, y: 35},
+    {x: 10, y: 25}, {x: 40, y: 25}, {x: 25, y: 10}, {x: 25, y: 40}
+  ];
+
+  let bestPoint = candidatePoints[0];
+  let bestMinDistance = 0;
+
+  for (const point of candidatePoints) {
+    let minDistance = 50;
+
+    spawns.forEach(spawn => {
+      const distance = Math.max(Math.abs(point.x - spawn.pos.x), Math.abs(point.y - spawn.pos.y));
+      minDistance = Math.min(minDistance, distance);
+    });
+
+    sources.forEach(source => {
+      const distance = Math.max(Math.abs(point.x - source.pos.x), Math.abs(point.y - source.pos.y));
+      minDistance = Math.min(minDistance, distance);
+    });
+
+    const terrain = room.getTerrain();
+    if (terrain.get(point.x, point.y) !== TERRAIN_MASK_WALL && minDistance > bestMinDistance) {
+      bestMinDistance = minDistance;
+      bestPoint = point;
+    }
+  }
+
+  return bestPoint;
+}
+
+
+
 
 function spawnScavengers() {
   if (!Game.events) return;
@@ -171,6 +293,17 @@ function spawnScavengers() {
         }
       }
     }
+  }
+}
+function processSquadSpawnQueues() {
+  for (const roomName in Game.rooms) {
+    const room = Game.rooms[roomName];
+    if (!room.controller || !room.controller.my) continue;
+
+    const spawns = room.find(FIND_MY_SPAWNS);
+    if (spawns.length === 0) continue;
+
+    squad.processSpawnQueue(roomName);
   }
 }
 
@@ -377,6 +510,59 @@ function runTowers () {
 // === SPAWN MANAGEMENT ============================================
 // =================================================================
 
+function manageTowerDrainSpawns() {
+    if (!Memory.towerDrainOrders || Memory.towerDrainOrders.length === 0) return;
+
+    for (const order of Memory.towerDrainOrders) {
+        const { homeRoom, targetRoom, count } = order;
+
+        const existingDrainers = _.filter(Game.creeps, c =>
+            c.memory.role === 'towerDrain' &&
+            c.memory.targetRoom === targetRoom &&
+            c.memory.homeRoom === homeRoom
+        );
+
+        if (existingDrainers.length >= count) {
+            continue; // Order is fulfilled
+        }
+
+        const home = Game.rooms[homeRoom];
+        if (!home || !home.controller || !home.controller.my) {
+            console.log(`[TowerDrain] Home room ${homeRoom} is no longer valid. Skipping spawn.`);
+            continue;
+        }
+
+        const spawn = home.find(FIND_MY_SPAWNS, { filter: s => !s.spawning })[0];
+        if (!spawn) {
+            continue; // No available spawn
+        }
+
+        const cost = bodyCost(TOWER_DRAIN_BODY);
+
+        if (cost > spawn.room.energyAvailable) {
+            if (Game.time % 10 === 0) {
+                console.log(`[TowerDrain] Not enough energy in ${homeRoom}. Have: ${spawn.room.energyAvailable}, Need: ${cost}`);
+            }
+            continue;
+        }
+
+        const newName = `TowerDrain_${targetRoom}_${Game.time % 1000}`;
+        const memory = {
+            role: 'towerDrain',
+            homeRoom: homeRoom,
+            targetRoom: targetRoom
+        };
+
+        const result = spawn.spawnCreep(TOWER_DRAIN_BODY, newName, { memory: memory });
+        if (result === OK) {
+            console.log(`[TowerDrain] Spawning '${newName}' from ${homeRoom} to drain towers in ${targetRoom}.`);
+        } else if (result !== ERR_BUSY && result !== ERR_NOT_ENOUGH_ENERGY) {
+            console.log(`[TowerDrain] Error spawning tower drain bot in ${homeRoom}: ${result}`);
+        }
+    }
+}
+
+
 function manageThiefSpawns() {
     if (!Memory.thiefOrders || Memory.thiefOrders.length === 0) return;
 
@@ -466,45 +652,191 @@ function manageThiefSpawns() {
 
 function manageAttackerSpawns() {
   if (!Memory.attackOrders || Memory.attackOrders.length === 0) return;
-  const order          = Memory.attackOrders[0];
-  const targetRoom     = order.targetRoom;
-  const requiredCount  = order.count;
-  const existingAttackers = _.filter(
-    Game.creeps,
-    c => c.memory.role === 'attacker' && c.memory.targetRoom === targetRoom
-  );
 
-  if (existingAttackers.length >= requiredCount) {
-    console.log(`[Attack] Attack order for ${targetRoom} is fulfilled. Removing order.`);
-    Memory.attackOrders.shift();
-    return;
+  for (let i = Memory.attackOrders.length - 1; i >= 0; i--) {
+    const order = Memory.attackOrders[i];
+    const { targetRoom, rallyRoom, count, spawned, startTime, rallyPhase } = order;
+
+    // Handle different phases
+    if (rallyPhase === 'spawning') {
+      // Continue spawning until we have enough or timeout
+      if (spawned < count) {
+        const spawnResults = trySpawnAttackersFromAllRooms(order, i);
+        if (spawnResults > 0) {
+          order.spawned += spawnResults;
+          console.log(`[Attack] Spawned ${spawnResults} attackers (${order.spawned}/${count} total) for ${targetRoom}`);
+        }
+      }
+
+      // Check if we should move to rally phase
+      const timeElapsed = Game.time - startTime;
+      if (spawned >= count || timeElapsed >= 50) {
+        order.rallyPhase = 'rallying';
+        order.rallyStartTime = Game.time;
+        console.log(`[Attack] Moving to rally phase for ${targetRoom} (${spawned}/${count} spawned)`);
+      }
+    }
+
+    else if (rallyPhase === 'rallying') {
+      // Count attackers at rally point
+      const attackersAtRally = _.filter(Game.creeps, c => 
+        c.memory.role === 'attacker' && 
+        c.memory.targetRoom === targetRoom &&
+        c.room.name === rallyRoom &&
+        c.pos.getRangeTo(order.rallyPoint.x, order.rallyPoint.y) <= 3
+      );
+
+      const rallyTimeElapsed = Game.time - order.rallyStartTime;
+      const shouldProceed = rallyTimeElapsed >= 50 || attackersAtRally.length >= spawned;
+
+      if (shouldProceed) {
+        // Mark all attackers of this order to proceed
+        const allAttackers = _.filter(Game.creeps, c => 
+          c.memory.role === 'attacker' && c.memory.targetRoom === targetRoom
+        );
+
+        allAttackers.forEach(creep => {
+          creep.memory.rallyComplete = true;
+        });
+
+        order.rallyPhase = 'attacking';
+        console.log(`[Attack] Rally complete for ${targetRoom}. ${allAttackers.length} attackers proceeding to attack.`);
+      }
+    }
+
+    else if (rallyPhase === 'attacking') {
+      // Check if any attackers are still alive
+      const remainingAttackers = _.filter(Game.creeps, c => 
+        c.memory.role === 'attacker' && c.memory.targetRoom === targetRoom
+      );
+
+      if (remainingAttackers.length === 0) {
+        console.log(`[Attack] All attackers for ${targetRoom} have been eliminated. Order complete.`);
+        Memory.attackOrders.splice(i, 1);
+      }
+    }
   }
+}
 
-  let bestSpawn   = null;
-  let minDistance = Infinity;
+function trySpawnAttackersFromAllRooms(order, orderIndex) {
+  let totalSpawned = 0;
+  const remainingToSpawn = order.count - order.spawned;
+
+  if (remainingToSpawn <= 0) return 0;
+
+  // Get all rooms with available spawns
+  const roomsWithSpawns = [];
+
   for (const roomName in Game.rooms) {
     const room = Game.rooms[roomName];
     if (!room.controller || !room.controller.my) continue;
+
     const spawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
-    if (spawns.length === 0) continue;
-    const distance = Game.map.getRoomLinearDistance(roomName, targetRoom);
-    if (distance < minDistance) {
-      minDistance = distance;
-      bestSpawn   = spawns[0];
+    const availableSpawns = spawns.filter(spawn => {
+      const body = getCreepBody('attacker', spawn.room.energyAvailable);
+      const cost = bodyCost(body);
+      return body && cost <= spawn.room.energyAvailable;
+    });
+
+    if (availableSpawns.length > 0) {
+      roomsWithSpawns.push({
+        roomName: roomName,
+        room: room,
+        spawns: availableSpawns,
+        distance: Game.map.getRoomLinearDistance(roomName, order.targetRoom)
+      });
     }
   }
 
-  if (!bestSpawn) return;
-  const body = getCreepBody('attacker', bestSpawn.room.energyAvailable);
-  if (!body || bodyCost(body) > bestSpawn.room.energyAvailable) return;
+  if (roomsWithSpawns.length === 0) return 0;
 
-  const newName = `Attacker_${targetRoom}_${Game.time % 1000}`;
-  const memory  = { role: 'attacker', targetRoom: targetRoom, homeRoom: bestSpawn.room.name };
-  const result  = bestSpawn.spawnCreep(body, newName, { memory: memory });
-  if (result === OK) {
-    console.log(`[Attack] Spawning '${newName}' from ${bestSpawn.room.name} for mission to ${targetRoom}.`);
+  // Initialize spawn tracking for this order if it doesn't exist
+  if (!order.roomSpawnCount) {
+    order.roomSpawnCount = {};
   }
+
+  // Calculate how many each room should spawn (even distribution)
+  const basePerRoom = Math.floor(remainingToSpawn / roomsWithSpawns.length);
+  const extraSpawns = remainingToSpawn % roomsWithSpawns.length;
+
+  // Distribute spawning evenly
+  for (let i = 0; i < roomsWithSpawns.length && totalSpawned < remainingToSpawn; i++) {
+    const roomInfo = roomsWithSpawns[i];
+    const shouldSpawnFromRoom = basePerRoom + (i < extraSpawns ? 1 : 0);
+    const alreadySpawnedFromRoom = order.roomSpawnCount[roomInfo.roomName] || 0;
+    const needToSpawnFromRoom = Math.max(0, shouldSpawnFromRoom - alreadySpawnedFromRoom);
+
+    if (needToSpawnFromRoom > 0 && roomInfo.spawns.length > 0) {
+      const spawn = roomInfo.spawns[0]; // Use first available spawn
+      const body = getCreepBody('attacker', spawn.room.energyAvailable);
+
+      const attackerName = `Attacker_${order.targetRoom}_${Game.time}_${order.spawned + totalSpawned}`;
+      const result = spawn.spawnCreep(body, attackerName, {
+        memory: {
+          role: 'attacker',
+          targetRoom: order.targetRoom,
+          rallyRoom: order.rallyRoom,
+          spawnRoom: roomInfo.roomName,
+          orderIndex: orderIndex,
+          rallyComplete: false
+        }
+      });
+
+      if (result === OK) {
+        totalSpawned++;
+        order.roomSpawnCount[roomInfo.roomName] = alreadySpawnedFromRoom + 1;
+        console.log(`[Attack] Spawning attacker from ${roomInfo.roomName} (${order.roomSpawnCount[roomInfo.roomName]} from this room) for ${order.targetRoom}`);
+      }
+    }
+  }
+
+  return totalSpawned;
 }
+
+
+
+function trySpawnAttacker(order, orderIndex) {
+  // Find best available spawn across all rooms
+  let bestSpawn = null;
+  let minDistance = Infinity;
+
+  for (const roomName in Game.rooms) {
+    const room = Game.rooms[roomName];
+    if (!room.controller || !room.controller.my) continue;
+
+    const spawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
+    if (spawns.length === 0) continue;
+
+    const distance = Game.map.getRoomLinearDistance(roomName, order.targetRoom);
+    if (distance < minDistance) {
+      minDistance = distance;
+      bestSpawn = spawns[0];
+    }
+  }
+
+  if (!bestSpawn) return false;
+
+  const body = getCreepBody('attacker', bestSpawn.room.energyAvailable);
+  const cost = bodyCost(body);
+
+  if (!body || cost > bestSpawn.room.energyAvailable) return false;
+
+  const attackerName = `Attacker_${order.targetRoom}_${Game.time}_${order.spawned}`;
+  const result = bestSpawn.spawnCreep(body, attackerName, {
+    memory: {
+      role: 'attacker',
+      targetRoom: order.targetRoom,
+      rallyRoom: order.rallyRoom,
+      spawnRoom: bestSpawn.room.name,
+      orderIndex: orderIndex,
+      rallyComplete: false
+    }
+  });
+
+  return result === OK;
+}
+
+
 
 function manageExtractorSpawns() {
   for (const roomName in Game.rooms) {
@@ -659,9 +991,17 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
 // =================================================================
 
 function runCreeps() {
+  // Clean up memory first
+  for (const name in Memory.creeps) {
+    if (!Game.creeps[name]) {
+      delete Memory.creeps[name];
+    }
+  }
+
   for (const name in Game.creeps) {
     const creep = Game.creeps[name];
     if (creep.spawning) continue;
+
     const role = creep.memory.role;
     let cpuBefore, cpuAfter;
     if (ENABLE_CPU_LOGGING) cpuBefore = Game.cpu.getUsed();
@@ -679,6 +1019,8 @@ function runCreeps() {
       case 'extractor':      roleExtractor.run(creep);       break;
       case 'scavenger':      roleScavenger.run(creep);       break;
       case 'thief':          roleThief.run(creep);           break;
+      case 'towerDrain':     roleTowerDrain.run(creep);      break;
+      //case 'squadMember':    squad.run(creep);               break; // Fixed: was 'squad', now 'squadMember'
       default:
         creep.memory.role = 'harvester';
         roleHarvester.run(creep);
@@ -718,6 +1060,16 @@ function bodyCost(body) {
 }
 
 function getCreepBody(role, energy) {
+  // Special case for attacker role - use dynamic scaling logic
+  if (role === 'attacker') {
+    const numSets = Math.min(16, Math.floor(energy / 390));
+    const body = [];
+    for (let i = 0; i < numSets; i++) {
+      body.push(TOUGH, MOVE, ATTACK, HEAL);
+    }
+    return body.length > 0 ? body : BASIC_HARVESTER; // Fallback if no sets possible
+  }
+
   const bodyConfigs = {
     harvester: {
       300: BASIC_HARVESTER,
@@ -755,19 +1107,13 @@ function getCreepBody(role, energy) {
       900: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
       1000:[CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
     },
-    scout:   { 300: SCOUT_BODY },
-    attacker:{
-      360:  [TOUGH, TOUGH, MOVE, MOVE, ATTACK, ATTACK],
-      600:  [TOUGH, TOUGH, TOUGH, TOUGH, MOVE, MOVE, MOVE, MOVE, ATTACK, ATTACK, ATTACK, ATTACK],
-      1080: [TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE,
-             ATTACK, ATTACK, ATTACK, ATTACK, ATTACK, ATTACK, ATTACK, ATTACK]
-    }
+    scout: { 300: SCOUT_BODY }
   };
 
   if (role === 'scout') {
     return SCOUT_BODY;
   }
-  if (energy <= 300 && role !== 'defender' && role !== 'supplier' && role !== 'attacker') {
+  if (energy <= 300 && role !== 'defender' && role !== 'supplier') {
     return BASIC_HARVESTER;
   }
   const configs = bodyConfigs[role] || bodyConfigs.harvester;
@@ -782,7 +1128,8 @@ function getCreepBody(role, energy) {
     }
     return bodyTiers[bestTier];
   }
-}
+};
+
 
 function spawnCreepInRoom(role, body, spawn, roomName) {
   const newName         = `${role}_${roomName}_${Game.time}`;
@@ -862,6 +1209,18 @@ function cleanMemory() {
         }
       }
       // --- End of thief logic ---
+      // Add this in the cleanMemory function after the thief logic
+        if (creepMemory.role === 'towerDrain') {
+            if (Memory.towerDrainOrders) {
+                const orderIndex = Memory.towerDrainOrders.findIndex(o =>
+                    o.targetRoom === creepMemory.targetRoom && o.homeRoom === creepMemory.homeRoom
+                );
+                if (orderIndex > -1) {
+                    console.log(`[TowerDrain] A tower drain bot for ${creepMemory.targetRoom} has died. Keeping operation active.`);
+                    // Don't remove the order, let it respawn
+                }
+            }
+        }
 
       delete Memory.creeps[name];
     }
@@ -883,7 +1242,9 @@ function getPerRoomRoleCounts() {
         claimbot: 0,
         attacker: 0,
         scavenger: 0,
-        thief: 0
+        thief: 0,
+        squadMember: 0, // Fixed: was 'squad', now 'squadMember'
+        towerDrain: 0
       };
     }
   }
@@ -959,36 +1320,52 @@ function countBuilderJobs(room) {
 
 function displayStatus(perRoomRoleCounts) {
   const GCL_WINDOW   = 5000;
-  const GCL_INTERVAL = 500;
+  const GCL_INTERVAL = 50;
+  const TICK_WINDOW  = 500;
+  let gclEta = null;
+
+  // ─── Global Control Level (GCL) tracking ────────────────────────────────────
   if (!Memory.gclTracker) {
     Memory.gclTracker = { history: [] };
   }
+
   if (Game.time % GCL_INTERVAL === 0) {
     const currentPercent = Game.gcl.progress / Game.gcl.progressTotal * 100;
     Memory.gclTracker.history.push({ tick: Game.time, percent: currentPercent });
-    while (Memory.gclTracker.history.length > 0 &&
-           Memory.gclTracker.history[0].tick < Game.time - GCL_WINDOW) {
+
+    // Prune old entries
+    while (
+      Memory.gclTracker.history.length > 0 &&
+      Memory.gclTracker.history[0].tick < Game.time - GCL_WINDOW
+    ) {
       Memory.gclTracker.history.shift();
     }
+
     if (Memory.gclTracker.history.length > 1) {
-      const oldest  = Memory.gclTracker.history[0];
-      const newest  = Memory.gclTracker.history[Memory.gclTracker.history.length - 1];
+      const hist    = Memory.gclTracker.history;
+      const oldest  = hist[0];
+      const newest  = hist[hist.length - 1];
       const dt      = newest.tick - oldest.tick;
       const dPerc   = newest.percent - oldest.percent;
       let etaString = '';
+
       if (dPerc > 0) {
-        const rate        = dPerc / dt;
-        const remaining   = 100 - newest.percent;
-        const etaTicks    = Math.ceil(remaining / rate);
-        const totalSec    = etaTicks * 4;
-        const h           = Math.floor(totalSec / 3600);
-        const m           = Math.floor((totalSec % 3600) / 60);
-        const s           = totalSec % 60;
-        const humanTime   = `${h}h ${m}m ${s}s`;
-        etaString = ` | ETA: ${etaTicks} ticks (~${humanTime})`;
+        const rate      = dPerc / dt;
+        const remaining = 100 - newest.percent;
+        const etaTicks  = Math.ceil(remaining / rate);
+        const totalSec  = etaTicks * 4; // 1 tick = 4s
+
+        // Breakdown into days, hours, minutes
+        const days    = Math.floor(totalSec / 86400);
+        const hours   = Math.floor((totalSec % 86400) / 3600);
+        const minutes = Math.floor((totalSec % 3600) / 60);
+
+        gclEta = { days, hours, minutes };
+        etaString = ` | ETA: ${etaTicks} ticks (~${days}d ${hours}h ${minutes}m)`;
       } else {
         etaString = ' | ETA: ∞ (no progress)';
       }
+
       console.log(
         `Global Control Level: ${Game.gcl.level}` +
         ` - Progress: ${newest.percent.toFixed(2)}%${etaString}`
@@ -1001,13 +1378,15 @@ function displayStatus(perRoomRoleCounts) {
     }
   }
 
-  const TICK_WINDOW = 500;
+  // ─── Per-room creep statistics ─────────────────────────────────────────────
   const perRoomStats = {};
-
-  for(const name in Game.creeps) {
+  for (const name in Game.creeps) {
     const creep        = Game.creeps[name];
-    const assignedRoom = creep.memory.homeRoom || creep.memory.assignedRoom || creep.room.name;
-    if(!perRoomStats[assignedRoom]) {
+    const assignedRoom = creep.memory.homeRoom
+                       || creep.memory.assignedRoom
+                       || creep.room.name;
+
+    if (!perRoomStats[assignedRoom]) {
       perRoomStats[assignedRoom] = {
         totalBodyParts: 0,
         totalCreeps:    0,
@@ -1015,10 +1394,11 @@ function displayStatus(perRoomRoleCounts) {
         oldestCreepTTL: Infinity
       };
     }
+
     const stats = perRoomStats[assignedRoom];
     stats.totalBodyParts += creep.body.length;
     stats.totalCreeps++;
-    if(creep.ticksToLive) {
+    if (creep.ticksToLive) {
       stats.totalTTL += creep.ticksToLive;
       if (creep.ticksToLive < stats.oldestCreepTTL) {
         stats.oldestCreepTTL = creep.ticksToLive;
@@ -1027,14 +1407,15 @@ function displayStatus(perRoomRoleCounts) {
   }
 
   console.log(`=== COLONY STATUS ===`);
-  for(const roomName in perRoomRoleCounts) {
+  for (const roomName in perRoomRoleCounts) {
     const counts = perRoomRoleCounts[roomName];
     const stats  = perRoomStats[roomName] || {
       totalBodyParts: 0,
-      totalCreeps: 0,
-      oldestCreepTTL: 0,
-      totalTTL: 0
+      totalCreeps:    0,
+      totalTTL:       0,
+      oldestCreepTTL: 0
     };
+
     const avgBodyParts = stats.totalCreeps > 0
       ? (stats.totalBodyParts / stats.totalCreeps).toFixed(1)
       : 0;
@@ -1051,70 +1432,93 @@ function displayStatus(perRoomRoleCounts) {
       ` ⚔️${counts.attacker}` +
       ` 🦹${counts.thief}` +
       ` 🔋${counts.supplier}` +
+      ` 🚀${counts.squadMember}` +
       ` | Avg Parts: ${avgBodyParts}` +
       ` | Avg TTL: ${avgTTL}`
     );
   }
 
-  const perfData     = getPerformanceData();
-  const currentEnergy= calculateTotalEnergy();
+  // ─── CPU & Energy ─────────────────────────────────────────────────────────
+  const perfData      = getPerformanceData();
+  const currentEnergy = calculateTotalEnergy();
   console.log(`💰 Total Energy: ${currentEnergy}`);
 
   if (!ENABLE_CPU_LOGGING || !DISABLE_CPU_CONSOLE) {
-    console.log(`🖥️ CPU: ${Math.round(perfData.cpuUsed)}/${perfData.cpuLimit} (${Math.round(perfData.cpuPercent)}%) | Avg: ${Math.round(perfData.cpuAverage)}`);
+    console.log(
+      `🖥️ CPU: ${Math.round(perfData.cpuUsed)}/${perfData.cpuLimit}` +
+      ` (${Math.round(perfData.cpuPercent)}%) | Avg: ${Math.round(perfData.cpuAverage)}`
+    );
   }
 
-  for(const roomName in Game.rooms) {
+  // ─── Per-room RCL tracking ────────────────────────────────────────────────
+  if (!Memory.progressTracker) {
+    Memory.progressTracker = {};
+  }
+
+  for (const roomName in Game.rooms) {
     const room = Game.rooms[roomName];
-    if(room.controller && room.controller.my) {
-      const percent       = (room.controller.progress / room.controller.progressTotal * 100);
-      const progress      = percent.toFixed(1);
-      const energyPercent = (room.energyAvailable / room.energyCapacityAvailable * 100).toFixed(1);
+    if (!room.controller || !room.controller.my) continue;
 
-      if(!Memory.progressTracker) Memory.progressTracker = {};
-      if(!Memory.progressTracker[roomName]) Memory.progressTracker[roomName] = {};
-      const tracker = Memory.progressTracker[roomName];
+    const percent       = room.controller.progress / room.controller.progressTotal * 100;
+    const energyPercent = room.energyAvailable / room.energyCapacityAvailable * 100;
 
-      if(tracker.level !== room.controller.level) {
-        tracker.level   = room.controller.level;
-        tracker.history = [{ tick: Game.time, percent: percent }];
-      }
-      if(!tracker.history) tracker.history = [];
-      tracker.history.push({ tick: Game.time, percent: percent });
-      while(tracker.history.length > 0 && tracker.history[0].tick < Game.time - TICK_WINDOW) {
-        tracker.history.shift();
-      }
-
-      let etaString = '';
-      if(tracker.history.length > 1) {
-        const oldest      = tracker.history[0];
-        const newest      = tracker.history[tracker.history.length - 1];
-        const tickDelta   = newest.tick - oldest.tick;
-        const percentDelta= newest.percent - oldest.percent;
-        if(tickDelta >= TICK_WINDOW && percentDelta > 0) {
-          const percentRemaining = 100 - newest.percent;
-          const rate             = percentDelta / tickDelta;
-          const etaTicks         = Math.ceil(percentRemaining / rate);
-          const etaMinutes       = etaTicks * 4 / 60;
-          etaString = ` | ETA: ${etaTicks} ticks (~${formatTime(etaMinutes)})`;
-        } else if(tickDelta >= TICK_WINDOW && percentDelta <= 0) {
-          etaString = ' | ETA: ∞ (no progress)';
-        }
-      }
-
-      console.log(
-        `Room ${roomName}: RCL ${room.controller.level}` +
-        ` - Progress: ${progress}%` +
-        ` | Energy: ${room.energyAvailable}/${room.energyCapacityAvailable}` +
-        ` (${energyPercent}%)${etaString}`
-      );
+    if (!Memory.progressTracker[roomName]) {
+      Memory.progressTracker[roomName] = { level: room.controller.level, history: [] };
     }
+
+    const tracker = Memory.progressTracker[roomName];
+    if (tracker.level !== room.controller.level) {
+      tracker.level   = room.controller.level;
+      tracker.history = [{ tick: Game.time, percent }];
+    }
+
+    tracker.history.push({ tick: Game.time, percent });
+    while (
+      tracker.history.length > 0 &&
+      tracker.history[0].tick < Game.time - TICK_WINDOW
+    ) {
+      tracker.history.shift();
+    }
+
+    let etaString = '';
+    if (tracker.history.length > 1) {
+      const hist         = tracker.history;
+      const oldest       = hist[0];
+      const newest       = hist[hist.length - 1];
+      const tickDelta    = newest.tick - oldest.tick;
+      const percentDelta = newest.percent - oldest.percent;
+
+      if (tickDelta >= TICK_WINDOW && percentDelta > 0) {
+        const percentRemaining = 100 - newest.percent;
+        const rate             = percentDelta / tickDelta;
+        const etaTicks         = Math.ceil(percentRemaining / rate);
+        const etaMinutes       = etaTicks * 4 / 60;
+        etaString = ` | ETA: ${etaTicks} ticks (~${formatTime(etaMinutes)})`;
+      }
+      else if (tickDelta >= TICK_WINDOW) {
+        etaString = ' | ETA: ∞ (no progress)';
+      }
+    }
+
+    console.log(
+      `Room ${roomName}: RCL ${room.controller.level}` +
+      ` - Progress: ${percent.toFixed(1)}%` +
+      ` | Energy: ${room.energyAvailable}/${room.energyCapacityAvailable}` +
+      ` (${energyPercent.toFixed(1)}%)${etaString}`
+    );
   }
 
-  if(Memory.exploration && Memory.exploration.rooms) {
+  // ─── Exploration summary ──────────────────────────────────────────────────
+  if (Memory.exploration && Memory.exploration.rooms) {
     console.log(`Explored rooms: ${Object.keys(Memory.exploration.rooms).length}`);
   }
+
+  // Return the GCL ETA breakdown (or null if unavailable)
+  return gclEta;
 }
+
+
+
 
 function calculateTotalEnergy() {
   let totalEnergy = 0;
@@ -1209,12 +1613,21 @@ module.exports.loop = function() {
     profileSection('runLinks', runLinks);
   }
 
+  //// Squad coordination is handled per-creep in runCreeps function
+// No global coordination needed
+
+
+
   // --- SPAWNING ---
   if (Game.time % 10 === 0) profileSection('manageClaimbotSpawns', manageClaimbotSpawns);
   if (Game.time % 5 === 0)  profileSection('manageAttackerSpawns', manageAttackerSpawns);
+  // Add this line with other spawn management calls
+  profileSection('manageTowerDrainSpawns', manageTowerDrainSpawns);
+
   profileSection('manageThiefSpawns',       manageThiefSpawns);
   if (Game.time % 50 === 0) profileSection('manageExtractorSpawns', manageExtractorSpawns);
   if (Game.time % 10 === 0) profileSection('spawnScavengers', spawnScavengers);
+
   if (needsNewCreeps(perRoomRoleCounts) || Game.time % 10 === 0) {
     profileSection('manageSpawnsPerRoom', () => {
       manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache);
@@ -1223,6 +1636,7 @@ module.exports.loop = function() {
 
   // --- CREEP ACTIONS ---
   profileSection('runCreeps', runCreeps);
+  // REMOVED: profileSection('runSquads', squad.run); // This was causing the error
 
   // --- TRACKING & VISUALS ---
   profileSection('trackCPUUsage', trackCPUUsage);
