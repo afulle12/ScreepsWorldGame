@@ -45,26 +45,6 @@ const PRIORITIES = [
     need: s => `${s.hits}/${s.hitsMax}`,
     urgency: s => s.hits,
   },
-  {
-    type: 'repair',
-    filter: s =>
-      ![STRUCTURE_ROAD, STRUCTURE_CONTAINER, STRUCTURE_WALL, STRUCTURE_RAMPART].includes(s.structureType) &&
-      s.hits / s.hitsMax < 0.75 &&
-      s.hits / s.hitsMax >= 0.25 &&
-      s.hits < s.hitsMax,
-    label: 'Repair Other <75%',
-    need: s => `${s.hits}/${s.hitsMax}`,
-    urgency: s => s.hits,
-  },
-  {
-    type: 'reinforce',
-    filter: s =>
-      (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) &&
-      s.hits < 100000,
-    label: 'Reinforce <20k',
-    need: s => `${s.hits}/20000`,
-    urgency: s => s.hits,
-  },
 ];
 
 // == GLOBAL JOB QUEUE GENERATION ==
@@ -334,11 +314,9 @@ const roleBuilder = {
     }
 
     // Optional logging (only for first builder in room)
-    if (BUILDER_LOGGING && Game.time % BUILDER_LOG_INTERVAL === 0) {
-      let builders = _.filter(Game.creeps, c => c.memory.role === 'builder' && c.room.name === creep.room.name);
-      if (builders.length && creep.name === _.min(builders, 'name').name) {
-        logBuilderTasks(creep.room, jobs, Memory._builderAssignments);
-      }
+    if (BUILDER_LOGGING && (Game.time % BUILDER_LOG_INTERVAL) === 0) {
+      const roomJobs = (Memory._builderJobs || []).filter(j => j.roomName === creep.room.name);
+      logBuilderTasks(creep.room, roomJobs, Memory._builderAssignments);
     }
   }
 };

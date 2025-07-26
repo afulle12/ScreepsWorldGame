@@ -1,3 +1,10 @@
+// Order 2 tower drain bots from E1S1 to attack towers in E2S1
+//orderTowerDrain('E1S1', 'E2S1', 2)
+
+// Cancel the operation
+//cancelTowerDrainOrder('E1S1', 'E2S1')
+
+
 const roleTowerDrain = {
     run: function(creep) {
         // Initialize or reset the state machine

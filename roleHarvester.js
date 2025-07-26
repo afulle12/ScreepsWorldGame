@@ -1,8 +1,14 @@
 const DEBUG = false; // Set to false to disable console logging
 
+// Global cache for room data
+global.roomCache = global.roomCache || {};
+
 const roleHarvester = {
     /** @param {Creep} creep **/
     run: function(creep) {
+        // Initialize room cache if needed
+        this.initializeRoomCache(creep.room);
+
         // Assign a source if the creep doesn't have one
         if (!creep.memory.sourceId) {
             if (DEBUG) console.log(`Harvester ${creep.name}: No source assigned, finding one.`);
@@ -29,47 +35,111 @@ const roleHarvester = {
         }
     },
 
-    /** OPTIMIZED: Assigns a source by counting assignments in a single pass. **/
-    assignBalancedSource: function(creep) {
-        const sources = creep.room.find(FIND_SOURCES);
-        if (sources.length === 0) return;
+    /** Initialize and manage global room cache **/
+    initializeRoomCache: function(room) {
+        const roomName = room.name;
 
-        // Create a count for each source, initialized to 0
-        const sourceCounts = sources.reduce((acc, s) => {
-            acc[s.id] = 0;
-            return acc;
-        }, {});
-
-        // Count existing assignments in a single loop over all creeps
-        for (const name in Game.creeps) {
-            const c = Game.creeps[name];
-            if (c.memory.role === 'harvester' && c.memory.sourceId && sourceCounts.hasOwnProperty(c.memory.sourceId)) {
-                sourceCounts[c.memory.sourceId]++;
-            }
+        if (!global.roomCache[roomName]) {
+            global.roomCache[roomName] = {
+                lastUpdate: 0,
+                sources: [],
+                depositTargets: [],
+                sourceAssignments: {}
+            };
         }
 
-        // Find the source with the minimum number of assigned harvesters
+        const cache = global.roomCache[roomName];
+
+        // Refresh cache every 10 ticks
+        if (Game.time - cache.lastUpdate >= 10) {
+            cache.sources = room.find(FIND_SOURCES);
+            cache.depositTargets = this.findAllDepositTargets(room);
+            cache.lastUpdate = Game.time;
+
+            if (DEBUG) console.log(`Room ${roomName}: Cache refreshed with ${cache.depositTargets.length} deposit targets`);
+        }
+    },
+
+    /** Find all deposit targets in a single operation with priority sorting **/
+    findAllDepositTargets: function(room) {
+        const allTargets = room.find(FIND_STRUCTURES, {
+            filter: s => {
+                const hasCapacity = s.store && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
+                return hasCapacity && (
+                    s.structureType === STRUCTURE_LINK ||
+                    s.structureType === STRUCTURE_STORAGE ||
+                    s.structureType === STRUCTURE_CONTAINER ||
+                    s.structureType === STRUCTURE_EXTENSION ||
+                    s.structureType === STRUCTURE_SPAWN
+                );
+            }
+        });
+
+        // Sort by priority: Links > Storage/Containers > Spawns/Extensions
+        return allTargets.sort((a, b) => {
+            const getPriority = (structure) => {
+                switch (structure.structureType) {
+                    case STRUCTURE_LINK: return 1;
+                    case STRUCTURE_STORAGE:
+                    case STRUCTURE_CONTAINER: return 2;
+                    case STRUCTURE_SPAWN:
+                    case STRUCTURE_EXTENSION: return 3;
+                    default: return 4;
+                }
+            };
+            return getPriority(a) - getPriority(b);
+        });
+    },
+
+    /** ENHANCED: Uses incremental source assignment caching **/
+    assignBalancedSource: function(creep) {
+        const roomName = creep.room.name;
+        const cache = global.roomCache[roomName];
+
+        if (!cache || cache.sources.length === 0) return;
+
+        // Initialize source assignments if not present
+        if (!Memory.sourceAssignments) {
+            Memory.sourceAssignments = {};
+        }
+        if (!Memory.sourceAssignments[roomName]) {
+            Memory.sourceAssignments[roomName] = {};
+            // Initialize all sources with 0 count
+            cache.sources.forEach(source => {
+                Memory.sourceAssignments[roomName][source.id] = 0;
+            });
+        }
+
+        const assignments = Memory.sourceAssignments[roomName];
+
+        // Find the source with minimum assignments
         let minCount = Infinity;
         let bestSourceId = null;
-        for (const sourceId in sourceCounts) {
-            if (sourceCounts[sourceId] < minCount) {
-                minCount = sourceCounts[sourceId];
+
+        for (const sourceId in assignments) {
+            if (assignments[sourceId] < minCount) {
+                minCount = assignments[sourceId];
                 bestSourceId = sourceId;
             }
         }
 
         if (bestSourceId) {
             creep.memory.sourceId = bestSourceId;
-            if (DEBUG) console.log(`Harvester ${creep.name}: Assigned to source ${bestSourceId.slice(-6)} (${minCount} harvesters).`);
+            // Increment assignment count
+            assignments[bestSourceId]++;
+
+            if (DEBUG) console.log(`Harvester ${creep.name}: Assigned to source ${bestSourceId.slice(-6)} (${minCount + 1} harvesters).`);
         }
     },
 
-    /** OPTIMIZED: Harvests energy, using reusePath. **/
+    /** ENHANCED: Harvests energy with optimized pathing **/
     harvestEnergy: function(creep) {
         const source = Game.getObjectById(creep.memory.sourceId);
         if (!source) {
             if (DEBUG) console.log(`Harvester ${creep.name}: Source ${creep.memory.sourceId} invalid, reassigning.`);
-            delete creep.memory.sourceId; // Clear invalid source and let it re-assign next tick
+            // Decrement assignment count for invalid source
+            this.decrementSourceAssignment(creep);
+            delete creep.memory.sourceId;
             return;
         }
 
@@ -81,16 +151,32 @@ const roleHarvester = {
 
         const harvestResult = creep.harvest(source);
         if (harvestResult === ERR_NOT_IN_RANGE) {
-            // OPTIMIZATION: Reuse path to save CPU
-            creep.moveTo(source, { visualizePathStyle: { stroke: '#ffaa00' }, reusePath: 5 });
+            // OPTIMIZATION: Increased reusePath for more stable pathing
+            creep.moveTo(source, { 
+                visualizePathStyle: { stroke: '#ffaa00' }, 
+                reusePath: 12 
+            });
+        }
+    },
+
+    /** Helper function to decrement source assignment count **/
+    decrementSourceAssignment: function(creep) {
+        const roomName = creep.room.name;
+        if (Memory.sourceAssignments && 
+            Memory.sourceAssignments[roomName] && 
+            creep.memory.sourceId &&
+            Memory.sourceAssignments[roomName][creep.memory.sourceId] > 0) {
+            Memory.sourceAssignments[roomName][creep.memory.sourceId]--;
         }
     },
 
     /**
-     * MODIFIED & OPTIMIZED: Deposits energy, using a cached target that refreshes periodically.
+     * ENHANCED: Deposits energy using global cache and extended target caching
      * @param {Creep} creep
      */
     depositEnergy: function(creep) {
+        const roomName = creep.room.name;
+        const cache = global.roomCache[roomName];
         let target = Game.getObjectById(creep.memory.targetId);
         let shouldSearch = false;
 
@@ -100,51 +186,52 @@ const roleHarvester = {
             if (DEBUG && target) console.log(`Harvester ${creep.name}: Target is full, forcing a new search.`);
         }
 
-        // Condition 2: It's time for a periodic refresh (every 5 ticks).
-        // This allows the creep to find a better/closer target if one becomes available.
-        if (!creep.memory.lastSearchTick || (Game.time - creep.memory.lastSearchTick) >= 5) {
+        // Condition 2: Extended periodic refresh (every 10 ticks for better caching)
+        if (!creep.memory.lastSearchTick || (Game.time - creep.memory.lastSearchTick) >= 10) {
             shouldSearch = true;
         }
 
-        // --- Perform the expensive search only if necessary ---
+        // --- Perform the search using cached targets ---
         if (shouldSearch) {
             if (DEBUG) console.log(`Harvester ${creep.name}: Searching for a new deposit target.`);
-
-            // Update the search timer *before* searching to prevent searching every tick if no target is found.
-            creep.memory.lastSearchTick = Game.time;
 
             let newTarget = null;
             const source = Game.getObjectById(creep.memory.sourceId);
 
-            // Priority 1: Links within 3 squares of the assigned source
-            if (source) {
-                const nearbyLinks = source.pos.findInRange(FIND_STRUCTURES, 3, {
-                    filter: s => s.structureType === STRUCTURE_LINK && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-                });
-                if (nearbyLinks.length > 0) {
-                    newTarget = creep.pos.findClosestByPath(nearbyLinks);
+            // Use cached deposit targets instead of repeated finds
+            const availableTargets = cache.depositTargets.filter(structure => {
+                const obj = Game.getObjectById(structure.id);
+                return obj && obj.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
+            });
+
+            if (availableTargets.length > 0) {
+                // Priority 1: Links within 3 squares of the assigned source
+                if (source) {
+                    const nearbyLinks = availableTargets.filter(structure => {
+                        const obj = Game.getObjectById(structure.id);
+                        return obj && 
+                               obj.structureType === STRUCTURE_LINK && 
+                               source.pos.getRangeTo(obj) <= 3;
+                    });
+
+                    if (nearbyLinks.length > 0) {
+                        newTarget = creep.pos.findClosestByPath(nearbyLinks.map(s => Game.getObjectById(s.id)));
+                    }
+                }
+
+                // If no nearby link found, use the pre-sorted cached targets
+                if (!newTarget) {
+                    const validTargets = availableTargets.map(s => Game.getObjectById(s.id)).filter(Boolean);
+                    newTarget = creep.pos.findClosestByPath(validTargets);
                 }
             }
 
-            // Priority 2: Storage or Containers
-            if (!newTarget) {
-                newTarget = creep.pos.findClosestByPath(FIND_STRUCTURES, {
-                    filter: s => (s.structureType === STRUCTURE_STORAGE || s.structureType === STRUCTURE_CONTAINER) &&
-                                 s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-                });
-            }
-
-            // Priority 3: Spawns or Extensions
-            if (!newTarget) {
-                newTarget = creep.pos.findClosestByPath(FIND_STRUCTURES, {
-                    filter: s => (s.structureType === STRUCTURE_EXTENSION || s.structureType === STRUCTURE_SPAWN) &&
-                                 s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-                });
-            }
+            // Update search timing - extend to 10 ticks when no target found (idle optimization)
+            creep.memory.lastSearchTick = Game.time;
 
             if (newTarget) {
                 creep.memory.targetId = newTarget.id;
-                target = newTarget; // Use the new target immediately
+                target = newTarget;
                 if (DEBUG) console.log(`Harvester ${creep.name}: New target set to ${target.structureType} (${target.id})`);
             } else {
                 // If no target was found, clear the old one
@@ -155,7 +242,11 @@ const roleHarvester = {
         // --- Act based on the final target (either cached or newly found) ---
         if (target) {
             if (creep.transfer(target, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
-                creep.moveTo(target, { visualizePathStyle: false, reusePath: 5 });
+                // OPTIMIZATION: Increased reusePath for more stable pathing
+                creep.moveTo(target, { 
+                    visualizePathStyle: false, 
+                    reusePath: 12 
+                });
             }
         } else {
             // If no targets, rest.
@@ -163,6 +254,20 @@ const roleHarvester = {
             creep.say('Idle');
         }
     }
+};
+
+// Clean up source assignments when creeps die
+const originalCreepDie = Creep.prototype.suicide;
+Creep.prototype.suicide = function() {
+    if (this.memory.role === 'harvester' && this.memory.sourceId) {
+        const roomName = this.room.name;
+        if (Memory.sourceAssignments && 
+            Memory.sourceAssignments[roomName] && 
+            Memory.sourceAssignments[roomName][this.memory.sourceId] > 0) {
+            Memory.sourceAssignments[roomName][this.memory.sourceId]--;
+        }
+    }
+    return originalCreepDie.call(this);
 };
 
 module.exports = roleHarvester;
