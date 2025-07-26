@@ -80,3 +80,7 @@ The latest code updates introduce significant improvements:
 ### Development Approach
 
 Development began with AI-generated boilerplate for Screeps API familiarity, followed by custom rules for operations. Emergency modes and resource logic have been refined, with ongoing optimizations for CPU efficiency. Combat and economic strategies are iteratively improved based on live performance, incorporating the new features for better adaptability.
+
+### Credit to:
+[Harabi](https://sy-harabi.github.io/Quad-Movement-Basics/)
+[Screeps-profile](https://github.com/screepers/screeps-profiler/tree/master)
