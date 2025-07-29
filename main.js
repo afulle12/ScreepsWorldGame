@@ -25,6 +25,7 @@ const roleThief = require('roleThief');
 const squad = require('squadModule');
 const roleTowerDrain = require('roleTowerDrain');
 const roleDemolition = require('roleDemolition');
+const roleMineralCollector = require('roleMineralCollector');
 
 // Register modules with profiler
 profiler.registerObject(roleHarvester, 'roleHarvester');
@@ -42,6 +43,7 @@ profiler.registerObject(roleThief, 'roleThief');
 profiler.registerObject(squad, 'squad');
 profiler.registerObject(roleTowerDrain, 'roleTowerDrain');
 profiler.registerObject(roleDemolition, 'roleDemolition');
+profiler.registerObject(roleMineralCollector, 'roleMineralCollector');
 
 // --- CONSTANTS ---
 const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
@@ -51,69 +53,9 @@ const SCAVENGER_BODY = [MOVE, CARRY, CARRY, MOVE];
 const TOWER_DRAIN_BODY = [TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, HEAL, HEAL, HEAL, HEAL, MOVE];
 
 const MAX_REMOTE_SOURCES_PER_ROOM = 3;
+// Define how often (in ticks) to run the link logic
+const LINKS_CHECK_INTERVAL = 3; // Run every 3 ticks
 
-const PRIORITIES = [
-  {
-    type: 'repair',
-    filter: s =>
-      (s.structureType !== STRUCTURE_CONTAINER &&
-       s.structureType !== STRUCTURE_WALL &&
-       s.structureType !== STRUCTURE_RAMPART) &&
-      (s.hits / s.hitsMax < 0.25) &&
-      s.hits < s.hitsMax,
-    label: 'Repair <25%',
-    need: s => `${s.hits}/${s.hitsMax}`,
-    urgency: s => s.hits,
-  },
-  {
-    type: 'build',
-    filter: s => true,
-    targetFinder: room => room.find(FIND_CONSTRUCTION_SITES),
-    label: 'Build',
-    need: s => `${s.progress}/${s.progressTotal}`,
-    urgency: s => -s.progress,
-  },
-  {
-    type: 'repair',
-    filter: s =>
-      s.structureType === STRUCTURE_CONTAINER &&
-      s.hits / s.hitsMax < 0.75 &&
-      s.hits < s.hitsMax,
-    label: 'Repair Container <75%',
-    need: s => `${s.hits}/${s.hitsMax}`,
-    urgency: s => s.hits,
-  },
-  {
-    type: 'repair',
-    filter: s =>
-      s.structureType === STRUCTURE_ROAD &&
-      (s.hits / s.hitsMax < 0.75) &&
-      (s.hits / s.hitsMax >= 0.25) &&
-      s.hits < s.hitsMax,
-    label: 'Repair Road <75%',
-    need: s => `${s.hits}/${s.hitsMax}`,
-    urgency: s => s.hits,
-  },
-  {
-    type: 'repair',
-    filter: s =>
-      ![STRUCTURE_ROAD, STRUCTURE_CONTAINER].includes(s.structureType) &&
-      (s.hits / s.hitsMax < 0.75) &&
-      (s.hits / s.hitsMax >= 0.25) &&
-      s.hits < s.hitsMax,
-    label: 'Repair Other <75%',
-    need: s => `${s.hits}/${s.hitsMax}`,
-    urgency: s => s.hits,
-  },
-  {
-    type: 'collect',
-    filter: r => r.amount > 50,
-    targetFinder: room => room.find(FIND_DROPPED_RESOURCES, { filter: r => r.resourceType === RESOURCE_ENERGY && r.amount > 50 }),
-    label: 'Collect >50',
-    need: r => `${r.amount}`,
-    urgency: r => -r.amount,
-  },
-];
 
 // =================================================================
 // === ALL HELPER FUNCTIONS & CONSOLE COMMANDS ARE DEFINED HERE ===
@@ -339,8 +281,6 @@ global.orderAttack = function(targetRoom, count, rallyRoom = null) {
     return `[Attack] Attack order for ${targetRoom} already exists!`;
   }
 
-  const rallyPoint = findRallyPointInRoom(Game.rooms[rallyRoom]);
-
   Memory.attackOrders.push({
     targetRoom: targetRoom,
     rallyRoom: rallyRoom,
@@ -355,40 +295,6 @@ global.orderAttack = function(targetRoom, count, rallyRoom = null) {
   return `[Attack] Order created: ${count} attackers to attack ${targetRoom}, rally in ${rallyRoom}`;
 };
 
-function findRallyPointInRoom(room) {
-  const spawns = room.find(FIND_MY_SPAWNS);
-  const sources = room.find(FIND_SOURCES);
-
-  const candidatePoints = [
-    {x: 15, y: 15}, {x: 35, y: 15}, {x: 15, y: 35}, {x: 35, y: 35},
-    {x: 10, y: 25}, {x: 40, y: 25}, {x: 25, y: 10}, {x: 25, y: 40}
-  ];
-
-  let bestPoint = candidatePoints[0];
-  let bestMinDistance = 0;
-
-  for (const point of candidatePoints) {
-    let minDistance = 50;
-
-    spawns.forEach(spawn => {
-      const distance = Math.max(Math.abs(point.x - spawn.pos.x), Math.abs(point.y - spawn.pos.y));
-      minDistance = Math.min(minDistance, distance);
-    });
-
-    sources.forEach(source => {
-      const distance = Math.max(Math.abs(point.x - source.pos.x), Math.abs(point.y - source.pos.y));
-      minDistance = Math.min(minDistance, distance);
-    });
-
-    const terrain = room.getTerrain();
-    if (terrain.get(point.x, point.y) !== TERRAIN_MASK_WALL && minDistance > bestMinDistance) {
-      bestMinDistance = minDistance;
-      bestPoint = point;
-    }
-  }
-
-  return bestPoint;
-}
 
 function spawnScavengers() {
   if (!Game.events) return;
@@ -478,24 +384,33 @@ function cleanCpuProfileMemory(maxAge = 5000) {
   }
 }
 
-// --- STRUCTURE LOGIC ---
+
+
 function runLinks() {
-  for(const roomName in Game.rooms) {
+  // Only run the link logic if the current tick is a multiple of the interval
+  if (Game.time % LINKS_CHECK_INTERVAL !== 0) {
+    return;
+  }
+
+  // The rest of your existing logic remains unchanged
+  for (const roomName in Game.rooms) {
     const room = Game.rooms[roomName];
-    if(!room.controller || !room.controller.my) continue;
+    if (!room.controller || !room.controller.my) continue;
+
     const allLinks = room.find(FIND_MY_STRUCTURES, {
       filter: { structureType: STRUCTURE_LINK }
     });
-    if(allLinks.length < 2) continue;
+    if (allLinks.length < 2) continue;
 
-    const sources       = room.find(FIND_SOURCES);
-    const storage       = room.storage;
-    const controller    = room.controller;
-    const recipientLinks= [];
-    const sendingLinks  = [];
+    const sources = room.find(FIND_SOURCES);
+    const storage = room.storage;
+    const controller = room.controller;
+
+    const recipientLinks = [];
+    const sendingLinks = [];
 
     for (const link of allLinks) {
-      if (controller && link.pos.inRangeTo(controller, 5)) {
+      if (controller && link.pos.inRangeTo(controller, 2)) {
         recipientLinks.push(link);
       } else {
         sendingLinks.push(link);
@@ -503,7 +418,7 @@ function runLinks() {
     }
 
     const storageLinks = sendingLinks.filter(l => storage && l.pos.inRangeTo(storage, 3));
-    const donorLinks   = sendingLinks.filter(l => sources.some(s => l.pos.inRangeTo(s, 3)));
+    const donorLinks = sendingLinks.filter(l => sources.some(s => l.pos.inRangeTo(s, 3)));
 
     for (const storageLink of storageLinks) {
       if (storageLink.cooldown > 0 || storageLink.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
@@ -534,6 +449,7 @@ function runLinks() {
   }
 }
 
+
 function runTowers () {
   if (Memory.towerTargets === undefined) Memory.towerTargets = {};
 
@@ -553,7 +469,7 @@ function runTowers () {
     let damagedNonWall  = null;
     let weakestWall     = null;
 
-    const tickMod5 = (Game.time % 2) === 0;
+    const tickMod5 = (Game.time % 5) === 0;
 
     // Special case: 2 enemies with specific composition
     let specialTargeting = false;
@@ -1042,6 +958,24 @@ function manageAttackerSpawns() {
   }
 }
 
+global.orderMineralCollect = function (roomName) {
+     if (!Game.rooms[roomName] || !Game.rooms[roomName].controller || !Game.rooms[roomName].controller.my) {
+         return `[MineralCollector] Invalid room: ${roomName}`;
+     }
+     const spawn = Game.rooms[roomName].find(FIND_MY_SPAWNS, { filter: s => !s.spawning })[0];
+     if (!spawn) return `[MineralCollector] No free spawn in ${roomName}`;
+
+     const body = getCreepBody('supplier', spawn.room.energyAvailable);
+     const cost = bodyCost(body);
+     if (cost > spawn.room.energyAvailable) {
+         return `[MineralCollector] Not enough energy (need ${cost})`;
+     }
+
+     const name = `MC_${roomName}_${Game.time}`;
+     spawn.spawnCreep(body, name, { memory: { role: 'mineralCollector', homeRoom: roomName } });
+     return `[MineralCollector] Spawning ${name}`;
+};
+
 function trySpawnAttackersFromAllRooms(order, orderIndex) {
   let totalSpawned = 0;
   const remainingToSpawn = order.count - order.spawned;
@@ -1115,47 +1049,6 @@ function trySpawnAttackersFromAllRooms(order, orderIndex) {
   }
 
   return totalSpawned;
-}
-
-function trySpawnAttacker(order, orderIndex) {
-  // Find best available spawn across all rooms
-  let bestSpawn = null;
-  let minDistance = Infinity;
-
-  for (const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
-
-    const spawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
-    if (spawns.length === 0) continue;
-
-    const distance = Game.map.getRoomLinearDistance(roomName, order.targetRoom);
-    if (distance < minDistance) {
-      minDistance = distance;
-      bestSpawn = spawns[0];
-    }
-  }
-
-  if (!bestSpawn) return false;
-
-  const body = getCreepBody('attacker', bestSpawn.room.energyAvailable);
-  const cost = bodyCost(body);
-
-  if (!body || cost > bestSpawn.room.energyAvailable) return false;
-
-  const attackerName = `Attacker_${order.targetRoom}_${Game.time}_${order.spawned}`;
-  const result = bestSpawn.spawnCreep(body, attackerName, {
-    memory: {
-      role: 'attacker',
-      targetRoom: order.targetRoom,
-      rallyRoom: order.rallyRoom,
-      spawnRoom: bestSpawn.room.name,
-      orderIndex: orderIndex,
-      rallyComplete: false
-    }
-  });
-
-  return result === OK;
 }
 
 function manageExtractorSpawns() {
@@ -1342,6 +1235,7 @@ function runCreeps() {
       case 'towerDrain':     roleTowerDrain.run(creep);      break;
       case 'demolition':     roleDemolition.run(creep);      break;
       case 'squadMember':    squad.run(creep);               break;
+      case 'mineralCollector': roleMineralCollector.run(creep); break;
       default:
         creep.memory.role = 'harvester';
         roleHarvester.run(creep);
@@ -1491,13 +1385,12 @@ function getRoomTargets(roomName, roomData, room) {
   });
   const storage               = room.storage;
   const hasStorageStructures  = containers.length > 0 || !!storage;
-
   const builderJobs = countBuilderJobs(room);
   let builderTarget = 0;
-  if (builderJobs > 0) {
-    //builderTarget = 1 + Math.floor((builderJobs - 1) / 10);
-    builderTarget = 1; //Save CPU temp rule
-  }
+    if (builderJobs > 0) {
+        //builderTarget = 1 + Math.floor((builderJobs - 1) / 10);
+        builderTarget = 1; //Save CPU temp rule
+        }
 
   let upgraderTarget = 1;
   let storedEnergy   = storage ? (storage.store[RESOURCE_ENERGY] || 0) : 0;
@@ -1515,6 +1408,12 @@ function getRoomTargets(roomName, roomData, room) {
     supplier:    hasStorageStructures ? 1 : 0 //hasStorageStructures ? sourcesCount : 0
   };
 }
+
+function countBuilderJobs(room) {
+  const sites = room.find(FIND_CONSTRUCTION_SITES);
+  return sites.length > 0 ? 1 : 0;
+}
+
 
 function cleanMemory() {
   for (const name in Memory.creeps) {
@@ -1652,20 +1551,6 @@ function needsNewCreeps(perRoomRoleCounts) {
   return false;
 }
 
-function countBuilderJobs(room) {
-  const hasTower = room.find(FIND_MY_STRUCTURES, {
-    filter: { structureType: STRUCTURE_TOWER }
-  }).length > 0;
-  let total = 0;
-  for (let prio of PRIORITIES) {
-    if (hasTower && prio.type !== 'build') continue;
-    let targets = prio.targetFinder
-      ? prio.targetFinder(room)
-      : room.find(FIND_STRUCTURES, { filter: prio.filter });
-    total += targets.length;
-  }
-  return total;
-}
 
 // =================================================================
 // === STATUS & TRACKING FUNCTIONS =================================
@@ -1870,6 +1755,7 @@ function displayStatus(perRoomRoleCounts) {
   // ─── Exploration summary ──────────────────────────────────────────────────
   if (Memory.exploration && Memory.exploration.rooms) {
     console.log(`Explored rooms: ${Object.keys(Memory.exploration.rooms).length}`);
+    console.log('==============================================================');
   }
 
   // Return the GCL ETA breakdown (or null if unavailable)

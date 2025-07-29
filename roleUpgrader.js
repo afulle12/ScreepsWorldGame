@@ -6,6 +6,12 @@
 const roleUpgrader = {
     /** @param {Creep} creep **/
     run: function(creep) {
+        // 1. Cache the controller reference once
+        if (!creep.memory.ctrlId) {
+            creep.memory.ctrlId = creep.room.controller.id;
+        }
+        const ctrl = Game.getObjectById(creep.memory.ctrlId);
+
         // State switching logic
         if (creep.memory.upgrading && creep.store[RESOURCE_ENERGY] == 0) {
             creep.memory.upgrading = false;
@@ -19,62 +25,68 @@ const roleUpgrader = {
         }
 
         if (creep.memory.upgrading) {
-            this.upgrade(creep);
+            this.upgrade(creep, ctrl);
         } else {
             this.getEnergy(creep);
         }
     },
 
     /** @param {Creep} creep **/
-    upgrade: function(creep) {
-        if (creep.upgradeController(creep.room.controller) == ERR_NOT_IN_RANGE) {
+    upgrade: function(creep, ctrl) {
+        if (creep.upgradeController(ctrl) == ERR_NOT_IN_RANGE) {
             // Move to controller, reusing path to save CPU
-            creep.moveTo(creep.room.controller, { visualizePathStyle: { stroke: '#ffffff' }, reusePath: 10 });
+            creep.moveTo(ctrl, { visualizePathStyle: { stroke: '#ffffff' }, reusePath: 100 });
         }
     },
 
     /** @param {Creep} creep **/
     getEnergy: function(creep) {
-        let target = Game.getObjectById(creep.memory.energyTargetId);
+        // 2. Cache the search result for 20 ticks
+        if (!creep.memory.srcTick || Game.time - creep.memory.srcTick > 20) {
+            let target;
 
-        // 1. Find a new target ONLY if the cached one is invalid or empty
-        if (!target || (target.store && target.store.getUsedCapacity(RESOURCE_ENERGY) === 0)) {
-            // First try to find stored energy sources
-            target = creep.pos.findClosestByPath(FIND_STRUCTURES, {
-                filter: (s) =>
-                    (s.structureType == STRUCTURE_STORAGE ||
-                     s.structureType == STRUCTURE_CONTAINER ||
-                     s.structureType == STRUCTURE_LINK) &&
+            // 3. Use Room.find once and filter in JS
+            const stores = creep.room.find(FIND_STRUCTURES, {
+                filter: s =>
+                    (s.structureType === STRUCTURE_STORAGE ||
+                     s.structureType === STRUCTURE_CONTAINER ||
+                     s.structureType === STRUCTURE_LINK) &&
                     s.store.getUsedCapacity(RESOURCE_ENERGY) > 0
             });
+            target = creep.pos.findClosestByPath(stores);
 
             if (target) {
-                // Cache the new target's ID and mark as withdraw target
                 creep.memory.energyTargetId = target.id;
                 creep.memory.shouldHarvest = false;
             } else {
                 // No stored energy found, try to find energy sources to harvest
-                target = creep.pos.findClosestByPath(FIND_SOURCES, {
-                    filter: (source) => source.energy > 0
+                const sources = creep.room.find(FIND_SOURCES, {
+                    filter: source => source.energy > 0
                 });
+                target = creep.pos.findClosestByPath(sources);
 
                 if (target) {
-                    // Cache the energy source ID and mark as harvest target
                     creep.memory.energyTargetId = target.id;
                     creep.memory.shouldHarvest = true;
                     creep.say('⛏️ mining');
                 } else {
                     // If no energy sources are available, wait near the controller
-                    if (creep.pos.getRangeTo(creep.room.controller) > 3) {
-                        creep.moveTo(creep.room.controller);
+                    const ctrl = Game.getObjectById(creep.memory.ctrlId) || creep.room.controller;
+                    if (creep.pos.getRangeTo(ctrl) > 3) {
+                        creep.moveTo(ctrl);
                     }
                     creep.say('😴 no energy');
                     return; // No energy sources at all, do nothing else
                 }
             }
+            creep.memory.srcTick = Game.time;
         }
 
-        // 2. Interact with the target (withdraw or harvest)
+        // Retrieve cached target
+        const target = Game.getObjectById(creep.memory.energyTargetId);
+        if (!target) return;
+
+        // Interact with the target (withdraw or harvest)
         if (creep.memory.shouldHarvest) {
             // Harvest from energy source
             if (creep.harvest(target) == ERR_NOT_IN_RANGE) {
