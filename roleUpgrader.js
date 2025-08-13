@@ -1,25 +1,35 @@
 /**
- * An efficient upgrader that pulls from a cached energy source.
- * It will harvest if no stored energy is available, and wait near the controller as a last resort.
- * This saves CPU and ensures the creep is always in position to work.
+
+* An efficient upgrader that pulls from a cached energy source.
+* Fixed version with proper object handling and additional safety checks.
  */
 const roleUpgrader = {
     /** @param {Creep} creep **/
     run: function(creep) {
-        // 1. Cache the controller reference once
-        if (!creep.memory.ctrlId) {
-            creep.memory.ctrlId = creep.room.controller.id;
+        // Cache controller reference for multiple ticks
+        if (!creep.memory.ctrlTick || Game.time - creep.memory.ctrlTick > 5) {
+            // Added safety check for controller existence
+            if (creep.room.controller) {
+                creep.memory.ctrlId = creep.room.controller.id;
+                creep.memory.ctrlTick = Game.time;
+            } else {
+                // No controller in room - clear memory and return
+                creep.memory.ctrlId = null;
+                creep.memory.ctrlTick = null;
+                return;
+            }
         }
-        const ctrl = Game.getObjectById(creep.memory.ctrlId);
+
+        const ctrl = creep.memory.ctrlId ? Game.getObjectById(creep.memory.ctrlId) : null;
+        if (!ctrl) return;
 
         // State switching logic
-        if (creep.memory.upgrading && creep.store[RESOURCE_ENERGY] == 0) {
+        if (creep.memory.upgrading && creep.store[RESOURCE_ENERGY] === 0) {
             creep.memory.upgrading = false;
             creep.say('🔄 withdraw');
         }
-        if (!creep.memory.upgrading && creep.store.getFreeCapacity() == 0) {
+        if (!creep.memory.upgrading && creep.store.getFreeCapacity() === 0) {
             creep.memory.upgrading = true;
-            // Clear the energy target when we start upgrading
             creep.memory.energyTargetId = null;
             creep.say('⚡ upgrade');
         }
@@ -33,69 +43,128 @@ const roleUpgrader = {
 
     /** @param {Creep} creep **/
     upgrade: function(creep, ctrl) {
-        if (creep.upgradeController(ctrl) == ERR_NOT_IN_RANGE) {
-            // Move to controller, reusing path to save CPU
-            creep.moveTo(ctrl, { visualizePathStyle: { stroke: '#ffffff' }, reusePath: 100 });
+        if (!ctrl) {
+            creep.memory.ctrlTick = 0; // Force controller refresh
+            return;
+        }
+
+        if (creep.upgradeController(ctrl) === ERR_NOT_IN_RANGE) {
+            creep.moveTo(ctrl, { 
+                visualizePathStyle: { stroke: '#ffffff' }, 
+                reusePath: 200,
+                // Added range parameter to prevent overshooting
+                range: 1
+            });
         }
     },
 
     /** @param {Creep} creep **/
     getEnergy: function(creep) {
-        // 2. Cache the search result for 20 ticks
+        // Cache energy target search for 20 ticks
         if (!creep.memory.srcTick || Game.time - creep.memory.srcTick > 20) {
-            let target;
+            let target = null;
 
-            // 3. Use Room.find once and filter in JS
+            // Use direct property access instead of method call
             const stores = creep.room.find(FIND_STRUCTURES, {
                 filter: s =>
                     (s.structureType === STRUCTURE_STORAGE ||
                      s.structureType === STRUCTURE_CONTAINER ||
                      s.structureType === STRUCTURE_LINK) &&
-                    s.store.getUsedCapacity(RESOURCE_ENERGY) > 0
+                    s.store && s.store[RESOURCE_ENERGY] > 0
             });
-            target = creep.pos.findClosestByPath(stores);
 
-            if (target) {
-                creep.memory.energyTargetId = target.id;
-                creep.memory.shouldHarvest = false;
+            // First find closest by range
+            const closestByRange = creep.pos.findClosestByRange(stores);
+
+            if (closestByRange) {
+                // CORRECTED: findClosestByPath returns single object, not array
+                target = creep.pos.findClosestByPath([closestByRange]);
+                if (target) {
+                    creep.memory.energyTargetId = target.id;
+                    creep.memory.shouldHarvest = false;
+                } else {
+                    // No path found to storage
+                    creep.memory.srcTick = 0;
+                    return;
+                }
             } else {
-                // No stored energy found, try to find energy sources to harvest
+                // No stored energy found, try energy sources
                 const sources = creep.room.find(FIND_SOURCES, {
                     filter: source => source.energy > 0
                 });
-                target = creep.pos.findClosestByPath(sources);
 
-                if (target) {
-                    creep.memory.energyTargetId = target.id;
-                    creep.memory.shouldHarvest = true;
-                    creep.say('⛏️ mining');
+                // First find closest by range
+                const sourceByRange = creep.pos.findClosestByRange(sources);
+
+                if (sourceByRange) {
+                    // CORRECTED: findClosestByPath returns single object, not array
+                    target = creep.pos.findClosestByPath([sourceByRange]);
+                    if (target) {
+                        creep.memory.energyTargetId = target.id;
+                        creep.memory.shouldHarvest = true;
+                        creep.say('⛏️ mining');
+                    } else {
+                        // No path found to source
+                        creep.memory.srcTick = 0;
+                        return;
+                    }
                 } else {
-                    // If no energy sources are available, wait near the controller
-                    const ctrl = Game.getObjectById(creep.memory.ctrlId) || creep.room.controller;
-                    if (creep.pos.getRangeTo(ctrl) > 3) {
-                        creep.moveTo(ctrl);
+                    // Wait near controller with path caching
+                    const ctrl = creep.memory.ctrlId ? 
+                                 Game.getObjectById(creep.memory.ctrlId) : 
+                                 creep.room.controller;
+
+                    if (ctrl && creep.pos.getRangeTo(ctrl) > 3) {
+                        creep.moveTo(ctrl, { reusePath: 5, range: 3 });
                     }
                     creep.say('😴 no energy');
-                    return; // No energy sources at all, do nothing else
+                    return;
                 }
             }
             creep.memory.srcTick = Game.time;
         }
 
-        // Retrieve cached target
-        const target = Game.getObjectById(creep.memory.energyTargetId);
-        if (!target) return;
+        // Retrieve cached target with safety check
+        const target = creep.memory.energyTargetId ? 
+                      Game.getObjectById(creep.memory.energyTargetId) : 
+                      null;
 
-        // Interact with the target (withdraw or harvest)
+        if (!target) {
+            creep.memory.srcTick = 0; // Force refresh
+            return;
+        }
+
+        // Early exit if target no longer has energy
+        if ((creep.memory.shouldHarvest && (!target || target.energy === 0)) || 
+            (!creep.memory.shouldHarvest && (!target.store || target.store[RESOURCE_ENERGY] === 0))) {
+            creep.memory.srcTick = 0; // Force refresh
+            return;
+        }
+
+        // Interact with target
         if (creep.memory.shouldHarvest) {
-            // Harvest from energy source
-            if (creep.harvest(target) == ERR_NOT_IN_RANGE) {
-                creep.moveTo(target, { visualizePathStyle: { stroke: '#ffaa00' }, reusePath: 10 });
+            const harvestResult = creep.harvest(target);
+            if (harvestResult === ERR_NOT_IN_RANGE) {
+                creep.moveTo(target, { 
+                    visualizePathStyle: { stroke: '#ffaa00' }, 
+                    reusePath: 20,
+                    range: 1
+                });
+            } else if (harvestResult < 0) {
+                // Handle other errors
+                creep.memory.srcTick = 0;
             }
         } else {
-            // Withdraw from storage/container/link
-            if (creep.withdraw(target, RESOURCE_ENERGY) == ERR_NOT_IN_RANGE) {
-                creep.moveTo(target, { visualizePathStyle: { stroke: '#ffaa00' }, reusePath: 10 });
+            const withdrawResult = creep.withdraw(target, RESOURCE_ENERGY);
+            if (withdrawResult === ERR_NOT_IN_RANGE) {
+                creep.moveTo(target, { 
+                    visualizePathStyle: { stroke: '#ffaa00' }, 
+                    reusePath: 20,
+                    range: 1
+                });
+            } else if (withdrawResult < 0) {
+                // Handle other errors
+                creep.memory.srcTick = 0;
             }
         }
     }

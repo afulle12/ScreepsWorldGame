@@ -132,7 +132,7 @@ const roleHarvester = {
         }
     },
 
-    /** ENHANCED: Harvests energy with optimized pathing **/
+    /** Harvests energy with regeneration-aware waiting; only idles when parked by the source */
     harvestEnergy: function(creep) {
         const source = Game.getObjectById(creep.memory.sourceId);
         if (!source) {
@@ -143,19 +143,38 @@ const roleHarvester = {
             return;
         }
 
-        // If the source is empty, don't move, just wait.
+        // If we have a wait window, only keep waiting while the source is still empty and time hasn't passed
+        if (creep.memory.waitUntil) {
+            if (source.energy > 0 || Game.time >= creep.memory.waitUntil) {
+                delete creep.memory.waitUntil;
+            } else {
+                // Honor the wait window and just park at the source
+                if (!creep.pos.isNearTo(source)) {
+                    creep.moveTo(source, { range: 1, reusePath: 50, visualizePathStyle: false });
+                } else {
+                    if (DEBUG) creep.say(`⏳${creep.memory.waitUntil - Game.time}`);
+                }
+                return;
+            }
+        }
+
+        // If the source is empty now, compute a wake-up tick and park next to it
         if (source.energy === 0) {
-            creep.say('⏳ waiting');
+            const ttr = typeof source.ticksToRegeneration === 'number' ? source.ticksToRegeneration : 10;
+            creep.memory.waitUntil = Game.time + Math.max(1, ttr - 1); // wake 1 tick early
+            if (!creep.pos.isNearTo(source)) {
+                creep.moveTo(source, { range: 1, reusePath: 50, visualizePathStyle: false });
+            } else {
+                if (DEBUG) creep.say(`⏳${creep.memory.waitUntil - Game.time}`);
+            }
             return;
         }
 
-        const harvestResult = creep.harvest(source);
-        if (harvestResult === ERR_NOT_IN_RANGE) {
-            // OPTIMIZATION: Increased reusePath for more stable pathing
-            creep.moveTo(source, { 
-                visualizePathStyle: { stroke: '#ffaa00' }, 
-                reusePath: 12 
-            });
+        // Source has energy and we're not in a wait window → harvest
+        if (creep.pos.isNearTo(source)) {
+            creep.harvest(source);
+        } else {
+            creep.moveTo(source, { range: 1, reusePath: 12, visualizePathStyle: false });
         }
     },
 
@@ -171,10 +190,55 @@ const roleHarvester = {
     },
 
     /**
-     * ENHANCED: Deposits energy using global cache and extended target caching
+     * ENHANCED: Deposits energy with priority to nearby storage, no wandering when full.
+     * If unable to deposit, parks at the source and idles there.
      * @param {Creep} creep
      */
     depositEnergy: function(creep) {
+        // First check if there's a nearby container/link within 1 range
+        const nearbyStorage = creep.pos.findInRange(FIND_STRUCTURES, 1, {
+            filter: s => (s.structureType === STRUCTURE_CONTAINER || 
+                         s.structureType === STRUCTURE_LINK) &&
+                         s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+        });
+
+        // If there's nearby storage with capacity, use it immediately
+        if (nearbyStorage.length > 0) {
+            const target = nearbyStorage[0];
+            // Single-intent-per-tick: check range first, then transfer or move
+            if (creep.pos.isNearTo(target)) {
+                creep.transfer(target, RESOURCE_ENERGY);
+            } else {
+                creep.moveTo(target, { 
+                    visualizePathStyle: false, 
+                    reusePath: 12 
+                });
+            }
+            return;
+        }
+
+        // If nearby storage is full, do not idle here — park at the source instead
+        const nearbyFullStorage = creep.pos.findInRange(FIND_STRUCTURES, 1, {
+            filter: s => (s.structureType === STRUCTURE_CONTAINER || 
+                         s.structureType === STRUCTURE_LINK) &&
+                         s.store.getFreeCapacity(RESOURCE_ENERGY) === 0
+        });
+
+        if (nearbyFullStorage.length > 0) {
+            const source = Game.getObjectById(creep.memory.sourceId);
+            if (source) {
+                if (!creep.pos.isNearTo(source)) {
+                    creep.moveTo(source, { range: 1, reusePath: 50, visualizePathStyle: false });
+                } else {
+                    creep.say('Idle');
+                }
+            } else {
+                creep.say('Idle');
+            }
+            return; // Don't search for other targets; just wait by the source
+        }
+
+        // Only if there's no nearby container/link at all, then use the existing logic
         const roomName = creep.room.name;
         const cache = global.roomCache[roomName];
         let target = Game.getObjectById(creep.memory.targetId);
@@ -215,14 +279,17 @@ const roleHarvester = {
                     });
 
                     if (nearbyLinks.length > 0) {
-                        newTarget = creep.pos.findClosestByPath(nearbyLinks.map(s => Game.getObjectById(s.id)));
+                        // Avoid findClosestByPath: use findClosestByRange
+                        const objs = nearbyLinks.map(s => Game.getObjectById(s.id)).filter(Boolean);
+                        newTarget = creep.pos.findClosestByRange(objs);
                     }
                 }
 
                 // If no nearby link found, use the pre-sorted cached targets
                 if (!newTarget) {
                     const validTargets = availableTargets.map(s => Game.getObjectById(s.id)).filter(Boolean);
-                    newTarget = creep.pos.findClosestByPath(validTargets);
+                    // Avoid findClosestByPath: use findClosestByRange
+                    newTarget = creep.pos.findClosestByRange(validTargets);
                 }
             }
 
@@ -241,7 +308,10 @@ const roleHarvester = {
 
         // --- Act based on the final target (either cached or newly found) ---
         if (target) {
-            if (creep.transfer(target, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE) {
+            // Single-intent-per-tick: check range first, then transfer or move
+            if (creep.pos.isNearTo(target)) {
+                creep.transfer(target, RESOURCE_ENERGY);
+            } else {
                 // OPTIMIZATION: Increased reusePath for more stable pathing
                 creep.moveTo(target, { 
                     visualizePathStyle: false, 
@@ -249,9 +319,18 @@ const roleHarvester = {
                 });
             }
         } else {
-            // If no targets, rest.
-            if (DEBUG) console.log(`Harvester ${creep.name}: No deposit targets, resting.`);
-            creep.say('Idle');
+            // Park at the source and idle there (as requested)
+            const source = Game.getObjectById(creep.memory.sourceId);
+            if (source) {
+                if (!creep.pos.isNearTo(source)) {
+                    creep.moveTo(source, { range: 1, reusePath: 50, visualizePathStyle: false });
+                } else {
+                    creep.say('Idle');
+                }
+            } else {
+                if (DEBUG) console.log(`Harvester ${creep.name}: No deposit targets and no source; resting.`);
+                creep.say('Idle');
+            }
         }
     }
 };

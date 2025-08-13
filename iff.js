@@ -3,7 +3,8 @@
 
 const IFF_WHITELIST = [
     'tarenty',
-    'TimelessTacticianEon'
+    'TimelessTacticianEon',
+    'dustinc555'
     // Add more player usernames to whitelist here.
 ];
 

@@ -1,0 +1,170 @@
+# 🎯 Complete System Integration Overview
+
+## **How Everything Fits Together**
+
+### **Main.js Integration**
+- **Terminal Manager** is imported and runs via ```terminalManager.run()``` in the main loop
+- **Terminal Bots** are handled in the creep management section with ```runTerminalBot(creep)```
+- **Helper functions** like ```getResourceNeeded()``` are defined in main.js to support terminal operations
+
+### **Terminal Manager Lifecycle**
+1. **Initialization**: Sets up memory structure on first run
+2. **Operation Processing**: Handles market buy/sell and transfers each tick
+3. **Bot Management**: Spawns and manages terminal bots as needed
+4. **Cleanup**: Removes completed operations and syncs with actual market orders
+
+---
+
+## **🚀 All Available Console Commands**
+
+### **Terminal Management Commands**
+```javascript
+// === MARKET OPERATIONS ===
+marketBuy('roomName', 'resourceType', amount, maxPrice)
+// Example: marketBuy('W7N23', 'energy', 10000, 0.5)
+
+marketSell('roomName', 'resourceType', amount, minPrice)  
+// Example: marketSell('E15S42', 'O', 5000, 2.0)
+
+transferStuff('fromRoom', 'toRoom', 'resourceType', amount)
+// Example: transferStuff('W7N23', 'E15S42', 'energy', 3000)
+
+// === STATUS & MANAGEMENT ===
+terminalStatus()                    // Show all operations and bots
+cancelTerminalOperation('opId')     // Cancel specific operation
+checkMarketStatus()                 // Debug market orders vs operations
+cleanupTerminalOps()               // Enhanced cleanup with sync
+forceCleanup()                     // Debug cleanup with detailed logs
+debugTerminalBot('botName')        // Debug specific terminal bot
+```
+
+### **Military Operations**
+```javascript
+// === SQUAD ATTACKS ===
+orderSquad('formRoom', 'attackRoom', numSquads)
+cancelSquadOrder('attackRoom')
+
+// === INDIVIDUAL ATTACKERS ===
+orderAttack('targetRoom', count, 'rallyRoom')
+cancelAttackOrder('targetRoom')
+assignAttackTarget('roomName', 'targetId')
+
+// === SPECIALIZED OPERATIONS ===
+orderThieves('homeRoom', 'targetRoom', count)
+cancelThiefOrder('targetRoom')
+
+orderTowerDrain('homeRoom', 'targetRoom', count)
+cancelTowerDrainOrder('homeRoom', 'targetRoom')
+
+orderDemolition('homeRoom', 'targetRoom', teamCount)
+cancelDemolitionOrder('targetRoom')
+```
+
+### **Utility Commands**
+```javascript
+orderMineralCollect('roomName')     // Spawn mineral collector
+```
+
+---
+
+## **🔧 Unused/Redundant Components**
+
+### **In Main.js**
+- **```roleRemoteHarvester```** - Commented out/disabled
+- **```spawnScavengers()```** - Only triggers on specific tower kill events
+- **Duplicate CPU profiling** - Some sections have redundant profiling calls
+- **```cleanupCompletedOperations()```** - Called twice (once in terminalManager, once standalone)
+
+### **In Terminal Manager**
+- **Duplicate ```cleanupCompletedOperations```** - There are two versions (enhanced and simple)
+- **```checkMarketOrderStatus()```** - Mainly for debugging, could be removed in production
+- **Email notifications** - Setting exists but may not be used
+- **```maxBotsPerRoom``` setting** - Defined but not enforced
+
+---
+
+## **⚡ Key Integration Points**
+
+### **Creep Role Handling**
+```javascript
+// In main.js runCreeps() function
+case 'terminalBot': runTerminalBot(creep); break;
+```
+
+### **Resource Calculation**
+```javascript
+// Helper function in main.js used by terminal bots
+function getResourceNeeded(roomName, resourceType) {
+    // Calculates exact amount needed for operations
+}
+```
+
+### **Body Generation**
+```javascript
+// Terminal manager uses main.js body generation
+const body = this.getCreepBody('supplier', spawn.room.energyAvailable);
+```
+
+---
+
+## **📊 System Status Flow**
+
+1. **Operations Created** → Console commands create operations in memory
+2. **Processing Loop** → Each tick processes pending operations
+3. **Bot Spawning** → Automatically spawns bots when resources needed
+4. **Market Integration** → Handles both deals and order creation
+5. **Cleanup & Sync** → Keeps operations synchronized with actual market state
+
+---
+
+## **🎮 Complete Command Reference Card**
+
+```javascript
+// === TERMINAL OPERATIONS ===
+marketBuy('W12S8', 'energy', 10000, 0.5)        // Buy energy
+marketSell('E31N17', 'O', 5000, 2.0)            // Sell oxygen  
+transferStuff('W12S8', 'E31N17', 'energy', 3000) // Transfer between rooms
+
+// === STATUS COMMANDS ===
+terminalStatus()                                 // Show all operations
+checkMarketStatus()                             // Debug market sync
+forceCleanup()                                  // Force operation cleanup
+
+// === MILITARY COMMANDS ===
+orderSquad('W5N41', 'E22S35', 2)               // Send 2 squads
+orderAttack('E22S35', 5, 'W5N41')              // Send 5 attackers
+orderThieves('W12S8', 'E9N26', 3)              // Send 3 thieves
+orderTowerDrain('E31N17', 'W18S14', 2)         // Send 2 drain bots
+orderDemolition('W5N41', 'E44N3', 1)           // Send 1 demo team
+
+// === CANCEL COMMANDS ===
+cancelTerminalOperation('sell_12345_abc')       // Cancel terminal op
+cancelSquadOrder('E22S35')                      // Cancel squad attack
+cancelAttackOrder('W18S14')                     // Cancel attack order
+```
+
+The system is **fully integrated** and **production-ready**! The terminal manager seamlessly handles resource trading, transfers, and logistics while the main system manages all other colony operations. 🚀✨
+
+To cancel all market orders:
+const myOrders = Game.market.orders;
+let cancelCount = 0;
+let totalRefund = 0;
+console.log('=== CANCELLING ALL MARKET ORDERS ===');
+for (const orderId in myOrders) {
+    const order = myOrders[orderId];
+    console.log(`Cancelling: ${orderId} - ${order.type} ${order.remainingAmount} ${order.resourceType} @ ${order.price}`);
+    const result = Game.market.cancelOrder(orderId);
+    if (result === OK) {
+        cancelCount++;
+        const orderValue = order.totalAmount * order.price;
+        const estimatedRefund = orderValue * 0.05;
+        totalRefund += estimatedRefund;
+        console.log(`✓ Cancelled ${orderId}`);
+    } else {
+        console.log(`✗ Failed to cancel ${orderId}: ${result}`);
+    }
+}
+console.log(`=== CANCELLATION COMPLETE ===`);
+console.log(`Cancelled: ${cancelCount} orders`);
+console.log(`Estimated refund: ~${Math.floor(totalRefund)} credits`);
+

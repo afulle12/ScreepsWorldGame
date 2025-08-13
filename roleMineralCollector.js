@@ -13,7 +13,7 @@ module.exports = {
             let total = 0;
             const targets = home.find(FIND_STRUCTURES, {
                 filter: s =>
-                    [STRUCTURE_CONTAINER, STRUCTURE_TERMINAL, STRUCTURE_LAB].includes(s.structureType) &&
+                    [STRUCTURE_CONTAINER, STRUCTURE_TERMINAL, STRUCTURE_LAB, STRUCTURE_FACTORY].includes(s.structureType) &&
                     s.store &&
                     Object.keys(s.store).some(r => r !== RESOURCE_ENERGY && s.store[r] > 0)
             });
