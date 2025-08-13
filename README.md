@@ -1,7 +1,3 @@
-We need to produce updated README without the Disabled/Not-Functional Features section. Also need to keep other sections. Ensure formatting guidelines. Provide updated README. Remove that section entirely. Also keep note about RemoteHarvester being disabled? The user wants to remove that whole section. So we should delete that section entirely. Possibly keep a note elsewhere? The user explicitly says "Remove: Disabled / Not‑Functional Features ... Then give me the updated version". So we should remove that entire section. Possibly we should still mention that RemoteHarvester is disabled? The user wants to remove that section, so we remove it entirely. Provide updated README. Ensure formatting guidelines. Use markdown. Provide concise. Let's produce final README with sections: Overview, Core Systems (Creep Roles table), Defense & Infrastructure, Colony & Resource Management, New Features, Command Reference, Installation & Usage, Contributing. Remove Disabled section. Ensure no leftover. Provide updated README.
-
-</details>
-
 # Screeps Colony – README  
 
 *Version: 2025‑08‑13*  
