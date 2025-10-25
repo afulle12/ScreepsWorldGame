@@ -1,352 +1,409 @@
-const DEBUG = false; // Set to false to disable console logging
+// role.harvester.js
+// Purpose: Harvester role that uses getRoomState cache instead of room.find()
+// Dependency: getRoomState (see getRoomState.js)
+// Intent/CPU notes (from your resources):
+// - When an action method returns OK, it schedules an intent (typically ~0.2 CPU), plus engine checks.
+// - Not every API method creates an intent; check the API "A" icon/CPU bars.
+// - creep.say() does not create an intent.
+// - Helpers like moveTo perform pathfinding; the actual intent is move.
 
-// Global cache for room data
-global.roomCache = global.roomCache || {};
+const getRoomState = require('getRoomState');
+const SUICIDE_TTL_THRESHOLD = 150;
 
-const roleHarvester = {
-    /** @param {Creep} creep **/
+var roleHarvester = {
     run: function(creep) {
-        // Initialize room cache if needed
-        this.initializeRoomCache(creep.room);
-
-        // Assign a source if the creep doesn't have one
-        if (!creep.memory.sourceId) {
-            if (DEBUG) console.log(`Harvester ${creep.name}: No source assigned, finding one.`);
-            this.assignBalancedSource(creep);
-        }
-
-        // State switching logic
-        if (creep.memory.depositing && creep.store[RESOURCE_ENERGY] === 0) {
-            creep.memory.depositing = false;
-            creep.memory.targetId = null; // Clear deposit target
-            delete creep.memory.lastSearchTick; // Clear search timer when switching to harvest
-            if (DEBUG) console.log(`Harvester ${creep.name}: Switching to harvest mode.`);
-        }
-        if (!creep.memory.depositing && creep.store.getFreeCapacity() === 0) {
-            creep.memory.depositing = true;
-            if (DEBUG) console.log(`Harvester ${creep.name}: Switching to deposit mode.`);
-        }
-
-        // Execute actions based on state
-        if (creep.memory.depositing) {
-            this.depositEnergy(creep);
-        } else {
-            this.harvestEnergy(creep);
-        }
-    },
-
-    /** Initialize and manage global room cache **/
-    initializeRoomCache: function(room) {
-        const roomName = room.name;
-
-        if (!global.roomCache[roomName]) {
-            global.roomCache[roomName] = {
-                lastUpdate: 0,
-                sources: [],
-                depositTargets: [],
-                sourceAssignments: {}
-            };
-        }
-
-        const cache = global.roomCache[roomName];
-
-        // Refresh cache every 10 ticks
-        if (Game.time - cache.lastUpdate >= 10) {
-            cache.sources = room.find(FIND_SOURCES);
-            cache.depositTargets = this.findAllDepositTargets(room);
-            cache.lastUpdate = Game.time;
-
-            if (DEBUG) console.log(`Room ${roomName}: Cache refreshed with ${cache.depositTargets.length} deposit targets`);
-        }
-    },
-
-    /** Find all deposit targets in a single operation with priority sorting **/
-    findAllDepositTargets: function(room) {
-        const allTargets = room.find(FIND_STRUCTURES, {
-            filter: s => {
-                const hasCapacity = s.store && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
-                return hasCapacity && (
-                    s.structureType === STRUCTURE_LINK ||
-                    s.structureType === STRUCTURE_STORAGE ||
-                    s.structureType === STRUCTURE_CONTAINER ||
-                    s.structureType === STRUCTURE_EXTENSION ||
-                    s.structureType === STRUCTURE_SPAWN
-                );
-            }
-        });
-
-        // Sort by priority: Links > Storage/Containers > Spawns/Extensions
-        return allTargets.sort((a, b) => {
-            const getPriority = (structure) => {
-                switch (structure.structureType) {
-                    case STRUCTURE_LINK: return 1;
-                    case STRUCTURE_STORAGE:
-                    case STRUCTURE_CONTAINER: return 2;
-                    case STRUCTURE_SPAWN:
-                    case STRUCTURE_EXTENSION: return 3;
-                    default: return 4;
-                }
-            };
-            return getPriority(a) - getPriority(b);
-        });
-    },
-
-    /** ENHANCED: Uses incremental source assignment caching **/
-    assignBalancedSource: function(creep) {
-        const roomName = creep.room.name;
-        const cache = global.roomCache[roomName];
-
-        if (!cache || cache.sources.length === 0) return;
-
-        // Initialize source assignments if not present
-        if (!Memory.sourceAssignments) {
-            Memory.sourceAssignments = {};
-        }
-        if (!Memory.sourceAssignments[roomName]) {
-            Memory.sourceAssignments[roomName] = {};
-            // Initialize all sources with 0 count
-            cache.sources.forEach(source => {
-                Memory.sourceAssignments[roomName][source.id] = 0;
-            });
-        }
-
-        const assignments = Memory.sourceAssignments[roomName];
-
-        // Find the source with minimum assignments
-        let minCount = Infinity;
-        let bestSourceId = null;
-
-        for (const sourceId in assignments) {
-            if (assignments[sourceId] < minCount) {
-                minCount = assignments[sourceId];
-                bestSourceId = sourceId;
-            }
-        }
-
-        if (bestSourceId) {
-            creep.memory.sourceId = bestSourceId;
-            // Increment assignment count
-            assignments[bestSourceId]++;
-
-            if (DEBUG) console.log(`Harvester ${creep.name}: Assigned to source ${bestSourceId.slice(-6)} (${minCount + 1} harvesters).`);
-        }
-    },
-
-    /** Harvests energy with regeneration-aware waiting; only idles when parked by the source */
-    harvestEnergy: function(creep) {
-        const source = Game.getObjectById(creep.memory.sourceId);
-        if (!source) {
-            if (DEBUG) console.log(`Harvester ${creep.name}: Source ${creep.memory.sourceId} invalid, reassigning.`);
-            // Decrement assignment count for invalid source
-            this.decrementSourceAssignment(creep);
-            delete creep.memory.sourceId;
+        var state = getRoomState.get(creep.room.name);
+        if (!state) {
+            console.log('[Harvester] ' + creep.name + ' no room state available for ' + creep.room.name + ' at tick ' + Game.time);
             return;
         }
 
-        // If we have a wait window, only keep waiting while the source is still empty and time hasn't passed
-        if (creep.memory.waitUntil) {
-            if (source.energy > 0 || Game.time >= creep.memory.waitUntil) {
-                delete creep.memory.waitUntil;
+        // Validate source assignment
+        if (!creep.memory.sourceId) {
+            console.log('[Harvester] ' + creep.name + ' has no sourceId assigned!');
+            this.findNearestSource(creep, state);
+            return;
+        }
+
+        var source = Game.getObjectById(creep.memory.sourceId);
+        if (!source) {
+            console.log('[Harvester] ' + creep.name + ' assigned source no longer exists!');
+            this.findNearestSource(creep, state);
+            return;
+        }
+
+        // Suicide flag if TTL low and source drained
+        if (creep.ticksToLive <= SUICIDE_TTL_THRESHOLD && source.energy === 0) {
+            creep.memory.suicideAfterDelivery = true;
+            if (creep.memory.idleUntil) delete creep.memory.idleUntil;
+        }
+
+        // Handle pending suicide
+        if (creep.memory.suicideAfterDelivery === true) {
+            if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                this.deliverEnergy(creep, source, state);
+                if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+                    creep.say('💀'); // no intent
+                    creep.suicide();
+                }
             } else {
-                // Honor the wait window and just park at the source
-                if (!creep.pos.isNearTo(source)) {
-                    creep.moveTo(source, { range: 1, reusePath: 50, visualizePathStyle: false });
+                creep.say('💀');
+                creep.suicide();
+            }
+            return;
+        }
+
+        // Idle window: 0 intents per tick; break idle early if capacity opens or buffers disappear
+        if (creep.memory.idleUntil) {
+            if (Game.time < creep.memory.idleUntil) {
+                if (!this.shouldIdleAtSource(creep, source, state)) {
+                    delete creep.memory.idleUntil;
                 } else {
-                    if (DEBUG) creep.say(`⏳${creep.memory.waitUntil - Game.time}`);
+                    // Idle in place; do nothing (no move/moveTo)
+                    return;
+                }
+            } else {
+                delete creep.memory.idleUntil;
+            }
+        }
+
+        // Consolidated state management using cached used capacity
+        const usedEnergy = creep.store.getUsedCapacity(RESOURCE_ENERGY);
+        const capEnergy = creep.store.getCapacity(RESOURCE_ENERGY);
+        if (usedEnergy === capEnergy) {
+            creep.memory.harvesting = false;
+        } else if (usedEnergy === 0) {
+            creep.memory.harvesting = true;
+        }
+
+        // If we're next to the source and all adjacent (to the creep) buffers are full, start a short idle
+        if (creep.pos.isNearTo(source) && this.shouldIdleAtSource(creep, source, state)) {
+            this.startIdle(creep);
+            return;
+        }
+
+        // Early exit optimization:
+        // When fatigued and in delivery mode, allow only in-range transfers (no moves/pathing/target searches).
+        if (creep.fatigue > 0 && !creep.memory.harvesting) {
+            // Try a cheap, immediate adjacent transfer if possible; otherwise do nothing this tick.
+            if (usedEnergy > 0) {
+                if (this.attemptImmediateTransfer(creep, state)) {
+                    // Either transferred or cleared invalid target; nothing else to do while fatigued.
+                }
+            }
+            return;
+        }
+
+        // Main behavior
+        if (creep.memory.harvesting) {
+            if (source.energy === 0) {
+                this.handleDepletedSource(creep, source, state);
+                return;
+            }
+
+            if (!creep.pos.isNearTo(source)) {
+                if (creep.fatigue === 0) {
+                    creep.moveTo(source, {
+                        reusePath: 50,
+                        // visualizePathStyle: { stroke: '#ffaa00' },
+                        maxOps: 200,
+                        ignoreCreeps: true
+                    });
                 }
                 return;
             }
+
+            var result = creep.harvest(source);
+            if (result === ERR_NOT_ENOUGH_RESOURCES) {
+                this.handleDepletedSource(creep, source, state);
+            }
+        } else {
+            this.deliverEnergy(creep, source, state);
+        }
+    },
+
+    handleDepletedSource: function(creep, source, state) {
+        if (creep.ticksToLive <= SUICIDE_TTL_THRESHOLD) {
+            creep.memory.suicideAfterDelivery = true;
+            if (creep.memory.idleUntil) delete creep.memory.idleUntil;
         }
 
-        // If the source is empty now, compute a wake-up tick and park next to it
-        if (source.energy === 0) {
-            const ttr = typeof source.ticksToRegeneration === 'number' ? source.ticksToRegeneration : 10;
-            creep.memory.waitUntil = Game.time + Math.max(1, ttr - 1); // wake 1 tick early
+        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+            this.deliverEnergy(creep, source, state);
+            if (creep.memory.suicideAfterDelivery === true &&
+                creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+                creep.say('💀');
+                creep.suicide();
+            }
+        } else {
             if (!creep.pos.isNearTo(source)) {
-                creep.moveTo(source, { range: 1, reusePath: 50, visualizePathStyle: false });
-            } else {
-                if (DEBUG) creep.say(`⏳${creep.memory.waitUntil - Game.time}`);
-            }
-            return;
-        }
-
-        // Source has energy and we're not in a wait window → harvest
-        if (creep.pos.isNearTo(source)) {
-            creep.harvest(source);
-        } else {
-            creep.moveTo(source, { range: 1, reusePath: 12, visualizePathStyle: false });
-        }
-    },
-
-    /** Helper function to decrement source assignment count **/
-    decrementSourceAssignment: function(creep) {
-        const roomName = creep.room.name;
-        if (Memory.sourceAssignments && 
-            Memory.sourceAssignments[roomName] && 
-            creep.memory.sourceId &&
-            Memory.sourceAssignments[roomName][creep.memory.sourceId] > 0) {
-            Memory.sourceAssignments[roomName][creep.memory.sourceId]--;
-        }
-    },
-
-    /**
-     * ENHANCED: Deposits energy with priority to nearby storage, no wandering when full.
-     * If unable to deposit, parks at the source and idles there.
-     * @param {Creep} creep
-     */
-    depositEnergy: function(creep) {
-        // First check if there's a nearby container/link within 1 range
-        const nearbyStorage = creep.pos.findInRange(FIND_STRUCTURES, 1, {
-            filter: s => (s.structureType === STRUCTURE_CONTAINER || 
-                         s.structureType === STRUCTURE_LINK) &&
-                         s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-        });
-
-        // If there's nearby storage with capacity, use it immediately
-        if (nearbyStorage.length > 0) {
-            const target = nearbyStorage[0];
-            // Single-intent-per-tick: check range first, then transfer or move
-            if (creep.pos.isNearTo(target)) {
-                creep.transfer(target, RESOURCE_ENERGY);
-            } else {
-                creep.moveTo(target, { 
-                    visualizePathStyle: false, 
-                    reusePath: 12 
-                });
-            }
-            return;
-        }
-
-        // If nearby storage is full, do not idle here — park at the source instead
-        const nearbyFullStorage = creep.pos.findInRange(FIND_STRUCTURES, 1, {
-            filter: s => (s.structureType === STRUCTURE_CONTAINER || 
-                         s.structureType === STRUCTURE_LINK) &&
-                         s.store.getFreeCapacity(RESOURCE_ENERGY) === 0
-        });
-
-        if (nearbyFullStorage.length > 0) {
-            const source = Game.getObjectById(creep.memory.sourceId);
-            if (source) {
-                if (!creep.pos.isNearTo(source)) {
-                    creep.moveTo(source, { range: 1, reusePath: 50, visualizePathStyle: false });
-                } else {
-                    creep.say('Idle');
-                }
-            } else {
-                creep.say('Idle');
-            }
-            return; // Don't search for other targets; just wait by the source
-        }
-
-        // Only if there's no nearby container/link at all, then use the existing logic
-        const roomName = creep.room.name;
-        const cache = global.roomCache[roomName];
-        let target = Game.getObjectById(creep.memory.targetId);
-        let shouldSearch = false;
-
-        // Condition 1: The cached target is invalid (doesn't exist or is full).
-        if (!target || target.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
-            shouldSearch = true;
-            if (DEBUG && target) console.log(`Harvester ${creep.name}: Target is full, forcing a new search.`);
-        }
-
-        // Condition 2: Extended periodic refresh (every 10 ticks for better caching)
-        if (!creep.memory.lastSearchTick || (Game.time - creep.memory.lastSearchTick) >= 10) {
-            shouldSearch = true;
-        }
-
-        // --- Perform the search using cached targets ---
-        if (shouldSearch) {
-            if (DEBUG) console.log(`Harvester ${creep.name}: Searching for a new deposit target.`);
-
-            let newTarget = null;
-            const source = Game.getObjectById(creep.memory.sourceId);
-
-            // Use cached deposit targets instead of repeated finds
-            const availableTargets = cache.depositTargets.filter(structure => {
-                const obj = Game.getObjectById(structure.id);
-                return obj && obj.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
-            });
-
-            if (availableTargets.length > 0) {
-                // Priority 1: Links within 3 squares of the assigned source
-                if (source) {
-                    const nearbyLinks = availableTargets.filter(structure => {
-                        const obj = Game.getObjectById(structure.id);
-                        return obj && 
-                               obj.structureType === STRUCTURE_LINK && 
-                               source.pos.getRangeTo(obj) <= 3;
+                if (creep.fatigue === 0) {
+                    creep.moveTo(source, {
+                        reusePath: 50,
+                        // visualizePathStyle: { stroke: '#ffaa00' },
+                        maxOps: 200,
+                        ignoreCreeps: true
                     });
-
-                    if (nearbyLinks.length > 0) {
-                        // Avoid findClosestByPath: use findClosestByRange
-                        const objs = nearbyLinks.map(s => Game.getObjectById(s.id)).filter(Boolean);
-                        newTarget = creep.pos.findClosestByRange(objs);
-                    }
                 }
-
-                // If no nearby link found, use the pre-sorted cached targets
-                if (!newTarget) {
-                    const validTargets = availableTargets.map(s => Game.getObjectById(s.id)).filter(Boolean);
-                    // Avoid findClosestByPath: use findClosestByRange
-                    newTarget = creep.pos.findClosestByRange(validTargets);
-                }
+            } else if (typeof source.ticksToRegeneration === 'number') {
+                creep.say('⏳' + source.ticksToRegeneration);
             }
+        }
+    },
 
-            // Update search timing - extend to 10 ticks when no target found (idle optimization)
-            creep.memory.lastSearchTick = Game.time;
+    // Intent-first: reuse target, avoid transfer when out of range, distance-only selection, high reusePath
+    deliverEnergy: function(creep, source, state) {
+        // If adjacent to source and all adjacent (to the creep) buffers are full, idle instead of walking energy away
+        if (creep.pos.isNearTo(source) && this.shouldIdleAtSource(creep, source, state)) {
+            this.startIdle(creep);
+            return;
+        }
 
-            if (newTarget) {
-                creep.memory.targetId = newTarget.id;
-                target = newTarget;
-                if (DEBUG) console.log(`Harvester ${creep.name}: New target set to ${target.structureType} (${target.id})`);
-            } else {
-                // If no target was found, clear the old one
-                delete creep.memory.targetId;
+        // Reuse an existing delivery target if it still wants energy
+        let target = null;
+        if (creep.memory.deliveryId) {
+            target = Game.getObjectById(creep.memory.deliveryId);
+            if (!target || this.freeEnergyCapacity(target) <= 0) {
+                target = null;
+                delete creep.memory.deliveryId;
             }
         }
 
-        // --- Act based on the final target (either cached or newly found) ---
-        if (target) {
-            // Single-intent-per-tick: check range first, then transfer or move
-            if (creep.pos.isNearTo(target)) {
-                creep.transfer(target, RESOURCE_ENERGY);
-            } else {
-                // OPTIMIZATION: Increased reusePath for more stable pathing
-                creep.moveTo(target, { 
-                    visualizePathStyle: false, 
-                    reusePath: 12 
+        // Pick a new target only when needed
+        if (!target) {
+            target = this.pickDeliveryTargetQuick(creep, state, source);
+            if (target) {
+                creep.memory.deliveryId = target.id;
+            }
+        }
+
+        // Nothing to deliver to: hover near source cheaply
+        if (!target) {
+            if (!creep.pos.inRangeTo(source, 3) && creep.fatigue === 0) {
+                creep.moveTo(source, {
+                    reusePath: 50,
+                    // visualizePathStyle: { stroke: '#ffaa00' },
+                    maxOps: 200,
+                    ignoreCreeps: true
                 });
             }
-        } else {
-            // Park at the source and idle there (as requested)
-            const source = Game.getObjectById(creep.memory.sourceId);
-            if (source) {
-                if (!creep.pos.isNearTo(source)) {
-                    creep.moveTo(source, { range: 1, reusePath: 50, visualizePathStyle: false });
-                } else {
-                    creep.say('Idle');
-                }
-            } else {
-                if (DEBUG) console.log(`Harvester ${creep.name}: No deposit targets and no source; resting.`);
-                creep.say('Idle');
+            return;
+        }
+
+        // If not in range, just move (do not call transfer yet to avoid extra engine checks)
+        if (!creep.pos.isNearTo(target)) {
+            if (creep.fatigue === 0) {
+                creep.moveTo(target, {
+                    reusePath: 50,
+                    // visualizePathStyle: { stroke: '#ffffff' },
+                    maxOps: 300,
+                    ignoreCreeps: true
+                });
+            }
+            return;
+        }
+
+        // In range: transfer once
+        const tr = creep.transfer(target, RESOURCE_ENERGY);
+        if (tr === OK) {
+            if (this.freeEnergyCapacity(target) <= 0 || creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+                delete creep.memory.deliveryId;
+            }
+            return;
+        }
+
+        // Target rejected energy; clear and retry next tick
+        if (tr === ERR_FULL || tr === ERR_INVALID_TARGET || tr === ERR_NOT_ENOUGH_RESOURCES) {
+            delete creep.memory.deliveryId;
+        }
+    },
+
+    // Numeric free energy capacity across different structure types (store vs legacy)
+    freeEnergyCapacity: function(s) {
+        if (s.store && typeof s.store.getFreeCapacity === 'function') {
+            return s.store.getFreeCapacity(RESOURCE_ENERGY) || 0;
+        }
+        if (s.energyCapacity !== undefined && s.energy !== undefined) {
+            return s.energyCapacity - s.energy;
+        }
+        return 0;
+    },
+
+    // Fast, distance-only picker that mirrors your priorities, no pathfinding
+    pickDeliveryTargetQuick: function(creep, state, source) {
+        const byType = state.structuresByType || {};
+        const containers = byType[STRUCTURE_CONTAINER] || [];
+        const links = byType[STRUCTURE_LINK] || [];
+        const spawns = byType[STRUCTURE_SPAWN] || [];
+        const extensions = byType[STRUCTURE_EXTENSION] || [];
+
+        // Priority 1: buffer within 3 (containers/links)
+        let best = null, bestRange = Infinity;
+
+        for (let i = 0; i < containers.length; i++) {
+            const s = containers[i];
+            if (this.freeEnergyCapacity(s) <= 0) continue;
+            const r = creep.pos.getRangeTo(s);
+            if (r <= 3 && r < bestRange) { best = s; bestRange = r; }
+        }
+        for (let i = 0; i < links.length; i++) {
+            const s = links[i];
+            if (!s.my) continue;
+            if (this.freeEnergyCapacity(s) <= 0) continue;
+            const r = creep.pos.getRangeTo(s);
+            if (r <= 3 && r < bestRange) { best = s; bestRange = r; }
+        }
+        if (best) return best;
+
+        // Priority 2: spawns/extensions needing energy (closest by range)
+        best = null; bestRange = Infinity;
+        for (let i = 0; i < spawns.length; i++) {
+            const s = spawns[i];
+            if (this.freeEnergyCapacity(s) <= 0) continue;
+            const r = creep.pos.getRangeTo(s);
+            if (r < bestRange) { best = s; bestRange = r; }
+        }
+        for (let i = 0; i < extensions.length; i++) {
+            const s = extensions[i];
+            if (this.freeEnergyCapacity(s) <= 0) continue;
+            const r = creep.pos.getRangeTo(s);
+            if (r < bestRange) { best = s; bestRange = r; }
+        }
+        if (best) return best;
+
+        // Priority 3: storage (if it wants energy)
+        if (state.storage && this.freeEnergyCapacity(state.storage) > 0) {
+            return state.storage;
+        }
+
+        // Priority 4: any container with space (closest by range)
+        best = null; bestRange = Infinity;
+        for (let i = 0; i < containers.length; i++) {
+            const s = containers[i];
+            if (this.freeEnergyCapacity(s) <= 0) continue;
+            const r = creep.pos.getRangeTo(s);
+            if (r < bestRange) { best = s; bestRange = r; }
+        }
+        return best || null;
+    },
+
+    // Optimized and corrected:
+    // - Check buffers within range 1 of the CREEP (not the source).
+    // - Return true (idle) only if: creep is near the source AND at least one adjacent buffer exists AND all such buffers are full.
+    // - Per-tick cache on the creep object to avoid duplicate work.
+    shouldIdleAtSource: function(creep, source, state) {
+        if (creep._idleCheckTick === Game.time) return !!creep._idleCheckResult;
+
+        if (!creep.pos.isNearTo(source)) {
+            creep._idleCheckTick = Game.time;
+            creep._idleCheckResult = false;
+            return false;
+        }
+
+        const byType = state.structuresByType || {};
+        const containers = byType[STRUCTURE_CONTAINER] || [];
+        const links = byType[STRUCTURE_LINK] || [];
+
+        let sawAny = false;
+
+        // Single loop combining both structure types
+        const allBuffers = [];
+        for (let i = 0; i < containers.length; i++) allBuffers.push(containers[i]);
+        for (let i = 0; i < links.length; i++) {
+            const s = links[i];
+            if (s.my) allBuffers.push(s);
+        }
+        for (let i = 0; i < allBuffers.length; i++) {
+            const s = allBuffers[i];
+            if (creep.pos.getRangeTo(s) > 1) continue;
+            sawAny = true;
+            if (this.freeEnergyCapacity(s) > 0) {
+                creep._idleCheckTick = Game.time;
+                creep._idleCheckResult = false;
+                return false;
             }
         }
-    }
-};
 
-// Clean up source assignments when creeps die
-const originalCreepDie = Creep.prototype.suicide;
-Creep.prototype.suicide = function() {
-    if (this.memory.role === 'harvester' && this.memory.sourceId) {
-        const roomName = this.room.name;
-        if (Memory.sourceAssignments && 
-            Memory.sourceAssignments[roomName] && 
-            Memory.sourceAssignments[roomName][this.memory.sourceId] > 0) {
-            Memory.sourceAssignments[roomName][this.memory.sourceId]--;
+        const result = sawAny;
+        creep._idleCheckTick = Game.time;
+        creep._idleCheckResult = result;
+        return result;
+    },
+
+    // Try a single, in-range transfer to any adjacent structure that can accept energy.
+    // Returns true if we attempted a transfer (success or clear), false otherwise.
+    attemptImmediateTransfer: function(creep, state) {
+        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) <= 0) return false;
+
+        // Reuse current target if it is adjacent and wants energy
+        if (creep.memory.deliveryId) {
+            const t = Game.getObjectById(creep.memory.deliveryId);
+            if (t && creep.pos.isNearTo(t) && this.freeEnergyCapacity(t) > 0) {
+                const tr = creep.transfer(t, RESOURCE_ENERGY);
+                if (tr === OK) return true;
+                if (tr === ERR_FULL || tr === ERR_INVALID_TARGET) delete creep.memory.deliveryId;
+                return true; // attempted
+            }
+        }
+
+        const byType = state.structuresByType || {};
+        const containers = byType[STRUCTURE_CONTAINER] || [];
+        const links = byType[STRUCTURE_LINK] || [];
+        const spawns = byType[STRUCTURE_SPAWN] || [];
+        const extensions = byType[STRUCTURE_EXTENSION] || [];
+        const candidates = [];
+
+        // Priority: buffers first (adjacent), then spawns/extensions (adjacent), then storage (adjacent)
+        for (let i = 0; i < containers.length; i++) {
+            const s = containers[i];
+            if (this.freeEnergyCapacity(s) > 0 && creep.pos.getRangeTo(s) <= 1) candidates.push(s);
+        }
+        for (let i = 0; i < links.length; i++) {
+            const s = links[i];
+            if (s.my && this.freeEnergyCapacity(s) > 0 && creep.pos.getRangeTo(s) <= 1) candidates.push(s);
+        }
+        for (let i = 0; i < spawns.length; i++) {
+            const s = spawns[i];
+            if (this.freeEnergyCapacity(s) > 0 && creep.pos.getRangeTo(s) <= 1) candidates.push(s);
+        }
+        for (let i = 0; i < extensions.length; i++) {
+            const s = extensions[i];
+            if (this.freeEnergyCapacity(s) > 0 && creep.pos.getRangeTo(s) <= 1) candidates.push(s);
+        }
+        if (state.storage && this.freeEnergyCapacity(state.storage) > 0 && creep.pos.getRangeTo(state.storage) <= 1) {
+            candidates.push(state.storage);
+        }
+
+        if (candidates.length === 0) return false;
+
+        // Choose the first candidate (all are adjacent; picking order already reflects priority)
+        const target = candidates[0];
+        const tr = creep.transfer(target, RESOURCE_ENERGY);
+        if (tr === OK) return true;
+        if (tr === ERR_FULL || tr === ERR_INVALID_TARGET) {
+            if (creep.memory.deliveryId && creep.memory.deliveryId === target.id) delete creep.memory.deliveryId;
+        }
+        return true; // attempted
+    },
+
+    startIdle: function(creep) {
+        if (!creep.memory.idleUntil || Game.time >= creep.memory.idleUntil) {
+            creep.memory.idleUntil = Game.time + 5; // 5 ticks
+            creep.say('😴'); // say once on idle start; no intent cost
+        }
+    },
+
+    findNearestSource: function(creep, state) {
+        // Emergency fallback - find closest source from cached state (range-only to avoid pathfinding cost)
+        var sources = state.sources || [];
+        if (sources.length === 0) return;
+
+        var closestSource = creep.pos.findClosestByRange(sources);
+        if (closestSource) {
+            creep.memory.sourceId = closestSource.id;
+            console.log('[Harvester] ' + creep.name + ' assigned to emergency source: ' + closestSource.id);
         }
     }
-    return originalCreepDie.call(this);
 };
 
 module.exports = roleHarvester;

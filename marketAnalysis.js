@@ -213,9 +213,11 @@
 
   // ---------- tables ----------
   function buildFactoryTable(rows, outMode, inMode) {
+    var energyPrice = priceOf('energy', inMode);
     var header = [
       '=== Factory Production and Profitability ===',
       '(out=' + outMode + ', in=' + inMode + ')',
+      'Assumed energy cost (in=' + inMode + '): ' + (energyPrice === null ? 'n/a' : fmt(energyPrice)) + ' Cr/u',
       [
         padRight('Item', 16),
         padRight('OutQty', 6),
@@ -246,9 +248,11 @@
   }
 
   function buildLabTable(rows, outMode, inMode) {
+    var energyPrice = priceOf('energy', inMode);
     var header = [
       '=== Lab Production and Profitability ===',
       '(out=' + outMode + ', in=' + inMode + ', batch=' + (typeof LAB_REACTION_AMOUNT === 'number' ? LAB_REACTION_AMOUNT : 5) + ')',
+      'Assumed energy cost (in=' + inMode + '): ' + (energyPrice === null ? 'n/a' : fmt(energyPrice)) + ' Cr/u',
       [
         padRight('Compound', 16),
         padRight('OutQty', 6),

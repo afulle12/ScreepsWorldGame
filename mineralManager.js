@@ -2,21 +2,26 @@
 // Automates processing minerals into bars and selling them.
 // Behavior:
 // - When a mineral vein depletes, orders the factory to process its stock into bars.
-// - Once bars exist (or an order already exists), enters "selling" phase.
+// - Once processing completes, immediately attempts to create a sell order via marketSell
+//   if no active sell order exists for the same bar in the same room.
+// - If bars are present in the room (terminal/storage/factory) and no sell order exists,
+//   create a new sell order via marketSell; bars will be moved to the terminal and wait to be sold.
 // - Selling rules:
-//   - Attempt one direct deal with buy orders at/above target price.
+//   - Do not attempt direct buy-order deals here; rely on marketSell to create/price the sell order.
 //   - Always call marketSell(roomName, resourceType, amount, price) to handle order creation
-//     (repricing and extending existing orders is not handled by marketSell - see note below)
+//     (repricing and extending existing orders is not handled by marketSell - see note below).
 // Pricing:
 // - Soft cap: if terminal free capacity < 100,000, price at 50% of market average.
 // - Otherwise: price at 85% of market average.
 // - Market average is taken from your marketPrice helper if present, else last up-to-2-days history average.
 // Important note: marketSell creates NEW orders but does NOT maintain existing ones. 
-// MineralManager now only creates orders when needed (not on every tick).
+// MineralManager only creates orders when needed (not on every tick).
 // Safeguards:
 // - Runs every 100 ticks.
 // - No optional chaining used.
 // - Exceptions in marketSell are caught and logged; selling stays active to retry next cycle.
+
+var getRoomState = require('getRoomState');
 
 function init() {
     if (!Memory.mineralManager) {
@@ -101,49 +106,23 @@ function computeDynamicSellPrice(resourceType, terminal) {
     return avg * factor;
 }
 
-// Try to sell immediately to the best buy orders at or above targetPrice.
-// Returns the remaining amount not sold.
-function trySellToBestBuyOrders(roomName, resourceType, targetPrice, availableAmount) {
-    var room = Game.rooms[roomName];
-    var terminal = room && room.terminal;
-    if (!terminal) return availableAmount;
+// Sum resource across terminal, storage, and factory in this room using room state
+function getTotalResourceInRoomState(rs, resourceType) {
+    var sum = 0;
+    if (rs.terminal && rs.terminal.store) sum += (rs.terminal.store[resourceType] || 0);
+    if (rs.storage && rs.storage.store) sum += (rs.storage.store[resourceType] || 0);
 
-    var orders = Game.market.getAllOrders({ type: ORDER_BUY, resourceType: resourceType }) || [];
-    orders.sort(function(a, b) { return b.price - a.price; });
-
-    var remaining = availableAmount;
-    for (var i = 0; i < orders.length && remaining > 0; i++) {
-        var o = orders[i];
-        if (o.price < targetPrice) break;
-
-        var amount = Math.min(o.remainingAmount, remaining);
-        if (amount <= 0) continue;
-
-        var energy = terminal.store[RESOURCE_ENERGY] || 0;
-        if (energy <= 0) break;
-
-        var cost = Game.market.calcTransactionCost(amount, roomName, o.roomName);
-        while (amount > 0 && cost > energy) {
-            amount = Math.floor(amount / 2);
-            if (amount <= 0) break;
-            cost = Game.market.calcTransactionCost(amount, roomName, o.roomName);
-        }
-        if (amount <= 0) continue;
-
-        if (terminal.cooldown !== 0) break;
-
-        var dealResult = Game.market.deal(o.id, amount, roomName);
-        if (dealResult === OK) {
-            remaining -= amount;
-            break; // one deal per cycle to respect cooldown
-        } else {
-            console.log('[MineralManager] deal failed in ' + roomName + ' for ' + resourceType + ': ' + dealResult);
+    var factories = (rs.structuresByType && rs.structuresByType[STRUCTURE_FACTORY]) ? rs.structuresByType[STRUCTURE_FACTORY] : [];
+    for (var i = 0; i < factories.length; i++) {
+        var fac = factories[i];
+        if (fac && fac.my && fac.store) {
+            sum += (fac.store[resourceType] || 0);
         }
     }
-    return remaining;
+    return sum;
 }
 
-// Find an active sell order for a given room and resource (to enter selling phase even without stock)
+// Find an existing sell order for a given room and resource
 function findActiveSellOrder(roomName, resourceType) {
     var mine = Game.market.orders || {};
     for (var id in mine) {
@@ -152,6 +131,8 @@ function findActiveSellOrder(roomName, resourceType) {
         if (ord.type !== ORDER_SELL) continue;
         if (ord.resourceType !== resourceType) continue;
         if (ord.roomName !== roomName) continue;
+        // Do NOT filter out inactive orders; they still represent an existing order
+        // if (ord.active === false) continue;
         if ((ord.remainingAmount || 0) <= 0) continue;
         return ord;
     }
@@ -169,18 +150,28 @@ function run() {
     if (Memory.mineralManager.lastRunTick === Game.time) return;
     Memory.mineralManager.lastRunTick = Game.time;
 
+    // Build room state cache for this tick
+    getRoomState.init();
+
     for (var roomName in Game.rooms) {
         var room = Game.rooms[roomName];
         if (!room.controller || !room.controller.my) continue;
 
-        // Check for extractor
-        var extractor = room.find(FIND_MY_STRUCTURES, {
-            filter: { structureType: STRUCTURE_EXTRACTOR }
-        })[0];
+        // Pull cached room state
+        var rs = getRoomState.get(roomName);
+        if (!rs) continue;
+
+        // Check for extractor via cached structures; mirror FIND_MY_STRUCTURES by filtering .my
+        var extractorList = (rs.structuresByType && rs.structuresByType[STRUCTURE_EXTRACTOR]) ? rs.structuresByType[STRUCTURE_EXTRACTOR] : [];
+        var extractor = null;
+        for (var ei = 0; ei < extractorList.length; ei++) {
+            var ex = extractorList[ei];
+            if (ex && ex.my) { extractor = ex; break; }
+        }
         if (!extractor) continue;
 
-        // Get mineral
-        var mineral = room.find(FIND_MINERALS)[0];
+        // Get mineral via cached minerals list
+        var mineral = (rs.minerals && rs.minerals.length > 0) ? rs.minerals[0] : null;
         if (!mineral) continue;
 
         // Initialize room state if needed
@@ -188,7 +179,8 @@ function run() {
             Memory.mineralManager.roomStates[roomName] = {
                 lastAmount: mineral.mineralAmount,
                 processingOrderId: null,
-                selling: false
+                selling: false,
+                lastSellCreateTick: 0
             };
         }
         var state = Memory.mineralManager.roomStates[roomName];
@@ -241,18 +233,20 @@ function run() {
 
         // Determine bar type once
         var barTypeRoom = getBarTypeFromMineral(mineral.mineralType);
-        var terminal = room.terminal;
+        var terminal = rs.terminal;
 
-        // Safety net: start selling if we have bars OR an active sell order exists
+        // Safety net: start selling only if we have bars in the room and no existing order exists
         if (!state.processingOrderId && !state.selling && terminal && barTypeRoom) {
-            var hasBars = (terminal.store[barTypeRoom] || 0) > 0;
-            var existingOrder = findActiveSellOrder(roomName, barTypeRoom);
-            if (hasBars || existingOrder) {
-                state.selling = true;
-                if (hasBars) {
-                    console.log('[MineralManager] Bars detected in terminal of ' + roomName + '; initiating sell for ' + barTypeRoom);
-                } else {
-                    console.log('[MineralManager] Active order exists in ' + roomName + '; initiating sell maintenance for ' + barTypeRoom);
+            // Cooldown to avoid rapid re-creation if helper delays activation/visibility
+            var coolDownTicks = 300; // ~3 cycles at 100-tick cadence
+            if (state.lastSellCreateTick && (Game.time - state.lastSellCreateTick) < coolDownTicks) {
+                // Skip re-init during cooldown
+            } else {
+                var existingOrder = findActiveSellOrder(roomName, barTypeRoom);
+                var hasBarsInRoom = getTotalResourceInRoomState(rs, barTypeRoom) > 0;
+                if (!existingOrder && hasBarsInRoom) {
+                    state.selling = true;
+                    console.log('[MineralManager] Bars detected in ' + roomName + '; initiating sell for ' + barTypeRoom);
                 }
             }
         }
@@ -265,55 +259,46 @@ function run() {
                 continue;
             }
 
+            // If an existing order already exists (active or inactive), do nothing (avoid duplicates)
+            var existingOrder2 = findActiveSellOrder(roomName, barTypeRoom);
+            if (existingOrder2) {
+                console.log('[MineralManager] Existing order found for ' + barTypeRoom + ' in ' + roomName + '; no new order created');
+                state.selling = false;
+                continue;
+            }
+
+            // Price: compute target; allow helper to auto-price if null
             var targetPrice = computeDynamicSellPrice(barTypeRoom, terminal);
             if (targetPrice === null) {
                 console.log('[MineralManager] No price history for ' + barTypeRoom + ' in ' + roomName + '; delegating price to marketSell');
             }
 
-            // 1) Try one direct deal at or above target price (only if we have a numeric target)
-            var available = terminal.store[barTypeRoom] || 0;
-            var amountToSell = available;
-            if (available > 0 && terminal.cooldown === 0 && targetPrice != null) {
-                var remaining = trySellToBestBuyOrders(roomName, barTypeRoom, targetPrice, available);
-                if (remaining < available) {
-                    var soldAmt = available - remaining;
-                    console.log('[MineralManager] Sold ' + soldAmt + ' ' + barTypeRoom + ' via buy orders from ' + roomName);
-                }
-                amountToSell = remaining;
-            }
+            // Amount: total bars present across terminal/storage/factory
+            var amountDesired = getTotalResourceInRoomState(rs, barTypeRoom);
 
-            // 2) Only create new order if we have something to sell and no active order exists
-            if (amountToSell > 0 && typeof marketSell === 'function') {
-                var existingOrder = findActiveSellOrder(roomName, barTypeRoom);
-                if (!existingOrder) {
-                    try {
-                        var res = marketSell(roomName, barTypeRoom, amountToSell, targetPrice);
-                        var priceStr;
-                        if (targetPrice == null) {
-                            priceStr = 'auto';
-                        } else {
-                            var rounded = Math.round(targetPrice * 1000) / 1000;
-                            priceStr = rounded.toFixed(3);
-                        }
-                        console.log('[MineralManager] marketSell invoked in ' + roomName + ' for ' + barTypeRoom + ' at ' + priceStr + ' -> ' + res);
-                        // Successful order creation; end selling phase
-                        state.selling = false;
-                    } catch (e) {
-                        // Keep selling active; retry next cycle
-                        console.log('[MineralManager] marketSell threw in ' + roomName + ' for ' + barTypeRoom + ': ' + e);
-                        // Do not set selling=false; let it retry next run
+            if (typeof marketSell === 'function') {
+                try {
+                    // marketSell should create the order and request bars be moved to the terminal.
+                    var res = marketSell(roomName, barTypeRoom, amountDesired, targetPrice);
+                    var priceStr;
+                    if (targetPrice == null) {
+                        priceStr = 'auto';
+                    } else {
+                        var rounded = Math.round(targetPrice * 1000) / 1000;
+                        priceStr = rounded.toFixed(3);
                     }
-                } else {
-                    console.log('[MineralManager] Active order exists for ' + barTypeRoom + ' in ' + roomName + '; no new order created');
-                    // End selling phase since order exists
+                    console.log('[MineralManager] marketSell invoked in ' + roomName + ' for ' + barTypeRoom + ' amount ' + amountDesired + ' at ' + priceStr + ' -> ' + res);
+                    // Successful invoke; set cooldown and let the bars wait to be sold
                     state.selling = false;
+                    state.lastSellCreateTick = Game.time;
+                } catch (e) {
+                    // Keep selling active; retry next cycle
+                    console.log('[MineralManager] marketSell threw in ' + roomName + ' for ' + barTypeRoom + ': ' + e);
+                    // Do not set selling=false; let it retry next run
                 }
-            } else if (typeof marketSell !== 'function') {
-                console.log('[MineralManager] marketSell helper not available; skipping market order creation for ' + barTypeRoom + ' in ' + roomName);
-                // Keep selling=true to retry when helper becomes available
             } else {
-                console.log('[MineralManager] No bars left to sell for ' + barTypeRoom + ' in ' + roomName);
-                state.selling = false;
+                console.log('[MineralManager] marketSell helper not available; will retry next cycle for ' + barTypeRoom + ' in ' + roomName);
+                // Keep selling=true to retry when helper becomes available
             }
         }
     }

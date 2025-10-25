@@ -1,3 +1,4 @@
+
 // spawnManager.js
 // ============================================================================
 // Spawn Manager
@@ -151,16 +152,16 @@ function ensureSourceMetaCache(room) {
   if (!needsScan) return meta;
 
   var rs = getRoomState.get(roomName);
-  var sources = (rs && rs.sources) ? rs.sources : room.find(FIND_SOURCES);
+  if (!rs) return meta;
+
+  var sources = rs.sources || [];
 
   var spawns = [];
-  if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
+  if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
     for (var i = 0; i < rs.structuresByType[STRUCTURE_SPAWN].length; i++) {
       var s = rs.structuresByType[STRUCTURE_SPAWN][i];
       if (s.my) spawns.push(s);
     }
-  } else {
-    spawns = room.find(FIND_MY_SPAWNS);
   }
 
   var byId = {};
@@ -218,6 +219,71 @@ function costOf(part) {
     default: return 0;
   }
 }
+
+// In spawnManager.js (top section already has getRoomState imported)
+function manageNukeFillSpawns() {
+  if (!Memory.nukeFillOrders) return;
+
+  for (var roomName in Memory.nukeFillOrders) {
+    var order = Memory.nukeFillOrders[roomName];
+    if (!order || order.completed) continue;
+
+    var room = Game.rooms[roomName];
+    if (!room || !room.controller || !room.controller.my) continue;
+
+    var rs = getRoomState.get(roomName);
+    if (!rs) continue;
+
+    // Verify nuker still exists
+    var nuker = null;
+    if (order.nukerId) nuker = Game.getObjectById(order.nukerId);
+    if (!nuker && rs.structuresByType && rs.structuresByType[STRUCTURE_NUKER] && rs.structuresByType[STRUCTURE_NUKER].length > 0) {
+      nuker = rs.structuresByType[STRUCTURE_NUKER][0];
+      order.nukerId = nuker.id;
+    }
+    if (!nuker) continue;
+
+    // Alive worker?
+    var exists = _.some(Game.creeps, function(c) {
+      if (!c || !c.memory) return false;
+      if (c.memory.role !== 'nukeFill') return false;
+      var assigned = c.memory.orderRoom || c.memory.homeRoom || (c.room ? c.room.name : null);
+      return assigned === roomName;
+    });
+    if (exists) continue;
+
+    // Find a free spawn in this room
+    var freeSpawn = null;
+    if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
+      for (var i = 0; i < rs.structuresByType[STRUCTURE_SPAWN].length; i++) {
+        var sp = rs.structuresByType[STRUCTURE_SPAWN][i];
+        if (sp.my && !sp.spawning) { freeSpawn = sp; break; }
+      }
+    }
+    if (!freeSpawn) continue;
+
+    var body = getCreepBody('supplier', freeSpawn.room.energyAvailable);
+    if (!body) continue;
+
+    var name = 'NukeFill_' + roomName + '_' + (Game.time % 1000);
+    var mem  = {
+      role: 'nukeFill',
+      homeRoom: roomName,
+      orderRoom: roomName,
+      nukerId: order.nukerId,
+      phase: order.phase
+    };
+
+    var cost = bodyCost(body);
+    var res = freeSpawn.spawnCreep(body, name, { memory: mem });
+    if (res === OK) {
+      console.log('[NukeFill] Spawning ' + name + ' in ' + roomName + ' | Parts: ' + body.length + ' | Cost: ' + cost);
+    } else if (res !== ERR_BUSY && res !== ERR_NOT_ENOUGH_ENERGY) {
+      console.log('[NukeFill] Failed to spawn in ' + roomName + ': ' + res);
+    }
+  }
+}
+
 
 function buildHarvesterBodyForDistance(distance, energyBudget) {
   if (energyBudget < 200) return null;
@@ -314,7 +380,7 @@ function manageHarvesterSpawns() {
 
     var storageEnergy = 0;
     var rs = getRoomState.get(roomName);
-    var storage = rs ? rs.storage : room.storage;
+    var storage = rs ? rs.storage : null;
     if (storage && storage.store) {
       storageEnergy = storage.store[RESOURCE_ENERGY] || 0;
     }
@@ -326,12 +392,8 @@ function manageHarvesterSpawns() {
 
     var availableSpawns = [];
     if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
-      availableSpawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ 
-        return s.my && !s.spawning; 
-      });
-    } else {
-      availableSpawns = room.find(FIND_MY_SPAWNS, { 
-        filter: function(s){ return !s.spawning; } 
+      availableSpawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){
+        return s.my && !s.spawning;
       });
     }
     if (availableSpawns.length === 0) continue;
@@ -375,18 +437,18 @@ function manageHarvesterSpawns() {
 
     var shortId = sourceToSpawn.id.slice(-6);
     var name = 'H_' + roomName + '_' + shortId + '_' + Game.time;
-    var memory = { 
-      role: 'harvester', 
-      assignedRoom: room.name, 
-      homeRoom: room.name, 
-      sourceId: sourceToSpawn.id 
+    var memory = {
+      role: 'harvester',
+      assignedRoom: room.name,
+      homeRoom: room.name,
+      sourceId: sourceToSpawn.id
     };
 
     var cost = bodyCost(body);
     var res = spawn.spawnCreep(body, name, { memory: memory });
 
     if (res === OK) {
-      console.log("Spawning harvester in " + room.name + " for source " + shortId + 
+      console.log("Spawning harvester in " + room.name + " for source " + shortId +
                   " (dist: " + distance + ") | Parts: " + body.length + " | Cost: " + cost);
     } else if (res !== ERR_BUSY && res !== ERR_NOT_ENOUGH_ENERGY) {
       console.log("Failed to spawn harvester in " + room.name + " for " + shortId + ": " + res);
@@ -417,18 +479,18 @@ function spawnEmergencyHarvester(room, spawn) {
 
   var shortId = pickSid.slice(-6);
   var name = 'H_EMG_' + room.name + '_' + shortId + '_' + Game.time;
-  var memory = { 
-    role: 'harvester', 
-    assignedRoom: room.name, 
-    homeRoom: room.name, 
-    sourceId: pickSid 
+  var memory = {
+    role: 'harvester',
+    assignedRoom: room.name,
+    homeRoom: room.name,
+    sourceId: pickSid
   };
 
   var cost = bodyCost(body);
   var res = spawn.spawnCreep(body, name, { memory: memory });
 
   if (res === OK) {
-    console.log("EMERGENCY: Spawning harvester in " + room.name + " for source " + shortId + 
+    console.log("EMERGENCY: Spawning harvester in " + room.name + " for source " + shortId +
                 " (dist: " + distance + ") | Parts: " + body.length + " | Cost: " + cost);
     return true;
   } else if (res !== ERR_BUSY && res !== ERR_NOT_ENOUGH_ENERGY) {
@@ -447,13 +509,11 @@ function roomHasLabBotOrSpawning(roomName) {
   if (alive) return true;
 
   var rs = getRoomState.get(roomName);
+  if (!rs) return false;
+
   var spawns = [];
-  if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
+  if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
     spawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my; });
-  } else {
-    var room = Game.rooms[roomName];
-    if (!room) return false;
-    spawns = room.find(FIND_MY_SPAWNS);
   }
 
   for (var i = 0; i < spawns.length; i++) {
@@ -526,11 +586,10 @@ function spawnScavengers() {
           destroyer.my) {
         const room = destroyer.room;
         var rs = getRoomState.get(room.name);
+        if (!rs) continue;
         var freeSpawns = [];
-        if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
+        if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
           freeSpawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my && !s.spawning; });
-        } else {
-          freeSpawns = room.find(FIND_MY_SPAWNS, { filter: function(s){ return !s.spawning; } });
         }
         if (freeSpawns.length > 0) {
           const spawn = freeSpawns[0];
@@ -559,14 +618,12 @@ function processSquadSpawnQueues() {
     var room = Game.rooms[roomName];
     if (!room.controller || !room.controller.my) continue;
 
-    if (formRooms && !formRooms[roomName]) continue;
-
     var rs = getRoomState.get(roomName);
+    if (!rs) continue;
+
     var spawns = [];
-    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
+    if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
       spawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my; });
-    } else {
-      spawns = room.find(FIND_MY_SPAWNS);
     }
     if (spawns.length === 0) continue;
 
@@ -644,14 +701,14 @@ function manageTowerDrainSpawns() {
     }
 
     var rs = getRoomState.get(homeRoom);
+    if (!rs) continue;
+
     var freeSpawn = null;
     if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
       for (var i = 0; i < rs.structuresByType[STRUCTURE_SPAWN].length; i++) {
         var sp = rs.structuresByType[STRUCTURE_SPAWN][i];
         if (sp.my && !sp.spawning) { freeSpawn = sp; break; }
       }
-    } else {
-      freeSpawn = home.find(FIND_MY_SPAWNS, { filter: function(s){ return !s.spawning; } })[0];
     }
     if (!freeSpawn) continue;
 
@@ -684,14 +741,14 @@ function manageDemolitionSpawns() {
     if (!home) { Memory.demolitionCollectorQueue.splice(i, 1); continue; }
 
     var rs = getRoomState.get(queueItem.homeRoom);
+    if (!rs) continue;
+
     var freeSpawn = null;
     if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
       for (var s = 0; s < rs.structuresByType[STRUCTURE_SPAWN].length; s++) {
         var sp = rs.structuresByType[STRUCTURE_SPAWN][s];
         if (sp.my && !sp.spawning) { freeSpawn = sp; break; }
       }
-    } else {
-      freeSpawn = home.find(FIND_MY_SPAWNS, { filter: function(s){ return !s.spawning; } })[0];
     }
     if (!freeSpawn) continue;
 
@@ -733,11 +790,11 @@ function manageDemolitionSpawns() {
     }
 
     var rsHome = getRoomState.get(homeRoom);
+    if (!rsHome) continue;
+
     var spawns = [];
     if (rsHome && rsHome.structuresByType && rsHome.structuresByType[STRUCTURE_SPAWN]) {
       spawns = rsHome.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my && !s.spawning; });
-    } else {
-      spawns = home.find(FIND_MY_SPAWNS, { filter: function(s){ return !s.spawning; } });
     }
     if (spawns.length === 0) continue;
 
@@ -834,17 +891,14 @@ function manageWallRepairSpawns() {
     }
 
     var rs = getRoomState.get(roomName);
+    if (!rs) continue;
 
     var stillBelow = [];
-    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_WALL]) {
+    if (rs.structuresByType && rs.structuresByType[STRUCTURE_WALL]) {
       for (var i = 0; i < rs.structuresByType[STRUCTURE_WALL].length; i++) {
         var w = rs.structuresByType[STRUCTURE_WALL][i];
         if (w.hits < order.threshold) stillBelow.push(w);
       }
-    } else {
-      stillBelow = room.find(FIND_STRUCTURES, {
-        filter: function(s) { return s.structureType === STRUCTURE_WALL && s.hits < order.threshold; }
-      });
     }
     if (stillBelow.length === 0) {
       order.active = false;
@@ -864,8 +918,6 @@ function manageWallRepairSpawns() {
         var sp = rs.structuresByType[STRUCTURE_SPAWN][s];
         if (sp.my && !sp.spawning) { freeSpawn = sp; break; }
       }
-    } else {
-      freeSpawn = room.find(FIND_MY_SPAWNS, { filter: function(s){ return !s.spawning; } })[0];
     }
     if (!freeSpawn) continue;
 
@@ -933,14 +985,14 @@ function manageThiefSpawns() {
     }
 
     var rs = getRoomState.get(homeRoom);
+    if (!rs) continue;
+
     var freeSpawn = null;
     if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
       for (var i = 0; i < rs.structuresByType[STRUCTURE_SPAWN].length; i++) {
         var sp = rs.structuresByType[STRUCTURE_SPAWN][i];
         if (sp.my && !sp.spawning) { freeSpawn = sp; break; }
       }
-    } else {
-      freeSpawn = home.find(FIND_MY_SPAWNS, { filter: function(s){ return !s.spawning; } })[0];
     }
     if (!freeSpawn) continue;
 
@@ -1056,11 +1108,11 @@ function trySpawnAttackersFromAllRooms(order, orderIndex) {
     if (!room.controller || !room.controller.my) continue;
 
     var rs = getRoomState.get(roomName);
+    if (!rs) continue;
+
     var spawns = [];
     if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
       spawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my && !s.spawning; });
-    } else {
-      spawns = room.find(FIND_MY_SPAWNS, { filter: function(s){ return !s.spawning; } });
     }
     if (spawns.length === 0) continue;
 
@@ -1212,6 +1264,8 @@ function manageClaimbotSpawns() {
     if (!room.controller || !room.controller.my) continue;
 
     var rs = getRoomState.get(roomName);
+    if (!rs) continue;
+
     var spawn = null;
     var spawns = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) ? rs.structuresByType[STRUCTURE_SPAWN] : [];
     for (var i = 0; i < spawns.length; i++) {
@@ -1295,18 +1349,13 @@ function getRoomTargets(roomName, roomData, room) {
   var containers = [];
   if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_CONTAINER]) {
     containers = rs.structuresByType[STRUCTURE_CONTAINER];
-  } else {
-    containers = room.find(FIND_STRUCTURES, { filter: function(s){ return s.structureType === STRUCTURE_CONTAINER; } });
   }
-  const storage = rs ? rs.storage : room.storage;
+  const storage = rs ? rs.storage : null;
   const hasStorageStructures = containers.length > 0 || !!storage;
 
   var constructionSitesCount = 0;
   if (rs && rs.constructionSites) {
     constructionSitesCount = rs.constructionSites.length;
-  } else {
-    var r = Game.rooms[roomName];
-    constructionSitesCount = (r && r.find(FIND_CONSTRUCTION_SITES).length) || 0;
   }
   let builderTarget = +(constructionSitesCount > 0);
 
@@ -1330,12 +1379,11 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
     if (!room.controller || !room.controller.my) continue;
 
     var rs = getRoomState.get(roomName);
+    if (!rs) continue;
 
     var availableSpawns = [];
     if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
       availableSpawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my && !s.spawning; });
-    } else {
-      availableSpawns = room.find(FIND_MY_STRUCTURES, { filter: function(s){ return s.structureType === STRUCTURE_SPAWN && !s.spawning; } });
     }
     if (availableSpawns.length === 0) continue;
 
@@ -1419,6 +1467,7 @@ function run(perRoomRoleCounts, roomDataCache) {
   if (Game.time % 2 === 0)  manageLabBotSpawns();
   if (Game.time % 2 === 0)  processSquadSpawnQueues();
   if (Game.time % 10 === 0) manageWallRepairSpawns();
+  if (Game.time % 10 === 0) manageNukeFillSpawns();
 
   if (needsNewCreeps(perRoomRoleCounts) || Game.time % 10 === 0) {
     manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache);
@@ -1458,6 +1507,7 @@ module.exports = {
   manageWallRepairSpawns,
   processSquadSpawnQueues,
   spawnScavengers,
+  manageNukeFillSpawns,
 
   // Utilities you use elsewhere
   getCreepBody,

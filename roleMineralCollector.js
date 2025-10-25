@@ -7,6 +7,40 @@
 module.exports = {
     run: function (creep) {
         const home = Game.rooms[creep.memory.homeRoom];
+        if (!home) { creep.suicide(); return; }
+
+        // helpers to unify store vs legacy lab API
+        function hasNonEnergyResources(structure) {
+            if (structure.store) {
+                const keys = Object.keys(structure.store);
+                for (let i = 0; i < keys.length; i++) {
+                    const r = keys[i];
+                    if (r !== RESOURCE_ENERGY && structure.store[r] > 0) return true;
+                }
+                return false;
+            }
+            // legacy labs: mineralType/mineralAmount
+            if (structure.structureType === STRUCTURE_LAB) {
+                return !!structure.mineralType && structure.mineralAmount > 0;
+            }
+            return false;
+        }
+
+        function firstNonEnergyResource(structure) {
+            if (structure.store) {
+                const keys = Object.keys(structure.store);
+                for (let i = 0; i < keys.length; i++) {
+                    const r = keys[i];
+                    if (r !== RESOURCE_ENERGY && structure.store[r] > 0) return r;
+                }
+                return null;
+            }
+            if (structure.structureType === STRUCTURE_LAB) {
+                if (structure.mineralType && structure.mineralAmount > 0) return structure.mineralType;
+                return null;
+            }
+            return null;
+        }
 
         /* 1.  Initial scan – count minerals (exclude storage) */
         if (!creep.memory.totalToCollect) {
@@ -14,12 +48,18 @@ module.exports = {
             const targets = home.find(FIND_STRUCTURES, {
                 filter: s =>
                     [STRUCTURE_CONTAINER, STRUCTURE_TERMINAL, STRUCTURE_LAB, STRUCTURE_FACTORY].includes(s.structureType) &&
-                    s.store &&
-                    Object.keys(s.store).some(r => r !== RESOURCE_ENERGY && s.store[r] > 0)
+                    hasNonEnergyResources(s)
             });
-            for (const t of targets) {
-                for (const res of Object.keys(t.store)) {
-                    if (res !== RESOURCE_ENERGY) total += t.store[res];
+            for (let i = 0; i < targets.length; i++) {
+                const t = targets[i];
+                if (t.store) {
+                    const keys = Object.keys(t.store);
+                    for (let k = 0; k < keys.length; k++) {
+                        const res = keys[k];
+                        if (res !== RESOURCE_ENERGY) total += t.store[res];
+                    }
+                } else if (t.structureType === STRUCTURE_LAB) {
+                    if (t.mineralType && t.mineralAmount > 0) total += t.mineralAmount;
                 }
             }
             creep.memory.totalToCollect = total;
@@ -37,18 +77,18 @@ module.exports = {
         if (_.sum(creep.store) === 0) {
             const target = creep.pos.findClosestByRange(FIND_STRUCTURES, {
                 filter: s =>
-                    [STRUCTURE_CONTAINER, STRUCTURE_TERMINAL, STRUCTURE_LAB].includes(s.structureType) &&
-                    s.store &&
-                    Object.keys(s.store).some(r => r !== RESOURCE_ENERGY && s.store[r] > 0)
+                    [STRUCTURE_CONTAINER, STRUCTURE_TERMINAL, STRUCTURE_LAB, STRUCTURE_FACTORY].includes(s.structureType) &&
+                    hasNonEnergyResources(s)
             });
             if (!target) { creep.suicide(); return; }
 
-            for (const res of Object.keys(target.store)) {
-                if (res !== RESOURCE_ENERGY && target.store[res] > 0) {
-                    if (creep.withdraw(target, res) === ERR_NOT_IN_RANGE) {
-                        creep.moveTo(target);
-                    }
-                    break;
+            const res = firstNonEnergyResource(target);
+            if (res) {
+                const code = creep.withdraw(target, res);
+                if (code === ERR_NOT_IN_RANGE) {
+                    creep.moveTo(target);
+                } else if (code === ERR_INVALID_TARGET || code === ERR_NOT_ENOUGH_RESOURCES) {
+                    // target became invalid; try again next tick
                 }
             }
             return;
@@ -58,12 +98,16 @@ module.exports = {
         const storage = home.storage;
         if (!storage) { creep.suicide(); return; }
 
-        for (const res of Object.keys(creep.store)) {
+        const keys = Object.keys(creep.store);
+        for (let i = 0; i < keys.length; i++) {
+            const res = keys[i];
             if (res !== RESOURCE_ENERGY && creep.store[res] > 0) {
-                if (creep.transfer(storage, res) === ERR_NOT_IN_RANGE) {
+                const amount = creep.store[res]; // capture pre-transfer amount
+                const code = creep.transfer(storage, res);
+                if (code === ERR_NOT_IN_RANGE) {
                     creep.moveTo(storage);
-                } else {
-                    creep.memory.collectedSoFar += creep.store[res];
+                } else if (code === OK) {
+                    creep.memory.collectedSoFar += amount;
                 }
                 break;
             }

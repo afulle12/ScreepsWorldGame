@@ -17,11 +17,11 @@
 //        and sets your price to 0.1 credits below it.
 //      - If no such orders exist, sets price to 105% of the 2-day average from Game.market.getHistory.
 //    - Price is clamped to a minimum of 0.001 to avoid invalid values.
-// 4) After a successful order is created, it will request in-room collection of the resource into the
-//    terminal by installing a focused hook into terminalManager.getResourceNeeded that adds your market
-//    gather needs. This does NOT alter any other terminalManager behavior and uses no optional chaining.
-// 5) Completion latch: once the terminal reaches the target at least once, the gather op is marked
-//    'completed' and will never top off again, even if market sales reduce the stock later.
+// 4) After a successful order is created, it will request an in-room move into the terminal by calling
+//    terminalManager.storageToTerminal(roomName, resourceType, needed), where needed equals
+//    min(order amount, total available in-room) minus what is already in the terminal.
+//    This reuses terminalManager’s local move ops and terminal bot; no hooks are installed.
+// 5) Completion latch: handled by terminalManager’s local operation (toTerminal). We only schedule once.
 //
 // Requirements:
 // - terminalManager.js (provided by you) must be present and export the terminalManager object.
@@ -40,47 +40,12 @@ var terminalManager = require('terminalManager');
 
 var marketSeller = {
 
-    // Install a minimal hook so terminalManager bots will collect our resource into the terminal
-    // based on our market gather operations stored in Memory.marketSell.operations.
-    installGetResourceNeededHook: function() {
-        if (!terminalManager) return;
-        if (terminalManager._marketSellHookInstalled) return;
-
-        if (typeof terminalManager.getResourceNeeded !== 'function') return;
-
-        terminalManager._marketSell_originalGetResourceNeeded = terminalManager.getResourceNeeded;
-        terminalManager.getResourceNeeded = function(roomName, resourceType) {
-            // Base from terminalManager (transfers, etc.)
-            var base = terminalManager._marketSell_originalGetResourceNeeded(roomName, resourceType);
-
-            // Add marketSell gather needs by contributing the full target.
-            // terminalManager.runCollectBot subtracts terminal stock once when computing
-            // actual deficit (actuallyNeeded = totalNeeded - inTerminal), so do NOT subtract here.
-            var extra = 0;
-            var ops = (Memory.marketSell && Array.isArray(Memory.marketSell.operations)) ? Memory.marketSell.operations : [];
-            for (var i = 0; i < ops.length; i++) {
-                var op = ops[i];
-                if (!op) continue;
-                if (op.roomName !== roomName) continue;
-                if (op.resourceType !== resourceType) continue;
-                if (op.status === 'completed' || op.status === 'cancelled') continue;
-                if (typeof op.expires === 'number' && Game.time > op.expires) continue;
-
-                var target = (typeof op.target === 'number') ? op.target : 0;
-                if (target > 0) extra += target;
-            }
-
-            return base + extra;
-        };
-
-        terminalManager._marketSellHookInstalled = true;
-    },
-
+    // Minimal memory for tracking marketSell -> terminalManager local op linkage
     ensureMemory: function() {
         if (!Memory.marketSell) {
-            Memory.marketSell = { operations: [] };
-        } else if (!Array.isArray(Memory.marketSell.operations)) {
-            Memory.marketSell.operations = [];
+            Memory.marketSell = { requests: [] };
+        } else if (!Array.isArray(Memory.marketSell.requests)) {
+            Memory.marketSell.requests = [];
         }
     },
 
@@ -165,91 +130,25 @@ var marketSeller = {
         return Math.max(price, 0.001);
     },
 
-    // Create a gather op so terminal bots move resource into the terminal up to "target".
-    createGatherOp: function(roomName, resourceType, targetAmount) {
-        this.ensureMemory();
-        // If already an op for same room/res, update it to the higher target.
-        var ops = Memory.marketSell.operations;
+    // Link the just-created toTerminal op (created this tick) so we can show/cancel later.
+    tryLinkLocalOp: function(roomName, resourceType, amount) {
+        if (!Memory.terminalManager || !Array.isArray(Memory.terminalManager.operations)) return null;
+        var ops = Memory.terminalManager.operations;
         for (var i = 0; i < ops.length; i++) {
             var op = ops[i];
             if (!op) continue;
-            if (op.roomName === roomName && op.resourceType === resourceType &&
-                op.status !== 'cancelled' && op.status !== 'completed') {
-                op.target = Math.max(op.target || 0, targetAmount);
-                op.expires = Game.time + 10000;
-                return op.id;
-            }
+            if (op.type !== 'toTerminal') continue;
+            if (op.roomName !== roomName) continue;
+            if (op.resourceType !== resourceType) continue;
+            if (op.amount !== amount) continue;
+            if (op.created !== Game.time) continue;
+            return op.id;
         }
-
-        var newOp = {
-            id: 'marketsell_' + Game.time + '_' + Math.random().toString(36).substr(2, 9),
-            roomName: roomName,
-            resourceType: resourceType,
-            target: targetAmount,
-            status: 'active',
-            created: Game.time,
-            expires: Game.time + 10000
-        };
-        Memory.marketSell.operations.push(newOp);
-        return newOp.id;
-    },
-
-    // Cleanup + proactively request bots while deficits exist.
-    // Completion latch: once we ever reach the target, mark completed and stop forever.
-    run: function() {
-        this.installGetResourceNeededHook();
-        this.ensureMemory();
-
-        var ops = Memory.marketSell.operations;
-        for (var i = ops.length - 1; i >= 0; i--) {
-            var op = ops[i];
-            if (!op) { ops.splice(i, 1); continue; }
-
-            var room = Game.rooms[op.roomName];
-            var terminal = room && room.terminal ? room.terminal : null;
-            var have = (terminal && terminal.store && terminal.store[op.resourceType]) ? terminal.store[op.resourceType] : 0;
-
-            // Expire if never completed and expired by time
-            if (op.status !== 'completed' && typeof op.expires === 'number' && Game.time > op.expires) {
-                ops.splice(i, 1);
-                continue;
-            }
-
-            // Completion latch
-            if (op.status !== 'completed' && have >= (op.target || 0)) {
-                op.status = 'completed';
-                op.completedAt = Game.time;
-            }
-
-            // Active ops: request a bot if deficit and outside supply exists
-            if (op.status !== 'completed') {
-                if (room && terminal && op.target > 0) {
-                    var deficit = Math.max(0, op.target - have);
-                    if (deficit > 0 &&
-                        terminalManager &&
-                        typeof terminalManager.getRoomAvailableOutsideTerminal === 'function' &&
-                        typeof terminalManager.requestBot === 'function') {
-
-                        var outside = terminalManager.getRoomAvailableOutsideTerminal(op.roomName, op.resourceType) || 0;
-                        if (outside > 0) {
-                            // requestBot enforces one-bot cap and avoids duplicate requests
-                            terminalManager.requestBot(op.roomName, 'collect', op.resourceType, op.id);
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Completed ops: auto-clean after a grace period to keep Memory tidy (no top-offs after sales)
-            if (typeof op.completedAt === 'number' && (Game.time - op.completedAt) > 2000) {
-                ops.splice(i, 1);
-            }
-        }
+        return null;
     },
 
     // Main API: marketSell('ROOM#', RESOURCE, AMOUNT[, price])
     marketSell: function(roomName, resourceType, amount, price) {
-        this.installGetResourceNeededHook();
         this.ensureMemory();
 
         // Basic validations
@@ -296,36 +195,75 @@ var marketSeller = {
             return '[MarketSell] Failed to create SELL order: ' + result + ' (room ' + roomName + ', ' + resourceType + ' x ' + amount + ' @ ' + finalPrice + ')';
         }
 
-        // After success: schedule in-room gather to bring up to min(amount, totalAvailable) into the terminal
+        // After success: schedule a one-time local move into the terminal
         var haveInTerminal = (terminal.store && terminal.store[resourceType]) ? terminal.store[resourceType] : 0;
         var targetInTerminal = Math.min(amount, totalAvailable);
-        if (haveInTerminal < targetInTerminal) {
-            this.createGatherOp(roomName, resourceType, targetInTerminal);
+        var need = Math.max(0, targetInTerminal - haveInTerminal);
+        var tmOpId = null;
+
+        if (need > 0) {
+            // Call terminalManager's local move (toTerminal). This will be handled by its bot.
+            if (typeof terminalManager.storageToTerminal === 'function') {
+                terminalManager.storageToTerminal(roomName, resourceType, need);
+                // Try to link the operation created this tick so we can show/cancel it later.
+                tmOpId = this.tryLinkLocalOp(roomName, resourceType, need);
+            } else {
+                console.log('[MarketSell] Warning: terminalManager.storageToTerminal not available.');
+            }
         }
 
-        return '[MarketSell] Created SELL order from ' + roomName + ': ' + amount + ' ' + resourceType + ' @ ' + finalPrice.toFixed(3);
+        // Track this marketSell request for status/cancel convenience
+        var entry = {
+            id: 'marketsell_' + Game.time + '_' + Math.random().toString(36).substr(2, 9),
+            roomName: roomName,
+            resourceType: resourceType,
+            amount: amount,
+            price: finalPrice,
+            created: Game.time
+        };
+        if (tmOpId) entry.tmOpId = tmOpId;
+        Memory.marketSell.requests.push(entry);
+
+        var msg = '[MarketSell] Created SELL order from ' + roomName + ': ' + amount + ' ' + resourceType + ' @ ' + finalPrice.toFixed(3);
+        if (need > 0) {
+            msg += ' | scheduled to move ' + need + ' into terminal' + (tmOpId ? (' (op ' + tmOpId + ')') : '');
+        } else {
+            msg += ' | terminal already has target amount';
+        }
+        return msg;
     },
 
     // Convenience helpers for console
     status: function() {
         this.ensureMemory();
-        var ops = Memory.marketSell.operations;
-        if (!ops || ops.length === 0) return '[MarketSell] No active gather ops.';
-        console.log('=== MARKET SELL GATHER OPS ===');
-        for (var i = 0; i < ops.length; i++) {
-            var op = ops[i];
-            var room = Game.rooms[op.roomName];
-            var terminal = room && room.terminal ? room.terminal : null;
-            var have = (terminal && terminal.store && terminal.store[op.resourceType]) ? terminal.store[op.resourceType] : 0;
+        var list = Memory.marketSell.requests;
+        if (!list || list.length === 0) return '[MarketSell] No recent marketSell requests. Use terminalStatus() for details on local ops.';
+
+        console.log('=== MARKET SELL REQUESTS ===');
+        for (var i = 0; i < list.length; i++) {
+            var r = list[i];
+            var progress = '';
+            if (r.tmOpId && Memory.terminalManager && Array.isArray(Memory.terminalManager.operations)) {
+                var ops = Memory.terminalManager.operations;
+                for (var j = 0; j < ops.length; j++) {
+                    var op = ops[j];
+                    if (op && op.id === r.tmOpId) {
+                        var moved = op.amountMoved || 0;
+                        if (moved < 0) moved = 0;
+                        if (moved > op.amount) moved = op.amount;
+                        progress = ' | toTerminal: ' + moved + '/' + op.amount + ' (' + (op.status || '-') + ')';
+                        break;
+                    }
+                }
+            }
             console.log(
-                '  ' + op.id +
-                ' | room: ' + op.roomName +
-                ' | res: ' + op.resourceType +
-                ' | target: ' + op.target +
-                ' | term: ' + have +
-                ' | status: ' + (op.status || 'active') +
-                ' | created: ' + (op.created || '-') +
-                ' | expires: ' + (op.expires || '-')
+                '  ' + r.id +
+                ' | room: ' + r.roomName +
+                ' | res: ' + r.resourceType +
+                ' | order: ' + r.amount + ' @ ' + (typeof r.price === 'number' ? r.price.toFixed(3) : r.price) +
+                ' | created: ' + (r.created || '-') +
+                (r.tmOpId ? (' | tmOp: ' + r.tmOpId) : '') +
+                progress
             );
         }
         return '[MarketSell] Status printed.';
@@ -333,14 +271,18 @@ var marketSeller = {
 
     cancelGather: function(id) {
         this.ensureMemory();
-        var ops = Memory.marketSell.operations;
-        for (var i = ops.length - 1; i >= 0; i--) {
-            if (ops[i] && ops[i].id === id) {
-                ops.splice(i, 1);
-                return '[MarketSell] Cancelled gather op: ' + id;
+        var list = Memory.marketSell.requests;
+        for (var i = list.length - 1; i >= 0; i--) {
+            var r = list[i];
+            if (r && r.id === id) {
+                if (r.tmOpId && terminalManager && typeof terminalManager.cancelOperation === 'function') {
+                    terminalManager.cancelOperation(r.tmOpId);
+                }
+                list.splice(i, 1);
+                return '[MarketSell] Cancelled associated local move and removed request: ' + id;
             }
         }
-        return '[MarketSell] Gather op not found: ' + id;
+        return '[MarketSell] Request not found: ' + id;
     }
 };
 
@@ -355,7 +297,6 @@ global.cancelMarketSellGather = function(id) {
     return marketSeller.cancelGather(id);
 };
 
-// Optional: call this once per tick from your main loop for cleanup and bot requests.
-// marketSeller.run();
+// Optional: marketSeller no longer needs a per-tick run loop.
 
 module.exports = marketSeller;
