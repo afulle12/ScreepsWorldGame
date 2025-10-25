@@ -1,3 +1,11 @@
+// role.builder.js
+// Notes:
+// - All direct room.find calls replaced with getRoomState reads.
+// - No optional chaining used.
+// - Initializes getRoomState once per tick before queue generation.
+
+var getRoomState = require('getRoomState');
+
 const BUILDER_LOGGING = false;
 const BUILDER_LOG_INTERVAL = 5;
 const JOB_QUEUE_REFRESH_INTERVAL = 5; // Rebuild queue every 5 ticks (adjust for your needs)
@@ -23,7 +31,11 @@ const PRIORITIES = [
   {
     type: 'build',
     filter: function(s) { return true; },
-    targetFinder: function(room) { return room.find(FIND_CONSTRUCTION_SITES); },
+    // Use getRoomState instead of room.find
+    targetFinder: function(room) {
+      var rs = getRoomState.get(room.name);
+      return rs && rs.constructionSites ? rs.constructionSites : [];
+    },
     label: 'Build',
     need: function(s) { return s.progress + '/' + s.progressTotal; },
     urgency: function(s) { return -s.progress; }
@@ -57,23 +69,6 @@ const PRIORITIES = [
   }
 ];
 
-// == PER-TICK ROOM CACHE (Suggestion #5) ==
-function getRoomCache(room) {
-  if (!global._roomCache || global._roomCache.time !== Game.time) {
-    global._roomCache = { time: Game.time, rooms: {} };
-  }
-  let rc = global._roomCache.rooms[room.name];
-  if (!rc) {
-    rc = {
-      structures: room.find(FIND_STRUCTURES),
-      constructionSites: room.find(FIND_CONSTRUCTION_SITES),
-      dropped: room.find(FIND_DROPPED_RESOURCES)
-    };
-    global._roomCache.rooms[room.name] = rc;
-  }
-  return rc;
-}
-
 // == UTILITY: select top-K by urgency without full sort (Suggestion #3) ==
 // NOTE: smaller urgency value means "more urgent" (as in original sort)
 function selectTopKByUrgency(items, k, urgencyFn) {
@@ -87,10 +82,10 @@ function selectTopKByUrgency(items, k, urgencyFn) {
     const it = items[i];
     const u = urgencyFn(it);
     if (best.length < k) {
-      best.push({ it, u });
+      best.push({ it: it, u: u });
       if (worstIdx === -1 || u > best[worstIdx].u) worstIdx = best.length - 1;
     } else if (u < best[worstIdx].u) {
-      best[worstIdx] = { it, u };
+      best[worstIdx] = { it: it, u: u };
       // recompute worst
       let wi = 0;
       for (let j = 1; j < best.length; j++) if (best[j].u > best[wi].u) wi = j;
@@ -98,38 +93,54 @@ function selectTopKByUrgency(items, k, urgencyFn) {
     }
   }
   best.sort(function(a, b) { return a.u - b.u; });
-  return best.map(x => x.it);
+  return best.map(function(x) { return x.it; });
+}
+
+// Helper: flatten structuresByType map into an array
+function flattenStructures(structuresByType) {
+  var out = [];
+  for (var t in structuresByType) {
+    if (!structuresByType.hasOwnProperty(t)) continue;
+    var arr = structuresByType[t];
+    for (var i = 0; i < arr.length; i++) out.push(arr[i]);
+  }
+  return out;
 }
 
 // == GLOBAL JOB QUEUE GENERATION (Suggestions #3, #5) ==
 function buildGlobalJobQueue() {
   var jobs = [];
   for (var roomName in Game.rooms) {
-    var room = Game.rooms[roomName];
-    const rc = getRoomCache(room);
+    if (!Game.rooms.hasOwnProperty(roomName)) continue;
+
+    var rs = getRoomState.get(roomName);
+    if (!rs) continue; // only rooms we own or have creeps in are cached
 
     for (var i = 0; i < PRIORITIES.length; i++) {
       var prio = PRIORITIES[i];
       if ((prio.type === 'repair' || prio.type === 'reinforce') &&
-          (!room.controller || !room.controller.my)) {
+          (!rs.controller || !rs.controller.my)) {
         continue;
       }
 
-      // Use cached finds
       var candidates;
       if (prio.type === 'build') {
-        candidates = rc.constructionSites;
+        candidates = rs.constructionSites || [];
       } else {
-        candidates = rc.structures.filter(prio.filter);
+        var allStructures = rs.structuresByType ? flattenStructures(rs.structuresByType) : [];
+        candidates = [];
+        for (var sIdx = 0; sIdx < allStructures.length; sIdx++) {
+          var s = allStructures[sIdx];
+          if (prio.filter(s)) candidates.push(s);
+        }
       }
 
-      // Keep only top-K most urgent (avoid full sort)
       var targets = selectTopKByUrgency(candidates, MAX_JOBS_PER_PRIORITY_PER_ROOM, prio.urgency);
 
       for (var t = 0; t < targets.length; t++) {
         var target = targets[t];
         jobs.push({
-          roomName: room.name,
+          roomName: rs.name,
           type: prio.type,
           label: prio.label,
           id: target.id,
@@ -161,6 +172,9 @@ function getAssignments() {
 
 // == GLOBAL UPDATE (CALL ONCE PER TICK) ==
 function updateGlobalBuilderData() {
+  // Ensure room state is initialized once per tick
+  getRoomState.init();
+
   if (!Memory._builderDataTick || Memory._builderDataTick !== Game.time) {
     // Refresh assignments every tick (cheap, as creep count is low)
     Memory._builderAssignments = getAssignments();
@@ -221,14 +235,17 @@ function logBuilderTasks(room, jobs, assignments) {
       console.log('│ ' + name + ' │ ' + task + ' │ ' + tgt + ' │');
     }
   }
-  console.log('└────────────────────────────┴──────────────┴──────────────┘');
+  console.log('└────────────────────────────┴──────────────┘');
 }
 
-// == FIND IDLE SPOT NEAR ROAD (unchanged) ==
+// == FIND IDLE SPOT NEAR ROAD (uses getRoomState for roads) ==
 function findIdleSpotNearRoad(creep) {
-  var road = creep.pos.findClosestByPath(FIND_STRUCTURES, {
-    filter: function(s) { return s.structureType === STRUCTURE_ROAD; }
-  });
+  var rs = getRoomState.get(creep.room.name);
+  var roads = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_ROAD]) ? rs.structuresByType[STRUCTURE_ROAD] : [];
+  var road = null;
+  if (roads.length > 0) {
+    road = creep.pos.findClosestByPath(roads);
+  }
   if (!road) return null;
 
   var positions = [];
@@ -301,13 +318,19 @@ function acquireEnergy(creep) {
   }
 
   // Prefer containers/storage (cheap withdraw)
-  var rc = getRoomCache(creep.room);
+  var rs = getRoomState.get(creep.room.name);
   var stores = [];
-  for (var i = 0; i < rc.structures.length; i++) {
-    var s = rc.structures[i];
-    if ((s.structureType === STRUCTURE_STORAGE || s.structureType === STRUCTURE_CONTAINER) &&
-        s.store && s.store[RESOURCE_ENERGY] > 0) {
-      stores.push(s);
+  if (rs && rs.structuresByType) {
+    var storArr = rs.structuresByType[STRUCTURE_STORAGE] || [];
+    var contArr = rs.structuresByType[STRUCTURE_CONTAINER] || [];
+    var combined = [];
+    for (var i1 = 0; i1 < storArr.length; i1++) combined.push(storArr[i1]);
+    for (var i2 = 0; i2 < contArr.length; i2++) combined.push(contArr[i2]);
+    for (var i3 = 0; i3 < combined.length; i3++) {
+      var s = combined[i3];
+      if (s.store && s.store[RESOURCE_ENERGY] > 0) {
+        stores.push(s);
+      }
     }
   }
   if (stores.length) {
@@ -320,8 +343,9 @@ function acquireEnergy(creep) {
 
   // Then sizeable dropped energy (avoid 2-tile room edge)
   var drops = [];
-  for (var d = 0; d < rc.dropped.length; d++) {
-    var r = rc.dropped[d];
+  var dropped = rs && rs.dropped ? rs.dropped : [];
+  for (var d = 0; d < dropped.length; d++) {
+    var r = dropped[d];
     if (r.resourceType === RESOURCE_ENERGY && r.amount > 50 && !isNearRoomEdge(r.pos, 2)) {
       drops.push(r);
     }
@@ -334,7 +358,7 @@ function acquireEnergy(creep) {
     }
   }
 
-  // Last resort: harvest
+  // Last resort: harvest (using FIND_SOURCES_ACTIVE on position is OK)
   var src = creep.pos.findClosestByPath(FIND_SOURCES_ACTIVE);
   if (src) {
     if (!creep.pos.inRangeTo(src, 1)) creep.moveTo(src, { range: 1, reusePath: 15 });

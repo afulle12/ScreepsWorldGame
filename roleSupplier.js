@@ -227,7 +227,7 @@ function getRoomState(room) {
                 if (isNearSource) continue;
 
                 const linkEnergy = link.store[RESOURCE_ENERGY];
-                const LINK_FILL_THRESHOLD = 150, LINK_DRAIN_THRESHOLD = 475;
+                const LINK_FILL_THRESHOLD = 200, LINK_DRAIN_THRESHOLD = 475;
                 if (linkEnergy < LINK_FILL_THRESHOLD && state.storage.store[RESOURCE_ENERGY] > 0) {
                     const amount = Math.min(LINK_DRAIN_THRESHOLD - linkEnergy, state.storage.store[RESOURCE_ENERGY], link.store.getFreeCapacity(RESOURCE_ENERGY));
                     if (amount > 0) state.tasks.push({
@@ -275,7 +275,7 @@ function getRoomState(room) {
                 });
             }
             const totalMinerals = c.store.getUsedCapacity() - c.store.getUsedCapacity(RESOURCE_ENERGY);
-            if (totalMinerals >= 200) {
+            if (totalMinerals >= 1000) {
                 const emptyTarget = state.storage || state.terminal;
                 if (emptyTarget) {
                     state.tasks.push({

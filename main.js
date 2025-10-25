@@ -1,14 +1,23 @@
+
 // === PROFILER INTEGRATION ===
 const profiler = require('screeps-profiler');
 
 // Enable profiling - you can toggle this on/off
 profiler.enable();
 
+// === LAB SYSTEM TOGGLE ===
+const LAB_LOGGING_ENABLED = false;
+global.LAB_LOGGING_ENABLED = LAB_LOGGING_ENABLED;
+
 // === CPU USAGE LOGGING TOGGLE VARIABLES ===
 const ENABLE_CPU_LOGGING = false;
 const DISABLE_CPU_CONSOLE = true;
 
 // --- ROLE & UTILITY IMPORTS ---
+require('marketQuery');
+require('marketAnalysis');
+require('roomObserver');
+require('maintenanceScanner');
 const roleHarvester = require('roleHarvester');
 const roleUpgrader = require('roleUpgrader');
 const roleBuilder = require('roleBuilder');
@@ -30,7 +39,33 @@ const terminalManager = require('terminalManager');
 const roleSignbot = require('roleSignbot');
 const factoryManager = require('factoryManager');
 const roleFactoryBot = require('roleFactoryBot');
+const roleWallRepair = require('roleWallRepair');
+const labManager = require('labManager');
+const roleLabBot = require('roleLabBot');
+const roomBalance = require('roomBalance');
+const mineralManager = require('mineralManager');
+const getRoomState = require('getRoomState');
+const towerManager = require('towerManager');
+const linkManager = require('linkManager');
+const globalOrders = require('globalOrders');
+const marketSeller = require('marketSell'); 
+const marketBuyer = require('marketBuy'); 
+const marketUpdater = require('marketUpdate');
+const opportunisticBuy = require('opportunisticBuy');
+const marketRefine = require('marketRefine');
+const roleNukeFill = require('roleNukeFill');
+const nukeUtils = require('nukeUtils');
+const nukeLaunch = require('nukeLaunch'); // provides launchNuke(...) and run()
 
+// === GLOBAL MODULE EXPOSURE FOR CONSOLE ACCESS ===
+global.opportunisticBuy = opportunisticBuy;
+global.nukeFill = roleNukeFill.order;
+global.nukeInRange = nukeUtils.nukeInRange;
+// Expose the console command: launchNuke('DonorRoom', 'RecipientRoom', 'structureType')
+global.launchNuke = nukeLaunch.launchNuke;
+
+// Centralized spawn manager
+const spawnManager = require('spawnManager');
 
 // Register modules with profiler
 profiler.registerObject(roleHarvester, 'roleHarvester');
@@ -40,6 +75,7 @@ profiler.registerObject(roleScout, 'roleScout');
 profiler.registerObject(roleDefender, 'roleDefender');
 profiler.registerObject(roleSupplier, 'roleSupplier');
 profiler.registerObject(roleClaimbot, 'roleClaimbot');
+// profiler.registerObject(roleRemoteHarvester, 'roleRemoteHarvester'); // disabled
 profiler.registerObject(roleAttacker, 'roleAttacker');
 profiler.registerObject(roleExtractor, 'roleExtractor');
 profiler.registerObject(iff, 'iff');
@@ -52,1375 +88,25 @@ profiler.registerObject(roleMineralCollector, 'roleMineralCollector');
 profiler.registerObject(roleSignbot, 'roleSignbot');
 profiler.registerObject(factoryManager, 'factoryManager');
 profiler.registerObject(roleFactoryBot, 'roleFactoryBot');
-
-
-// --- CONSTANTS ---
-const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
-const BASIC_DEFENDER   = [TOUGH, MOVE, RANGED_ATTACK];
-const SCOUT_BODY       = [MOVE, MOVE, MOVE, MOVE, MOVE];
-const SCAVENGER_BODY = [MOVE, CARRY, CARRY, MOVE];
-const TOWER_DRAIN_BODY = [TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, HEAL, HEAL, HEAL, HEAL, MOVE];
-
-const MAX_REMOTE_SOURCES_PER_ROOM = 3;
-// Define how often (in ticks) to run the link logic
-const LINKS_CHECK_INTERVAL = 1;
-
+profiler.registerObject(roleWallRepair, 'roleWallRepair');
+profiler.registerObject(labManager, 'labManager');
+profiler.registerObject(roleLabBot, 'roleLabBot');
+profiler.registerObject(roomBalance, 'roomBalance');
+profiler.registerObject(mineralManager, 'mineralManager');
+profiler.registerObject(getRoomState, 'getRoomState');
+profiler.registerObject(towerManager, 'towerManager');
+profiler.registerObject(linkManager, 'linkManager');
+profiler.registerObject(spawnManager, 'spawnManager');
+profiler.registerObject(marketUpdater, 'marketUpdater');
+profiler.registerObject(opportunisticBuy, 'opportunisticBuy');
+profiler.registerObject(marketRefine, 'marketRefine');
+profiler.registerObject(roleNukeFill, 'roleNukeFill');
+profiler.registerObject(nukeUtils, 'nukeUtils');
+// Profiler registration for nukeLaunch
+profiler.registerObject(nukeLaunch, 'nukeLaunch');
 
 // =================================================================
-// === ALL HELPER FUNCTIONS & CONSOLE COMMANDS ARE DEFINED HERE ===
-// =================================================================
-
-// --- CONSOLE COMMANDS ---
-global.orderThieves = function(homeRoom, targetRoom, count) {
-    if (!Game.rooms[homeRoom] || !Game.rooms[homeRoom].controller || !Game.rooms[homeRoom].controller.my) {
-        return `[Thief] Invalid home room: ${homeRoom}. Must be a room you own.`;
-    }
-    if (!targetRoom || !count || count <= 0) {
-        return `[Thief] Invalid order. Use: orderThieves('homeRoomName', 'targetRoomName', creepCount)`;
-    }
-    if (!Memory.thiefOrders) {
-        Memory.thiefOrders = [];
-    }
-    const existingOrder = Memory.thiefOrders.find(o => o.targetRoom === targetRoom);
-    if (existingOrder) {
-        return `[Thief] An operation against ${targetRoom} is already active. Cancel it first to create a new one.`;
-    }
-
-    Memory.thiefOrders.push({
-        homeRoom: homeRoom,
-        targetRoom: targetRoom,
-        count: parseInt(count, 10)
-    });
-    return `[Thief] Order placed for ${count} thieves to raid ${targetRoom} from ${homeRoom}.`;
-};
-
-global.cancelThiefOrder = function(targetRoom) {
-    if (!targetRoom) {
-        return `[Thief] Invalid command. Use: cancelThiefOrder('targetRoomName')`;
-    }
-    if (!Memory.thiefOrders || Memory.thiefOrders.length === 0) {
-        return `[Thief] No active thief orders to cancel.`;
-    }
-
-    const orderIndex = Memory.thiefOrders.findIndex(o => o.targetRoom === targetRoom);
-
-    if (orderIndex > -1) {
-        Memory.thiefOrders.splice(orderIndex, 1);
-        return `[Thief] Operation against ${targetRoom} has been cancelled. Existing thieves will not be replaced.`;
-    } else {
-        return `[Thief] No active operation found for target room ${targetRoom}.`;
-    }
-};
-
-global.orderTowerDrain = function(homeRoom, targetRoom, count) {
-    if (!Game.rooms[homeRoom] || !Game.rooms[homeRoom].controller || !Game.rooms[homeRoom].controller.my) {
-        return `[TowerDrain] Invalid home room: ${homeRoom}. Must be a room you own.`;
-    }
-    if (!targetRoom || !count || count <= 0) {
-        return `[TowerDrain] Invalid order. Use: orderTowerDrain('homeRoomName', 'targetRoomName', creepCount)`;
-    }
-    if (!Memory.towerDrainOrders) {
-        Memory.towerDrainOrders = [];
-    }
-    const existingOrder = Memory.towerDrainOrders.find(o => o.targetRoom === targetRoom && o.homeRoom === homeRoom);
-    if (existingOrder) {
-        return `[TowerDrain] An operation against ${targetRoom} from ${homeRoom} is already active.`;
-    }
-
-    Memory.towerDrainOrders.push({
-        homeRoom: homeRoom,
-        targetRoom: targetRoom,
-        count: parseInt(count, 10)
-    });
-    return `[TowerDrain] Order placed for ${count} tower drain bots to drain ${targetRoom} from ${homeRoom}.`;
-};
-
-global.cancelTowerDrainOrder = function(homeRoom, targetRoom) {
-    if (!homeRoom || !targetRoom) {
-        return `[TowerDrain] Invalid command. Use: cancelTowerDrainOrder('homeRoomName', 'targetRoomName')`;
-    }
-    if (!Memory.towerDrainOrders || Memory.towerDrainOrders.length === 0) {
-        return `[TowerDrain] No active tower drain orders to cancel.`;
-    }
-
-    const orderIndex = Memory.towerDrainOrders.findIndex(o => o.targetRoom === targetRoom && o.homeRoom === homeRoom);
-
-    if (orderIndex > -1) {
-        Memory.towerDrainOrders.splice(orderIndex, 1);
-        return `[TowerDrain] Operation against ${targetRoom} from ${homeRoom} has been cancelled.`;
-    } else {
-        return `[TowerDrain] No active operation found for ${homeRoom} -> ${targetRoom}.`;
-    }
-};
-
-global.orderDemolition = function(homeRoom, targetRoom, teamCount = 1) {
-    if (!Game.rooms[homeRoom] || !Game.rooms[homeRoom].controller || !Game.rooms[homeRoom].controller.my) {
-        return `[Demolition] Invalid home room: ${homeRoom}. Must be a room you own.`;
-    }
-    if (!targetRoom || teamCount <= 0) {
-        return `[Demolition] Invalid order. Use: orderDemolition('homeRoomName', 'targetRoomName', teamCount)`;
-    }
-
-    // Safety check against friendly rooms
-    const targetRoomObj = Game.rooms[targetRoom];
-    if (targetRoomObj && targetRoomObj.controller && targetRoomObj.controller.owner) {
-        if (iff.isAlly(targetRoomObj.controller.owner.username)) {
-            return `[Demolition] Cannot demolish ${targetRoom} - it's owned by ally ${targetRoomObj.controller.owner.username}`;
-        }
-        if (targetRoomObj.controller.my) {
-            return `[Demolition] Cannot demolish ${targetRoom} - it's your own room!`;
-        }
-    }
-
-    if (!Memory.demolitionOrders) {
-        Memory.demolitionOrders = [];
-    }
-    const existingOrder = Memory.demolitionOrders.find(o => o.targetRoom === targetRoom);
-    if (existingOrder) {
-        return `[Demolition] An operation against ${targetRoom} is already active. Cancel it first to create a new one.`;
-    }
-
-    Memory.demolitionOrders.push({
-        homeRoom: homeRoom,
-        targetRoom: targetRoom,
-        teamCount: parseInt(teamCount, 10),
-        teamsSpawned: 0
-    });
-    return `[Demolition] Order placed for ${teamCount} demolition team(s) to demolish ${targetRoom} from ${homeRoom}.`;
-};
-
-global.cancelDemolitionOrder = function(targetRoom) {
-    if (!targetRoom) {
-        return `[Demolition] Invalid command. Use: cancelDemolitionOrder('targetRoomName')`;
-    }
-    if (!Memory.demolitionOrders || Memory.demolitionOrders.length === 0) {
-        return `[Demolition] No active demolition orders to cancel.`;
-    }
-
-    const orderIndex = Memory.demolitionOrders.findIndex(o => o.targetRoom === targetRoom);
-
-    if (orderIndex > -1) {
-        Memory.demolitionOrders.splice(orderIndex, 1);
-        return `[Demolition] Operation against ${targetRoom} has been cancelled. Existing demolition teams will not be replaced.`;
-    } else {
-        return `[Demolition] No active operation found for target room ${targetRoom}.`;
-    }
-};
-
-// --- SQUAD COMMANDS ---
-global.orderSquad = function(formRoom, attackRoom, numSquads = 1) {
-    if (!Game.rooms[formRoom] || !Game.rooms[formRoom].controller || !Game.rooms[formRoom].controller.my) {
-        return `[Squad] Invalid form room: ${formRoom}. Must be a room you own.`;
-    }
-    if (!attackRoom || numSquads <= 0) {
-        return `[Squad] Invalid order. Use: orderSquad('formRoomName', 'attackRoomName', numSquads)`;
-    }
-
-    // Safety check against friendly rooms
-    const targetRoomObj = Game.rooms[attackRoom];
-    if (targetRoomObj && targetRoomObj.controller && targetRoomObj.controller.owner) {
-        if (iff.isAlly(targetRoomObj.controller.owner.username)) {
-            return `[Squad] Cannot attack ${attackRoom} - it's owned by ally ${targetRoomObj.controller.owner.username}`;
-        }
-        if (targetRoomObj.controller.my) {
-            return `[Squad] Cannot attack ${attackRoom} - it's your own room!`;
-        }
-    }
-
-    squad.spawnSquads(formRoom, attackRoom, numSquads);
-    return `[Squad] Order placed for ${numSquads} squad(s) to attack ${attackRoom} from ${formRoom}.`;
-};
-
-global.cancelSquadOrder = function(attackRoom) {
-    if (!attackRoom) {
-        return `[Squad] Invalid command. Use: cancelSquadOrder('attackRoomName')`;
-    }
-    if (!Memory.squadQueues || Memory.squadQueues.length === 0) {
-        return `[Squad] No active squad orders to cancel.`;
-    }
-
-    const initialLength = Memory.squadQueues.length;
-    Memory.squadQueues = Memory.squadQueues.filter(q => q.attackRoom !== attackRoom);
-
-    if (Memory.squadPackingAreas) {
-        for (const squadId in Memory.squadPackingAreas) {
-            if (squadId.includes(attackRoom)) {
-                delete Memory.squadPackingAreas[squadId];
-            }
-        }
-    }
-
-    const removed = initialLength - Memory.squadQueues.length;
-    if (removed > 0) {
-        return `[Squad] Cancelled ${removed} squad queue(s) for ${attackRoom}. Existing squad members will continue their mission.`;
-    } else {
-        return `[Squad] No active squad orders found for ${attackRoom}.`;
-    }
-};
-
-// Add this to your main.js or wherever your global functions are defined
-global.orderAttack = function(targetRoom, count, rallyRoom = null) {
-  if (!targetRoom || !count || count <= 0) {
-    return `[Attack] Invalid command. Use: orderAttack('targetRoom', count, 'rallyRoom')`;
-  }
-
-  // If no rally room specified, use the closest room to target
-  if (!rallyRoom) {
-    let minDistance = Infinity;
-    for (const roomName in Game.rooms) {
-      const room = Game.rooms[roomName];
-      if (!room.controller || !room.controller.my) continue;
-      const distance = Game.map.getRoomLinearDistance(roomName, targetRoom);
-      if (distance < minDistance) {
-        minDistance = distance;
-        rallyRoom = roomName;
-      }
-    }
-  }
-
-  // Validate rally room
-  if (!Game.rooms[rallyRoom] || !Game.rooms[rallyRoom].controller || !Game.rooms[rallyRoom].controller.my) {
-    return `[Attack] Invalid rally room: ${rallyRoom}. Must be a room you control.`;
-  }
-
-  if (!Memory.attackOrders) Memory.attackOrders = [];
-
-  const existingOrder = Memory.attackOrders.find(o => o.targetRoom === targetRoom);
-  if (existingOrder) {
-    return `[Attack] Attack order for ${targetRoom} already exists!`;
-  }
-
-  // Define rally point (center of rally room by default)
-  const rallyPoint = { x: 25, y: 25 };
-
-  Memory.attackOrders.push({
-    targetRoom: targetRoom,
-    rallyRoom: rallyRoom,
-    count: count,
-    spawned: 0,
-    startTime: Game.time,
-    rallyPoint: rallyPoint,
-    rallyPhase: 'spawning' // spawning -> rallying -> attacking
-  });
-
-  console.log(`[Attack] Order created: ${count} attackers to attack ${targetRoom}, rally in ${rallyRoom}`);
-  return `[Attack] Order created: ${count} attackers to attack ${targetRoom}, rally in ${rallyRoom}`;
-};
-
-
-global.orderSign = function(spawnRoom, targetRoom, message) {
-    if (!spawnRoom || !targetRoom || !message) {
-        return `[Signbot] Invalid command. Use: orderSign('spawnRoomName', 'targetRoomName', 'message')`;
-    }
-
-    if (!Game.rooms[spawnRoom] || !Game.rooms[spawnRoom].controller || !Game.rooms[spawnRoom].controller.my) {
-        return `[Signbot] Invalid spawn room: ${spawnRoom}. Must be a room you own.`;
-    }
-
-    const spawn = Game.rooms[spawnRoom].find(FIND_MY_SPAWNS, { filter: s => !s.spawning })[0];
-    if (!spawn) {
-        return `[Signbot] No available spawn in ${spawnRoom}`;
-    }
-
-    // Use a simple, fast body for the signbot
-    const body = [MOVE];
-    const cost = bodyCost(body);
-
-    if (cost > spawn.room.energyAvailable) {
-        return `[Signbot] Not enough energy in ${spawnRoom}. Need: ${cost}, Have: ${spawn.room.energyAvailable}`;
-    }
-
-    const name = `Signbot_${targetRoom}_${Game.time}`;
-    const memory = {
-        role: 'signbot',
-        targetRoom: targetRoom,
-        signMessage: message
-    };
-
-    const result = spawn.spawnCreep(body, name, { memory: memory });
-    if (result === OK) {
-        console.log(`[Signbot] Spawning '${name}' from ${spawnRoom} to sign ${targetRoom} with: "${message}"`);
-        return `[Signbot] Successfully ordered signbot from ${spawnRoom} to ${targetRoom}`;
-    } else {
-        return `[Signbot] Failed to spawn signbot: ${result}`;
-    }
-};
-
-
-
-function spawnScavengers() {
-  if (!Game.events) return;
-  for (const event of Game.events) {
-    if (event.event === EVENT_OBJECT_DESTROYED && event.data.type === 'creep') {
-      const destroyer = Game.getObjectById(event.data.destroyerId);
-      if (destroyer &&
-          destroyer.structureType === STRUCTURE_TOWER &&
-          destroyer.my) {
-        const room = destroyer.room;
-        const spawn = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning })[0];
-        if (spawn) {
-          const name = `Scavenger_${room.name}_${Game.time}`;
-          const memory = { role: 'scavenger', homeRoom: room.name };
-          spawn.spawnCreep(SCAVENGER_BODY, name, { memory });
-        }
-      }
-    }
-  }
-}
-
-function processSquadSpawnQueues() {
-  for (const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
-
-    const spawns = room.find(FIND_MY_SPAWNS);
-    if (spawns.length === 0) continue;
-
-    squad.processSpawnQueue(roomName);
-  }
-}
-
-global.assignAttackTarget = function(roomName, targetId) {
-  if (!roomName || !targetId) {
-    return `[Attack] Invalid command. Use global.assignAttackTarget('roomName', 'targetId').`;
-  }
-  const attackersInRoom = _.filter(Game.creeps, c => c.memory.role === 'attacker' && c.memory.targetRoom === roomName);
-  if (attackersInRoom.length === 0) {
-    return `[Attack] No attackers found for room ${roomName}.`;
-  }
-  let assignedCount = 0;
-  for (const creep of attackersInRoom) {
-    creep.memory.assignedTargetId = targetId;
-    assignedCount++;
-  }
-  return `[Attack] Assigned target ${targetId} to ${assignedCount} attackers in room ${roomName}.`;
-};
-
-global.cancelAttackOrder = function (targetRoom) {
-  if (!Memory.attackOrders || Memory.attackOrders.length === 0)
-    return '[Attack] No active attack orders.';
-
-  const i = Memory.attackOrders.findIndex(o => o.targetRoom === targetRoom);
-  if (i === -1)
-    return `[Attack] No attack order found for ${targetRoom}.`;
-
-  Memory.attackOrders.splice(i, 1);
-  return `[Attack] Attack on ${targetRoom} has been cancelled.`;
-};
-
-// --- CPU PROFILING ---
-if (ENABLE_CPU_LOGGING && !Memory.cpuProfile) Memory.cpuProfile = {};
-function profileSection(name, fn) {
-  if (!ENABLE_CPU_LOGGING) {
-    fn();
-    return;
-  }
-  const start = Game.cpu.getUsed();
-  fn();
-  const used = Game.cpu.getUsed() - start;
-  if (!Memory.cpuProfile[name]) Memory.cpuProfile[name] = [];
-  Memory.cpuProfile[name].push(used);
-  if (Memory.cpuProfile[name].length > 50) Memory.cpuProfile[name].shift();
-  if (!Memory.cpuProfileLastUsed) Memory.cpuProfileLastUsed = {};
-  Memory.cpuProfileLastUsed[name] = Game.time;
-}
-
-function cleanCpuProfileMemory(maxAge = 5000) {
-  if (!Memory.cpuProfileLastUsed) return;
-  const now = Game.time;
-  for (const key in Memory.cpuProfileLastUsed) {
-    if (now - Memory.cpuProfileLastUsed[key] > maxAge) {
-      delete Memory.cpuProfile[key];
-      delete Memory.cpuProfileLastUsed[key];
-    }
-  }
-}
-
-
-
-function runLinks() {
-  // Only run the link logic if the current tick is a multiple of the interval
-  if (Game.time % LINKS_CHECK_INTERVAL !== 0) {
-    return;
-  }
-
-  // The rest of your existing logic remains unchanged
-  for (const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
-
-    const allLinks = room.find(FIND_MY_STRUCTURES, {
-      filter: { structureType: STRUCTURE_LINK }
-    });
-    if (allLinks.length < 2) continue;
-
-    const sources = room.find(FIND_SOURCES);
-    const storage = room.storage;
-    const controller = room.controller;
-
-    const recipientLinks = [];
-    const sendingLinks = [];
-
-    for (const link of allLinks) {
-      if (controller && link.pos.inRangeTo(controller, 2)) {
-        recipientLinks.push(link);
-      } else {
-        sendingLinks.push(link);
-      }
-    }
-
-    const storageLinks = sendingLinks.filter(l => storage && l.pos.inRangeTo(storage, 2));
-    const donorLinks = sendingLinks.filter(l => sources.some(s => l.pos.inRangeTo(s, 3)));
-
-    for (const storageLink of storageLinks) {
-      if (storageLink.cooldown > 0 || storageLink.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-        continue;
-      }
-      const targetRecipient = recipientLinks.find(r => 
-        r.store.getUsedCapacity(RESOURCE_ENERGY) < 400 && 
-        r.store.getFreeCapacity(RESOURCE_ENERGY) >= 50
-      );
-      if (targetRecipient) {
-        const result = storageLink.transferEnergy(targetRecipient);
-        if (result === OK) {
-          continue;
-        }
-      }
-    }
-
-    for (const donorLink of donorLinks) {
-      if (donorLink.cooldown > 0 || donorLink.store[RESOURCE_ENERGY] === 0) {
-        continue;
-      }
-      let potentialTargets = [...storageLinks, ...recipientLinks];
-      potentialTargets = potentialTargets.filter(l => l.id !== donorLink.id);
-      if (potentialTargets.length > 0) {
-        const target = _.min(potentialTargets, l => l.store[RESOURCE_ENERGY]);
-        if (target && target.store.getFreeCapacity(RESOURCE_ENERGY) >= 50) {
-          donorLink.transferEnergy(target);
-        }
-      }
-    }
-  }
-}
-
-
-
-function runTowers() {
-  // Initialize tower memory structure
-  if (!Memory.towerCache) Memory.towerCache = {};
-  if (!Memory.towerTargets) Memory.towerTargets = {};
-
-  for (const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
-
-    // Initialize room cache
-    if (!Memory.towerCache[roomName]) {
-      Memory.towerCache[roomName] = {
-        towers: [],
-        lastUpdate: 0,
-        cacheValidUntil: 0
-      };
-    }
-
-    const roomCache = Memory.towerCache[roomName];
-    const currentTick = Game.time;
-
-    // Update tower cache every 50 ticks or if empty
-    if (currentTick >= roomCache.cacheValidUntil || roomCache.towers.length === 0) {
-      const towers = room.find(FIND_MY_STRUCTURES, {
-        filter: { structureType: STRUCTURE_TOWER }
-      });
-      roomCache.towers = towers.map(t => t.id);
-      roomCache.lastUpdate = currentTick;
-      roomCache.cacheValidUntil = currentTick + 50;
-    }
-
-    // Skip if no towers
-    if (roomCache.towers.length === 0) continue;
-
-    // Get actual tower objects from cached IDs
-    const towers = roomCache.towers.map(id => Game.getObjectById(id)).filter(t => t);
-    if (towers.length === 0) continue;
-
-    // Perform ONE room.find per tick - rotate through different searches
-    const tickMod = currentTick % 4;
-    let searchResults = null;
-    let searchType = null;
-
-    switch (tickMod) {
-      case 0:
-        // Search for hostiles
-        searchResults = room.find(FIND_HOSTILE_CREEPS, {
-          filter: creep => iff.isHostileCreep(creep)
-        });
-        searchType = 'hostiles';
-        break;
-      case 1:
-        // Search for injured creeps
-        searchResults = room.find(FIND_MY_CREEPS, {
-          filter: c => c.hits < c.hitsMax
-        });
-        searchType = 'injured';
-        break;
-      case 2:
-        // Search for damaged non-walls
-        searchResults = room.find(FIND_STRUCTURES, {
-          filter: s => s.hits < s.hitsMax &&
-                       s.structureType !== STRUCTURE_WALL &&
-                       s.structureType !== STRUCTURE_RAMPART
-        });
-        searchType = 'damaged';
-        break;
-      case 3:
-        // Search for weak walls (only if towers have excess energy)
-        const hasExcessEnergy = towers.some(t => 
-          t.store[RESOURCE_ENERGY] > t.store.getCapacity(RESOURCE_ENERGY) * 0.77
-        );
-        if (hasExcessEnergy) {
-          searchResults = room.find(FIND_STRUCTURES, {
-            filter: s => (s.structureType === STRUCTURE_WALL ||
-                          s.structureType === STRUCTURE_RAMPART) &&
-                         s.hits < 100000
-          });
-          searchType = 'walls';
-        }
-        break;
-    }
-
-    // Update cache with search results
-    if (searchResults !== null) {
-      if (!roomCache.searchCache) roomCache.searchCache = {};
-      roomCache.searchCache[searchType] = {
-        results: searchResults.map(obj => ({
-          id: obj.id,
-          pos: { x: obj.pos.x, y: obj.pos.y },
-          hits: obj.hits,
-          hitsMax: obj.hitsMax,
-          // Store additional properties based on search type
-          ...(searchType === 'hostiles' && {
-            healParts: obj.getActiveBodyparts(HEAL),
-            attackParts: obj.getActiveBodyparts(ATTACK),
-            workParts: obj.getActiveBodyparts(WORK)
-          })
-        })),
-        lastUpdate: currentTick,
-        validUntil: currentTick + 4 // Valid for one full cycle
-      };
-    }
-
-    // Get cached data for tower logic
-    const cache = roomCache.searchCache || {};
-    const hostileCache = cache.hostiles;
-    const injuredCache = cache.injured;
-    const damagedCache = cache.damaged;
-    const wallsCache = cache.walls;
-
-    // Get current hostiles from cache
-    let hostiles = [];
-    let healers = [];
-    if (hostileCache && currentTick < hostileCache.validUntil) {
-      hostiles = hostileCache.results
-        .map(data => Game.getObjectById(data.id))
-        .filter(obj => obj);
-      healers = hostiles.filter(c => c.getActiveBodyparts(HEAL) > 0);
-    }
-
-    // Special targeting logic for 2-enemy scenario
-    let specialTargeting = false;
-    let healerOnly = null;
-    let workerAttacker = null;
-
-    if (hostiles.length === 2 && towers.length > 1) {
-      const enemy1 = hostiles[0];
-      const enemy2 = hostiles[1];
-
-      if (enemy1.getActiveBodyparts(HEAL) > 0 && enemy1.getActiveBodyparts(ATTACK) === 0 &&
-          enemy2.getActiveBodyparts(HEAL) === 0 && 
-          (enemy2.getActiveBodyparts(WORK) > 0 || enemy2.getActiveBodyparts(ATTACK) > 0)) {
-        specialTargeting = true;
-        healerOnly = enemy1;
-        workerAttacker = enemy2;
-      } else if (enemy2.getActiveBodyparts(HEAL) > 0 && enemy2.getActiveBodyparts(ATTACK) === 0 &&
-                 enemy1.getActiveBodyparts(HEAL) === 0 && 
-                 (enemy1.getActiveBodyparts(WORK) > 0 || enemy1.getActiveBodyparts(ATTACK) > 0)) {
-        specialTargeting = true;
-        healerOnly = enemy2;
-        workerAttacker = enemy1;
-      }
-    }
-
-    // Process each tower
-    for (let i = 0; i < towers.length; i++) {
-      const tower = towers[i];
-      const mem = Memory.towerTargets[tower.id] ||
-                 (Memory.towerTargets[tower.id] = { targetId: null, lastHp: 0, sameHp: 0 });
-
-      let target = null;
-
-      // Combat targeting
-      if (specialTargeting) {
-        target = (i % 2 === 0) ? healerOnly : workerAttacker;
-      } else if (healers.length) {
-        target = tower.pos.findClosestByRange(healers);
-      } else if (hostiles.length) {
-        target = tower.pos.findClosestByRange(hostiles);
-      }
-
-      if (target) {
-        // Handle target switching logic
-        if (mem.targetId === target.id) {
-          mem.sameHp = (mem.lastHp === target.hits) ? mem.sameHp + 1 : 0;
-        } else {
-          mem.targetId = target.id;
-          mem.sameHp = 0;
-        }
-        mem.lastHp = target.hits;
-
-        // Switch targets if stuck and not in special targeting mode
-        if (!specialTargeting && mem.sameHp >= 5) {
-          const others = hostiles.filter(h => h.id !== target.id);
-          if (others.length) {
-            target = tower.pos.findClosestByRange(others);
-            mem.targetId = target.id;
-            mem.lastHp = target.hits;
-            mem.sameHp = 0;
-          }
-        }
-
-        tower.attack(target);
-        continue;
-      }
-
-      // Reset combat memory
-      mem.targetId = null;
-      mem.lastHp = 0;
-      mem.sameHp = 0;
-
-      // Healing logic - use cached injured creeps
-      if (injuredCache && currentTick < injuredCache.validUntil) {
-        const injuredCreeps = injuredCache.results
-          .map(data => Game.getObjectById(data.id))
-          .filter(obj => obj && obj.hits < obj.hitsMax);
-
-        if (injuredCreeps.length) {
-          const healTarget = tower.pos.findClosestByRange(injuredCreeps);
-          if (healTarget) {
-            tower.heal(healTarget);
-            continue;
-          }
-        }
-      }
-
-      // Repair damaged structures - use cached data
-      if (damagedCache && currentTick < damagedCache.validUntil) {
-        const damagedStructures = damagedCache.results
-          .map(data => Game.getObjectById(data.id))
-          .filter(obj => obj && obj.hits < obj.hitsMax);
-
-        if (damagedStructures.length) {
-          let weakest = damagedStructures[0];
-          for (let j = 1; j < damagedStructures.length; j++) {
-            if (damagedStructures[j].hits < weakest.hits) {
-              weakest = damagedStructures[j];
-            }
-          }
-          tower.repair(weakest);
-          continue;
-        }
-      }
-
-      // Wall repair - use cached data and only if tower has excess energy
-      if (tower.store[RESOURCE_ENERGY] > tower.store.getCapacity(RESOURCE_ENERGY) * 0.77 &&
-          wallsCache && currentTick < wallsCache.validUntil) {
-        const walls = wallsCache.results
-          .map(data => Game.getObjectById(data.id))
-          .filter(obj => obj && obj.hits < 1000000);
-
-        if (walls.length) {
-          let weakestWall = walls[0];
-          for (let j = 1; j < walls.length; j++) {
-            if (walls[j].hits < weakestWall.hits) {
-              weakestWall = walls[j];
-            }
-          }
-          tower.repair(weakestWall);
-        }
-      }
-    }
-  }
-}
-
-
-// =================================================================
-// === SPAWN MANAGEMENT ============================================
-// =================================================================
-
-function manageTowerDrainSpawns() {
-    if (!Memory.towerDrainOrders || Memory.towerDrainOrders.length === 0) return;
-
-    for (const order of Memory.towerDrainOrders) {
-        const { homeRoom, targetRoom, count } = order;
-
-        const existingDrainers = _.filter(Game.creeps, c =>
-            c.memory.role === 'towerDrain' &&
-            c.memory.targetRoom === targetRoom &&
-            c.memory.homeRoom === homeRoom
-        );
-
-        if (existingDrainers.length >= count) {
-            continue; // Order is fulfilled
-        }
-
-        const home = Game.rooms[homeRoom];
-        if (!home || !home.controller || !home.controller.my) {
-            console.log(`[TowerDrain] Home room ${homeRoom} is no longer valid. Skipping spawn.`);
-            continue;
-        }
-
-        const spawn = home.find(FIND_MY_SPAWNS, { filter: s => !s.spawning })[0];
-        if (!spawn) {
-            continue; // No available spawn
-        }
-
-        const cost = bodyCost(TOWER_DRAIN_BODY);
-
-        if (cost > spawn.room.energyAvailable) {
-            if (Game.time % 10 === 0) {
-                console.log(`[TowerDrain] Not enough energy in ${homeRoom}. Have: ${spawn.room.energyAvailable}, Need: ${cost}`);
-            }
-            continue;
-        }
-
-        const newName = `TowerDrain_${targetRoom}_${Game.time % 1000}`;
-        const memory = {
-            role: 'towerDrain',
-            homeRoom: homeRoom,
-            targetRoom: targetRoom
-        };
-
-        const result = spawn.spawnCreep(TOWER_DRAIN_BODY, newName, { memory: memory });
-        if (result === OK) {
-            console.log(`[TowerDrain] Spawning '${newName}' from ${homeRoom} to drain towers in ${targetRoom}.`);
-        } else if (result !== ERR_BUSY && result !== ERR_NOT_ENOUGH_ENERGY) {
-            console.log(`[TowerDrain] Error spawning tower drain bot in ${homeRoom}: ${result}`);
-        }
-    }
-}
-
-function manageDemolitionSpawns() {
-    if (!Memory.demolitionOrders || Memory.demolitionOrders.length === 0) return;
-
-    // Initialize collector queue if it doesn't exist
-    if (!Memory.demolitionCollectorQueue) Memory.demolitionCollectorQueue = [];
-
-    // Process collector queue first (for previously spawned demolishers)
-    for (let i = Memory.demolitionCollectorQueue.length - 1; i >= 0; i--) {
-        const queueItem = Memory.demolitionCollectorQueue[i];
-        const home = Game.rooms[queueItem.homeRoom];
-        if (!home) {
-            Memory.demolitionCollectorQueue.splice(i, 1);
-            continue;
-        }
-
-        const spawn = home.find(FIND_MY_SPAWNS, { filter: s => !s.spawning })[0];
-        if (!spawn) continue;
-
-        const cost = bodyCost(queueItem.collectorBody);
-        if (cost > spawn.room.energyAvailable) {
-            if (Game.time % 20 === 0) {
-                console.log(`[Demolition] Not enough energy in ${queueItem.homeRoom} for collector. Have: ${spawn.room.energyAvailable}, Need: ${cost}`);
-            }
-            continue;
-        }
-
-        const collectorMemory = {
-            role: 'demolition',
-            demolitionRole: 'collector',
-            homeRoom: queueItem.homeRoom,
-            targetRoom: queueItem.targetRoom,
-            partnerName: queueItem.demolisherName,
-            teamId: queueItem.teamId
-        };
-
-        const result = spawn.spawnCreep(queueItem.collectorBody, queueItem.collectorName, { memory: collectorMemory });
-        if (result === OK) {
-            console.log(`[Demolition] Spawning collector '${queueItem.collectorName}' from ${queueItem.homeRoom} for ${queueItem.targetRoom}.`);
-            Memory.demolitionCollectorQueue.splice(i, 1);
-        } else if (result !== ERR_BUSY) {
-            console.log(`[Demolition] Failed to spawn collector '${queueItem.collectorName}': ${result}`);
-        }
-    }
-
-    // Now handle demolition orders
-    for (const order of Memory.demolitionOrders) {
-        const { homeRoom, targetRoom, teamCount } = order;
-
-        const home = Game.rooms[homeRoom];
-        if (!home || !home.controller || !home.controller.my) {
-            console.log(`[Demolition] Home room ${homeRoom} is no longer valid. Skipping spawn.`);
-            continue;
-        }
-
-        const spawns = home.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
-        if (spawns.length === 0) continue;
-
-        // Check existing demolition creeps for this order
-        const existingCreeps = _.filter(Game.creeps, c => 
-            c.memory.role === 'demolition' && 
-            c.memory.targetRoom === targetRoom && 
-            c.memory.homeRoom === homeRoom
-        );
-
-        const existingDemolishers = existingCreeps.filter(c => c.memory.demolitionRole === 'demolisher');
-        const existingCollectors = existingCreeps.filter(c => c.memory.demolitionRole === 'collector');
-
-        // Group creeps by teamId to find complete pairs
-        const teamIds = new Set();
-        const completePairs = new Set();
-
-        // Collect all team IDs
-        existingCreeps.forEach(creep => {
-            if (creep.memory.teamId) {
-                teamIds.add(creep.memory.teamId);
-            }
-        });
-
-        // Check which teams have both demolisher and collector
-        teamIds.forEach(teamId => {
-            const teamDemolisher = existingDemolishers.find(c => c.memory.teamId === teamId);
-            const teamCollector = existingCollectors.find(c => c.memory.teamId === teamId);
-
-            if (teamDemolisher && teamCollector) {
-                completePairs.add(teamId);
-            }
-        });
-
-        const activeTeams = completePairs.size;
-        const teamsNeeded = teamCount - activeTeams;
-
-        if (Game.time % 20 === 0 && teamsNeeded > 0) {
-            console.log(`[Demolition] Order ${homeRoom}->${targetRoom}: Need ${teamsNeeded} teams, have ${activeTeams} complete pairs`);
-        }
-
-        // Spawn new teams if needed
-        for (let i = 0; i < teamsNeeded; i++) {
-            const spawn = spawns[0];
-            if (!spawn) break;
-
-            // Define bodies
-            const demolisherBody = [
-                WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, // 10 WORK parts
-                CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, // 10 CARRY parts (500 capacity)
-                MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE // 10 MOVE parts
-            ];
-
-            const collectorBody = getCreepBody('supplier', spawn.room.energyAvailable);
-
-            const demolisherCost = bodyCost(demolisherBody);
-
-            // Check if we can afford the demolisher
-            if (demolisherCost > spawn.room.energyAvailable) {
-                if (Game.time % 20 === 0) {
-                    console.log(`[Demolition] Not enough energy in ${homeRoom} for demolisher. Have: ${spawn.room.energyAvailable}, Need: ${demolisherCost}`);
-                }
-                break;
-            }
-
-            // Generate unique names
-            const teamId = `${targetRoom}_${Game.time}_${Math.floor(Math.random() * 1000)}`;
-            const demolisherName = `Demolisher_${teamId}`;
-            const collectorName = `Collector_${teamId}`;
-
-            // Spawn demolisher
-            const demolisherMemory = {
-                role: 'demolition',
-                demolitionRole: 'demolisher',
-                homeRoom: homeRoom,
-                targetRoom: targetRoom,
-                partnerName: collectorName,
-                teamId: teamId
-            };
-
-            const demolisherResult = spawn.spawnCreep(demolisherBody, demolisherName, { memory: demolisherMemory });
-            if (demolisherResult === OK) {
-                console.log(`[Demolition] Spawning replacement demolisher '${demolisherName}' from ${homeRoom} for ${targetRoom}.`);
-
-                // Queue collector spawn for next available spawn
-                Memory.demolitionCollectorQueue.push({
-                    homeRoom: homeRoom,
-                    collectorName: collectorName,
-                    demolisherName: demolisherName,
-                    targetRoom: targetRoom,
-                    teamId: teamId,
-                    collectorBody: collectorBody
-                });
-
-                break; // Only spawn one team per tick
-            } else if (demolisherResult !== ERR_BUSY) {
-                console.log(`[Demolition] Failed to spawn replacement demolisher '${demolisherName}': ${demolisherResult}`);
-                break;
-            }
-        }
-    }
-}
-
-function manageThiefSpawns() {
-    if (!Memory.thiefOrders || Memory.thiefOrders.length === 0) return;
-
-    // --- Filter out orders that should be cancelled ---
-    const activeOrders = Memory.thiefOrders.filter(order => {
-        const targetRoomObject = Game.rooms[order.targetRoom];
-        // If we don't have vision of the target room, we can't check it, so keep the order active.
-        if (!targetRoomObject) {
-            return true;
-        }
-
-        // We have vision, so check for any resources in target structures.
-        const structuresWithResources = targetRoomObject.find(FIND_STRUCTURES, {
-            filter: s => (s.structureType === STRUCTURE_EXTENSION ||
-                          s.structureType === STRUCTURE_SPAWN ||
-                          s.structureType === STRUCTURE_TOWER ||
-                          s.structureType === STRUCTURE_STORAGE ||
-                          s.structureType === STRUCTURE_CONTAINER ||
-                          s.structureType === STRUCTURE_LAB ||
-                          s.structureType === STRUCTURE_TERMINAL) &&
-                         _.sum(s.store) > 0
-        });
-
-        // If no structures with resources are found, the room is empty. Cancel the order.
-        if (structuresWithResources.length === 0) {
-            console.log(`[Thief] Target room ${order.targetRoom} appears to be empty. Cancelling operation.`);
-            return false; // This will remove the order from the active list.
-        }
-
-        return true; // Keep the order active.
-    });
-
-    // Update memory with only the orders that are still active.
-    Memory.thiefOrders = activeOrders;
-
-    // --- Process the remaining active orders ---
-    for (const order of Memory.thiefOrders) {
-        const { homeRoom, targetRoom, count } = order;
-
-        const existingThieves = _.filter(Game.creeps, c =>
-            c.memory.role === 'thief' &&
-            c.memory.targetRoom === targetRoom &&
-            c.memory.homeRoom === homeRoom
-        );
-
-        if (existingThieves.length >= count) {
-            continue; // Order is fulfilled for now
-        }
-
-        const home = Game.rooms[homeRoom];
-        if (!home || !home.controller || !home.controller.my) {
-            console.log(`[Thief] Home room ${homeRoom} for raid on ${targetRoom} is no longer valid. Skipping spawn.`);
-            continue;
-        }
-
-        const spawn = home.find(FIND_MY_SPAWNS, { filter: s => !s.spawning })[0];
-        if (!spawn) {
-            continue; // No available spawn in the designated home room
-        }
-
-        const body = getCreepBody('supplier', spawn.room.energyAvailable);
-        const cost = bodyCost(body);
-
-        if (!body || cost > spawn.room.energyAvailable) {
-            if (Game.time % 10 === 0) { // Log only periodically to prevent spam
-                 console.log(`[Thief] Not enough energy in ${homeRoom} to spawn a thief. Have: ${spawn.room.energyAvailable}, Need: ${cost}`);
-            }
-            continue;
-        }
-
-        const newName = `Thief_${targetRoom}_${Game.time % 1000}`;
-        const memory = {
-            role: 'thief',
-            homeRoom: homeRoom,
-            targetRoom: targetRoom,
-            stealing: true
-        };
-
-        const result = spawn.spawnCreep(body, newName, { memory: memory });
-        if (result === OK) {
-            console.log(`[Thief] Spawning '${newName}' from ${homeRoom} for raid on ${targetRoom}.`);
-        } else if (result !== ERR_BUSY && result !== ERR_NOT_ENOUGH_ENERGY) {
-            console.log(`[Thief] Error spawning thief in ${homeRoom}: ${result}`);
-        }
-    }
-}
-
-function manageAttackerSpawns() {
-  if (!Memory.attackOrders || Memory.attackOrders.length === 0) return;
-
-  for (let i = Memory.attackOrders.length - 1; i >= 0; i--) {
-    const order = Memory.attackOrders[i];
-    const { targetRoom, rallyRoom, count, spawned, startTime, rallyPhase } = order;
-
-    // Handle different phases
-    if (rallyPhase === 'spawning') {
-      // Continue spawning until we have enough or timeout
-      if (spawned < count) {
-        const spawnResults = trySpawnAttackersFromAllRooms(order, i);
-        if (spawnResults > 0) {
-          order.spawned += spawnResults;
-          console.log(`[Attack] Spawned ${spawnResults} attackers (${order.spawned}/${count} total) for ${targetRoom}`);
-        }
-      }
-
-      // Check if we should move to rally phase
-      const timeElapsed = Game.time - startTime;
-      if (spawned >= count || timeElapsed >= 50) {
-        order.rallyPhase = 'rallying';
-        order.rallyStartTime = Game.time;
-        console.log(`[Attack] Moving to rally phase for ${targetRoom} (${spawned}/${count} spawned)`);
-      }
-    }
-
-    else if (rallyPhase === 'rallying') {
-      // Count attackers at rally point
-      const attackersAtRally = _.filter(Game.creeps, c => 
-        c.memory.role === 'attacker' && 
-        c.memory.targetRoom === targetRoom &&
-        c.room.name === rallyRoom &&
-        c.pos.getRangeTo(order.rallyPoint.x, order.rallyPoint.y) <= 3
-      );
-
-      const rallyTimeElapsed = Game.time - order.rallyStartTime;
-      const shouldProceed = rallyTimeElapsed >= 50 || attackersAtRally.length >= spawned;
-
-      if (shouldProceed) {
-        // Mark all attackers of this order to proceed
-        const allAttackers = _.filter(Game.creeps, c => 
-          c.memory.role === 'attacker' && c.memory.targetRoom === targetRoom
-        );
-
-        allAttackers.forEach(creep => {
-          creep.memory.rallyComplete = true;
-        });
-
-        order.rallyPhase = 'attacking';
-        console.log(`[Attack] Rally complete for ${targetRoom}. ${allAttackers.length} attackers proceeding to attack.`);
-      }
-    }
-
-    else if (rallyPhase === 'attacking') {
-      // Check if any attackers are still alive
-      const remainingAttackers = _.filter(Game.creeps, c => 
-        c.memory.role === 'attacker' && c.memory.targetRoom === targetRoom
-      );
-
-      if (remainingAttackers.length === 0) {
-        console.log(`[Attack] All attackers for ${targetRoom} have been eliminated. Order complete.`);
-        Memory.attackOrders.splice(i, 1);
-      }
-    }
-  }
-}
-
-global.orderMineralCollect = function (roomName) {
-     if (!Game.rooms[roomName] || !Game.rooms[roomName].controller || !Game.rooms[roomName].controller.my) {
-         return `[MineralCollector] Invalid room: ${roomName}`;
-     }
-     const spawn = Game.rooms[roomName].find(FIND_MY_SPAWNS, { filter: s => !s.spawning })[0];
-     if (!spawn) return `[MineralCollector] No free spawn in ${roomName}`;
-
-     const body = getCreepBody('supplier', spawn.room.energyAvailable);
-     const cost = bodyCost(body);
-     if (cost > spawn.room.energyAvailable) {
-         return `[MineralCollector] Not enough energy (need ${cost})`;
-     }
-
-     const name = `MC_${roomName}_${Game.time}`;
-     spawn.spawnCreep(body, name, { memory: { role: 'mineralCollector', homeRoom: roomName } });
-     return `[MineralCollector] Spawning ${name}`;
-};
-
-function trySpawnAttackersFromAllRooms(order, orderIndex) {
-  let totalSpawned = 0;
-  const remainingToSpawn = order.count - order.spawned;
-
-  if (remainingToSpawn <= 0) return 0;
-
-  // Get all rooms with available spawns and rank them intelligently
-  const roomsWithSpawns = [];
-
-  for (const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
-
-    const spawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
-    if (spawns.length === 0) continue;
-
-    // Check if we can generate a valid attacker body
-    const body = getCreepBody('attacker', room.energyAvailable);
-    if (!body) continue;
-
-    const cost = bodyCost(body);
-    if (cost > room.energyAvailable) continue;
-
-    // Calculate room score (lower is better)
-    const distance = Game.map.getRoomLinearDistance(roomName, order.targetRoom);
-    const energyRatio = room.energyAvailable / room.energyCapacityAvailable;
-    const bodySize = body.length;
-
-    // Score calculation:
-    // - Distance penalty (each room away adds 1 point)
-    // - Energy bonus (more energy = lower score)
-    // - Body size bonus (bigger body = lower score)
-    const score = distance - (energyRatio * 5) - (bodySize * 0.1);
-
-    roomsWithSpawns.push({
-      roomName: roomName,
-      room: room,
-      spawns: spawns,
-      distance: distance,
-      energyAvailable: room.energyAvailable,
-      energyCapacity: room.energyCapacityAvailable,
-      energyRatio: energyRatio,
-      bodySize: bodySize,
-      score: score
-    });
-  }
-
-  if (roomsWithSpawns.length === 0) {
-    if (Game.time % 20 === 0) {
-      console.log(`[Attack] No rooms can spawn attackers for ${order.targetRoom}`);
-    }
-    return 0;
-  }
-
-  // Sort by score (best rooms first)
-  roomsWithSpawns.sort((a, b) => a.score - b.score);
-
-  if (Game.time % 20 === 0) {
-    console.log(`[Attack] Room selection for ${order.targetRoom}:`);
-    roomsWithSpawns.slice(0, 3).forEach((room, i) => {
-      console.log(`  ${i + 1}. ${room.roomName}: dist=${room.distance}, energy=${room.energyAvailable}/${room.energyCapacity} (${Math.round(room.energyRatio * 100)}%), body=${room.bodySize}, score=${room.score.toFixed(2)}`);
-    });
-  }
-
-  // Initialize spawn tracking for this order if it doesn't exist
-  if (!order.roomSpawnCount) {
-    order.roomSpawnCount = {};
-  }
-
-  // Spawn from the best rooms first
-  for (let i = 0; i < roomsWithSpawns.length && totalSpawned < remainingToSpawn; i++) {
-    const roomInfo = roomsWithSpawns[i];
-
-    // Limit spawns per room to distribute load
-    const alreadySpawnedFromRoom = order.roomSpawnCount[roomInfo.roomName] || 0;
-    const maxPerRoom = Math.ceil(order.count / Math.min(3, roomsWithSpawns.length)); // Distribute across up to 3 rooms
-
-    if (alreadySpawnedFromRoom >= maxPerRoom) continue;
-
-    const spawn = roomInfo.spawns[0]; // Use first available spawn
-    const body = getCreepBody('attacker', spawn.room.energyAvailable);
-
-    if (!body) {
-      console.log(`[Attack] ${roomInfo.roomName}: Failed to generate attacker body`);
-      continue;
-    }
-
-    const attackerName = `Attacker_${order.targetRoom}_${Game.time}_${order.spawned + totalSpawned}`;
-    const result = spawn.spawnCreep(body, attackerName, {
-      memory: {
-        role: 'attacker',
-        targetRoom: order.targetRoom,
-        rallyRoom: order.rallyRoom,
-        spawnRoom: roomInfo.roomName,
-        orderIndex: orderIndex,
-        rallyComplete: false
-      }
-    });
-
-    if (result === OK) {
-      totalSpawned++;
-      order.roomSpawnCount[roomInfo.roomName] = alreadySpawnedFromRoom + 1;
-      console.log(`[Attack] Spawning attacker '${attackerName}' from ${roomInfo.roomName} (dist=${roomInfo.distance}, energy=${roomInfo.energyAvailable}, body=${body.length} parts)`);
-    } else if (result !== ERR_BUSY) {
-      console.log(`[Attack] Failed to spawn attacker '${attackerName}' from ${roomInfo.roomName}: ${result}`);
-    }
-
-    // Only spawn one per tick to avoid overwhelming any single room
-    if (totalSpawned > 0) break;
-  }
-
-  return totalSpawned;
-}
-
-
-
-function manageExtractorSpawns() {
-  for (const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
-
-    const extractor = room.find(FIND_MY_STRUCTURES, {
-      filter: s => s.structureType === STRUCTURE_EXTRACTOR
-    })[0];
-    if (!extractor) continue;
-
-    const mineral = room.find(FIND_MINERALS)[0];
-    if (!mineral || mineral.mineralAmount === 0) continue;
-
-    const container = extractor.pos.findInRange(FIND_STRUCTURES, 1, {
-      filter: s => s.structureType === STRUCTURE_CONTAINER
-    })[0];
-    if (!container) continue;
-
-    const existing = _.filter(Game.creeps, c =>
-      c.memory.role === 'extractor' && c.memory.roomName === roomName
-    );
-    if (existing.length > 0) continue;
-
-    const spawn = room.find(FIND_MY_STRUCTURES, {
-      filter: s => s.structureType === STRUCTURE_SPAWN && !s.spawning
-    })[0];
-    if (!spawn) continue;
-
-    const body   = [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, MOVE];
-    const name   = `extractor_${roomName}_${Game.time % 1000}`;
-    const memory = { role: 'extractor', roomName, extractorId: extractor.id };
-    const result = spawn.spawnCreep(body, name, { memory });
-    if (result === OK) {
-      console.log(`[Spawn] extractor for ${roomName}`);
-    }
-  }
-}
-
-function manageClaimbotSpawns() {
-  if (!Memory.claimOrders) Memory.claimOrders = [];
-  if (Memory.claimOrders.length === 0) return;
-
-  const claimOrder = Memory.claimOrders[0];
-  const existing   = _.find(
-    Game.creeps,
-    c => c.memory.role === 'claimbot' && c.memory.targetRoom === claimOrder.room
-  );
-  if (existing) return;
-
-  let closestSpawn   = null;
-  let closestDistance= Infinity;
-  for (const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
-    const spawn = room.find(FIND_MY_STRUCTURES, {
-      filter: { structureType: STRUCTURE_SPAWN }
-    })[0];
-    if (!spawn || spawn.spawning) continue;
-    const distance = Game.map.getRoomLinearDistance(roomName, claimOrder.room);
-    if (distance < closestDistance) {
-      closestDistance = distance;
-      closestSpawn    = spawn;
-    }
-  }
-  if (!closestSpawn) return;
-
-  const claimBody      = [MOVE, MOVE, ATTACK, CLAIM, MOVE];
-  const cost           = bodyCost(claimBody);
-  const availableEnergy= closestSpawn.room.energyAvailable;
-  const result         = closestSpawn.spawnCreep(
-    claimBody,
-    'claimbot' + Game.time,
-    { memory: { role: 'claimbot', targetRoom: claimOrder.room } }
-  );
-  if (result === OK) {
-    console.log(`Spawning claimbot for ${claimOrder.room} | Cost: ${cost} | Energy before: ${availableEnergy}`);
-    Memory.claimOrders.shift();
-  } else {
-    console.log(`Failed to spawn claimbot: ${result}`);
-  }
-}
-
-function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
-  if (Memory.claimOrders && Memory.claimOrders.length > 0) return;
-  if(!Memory.harvesterSpawnDelay) Memory.harvesterSpawnDelay = {};
-
-  for(const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if(!room.controller || !room.controller.my) continue;
-
-    // Get ALL available spawns, not just the first one
-    const availableSpawns = room.find(FIND_MY_STRUCTURES, {
-      filter: s => s.structureType === STRUCTURE_SPAWN && !s.spawning
-    });
-
-    if(availableSpawns.length === 0) continue;
-
-    const roomData = roomDataCache[roomName] || {};
-    const roleCounts = perRoomRoleCounts[roomName] || {};
-    const roomTargets = getRoomTargets(roomName, roomData, room);
-
-    // Emergency mode - use first available spawn
-    if(roleCounts.harvester === 0) {
-      console.log(`EMERGENCY MODE in ${roomName}!!!`);
-      const body = getCreepBody('harvester', room.energyAvailable);
-      if (body && bodyCost(body) <= room.energyAvailable) {
-        spawnCreepInRoom('harvester', body, availableSpawns[0], roomName);
-      } else {
-        console.log(`Not enough energy in ${roomName} to spawn a harvester!`);
-      }
-      continue;
-    }
-
-    // Create a priority queue of roles needed
-    const spawnQueue = [];
-    if (roleCounts.defender < roomTargets.defender) spawnQueue.push('defender');
-    if (roleCounts.harvester < roomTargets.harvester) spawnQueue.push('harvester');
-    if (roleCounts.supplier < roomTargets.supplier) spawnQueue.push('supplier');
-    if (roleCounts.upgrader < roomTargets.upgrader) spawnQueue.push('upgrader');
-    if (roleCounts.builder < roomTargets.builder) spawnQueue.push('builder');
-    if (roleCounts.scout < roomTargets.scout) spawnQueue.push('scout');
-
-    // Spawn up to the number of available spawns
-    let spawnsUsed = 0;
-    for (const roleToSpawn of spawnQueue) {
-      if (spawnsUsed >= availableSpawns.length) break;
-
-      // Handle harvester delay logic
-      if(roleToSpawn === 'harvester') {
-        const totalEnergy = calculateTotalEnergy();
-        if(totalEnergy < 800) {
-          if(!Memory.harvesterSpawnDelay[roomName]) {
-            Memory.harvesterSpawnDelay[roomName] = { nextSpawnTime: Game.time + 60 };
-            console.log(`Low energy (${totalEnergy} < 800) - delaying harvester spawn in ${roomName} by 60 ticks`);
-            continue;
-          }
-          if(Game.time < Memory.harvesterSpawnDelay[roomName].nextSpawnTime) {
-            continue;
-          }
-          delete Memory.harvesterSpawnDelay[roomName];
-        }
-      }
-
-      let energyForSpawn = room.energyAvailable;
-      if (roleToSpawn === 'upgrader') {
-        const sourcesCount = roomData.sources ? roomData.sources.length : 0;
-        if (sourcesCount === 1) {
-          energyForSpawn = Math.min(energyForSpawn, 300);
-        }
-      }
-
-      const body = getCreepBody(roleToSpawn, energyForSpawn);
-      const success = spawnCreepInRoom(roleToSpawn, body, availableSpawns[spawnsUsed], roomName);
-
-      if (success) {
-        spawnsUsed++;
-        // Update the role count so we don't spawn duplicates in the same tick
-        roleCounts[roleToSpawn]++;
-      }
-    }
-  }
-}
-
-
-// =================================================================
-// === CREEP MANAGEMENT ============================================
+/* === CREEP MANAGEMENT ============================================ */
 // =================================================================
 
 function runCreeps() {
@@ -1456,9 +142,12 @@ function runCreeps() {
       case 'demolition':     roleDemolition.run(creep);      break;
       case 'squadMember':    squad.run(creep);               break;
       case 'mineralCollector': roleMineralCollector.run(creep); break;
-      case 'terminalBot': terminalManager.runTerminalBot(creep); break;
+      case 'terminalBot':    terminalManager.runTerminalBot(creep); break;
       case 'signbot':        roleSignbot.run(creep);         break;
-      case 'factoryBot': roleFactoryBot.run(creep); break;
+      case 'factoryBot':     roleFactoryBot.run(creep);      break;
+      case 'wallRepair':     roleWallRepair.run(creep);      break;
+      case 'labBot':         roleLabBot.run(creep);          break;
+      case 'nukeFill':      roleNukeFill.run(creep);         break;
       default:
         creep.memory.role = 'harvester';
         roleHarvester.run(creep);
@@ -1479,248 +168,66 @@ function runCreeps() {
   if (Game.time % 50 === 0 && ENABLE_CPU_LOGGING && !DISABLE_CPU_CONSOLE) {
     for (const role in Memory.cpuProfileCreeps) {
       const arr = Memory.cpuProfileCreeps[role];
-      const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
-      console.log(`Creep Role CPU: ${role} avg: ${Math.round(avg)}`);
+      const avg = arr.reduce(function(a, b){ return a + b; }, 0) / arr.length;
+      console.log("Creep Role CPU: " + role + " avg: " + Math.round(avg));
     }
   }
 }
 
 // =================================================================
-// === HELPER & UTILITY FUNCTIONS ==================================
+/* === HELPER & UTILITY FUNCTIONS (non-spawn) ====================== */
 // =================================================================
-
-function bodyCost(body) {
-  const BODYPART_COST = {
-    move: 50, work: 100, attack: 80, carry: 50, heal: 250,
-    ranged_attack: 150, tough: 10, claim: 600
-  };
-  return body.reduce((cost, part) => cost + BODYPART_COST[part], 0);
-}
-
-function getCreepBody(role, energy) {
-  // Special case for attacker role - use dynamic scaling logic
-  if (role === 'attacker') {
-    // Each set: TOUGH(10) + MOVE(50) + ATTACK(80) + HEAL(250) = 390
-    const costPerSet = 390;
-    const numSets = Math.min(16, Math.floor(energy / costPerSet));
-
-    if (numSets > 0) {
-      const body = [];
-      for (let i = 0; i < numSets; i++) {
-        body.push(TOUGH, MOVE, ATTACK, HEAL);
-      }
-      return body;
-    } else {
-      // Fallback for low energy - basic attacker without heal
-      if (energy >= 130) { // TOUGH(10) + MOVE(50) + ATTACK(80) = 130
-        return [TOUGH, MOVE, ATTACK];
-      } else if (energy >= 80) { // Just ATTACK(80) - minimum viable attacker
-        return [ATTACK];
-      } else {
-        return null; // Can't afford any attacker
-      }
-    }
-  }
-
-  const bodyConfigs = {
-      harvester: {
-        300: [WORK, WORK, CARRY, MOVE],
-        400: [WORK, WORK, WORK, CARRY, MOVE],
-        500: [WORK, WORK, WORK, WORK, CARRY, MOVE],
-        800: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE],
-        900: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE],
-        1300: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
-        1600: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
-        1900: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE]
-      },
-    
-      upgrader: {
-        200: [WORK, CARRY, MOVE],
-        300: [WORK, WORK, CARRY, MOVE],
-        500: [WORK, WORK, WORK, WORK, CARRY, MOVE],
-        550: [WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
-        800: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE],
-        1100: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
-        1200: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE],
-        //1500: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE]//,
-        //1800: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE]
-      },
-    
-      builder: {
-        300: [WORK, WORK, CARRY, MOVE],
-        400: [WORK, WORK, WORK, CARRY, MOVE],
-        450: [WORK, WORK, WORK, CARRY, MOVE, MOVE],
-        550: [WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE],
-        750: [WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE]
-      },
-    
-      defender: {
-        300: BASIC_DEFENDER, // define BASIC_DEFENDER to include this entry
-        460: [TOUGH, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE],
-        670: [TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE, MOVE],
-        880: [TOUGH, TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, MOVE, MOVE, MOVE, MOVE, MOVE]
-      },
-    
-      supplier: {
-        200: [CARRY, CARRY, MOVE, MOVE],
-        300: [CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
-        400: [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
-        600: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-        900: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-        1000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-        1200: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-        1400: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-        1600: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-        1800: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-        2000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
-      },
-    
-      scout: { 300: SCOUT_BODY } // define SCOUT_BODY to include this entry
-    };
-  if (role === 'scout') {
-    return SCOUT_BODY;
-  }
-  if (energy <= 300 && role !== 'defender' && role !== 'supplier') {
-    return BASIC_HARVESTER;
-  }
-  const configs = bodyConfigs[role] || bodyConfigs.harvester;
-  return getBestBody(configs, energy);
-
-  function getBestBody(bodyTiers, availableEnergy) {
-    const tiers = Object.keys(bodyTiers).map(Number).sort((a, b) => a - b);
-    let bestTier = tiers[0];
-    for (const tier of tiers) {
-      if (availableEnergy >= tier) bestTier = tier;
-      else break;
-    }
-    return bodyTiers[bestTier];
-  }
-};
-
-
-function spawnCreepInRoom(role, body, spawn, roomName) {
-  const newName         = `${role}_${roomName}_${Game.time}`;
-  const memory          = { role: role, assignedRoom: roomName };
-  const availableEnergy = spawn.room.energyAvailable;
-  const cost            = bodyCost(body);
-  const result          = spawn.spawnCreep(body, newName, { memory: memory });
-
-  if(result === OK) {
-    console.log(`Spawning ${role} in ${roomName} with ${body.length} parts | Cost: ${cost} | Energy before: ${availableEnergy}`);
-    return true;
-  } else {
-    if (result !== ERR_BUSY) {
-      console.log(`Failed to spawn ${role} in ${roomName}: ${result} (energy: ${availableEnergy}, cost: ${cost})`);
-    }
-    return false;
-  }
-}
-
-function getRoomTargets(roomName, roomData, room) {
-  const sourcesCount = roomData.sources ? roomData.sources.length : 2;
-  const harvesters = _.filter(Game.creeps, c => {
-    if (c.memory.role !== 'harvester') return false;
-    const assignedRoom = c.memory.homeRoom || c.memory.assignedRoom || c.room.name;
-    return assignedRoom === roomName;
-  });
-  const totalBodyParts = harvesters.reduce((sum, c) => sum + c.body.length, 0);
-  const avgBodyParts   = harvesters.length > 0 ? totalBodyParts / harvesters.length : 0;
-  const X = avgBodyParts <= 6 ? 2 : 1;
-  //const harvesterTarget = Math.max(X, sourcesCount * X);
-  const harvesterTarget = sourcesCount;
-
-  const containers            = room.find(FIND_STRUCTURES, {
-    filter: { structureType: STRUCTURE_CONTAINER }
-  });
-  const storage               = room.storage;
-  const hasStorageStructures  = containers.length > 0 || !!storage;
-  const builderJobs = countBuilderJobs(room);
-  let builderTarget = 0;
-    if (builderJobs > 0) {
-        //builderTarget = 1 + Math.floor((builderJobs - 1) / 10);
-        builderTarget = 1; //Save CPU temp rule
-        }
-
-  let upgraderTarget = 1;
-  let storedEnergy   = storage ? (storage.store[RESOURCE_ENERGY] || 0) : 0;
-  if (storedEnergy > 950000)      upgraderTarget += 8;
-  else if (storedEnergy > 900000) upgraderTarget += 4;
-  else if (storedEnergy > 750000) upgraderTarget += 2;
-  else if (storedEnergy > 600000) upgraderTarget += 1;
-
-  return {
-    harvester:   harvesterTarget,
-    upgrader:    1,//upgraderTarget,
-    builder:     builderTarget,
-    scout:       0,
-    defender:    0,
-    supplier:    hasStorageStructures ? 1 : 0 //hasStorageStructures ? sourcesCount : 0
-  };
-}
-
-function countBuilderJobs(room) {
-  const sites = room.find(FIND_CONSTRUCTION_SITES);
-  return sites.length; //> 0 ? 1 : 0;
-}
-
 
 function cleanMemory() {
   for (const name in Memory.creeps) {
     if (!Game.creeps[name]) {
-      const creepMemory = Memory.creeps[name]; // Get memory before deleting
+      const creepMemory = Memory.creeps[name];
 
-      // --- Thief operation cancellation logic ---
       if (creepMemory.role === 'thief') {
         if (Memory.thiefOrders) {
-          const orderIndex = Memory.thiefOrders.findIndex(o =>
-            o.targetRoom === creepMemory.targetRoom && o.homeRoom === creepMemory.homeRoom
-          );
+          const orderIndex = Memory.thiefOrders.findIndex(function(o){
+            return o.targetRoom === creepMemory.targetRoom && o.homeRoom === creepMemory.homeRoom;
+          });
           if (orderIndex > -1) {
-            console.log(`[Thief] A thief for operation against ${creepMemory.targetRoom} has died. Cancelling the operation.`);
+            console.log("[Thief] A thief for operation against " + creepMemory.targetRoom + " has died. Cancelling the operation.");
             Memory.thiefOrders.splice(orderIndex, 1);
           }
         }
       }
-      // --- End of thief logic ---
-      // Add this in the cleanMemory function after the thief logic
-      // --- Demolition operation cleanup logic ---
-        if (creepMemory.role === 'demolition') {
-            if (Memory.demolitionOrders) {
-                const orderIndex = Memory.demolitionOrders.findIndex(o =>
-                    o.targetRoom === creepMemory.targetRoom && o.homeRoom === creepMemory.homeRoom
-                );
-                if (orderIndex > -1 && creepMemory.demolitionRole === 'demolisher') {
-                    console.log(`[Demolition] A demolisher for operation against ${creepMemory.targetRoom} has died. Keeping operation active for respawn.`);
-                }
-            }
-        }
 
-        if (creepMemory.role === 'towerDrain') {
-            if (Memory.towerDrainOrders) {
-                const orderIndex = Memory.towerDrainOrders.findIndex(o =>
-                    o.targetRoom === creepMemory.targetRoom && o.homeRoom === creepMemory.homeRoom
-                );
-                if (orderIndex > -1) {
-                    console.log(`[TowerDrain] A tower drain bot for ${creepMemory.targetRoom} has died. Keeping operation active.`);
-                    // Don't remove the order, let it respawn
-                }
-            }
+      if (creepMemory.role === 'demolition') {
+        if (Memory.demolitionOrders) {
+          const orderIndex = Memory.demolitionOrders.findIndex(function(o){
+            return o.targetRoom === creepMemory.targetRoom && o.homeRoom === creepMemory.homeRoom;
+          });
+          if (orderIndex > -1 && creepMemory.demolitionRole === 'demolisher') {
+            console.log("[Demolition] A demolisher for operation against " + creepMemory.targetRoom + " has died. Keeping operation active for respawn.");
+          }
         }
+      }
 
-        // --- Squad member cleanup ---
-        if (creepMemory.role === 'squadMember') {
-            if (Memory.squadPackingAreas && creepMemory.squadId) {
-                // Clean up packing area if squad is decimated
-                const remainingMembers = _.filter(Game.creeps, c => 
-                    c.memory.role === 'squadMember' && 
-                    c.memory.squadId === creepMemory.squadId
-                );
-                if (remainingMembers.length <= 1) { // Only this dying creep left
-                    delete Memory.squadPackingAreas[creepMemory.squadId];
-                    console.log(`[Squad] Squad ${creepMemory.squadId} eliminated. Cleaning up packing area.`);
-                }
-            }
+      if (creepMemory.role === 'towerDrain') {
+        if (Memory.towerDrainOrders) {
+          const orderIndex = Memory.towerDrainOrders.findIndex(function(o){
+            return o.targetRoom === creepMemory.targetRoom && o.homeRoom === creepMemory.homeRoom;
+          });
+          if (orderIndex > -1) {
+            console.log("[TowerDrain] A tower drain bot for " + creepMemory.targetRoom + " has died. Keeping operation active.");
+          }
         }
+      }
+
+      if (creepMemory.role === 'squadMember') {
+        if (Memory.squadPackingAreas && creepMemory.squadId) {
+          const remainingMembers = _.filter(Game.creeps, function(c){
+            return c.memory.role === 'squadMember' && c.memory.squadId === creepMemory.squadId;
+          });
+          if (remainingMembers.length <= 1) {
+            delete Memory.squadPackingAreas[creepMemory.squadId];
+            console.log("[Squad] Squad " + creepMemory.squadId + " eliminated. Cleaning up packing area.");
+          }
+        }
+      }
 
       delete Memory.creeps[name];
     }
@@ -1733,25 +240,14 @@ function getPerRoomRoleCounts() {
     const room = Game.rooms[roomName];
     if(room.controller && room.controller.my) {
       perRoomCounts[roomName] = {
-        harvester: 0,
-        upgrader: 0,
-        builder: 0,
-        scout: 0,
-        defender: 0,
-        supplier: 0,
-        claimbot: 0,
-        attacker: 0,
-        scavenger: 0,
-        thief: 0,
-        squadMember: 0,
-        towerDrain: 0,
-        demolition: 0
+        harvester: 0, upgrader: 0, builder: 0, scout: 0, defender: 0, supplier: 0,
+        claimbot: 0, attacker: 0, scavenger: 0, thief: 0, squadMember: 0, towerDrain: 0, demolition: 0, wallRepair: 0
       };
     }
   }
   for(const name in Game.creeps) {
-    const creep        = Game.creeps[name];
-    const role         = creep.memory.role;
+    const creep = Game.creeps[name];
+    const role = creep.memory.role;
     const assignedRoom = creep.memory.homeRoom || creep.memory.assignedRoom || creep.room.name;
     if(perRoomCounts[assignedRoom] && perRoomCounts[assignedRoom][role] !== undefined) {
       perRoomCounts[assignedRoom][role]++;
@@ -1766,43 +262,42 @@ function cacheRoomData() {
   for(const roomName in Game.rooms) {
     const room = Game.rooms[roomName];
     if(!room.controller || !room.controller.my) continue;
+
+    var rs = getRoomState.get(roomName);
+
     const shouldUpdate = !Memory.roomData[roomName] || Game.time % 100 === 0;
     if(shouldUpdate) {
       if(!Memory.roomData[roomName]) Memory.roomData[roomName] = {};
       const roomMemory = Memory.roomData[roomName];
-      const sources    = room.find(FIND_SOURCES);
-      roomMemory.sources               = sources.map(s => s.id);
-      roomMemory.constructionSitesCount= room.find(FIND_CONSTRUCTION_SITES).length;
-      roomMemory.energyCapacity        = room.energyCapacityAvailable;
-      roomMemory.energyAvailable       = room.energyAvailable;
-      roomMemory.spawnIds              = room.find(FIND_MY_SPAWNS).map(s => s.id);
-      roomMemory.extensionIds          = room.find(FIND_MY_STRUCTURES, {
-        filter: { structureType: STRUCTURE_EXTENSION }
-      }).map(s => s.id);
-      const storage = room.storage;
-      roomMemory.storageId             = storage ? storage.id : null;
-      roomMemory.containerIds          = room.find(FIND_STRUCTURES, {
-        filter: { structureType: STRUCTURE_CONTAINER }
-      }).map(s => s.id);
+
+      var sources = (rs && rs.sources) ? rs.sources : room.find(FIND_SOURCES);
+      roomMemory.sources = sources.map(function(s){ return s.id; });
+
+      var constructionSitesCount = (rs && rs.constructionSites) ? rs.constructionSites.length : room.find(FIND_CONSTRUCTION_SITES).length;
+      roomMemory.constructionSitesCount = constructionSitesCount;
+
+      roomMemory.energyCapacity = room.energyCapacityAvailable;
+      roomMemory.energyAvailable = room.energyAvailable;
+
+      var spawns = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) ? rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my; }) : room.find(FIND_MY_SPAWNS);
+      roomMemory.spawnIds = spawns.map(function(s){ return s.id; });
+
+      var extensions = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_EXTENSION]) ? rs.structuresByType[STRUCTURE_EXTENSION].filter(function(s){ return s.my; }) : room.find(FIND_MY_STRUCTURES, { filter: { structureType: STRUCTURE_EXTENSION } });
+      roomMemory.extensionIds = extensions.map(function(s){ return s.id; });
+
+      const storage = rs ? rs.storage : room.storage;
+      roomMemory.storageId = storage ? storage.id : null;
+
+      var containers = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_CONTAINER]) ? rs.structuresByType[STRUCTURE_CONTAINER] : room.find(FIND_STRUCTURES, { filter: function(s){ return s.structureType === STRUCTURE_CONTAINER; } });
+      roomMemory.containerIds = containers.map(function(s){ return s.id; });
     }
     cache[roomName] = Memory.roomData[roomName];
   }
   return cache;
 }
 
-function needsNewCreeps(perRoomRoleCounts) {
-  for(const roomName in perRoomRoleCounts) {
-    const counts      = perRoomRoleCounts[roomName];
-    const totalCreeps = Object.values(counts).reduce((sum, count) => sum + count, 0);
-    if(counts.harvester === 0) return true;
-    if(totalCreeps < 3) return true;
-  }
-  return false;
-}
-
-
 // =================================================================
-// === STATUS & TRACKING FUNCTIONS =================================
+/* === STATUS & TRACKING FUNCTIONS ================================= */
 // =================================================================
 
 function displayStatus(perRoomRoleCounts) {
@@ -1811,25 +306,18 @@ function displayStatus(perRoomRoleCounts) {
   const TICK_WINDOW  = 500;
   let gclEta = null;
 
-  // ─── Global Control Level (GCL) tracking ────────────────────────────────────
-  if (!Memory.gclTracker) {
-    Memory.gclTracker = { history: [] };
-  }
+  if (!Memory.gclTracker) Memory.gclTracker = { history: [] };
 
   if (Game.time % GCL_INTERVAL === 0) {
     const currentPercent = Game.gcl.progress / Game.gcl.progressTotal * 100;
     Memory.gclTracker.history.push({ tick: Game.time, percent: currentPercent });
 
-    // Prune old entries
-    while (
-      Memory.gclTracker.history.length > 0 &&
-      Memory.gclTracker.history[0].tick < Game.time - GCL_WINDOW
-    ) {
+    while (Memory.gclTracker.history.length > 0 && Memory.gclTracker.history[0].tick < Game.time - GCL_WINDOW) {
       Memory.gclTracker.history.shift();
     }
 
     if (Memory.gclTracker.history.length > 1) {
-      const hist    = Memory.gclTracker.history;
+      const hist = Memory.gclTracker.history;
       const oldest  = hist[0];
       const newest  = hist[hist.length - 1];
       const dt      = newest.tick - oldest.tick;
@@ -1840,38 +328,34 @@ function displayStatus(perRoomRoleCounts) {
         const rate      = dPerc / dt;
         const remaining = 100 - newest.percent;
         const etaTicks  = Math.ceil(remaining / rate);
-        const totalSec  = etaTicks * 4; // 1 tick = 4s
+        const totalSec  = etaTicks * 4;
 
-        // Breakdown into days, hours, minutes
         const days    = Math.floor(totalSec / 86400);
         const hours   = Math.floor((totalSec % 86400) / 3600);
         const minutes = Math.floor((totalSec % 3600) / 60);
 
-        gclEta = { days, hours, minutes };
-        etaString = ` | ETA: ${etaTicks} ticks (~${days}d ${hours}h ${minutes}m)`;
+        gclEta = { days: days, hours: hours, minutes: minutes };
+        etaString = " | ETA: " + etaTicks + " ticks (~" + days + "d " + hours + "h " + minutes + "m)";
       } else {
         etaString = ' | ETA: ∞ (no progress)';
       }
 
       console.log(
-        `Global Control Level: ${Game.gcl.level}` +
-        ` - Progress: ${newest.percent.toFixed(2)}%${etaString}`
+        "Global Control Level: " + Game.gcl.level +
+        " - Progress: " + newest.percent.toFixed(2) + "%" + etaString
       );
     } else {
       console.log(
-        `Global Control Level: ${Game.gcl.level}` +
-        ` - Progress: ${currentPercent.toFixed(2)}%`
+        "Global Control Level: " + Game.gcl.level +
+        " - Progress: " + currentPercent.toFixed(2) + "%"
       );
     }
   }
 
-  // ─── Per-room creep statistics ─────────────────────────────────────────────
   const perRoomStats = {};
   for (const name in Game.creeps) {
-    const creep        = Game.creeps[name];
-    const assignedRoom = creep.memory.homeRoom
-                       || creep.memory.assignedRoom
-                       || creep.room.name;
+    const creep = Game.creeps[name];
+    const assignedRoom = creep.memory.homeRoom || creep.memory.assignedRoom || creep.room.name;
 
     if (!perRoomStats[assignedRoom]) {
       perRoomStats[assignedRoom] = {
@@ -1893,60 +377,61 @@ function displayStatus(perRoomRoleCounts) {
     }
   }
 
-  console.log(`=== COLONY STATUS ===`);
+  console.log("=== COLONY STATUS ===");
   for (const roomName in perRoomRoleCounts) {
     const counts = perRoomRoleCounts[roomName];
-    const stats  = perRoomStats[roomName] || {
-      totalBodyParts: 0,
-      totalCreeps:    0,
-      totalTTL:       0,
-      oldestCreepTTL: 0
-    };
+    const stats  = perRoomStats[roomName] || { totalBodyParts: 0, totalCreeps: 0, totalTTL: 0, oldestCreepTTL: 0 };
 
-    const avgBodyParts = stats.totalCreeps > 0
-      ? (stats.totalBodyParts / stats.totalCreeps).toFixed(1)
-      : 0;
-    const avgTTL = stats.totalCreeps > 0
-      ? Math.round(stats.totalTTL / stats.totalCreeps)
-      : 0;
+    const avgBodyParts = stats.totalCreeps > 0 ? (stats.totalBodyParts / stats.totalCreeps).toFixed(1) : 0;
+    const avgTTL = stats.totalCreeps > 0 ? Math.round(stats.totalTTL / stats.totalCreeps) : 0;
+
+    const roomObj = Game.rooms[roomName];
+    let storageEnergy = 0;
+    if (roomObj && roomObj.storage && roomObj.storage.store) {
+      storageEnergy = roomObj.storage.store[RESOURCE_ENERGY] || 0;
+    }
 
     console.log(
-      `${roomName}: 🧑‍🌾${counts.harvester}` +
-      ` ⚡${counts.upgrader}` +
-      ` 🔨${counts.builder}` +
-      ` 🔭${counts.scout}` +
-      ` 🛡${counts.defender}` +
-      ` ⚔️${counts.attacker}` +
-      ` 🦹${counts.thief}` +
-      ` 🔋${counts.supplier}` +
-      ` 🚀${counts.squadMember}` +
-      ` | Avg Parts: ${avgBodyParts}` +
-      ` | Avg TTL: ${avgTTL}`
+      roomName + ": 🧑‍🌾" + counts.harvester +
+      " ⚡" + counts.upgrader +
+      " 🔨" + counts.builder +
+      " 🔭" + counts.scout +
+      " 🛡" + counts.defender +
+      " ⚔️" + counts.attacker +
+      " 🦹" + counts.thief +
+      " 🔋" + counts.supplier +
+      " 🚀" + counts.squadMember +
+      " | Avg Parts: " + avgBodyParts +
+      " | Avg TTL: " + avgTTL +
+      " | Storage: " + storageEnergy
     );
   }
 
-  // ─── CPU & Energy ─────────────────────────────────────────────────────────
   const perfData      = getPerformanceData();
   const currentEnergy = calculateTotalEnergy();
-  console.log(`💰 Total Energy: ${currentEnergy}`);
+
+  if (!Memory.stats) Memory.stats = {};
+  var prevEnergy = (typeof Memory.stats.lastTotalEnergy === 'number') ? Memory.stats.lastTotalEnergy : null;
+  var deltaStr = '';
+  if (prevEnergy !== null) {
+    var delta = currentEnergy - prevEnergy;
+    deltaStr = ' (' + (delta >= 0 ? '+' : '') + delta + ')';
+  }
+  Memory.stats.lastTotalEnergy = currentEnergy;
 
   if (!ENABLE_CPU_LOGGING || !DISABLE_CPU_CONSOLE) {
-    // Calculate CPU bucket percentage (bucket max is 10,000)
     const bucketPercent = Math.round((Game.cpu.bucket / 10000) * 100);
-    const bucketStatus = Game.cpu.bucket >= 10000 ? '(FULL)' : `(${bucketPercent}%)`;
+    const bucketStatus = Game.cpu.bucket >= 10000 ? '(FULL)' : '(' + bucketPercent + '%)';
 
     console.log(
-      `🖥️ CPU: ${Math.round(perfData.cpuUsed)}/${perfData.cpuLimit}` +
-      ` (${Math.round(perfData.cpuPercent)}%) | Avg: ${Math.round(perfData.cpuAverage)}` +
-      ` | Bucket: ${Game.cpu.bucket}/10000 ${bucketStatus}` +
-      ` | Tick Limit: ${Game.cpu.tickLimit}`
+      "🖥️ CPU: " + Math.round(perfData.cpuUsed) + "/" + perfData.cpuLimit +
+      " (" + Math.round(perfData.cpuPercent) + "%) | Avg: " + Math.round(perfData.cpuAverage) +
+      " | Bucket: " + Game.cpu.bucket + "/10000 " + bucketStatus +
+      " | Tick Limit: " + Game.cpu.tickLimit
     );
   }
 
-  // ─── Per-room RCL tracking ────────────────────────────────────────────────
-  if (!Memory.progressTracker) {
-    Memory.progressTracker = {};
-  }
+  if (!Memory.progressTracker) Memory.progressTracker = {};
 
   for (const roomName in Game.rooms) {
     const room = Game.rooms[roomName];
@@ -1962,14 +447,11 @@ function displayStatus(perRoomRoleCounts) {
     const tracker = Memory.progressTracker[roomName];
     if (tracker.level !== room.controller.level) {
       tracker.level   = room.controller.level;
-      tracker.history = [{ tick: Game.time, percent }];
+      tracker.history = [{ tick: Game.time, percent: percent }];
     }
 
-    tracker.history.push({ tick: Game.time, percent });
-    while (
-      tracker.history.length > 0 &&
-      tracker.history[0].tick < Game.time - TICK_WINDOW
-    ) {
+    tracker.history.push({ tick: Game.time, percent: percent });
+    while (tracker.history.length > 0 && tracker.history[0].tick < Game.time - 500) {
       tracker.history.shift();
     }
 
@@ -1981,36 +463,33 @@ function displayStatus(perRoomRoleCounts) {
       const tickDelta    = newest.tick - oldest.tick;
       const percentDelta = newest.percent - oldest.percent;
 
-      if (tickDelta >= TICK_WINDOW && percentDelta > 0) {
+      if (tickDelta >= 500 && percentDelta > 0) {
         const percentRemaining = 100 - newest.percent;
         const rate             = percentDelta / tickDelta;
         const etaTicks         = Math.ceil(percentRemaining / rate);
         const etaMinutes       = etaTicks * 4 / 60;
-        etaString = ` | ETA: ${etaTicks} ticks (~${formatTime(etaMinutes)})`;
+        etaString = " | ETA: " + etaTicks + " ticks (~" + formatTime(etaMinutes) + ")";
       }
-      else if (tickDelta >= TICK_WINDOW) {
+      else if (tickDelta >= 500) {
         etaString = ' | ETA: ∞ (no progress)';
       }
     }
 
     console.log(
-      `Room ${roomName}: RCL ${room.controller.level}` +
-      ` - Progress: ${percent.toFixed(1)}%` +
-      ` | Energy: ${room.energyAvailable}/${room.energyCapacityAvailable}` +
-      ` (${energyPercent.toFixed(1)}%)${etaString}`
+      "Room " + roomName + ": RCL " + room.controller.level +
+      " - Progress: " + percent.toFixed(1) + "%" +
+      " | Energy: " + room.energyAvailable + "/" + room.energyCapacityAvailable +
+      " (" + energyPercent.toFixed(1) + "%)" + etaString
     );
   }
 
-  // ─── Exploration summary ──────────────────────────────────────────────────
   if (Memory.exploration && Memory.exploration.rooms) {
-    console.log(`Explored rooms: ${Object.keys(Memory.exploration.rooms).length}`);
+    console.log("Explored rooms: " + Object.keys(Memory.exploration.rooms).length);
     console.log('==============================================================');
   }
 
-  // Return the GCL ETA breakdown (or null if unavailable)
   return gclEta;
 }
-
 
 function calculateTotalEnergy() {
   let totalEnergy = 0;
@@ -2019,15 +498,13 @@ function calculateTotalEnergy() {
   for (const roomName in Memory.roomData) {
     const roomCache = Memory.roomData[roomName];
     if (!roomCache) continue;
-    const allIds = [
-      ...(roomCache.spawnIds || []),
-      ...(roomCache.extensionIds || []),
-      ...(roomCache.containerIds || [])
-    ];
-    if (roomCache.storageId) {
-      allIds.push(roomCache.storageId);
-    }
-    totalEnergy += allIds.reduce((sum, id) => {
+    const allIds = []
+      .concat(roomCache.spawnIds || [])
+      .concat(roomCache.extensionIds || [])
+      .concat(roomCache.containerIds || []);
+    if (roomCache.storageId) allIds.push(roomCache.storageId);
+
+    totalEnergy += allIds.reduce(function(sum, id){
       const structure = Game.getObjectById(id);
       if (structure && structure.store) {
         return sum + structure.store.getUsedCapacity(RESOURCE_ENERGY);
@@ -2035,7 +512,6 @@ function calculateTotalEnergy() {
       return sum;
     }, 0);
   }
-
   return totalEnergy;
 }
 
@@ -2045,12 +521,7 @@ function getPerformanceData() {
   const cpuLimit   = Game.cpu.limit;
   const cpuPercent = ((cpuUsed / cpuLimit) * 100).toFixed(1);
 
-  return {
-    cpuUsed,
-    cpuAverage: Math.round(cpuAverage),
-    cpuPercent,
-    cpuLimit,
-  };
+  return { cpuUsed: cpuUsed, cpuAverage: Math.round(cpuAverage), cpuPercent: cpuPercent, cpuLimit: cpuLimit };
 }
 
 function formatTime(totalMinutes) {
@@ -2058,318 +529,126 @@ function formatTime(totalMinutes) {
   const hours   = Math.floor((totalMinutes % (24 * 60)) / 60);
   const minutes = Math.floor(totalMinutes % 60);
   if (days > 0) {
-    return hours > 0
-      ? `${days}d ${hours}h ${minutes}m`
-      : `${days}d ${minutes}m`;
+    return hours > 0 ? (days + "d " + hours + "h " + minutes + "m") : (days + "d " + minutes + "m");
   } else if (hours > 0) {
-    return `${hours}h ${minutes}m`;
+    return hours + "h " + minutes + "m";
   } else {
-    return `${minutes}m`;
+    return minutes + "m";
   }
 }
-
-function runTerminalBot(creep) {
-    // Find operation (your existing logic)
-    let operation = Memory.terminalManager.operations.find(op => 
-        op.botId === creep.name && (op.status === 'waiting' || op.status === 'dealing' || op.status === 'pending')
-    );
-
-    if (!operation) {
-        creep.say('❌ No op');
-        return;
-    }
-
-    const room = Game.rooms[operation.roomName];
-    const terminal = room.terminal;
-
-    // Calculate needs (your existing logic)
-    const totalNeeded = getResourceNeeded(operation.roomName, operation.resourceType);
-    const inTerminal = terminal.store[operation.resourceType] || 0;
-    const actuallyNeeded = Math.max(0, totalNeeded - inTerminal);
-    const carrying = creep.store[operation.resourceType] || 0;
-
-    console.log(`[TerminalBot] ${creep.name}: Operation ${operation.id} - Total needed: ${totalNeeded}, In terminal: ${inTerminal}, Actually needed: ${actuallyNeeded}, Carrying: ${carrying}`);
-
-    // Initialize waiting state tracking
-    if (!creep.memory.waitingState) {
-        creep.memory.waitingState = {
-            isWaiting: false,
-            lastResourceCheck: 0,
-            waitStartTime: 0
-        };
-    }
-
-    // If we have resources to deposit, do that first
-    if (carrying > 0) {
-        if (creep.pos.isNearTo(terminal)) {
-            const transferResult = creep.transfer(terminal, operation.resourceType);
-            if (transferResult === OK) {
-                console.log(`[TerminalBot] ${creep.name}: Deposited ${carrying} ${operation.resourceType} to terminal`);
-                creep.say(`✅ +${carrying}`);
-            }
-        } else {
-            creep.moveTo(terminal, { visualizePathStyle: { stroke: '#00ff00' } });
-            creep.say('🏃 Deposit');
-        }
-        return;
-    }
-
-    // Check if we're done with the operation
-    if (actuallyNeeded <= 0) {
-        console.log(`[TerminalBot] ${creep.name}: Operation complete, no more ${operation.resourceType} needed`);
-        operation.status = 'completed';
-        operation.botId = null;
-        creep.suicide(); // This suicide is appropriate - job is done
-        return;
-    }
-
-    // If we need resources and have space, try to collect
-    if (actuallyNeeded > 0 && creep.store.getFreeCapacity() > 0) {
-
-        // Only check for resources every 10 ticks to reduce CPU usage
-        const shouldCheckResources = Game.time - creep.memory.waitingState.lastResourceCheck >= 10;
-
-        if (shouldCheckResources) {
-            creep.memory.waitingState.lastResourceCheck = Game.time;
-
-            // Look for resource sources
-            const sources = findResourceSources(room, operation.resourceType);
-
-            if (sources.length > 0) {
-                // Resources found! Exit waiting state
-                if (creep.memory.waitingState.isWaiting) {
-                    const waitTime = Game.time - creep.memory.waitingState.waitStartTime;
-                    console.log(`[TerminalBot] ${creep.name}: Resources found after waiting ${waitTime} ticks!`);
-                    creep.memory.waitingState.isWaiting = false;
-                }
-
-                // Collect from the best source
-                const bestSource = sources[0]; // You can add logic to pick the best one
-
-                if (creep.pos.isNearTo(bestSource.structure)) {
-                    const withdrawAmount = Math.min(
-                        creep.store.getFreeCapacity(),
-                        bestSource.amount,
-                        actuallyNeeded
-                    );
-
-                    const withdrawResult = creep.withdraw(bestSource.structure, operation.resourceType, withdrawAmount);
-                    if (withdrawResult === OK) {
-                        console.log(`[TerminalBot] ${creep.name}: Collected ${withdrawAmount} ${operation.resourceType} from ${bestSource.type}`);
-                        creep.say(`📦 +${withdrawAmount}`);
-                    }
-                } else {
-                    creep.moveTo(bestSource.structure, { visualizePathStyle: { stroke: '#ffaa00' } });
-                    creep.say(`🏃 Get ${operation.resourceType}`);
-                }
-
-            } else {
-                // No resources found - enter or continue waiting state
-                if (!creep.memory.waitingState.isWaiting) {
-                    creep.memory.waitingState.isWaiting = true;
-                    creep.memory.waitingState.waitStartTime = Game.time;
-                    console.log(`[TerminalBot] ${creep.name}: No ${operation.resourceType} sources found, entering waiting state`);
-                }
-
-                const waitTime = Game.time - creep.memory.waitingState.waitStartTime;
-                console.log(`[TerminalBot] ${creep.name}: Waiting for ${operation.resourceType} (${waitTime} ticks)`);
-                creep.say(`⏳ Wait ${operation.resourceType}`);
-
-                // Move to a corner or designated waiting area to stay out of the way
-                const waitingSpot = getWaitingSpot(room);
-                if (waitingSpot && !creep.pos.isEqualTo(waitingSpot)) {
-                    creep.moveTo(waitingSpot, { visualizePathStyle: { stroke: '#666666' } });
-                }
-            }
-        } else {
-            // Still in check cooldown, just show waiting status
-            if (creep.memory.waitingState.isWaiting) {
-                const waitTime = Game.time - creep.memory.waitingState.waitStartTime;
-                creep.say(`⏳ ${waitTime}`);
-            }
-        }
-    }
-}
-
-// Helper function to find resource sources
-function findResourceSources(room, resourceType) {
-    const sources = [];
-
-    // Check storage first (usually the main source)
-    if (room.storage && room.storage.store[resourceType] > 0) {
-        sources.push({
-            structure: room.storage,
-            amount: room.storage.store[resourceType],
-            type: 'storage',
-            priority: 1
-        });
-    }
-
-    // Check containers
-    const containers = room.find(FIND_STRUCTURES, {
-        filter: s => s.structureType === STRUCTURE_CONTAINER && s.store[resourceType] > 0
-    });
-    containers.forEach(container => {
-        sources.push({
-            structure: container,
-            amount: container.store[resourceType],
-            type: 'container',
-            priority: 2
-        });
-    });
-
-    // Check labs (lower priority, might be in use)
-    const labs = room.find(FIND_MY_STRUCTURES, {
-        filter: s => s.structureType === STRUCTURE_LAB && s.store[resourceType] > 0
-    });
-    labs.forEach(lab => {
-        sources.push({
-            structure: lab,
-            amount: lab.store[resourceType],
-            type: 'lab',
-            priority: 3
-        });
-    });
-
-    // Sort by priority and amount
-    sources.sort((a, b) => {
-        if (a.priority !== b.priority) return a.priority - b.priority;
-        return b.amount - a.amount;
-    });
-
-    return sources;
-}
-
-// Helper function to find a good waiting spot
-function getWaitingSpot(room) {
-    // Find a corner or edge position that's out of the way
-    const terrain = room.getTerrain();
-
-    // Try corners first
-    const corners = [
-        { x: 2, y: 2 },
-        { x: 47, y: 2 },
-        { x: 2, y: 47 },
-        { x: 47, y: 47 }
-    ];
-
-    for (const corner of corners) {
-        if (terrain.get(corner.x, corner.y) !== TERRAIN_MASK_WALL) {
-            const pos = room.getPositionAt(corner.x, corner.y);
-            if (pos && pos.lookFor(LOOK_CREEPS).length === 0) {
-                return pos;
-            }
-        }
-    }
-
-    // If no corners available, just stay where you are
-    return null;
-}
-
-
-
-
-
-
-
-// Helper function to calculate resource needed (add this to your main.js)
-function getResourceNeeded(roomName, resourceType) {
-    if (!Memory.terminalManager || !Memory.terminalManager.operations) return 0;
-
-    const operations = Memory.terminalManager.operations;
-    let needed = 0;
-
-    for (const op of operations) {
-        if (op.status === 'completed' || op.status === 'failed') continue;
-
-        if (op.type === 'marketSell' && op.roomName === roomName && op.resourceType === resourceType) {
-            needed += (op.amount - op.amountSold);
-        } else if (op.type === 'transfer' && op.fromRoom === roomName && op.resourceType === resourceType) {
-            needed += (op.amount - op.amountTransferred);
-        } else if (op.type === 'transfer' && op.fromRoom === roomName && resourceType === RESOURCE_ENERGY) {
-            // Energy needed for transfer cost
-            const transferCost = Game.market.calcTransactionCost(
-                op.amount - op.amountTransferred, 
-                op.fromRoom, 
-                op.toRoom
-            );
-            needed += transferCost;
-        }
-    }
-
-    return needed;
-}
-
 
 function trackCPUUsage() {
   if(!Memory.cpuStats) {
-    Memory.cpuStats = {
-      history: [],
-      average: 0
-    };
+    Memory.cpuStats = { history: [], average: 0 };
   }
   const cpuUsed = Game.cpu.getUsed();
   Memory.cpuStats.history.push(cpuUsed);
-  if(Memory.cpuStats.history.length > 50) {
-    Memory.cpuStats.history.shift();
-  }
-  Memory.cpuStats.average = Memory.cpuStats.history.reduce((sum, cpu) => sum + cpu, 0)
-                            / Memory.cpuStats.history.length;
+  if(Memory.cpuStats.history.length > 50) Memory.cpuStats.history.shift();
+  Memory.cpuStats.average = Memory.cpuStats.history.reduce(function(sum, cpu){ return sum + cpu; }, 0) / Memory.cpuStats.history.length;
 }
 
+// Initialize global orders with spawnManager helpers
+globalOrders.init({
+  getRoomState: getRoomState,
+  iff: iff,
+  squad: squad,
+  getCreepBody: spawnManager.getCreepBody,
+  bodyCost: spawnManager.bodyCost
+});
+
 // =================================================================
-// ========================= MAIN GAME LOOP ========================
+/* ========================= MAIN GAME LOOP ======================== */
 // =================================================================
 
 module.exports.loop = function() {
   profiler.wrap(function() {
+    // --- GLOBAL CREEP CACHE BY ROLE (Problem #1 Fix) ---
+    global.creepsByRole = {};
+    for (const name in Game.creeps) {
+      const creep = Game.creeps[name];
+      if (!creep.memory || !creep.memory.role) continue;
+
+      const role = creep.memory.role;
+      if (!global.creepsByRole[role]) {
+        global.creepsByRole[role] = [];
+      }
+      global.creepsByRole[role].push(creep);
+    }
+
+    // Also cache by room and role for faster lookups
+    global.creepsByRoomAndRole = {};
+    for (const name in Game.creeps) {
+      const creep = Game.creeps[name];
+      if (!creep.memory || !creep.memory.role) continue;
+
+      const assignedRoom = creep.memory.homeRoom || creep.memory.assignedRoom || creep.room.name;
+      const role = creep.memory.role;
+
+      if (!global.creepsByRoomAndRole[assignedRoom]) {
+        global.creepsByRoomAndRole[assignedRoom] = {};
+      }
+      if (!global.creepsByRoomAndRole[assignedRoom][role]) {
+        global.creepsByRoomAndRole[assignedRoom][role] = [];
+      }
+      global.creepsByRoomAndRole[assignedRoom][role].push(creep);
+    }
+
     // --- MEMORY & SYSTEM MANAGEMENT ---
     if (!Memory.stats) Memory.stats = {};
-    roleScout.handleDeadCreeps();
+    if (Game.time % 5 === 0) roleScout.handleDeadCreeps();
     if (Game.time % 20 === 0)   cleanMemory();
     if (Game.time % 1000 === 0) cleanCpuProfileMemory();
-    //if (Game.time % 1001 === 0) cleanupDeadCreeps();
+
+
+    // --- BUILD PER-TICK ROOM STATE EARLY ---
+    profileSection('getRoomState.init', function() { getRoomState.init(); });
 
     // --- CACHING & COUNTS ---
     const perRoomRoleCounts = getPerRoomRoleCounts();
     const roomDataCache     = cacheRoomData();
 
-    // --- STRUCTURES ---
-    profileSection('runTowers', runTowers);
-    if (Game.time % 5 === 0) {
-      profileSection('runLinks', runLinks);
+    // --- ROOM OBSERVER SCAN PROGRESSION ---
+    if (Memory.roomObserverState && Memory.roomObserverState.active === true) {
+      if (typeof roomObserverRun === 'function') {
+        profileSection('roomObserverRun', function() { roomObserverRun(); });
+      } else if (typeof scanRoomsStep === 'function') {
+        profileSection('scanRoomsStep', function() { scanRoomsStep(); });
+      } else if (Game.time % 50 === 0) {
+        console.log('roomObserver: scan active but runner not found. Did you require("roomObserver")?');
+      }
     }
-    
-        // In your main loop, replace the grouped spawn calls with individual profiling:
-        // Add these to your main loop profiling
-    profileSection('cleanMemory', cleanMemory);
-    profileSection('getPerRoomRoleCounts', () => getPerRoomRoleCounts());
-    profileSection('cacheRoomData', () => cacheRoomData());
-    profileSection('manageClaimbotSpawns', manageClaimbotSpawns);
-    profileSection('manageAttackerSpawns', manageAttackerSpawns);
-    profileSection('manageTowerDrainSpawns', manageTowerDrainSpawns);
-    profileSection('manageThiefSpawns', manageThiefSpawns);
-    profileSection('manageExtractorSpawns', manageExtractorSpawns);
-    profileSection('manageDemolitionSpawns', manageDemolitionSpawns);
-    profileSection('terminalManager', () => terminalManager.run());
-    profileSection('factoryManager', () => factoryManager.run());
 
+    // --- STRUCTURES ---
+    profileSection('towerManager.run', function(){ towerManager.run(); });
+    if (Game.time % 3 === 0) profileSection('linkManager.run', function(){ linkManager.run(); });
 
-    // --- SQUAD MANAGEMENT ---
-    profileSection('processSquadSpawnQueues', processSquadSpawnQueues);
+    // --- MAINTENANCE & MANAGERS ---
+    if (Game.time % 1000 === 0) {
+      profileSection('roomBalance', function() { roomBalance.run(); });
+    }
 
-    // --- SPAWNING ---
-    profileSection('manageDemolitionSpawns', manageDemolitionSpawns);
-    if (Game.time % 10 === 0) profileSection('manageClaimbotSpawns', manageClaimbotSpawns);
-    if (Game.time % 5 === 0)  profileSection('manageAttackerSpawns', manageAttackerSpawns);
-    profileSection('manageTowerDrainSpawns', manageTowerDrainSpawns);
-    profileSection('manageThiefSpawns',       manageThiefSpawns);
-    if (Game.time % 50 === 0) profileSection('manageExtractorSpawns', manageExtractorSpawns);
-    if (Game.time % 10 === 0) profileSection('spawnScavengers', spawnScavengers);
+    profileSection('terminalManager', function(){ terminalManager.run(); });
+    profileSection('mineralManager', function(){ mineralManager.run(); });
+    profileSection('factoryManager', function(){ factoryManager.run(); });
+    profileSection('marketUpdater', function(){ marketUpdater.run(); });
+    profileSection('marketRefine.run', function(){ marketRefine.run(); });
+    if (Game.time % 10 === 0) profileSection('opportunisticBuy', function(){ opportunisticBuy.process(); });
 
-    if (needsNewCreeps(perRoomRoleCounts) || Game.time % 10 === 0) {
-      profileSection('manageSpawnsPerRoom', () => {
-        manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache);
+    // --- NUKE LAUNCH PIPELINE (runs every tick; observer vision is next-tick) ---
+    profileSection('nukeLaunch.run', function(){ nukeLaunch.run(); });
+
+    profileSection('labManager', function() {
+      for (const roomName in Game.rooms) {
+        const room = Game.rooms[roomName];
+        if (!room.controller || !room.controller.my) continue;
+        labManager.run(roomName);
+      }
+    });
+
+    // --- SPAWNING (centralized) ---
+    if (Game.time % 10 === 0) {
+      profileSection('spawnManager.run', function() {
+        spawnManager.run(perRoomRoleCounts, roomDataCache);
       });
     }
 
@@ -2381,13 +660,42 @@ module.exports.loop = function() {
 
     // --- STATUS DISPLAY (LESS OFTEN) ---
     if (Game.time % 50 === 0) {
-      profileSection('displayStatus', () => displayStatus(perRoomRoleCounts));
+      profileSection('displayStatus', function(){ displayStatus(perRoomRoleCounts); });
       if (ENABLE_CPU_LOGGING && !DISABLE_CPU_CONSOLE) {
         for (const key in Memory.cpuProfile) {
-          const avg = Memory.cpuProfile[key].reduce((a, b) => a + b, 0) / Memory.cpuProfile[key].length;
-          console.log(`CPU Profile: ${key} avg: ${Math.round(avg)}`);
+          const avg = Memory.cpuProfile[key].reduce(function(a, b){ return a + b; }, 0) / Memory.cpuProfile[key].length;
+          console.log("CPU Profile: " + key + " avg: " + Math.round(avg));
         }
       }
     }
   });
 };
+
+// --- CPU PROFILING ---
+if (ENABLE_CPU_LOGGING && !Memory.cpuProfile) Memory.cpuProfile = {};
+function profileSection(name, fn) {
+  if (!ENABLE_CPU_LOGGING) {
+    fn();
+    return;
+  }
+  const start = Game.cpu.getUsed();
+  fn();
+  const used = Game.cpu.getUsed() - start;
+  if (!Memory.cpuProfile[name]) Memory.cpuProfile[name] = [];
+  Memory.cpuProfile[name].push(used);
+  if (Memory.cpuProfile[name].length > 50) Memory.cpuProfile[name].shift();
+  if (!Memory.cpuProfileLastUsed) Memory.cpuProfileLastUsed = {};
+  Memory.cpuProfileLastUsed[name] = Game.time;
+}
+
+function cleanCpuProfileMemory(maxAge) {
+  if (maxAge === undefined) maxAge = 5000;
+  if (!Memory.cpuProfileLastUsed) return;
+  const now = Game.time;
+  for (const key in Memory.cpuProfileLastUsed) {
+    if (now - Memory.cpuProfileLastUsed[key] > maxAge) {
+      delete Memory.cpuProfile[key];
+      delete Memory.cpuProfileLastUsed[key];
+    }
+  }
+}

@@ -1,49 +1,16 @@
-<details><summary>Thinking</summary>
-
-The user is asking me to update a README based on changes they've mentioned. However, I notice they said "Given this readme and these changes" but I don't see the actual changes document attached - they only provided a summary of changes at the beginning.
-
-Looking at what they provided:
-1. A summary of major changes (the "Summary" section at the top with all the bullet points about modified files)
-2. The current README
-
-What I need to do:
-- Incorporate the changes described in that summary into the README
-- Update sections that have changed
-- Add new sections for new functionality
-- Make sure the README reflects all the new systems mentioned
-
-Key updates based on the summary:
-1. New modules: getRoomState.js, globalOrders, labManager, linkManager, marketAnalysis, marketBuyer, marketSell, etc.
-2. New roles: roleMineralCollector, squad system, towerManager
-3. Enhanced existing systems: factoryManager, roleBuilder, roleHarvester, roleSupplier, terminalManager, etc.
-4. New management systems: spawnManager, market automation, lab reactions, link management
-
-I should update the README to reflect:
-- The new roles and managers
-- New console commands for the new systems (lab orders, market analysis, etc.)
-- Market automation features
-- Lab reaction management
-- Link manager
-- Room state caching
-- Squad system (though this is mentioned)
-
-Let me create an updated README that incorporates these changes.
-
-</details>
-
 # Screeps Colony – README
 
-*Version: 2025‑10‑18*
+*Version: 2025‑10‑24*
 
 ---
 
 ## 📖 Overview
 
 This repository powers a **multi‑room AI colony** for **Screeps World**.  
-All core decisions—creep roles, resource logistics, combat, and expansion—are hand‑crafted and continuously refined through live‑game testing.
+All core decisions—creep roles, logistics, combat, RCL progression, market operations, and nuclear warfare—are hand‑crafted and continuously refined through live‑game testing.
 
-The system is **modular**: each subsystem lives in its own module and is invoked from the main loop (`module.exports.loop`).  
-**Major refactor:** Introduces centralized room‑state caching, automated market trading, lab reaction management, advanced logistics (suppliers, harvesters, factory bots), squad/attack orchestration, and a comprehensive suite of utility modules.
+The system is **modular**: every subsystem lives in its own module and is invoked from the main loop (`module.exports.loop`).  
+**Latest refactor:** Tightens room‑state caching, expands factory automation to high‑tier commodities, introduces full terminal workforce orchestration, adds refinery and nuke pipelines, and greatly broadens spawn management coverage.
 
 ---
 
@@ -53,245 +20,226 @@ The system is **modular**: each subsystem lives in its own module and is invoked
 
 | Role | Primary duties | Highlights |
 |------|----------------|-----------|
-| **🧑‍🌾 Harvester** | Harvests sources, caches source assignments, idles by source when empty. | Balanced source assignments, regeneration‑aware waiting, per‑room cache, robust stuck handling. |
-| **⚡ Upgrader** | Refills controller, pulls energy from storage / container / link. | Cached controller, fast source lookup, fallback to harvesting. |
-| **🔨 Builder** | Global job queue (repair, build, wall repair) with urgency‑based selection. | Cached room data, priority‑tiered top‑K job selection, smart energy acquisition, reroute controls. |
-| **🔭 Scout** | Exploration, path‑finding, danger detection, black‑listing. | Stuck detection, local & mission blacklists, auto‑explorer. |
-| **🛡️ Defender** | Ranged combat, IFF whitelisting, target‑switching. | — |
-| **⚔️ Attacker** | Console‑orderable attacks, rally system, custom path‑finding with blacklists. | Hostile‑tower avoidance, coordinated retreat/heal logic, cached path clearing. |
-| **🔋 Supplier** | Energy logistics with prioritized task system. | Spawn/extension/tower/link/container/material/terminal balancing, anti‑stuck logic, mineral deliveries. |
-| **🗺️ Claimbot** | Claims or attacks controllers with edge‑avoidance. | Controller‑path caching, interactive logging. |
-| **💎 Miner** | Extracts minerals, drops them immediately. | — |
-| **🧪 Extractor** | Harvests minerals from extractor, drops into container. | — |
-| **💠 Mineral Collector** | Sweeps non‑energy minerals into storage and retires. | *New role.* |
-| **🧪 FactoryBot** | Feeds factories, evacuates finished product, drains leftovers. | Multi‑input recipes, startup drain, post‑order evacuation, smarter standby behavior. |
-| **🧟‍♂️ Thief** | Steals resources from enemy structures, returns home. | Filters allied/rampart‑protected structures, respects home deposits, clears stale targets. |
-| **⚡ TowerDrain** | Positions on room border, retreats to heal, returns home. | — |
-| **💣 Demolition** | Demolition‑team logic (demolisher + collector). | — |
-| **🧱 RemoteHarvester** *(disabled)* | Tiered body scaling, long‑distance harvesting. | Tiered body selection, flee logic with timers, smarter deposit targeting. |
-| **🧱 Scavenger** | Picks up dropped resources, delivers to storage. | — |
-| **🪧 Signbot** | Signs room controllers. | — |
-| **🛠️ SquadMember** | Part of a 2×2 quad squad (attack, heal, pack). | Quad formation packing, cost‑matrix transformation for group movement, per‑member healing. |
-| **🧑‍🔧 TerminalBot** | Handles terminal operations (buy/sell/transfer). | Market order creation, dynamic pricing, transfer energy checks, per‑operation spawn policies. |
-| **🧱 RoadTracker** *(optional, disabled)* | Tracks road usage, visualises over‑/under‑used tiles. | — |
+| **🧑‍🌾 Harvester** | Harvests assigned source, idles at source when buffers full. | Distance‑scaled bodies, regeneration guard, spawn‑room cache, emergency fallbacks. |
+| **⚡ Upgrader** | Controller upgrades with storage/fallback harvesting. | Controller‑range source cache, structural withdraw preference, TTL‑aware throttling. |
+| **🔨 Builder** | Builds/repairs from global job queue. | Central room cache, urgency‑based top‑K selection, edge avoidance. |
+| **🔭 Scout** | Exploration, safe pathing, danger blacklists. | Dynamic blacklist per mission, quad avoidance, observer integration. |
+| **🛡️ Defender** | Ranged defense. | Quad heater targeting, packed logistics. |
+| **⚔️ Attacker** | Console‑driven attacks with rally/target assignment. | Tower avoidance, healer priority, per‑target tracking, multi‑room staging. |
+| **🔋 Supplier** | Energy & resource logistics. | Intent‑first planner, container labelling (donor/hybrid/recipient/materials), terminal integration. |
+| **🗺️ Claimbot** | Claims/attacks controller with edge avoidance. | Controller path caching, renewable support. |
+| **💎 Miner** | Extracts minerals, drops instantly. | TTL reset, container binding. |
+| **🧪 Extractor** | Mineral harvesting via extractor+container pairs. | Auto spawn/renew pipeline, fallback caching. |
+| **💠 Mineral Collector** | Sweeps non‑energy minerals to storage. | Room‑wide stock scan, TTL auto‑retire. |
+| **🧪 FactoryBot** | Feeds/drenches factories. | Multi‑input recipes, startup drain, high‑tier commodities (Composite/Crystal/Liquid), factory level enforcement. |
+| **🧟‍♂️ Thief** | Steals from enemy industry. | Rampart detection, extension/storage targeting, resource‑aware deposit. |
+| **⚡ TowerDrain** | Border drain squads. | Heal retreat phase, paired positions, TTL auto‑return. |
+| **💣 Demolition** | Demolisher/collector tandems. | Team IDs, partner respawn, whitelist guard. |
+| **🧱 RemoteHarvester** *(disabled)* | Long‑distance harvesting. | Tiered body planner, flee timer, deposit retarget. |
+| **🧱 Scavenger** | Scoop dropped resources + notify. | Spawn on tower kills, controller idle. |
+| **🪧 Signbot** | Signs controllers with custom message. | Path fallback + TTL retire. |
+| **🛠️ SquadMember** | 2×2 quad squads. | Cost‑matrix transform, formation packing, heal routing. |
+| **🧑‍🔧 TerminalBot** | Local terminal logistics. | Collect/drain/storage shuttling, market integration. |
+| **🧱 WallRepair** | Thresholded wall & rampart repair. | Edge‑avoiding pathfinder, order queue with TTL renew. |
+| **🧑‍🔧 NukeFill** | Nuker refueller. | Energy + ghodium stages, opportunistic buy integration. |
 
 ---
 
-### 2️⃣ Defense & Infrastructure
+### 2️⃣ Defense, Infrastructure & Nuclear
 
-- **Advanced Tower Logic** – Cached hostile/injured/damaged/wall scans, special targeting (healers vs workers), rate‑limited repairs, IFF whitelist prevents friendly fire.
-- **Link Network** – Cached donor/storage/recipient classification (refreshed every 50 ticks), cost‑aware link sends, single‑intent enforcement per room.
-- **Smart Path‑finding** – Used by scouts, attackers, and squads; includes stuck detection and dynamic blacklisting.
-- **Road & Container Management** – Supplier role balances containers (donor / hybrid / recipient) and handles terminal‑energy balancing.
-
----
-
-### 3️⃣ Advanced Resource Management
-
-- **Factory Manager** – FIFO per‑room factory orders, multi‑resource inputs, factory‑level requirements, "max" production mode, per‑room capacity tracking, richer order state (active/queued).
-- **Lab Manager** – Automated lab reaction orchestration: layout discovery, chain planning, throttled validation, evacuation logic, full console tooling (order/cancel/show/debug/stats).
-- **Terminal Manager** – Full market + transfer orchestrator: market buy/sell order creation, dynamic pricing, transfer energy checks, per‑operation spawn policies, single terminal bot per room, automatic cleanup.
-- **Market Automation** – Energy‑decay analytics, commodity profitability reports, automated market buy/sell flows, price lookups, market upkeep, post‑mining processing/sales, price‑sensitive opportunistic purchasing.
-- **Link Manager** – Cached donor/storage/recipient classification refreshed every 50 ticks, cost‑aware link sends, single‑intent enforcement.
-- **Room State Caching** – Per‑tick cached snapshots of owned/visible rooms (structures grouped by type, creeps, hostiles, resources) feeding quick lookups across all systems.
+- **Advanced Tower Manager** – Hostile priority cache, per‑room heal budgets, wall/rampart hysteresis, road exclusion, and repair cooldowns.
+- **Link Network** – Cached donor/storage/recipient roles, single intent per room, cost‑aware sends.
+- **Room State Cache** – Per tick, observer/creep visibility, structured cache with 25‑tick structure TTL.
+- **Observer Scanner** – `roomObserver` module with console BFS scan helpers.
+- **Nuke Command Stack** – `nukeUtils`, `nukeLaunch`, and `nukeFill` provide range checks, vision scheduling, automated nuker loading, and launch console commands.
 
 ---
 
-### 4️⃣ Colony & Resource Management
+### 3️⃣ Advanced Economic Automation
 
-- **Centralized Spawn Manager** – Orchestrates all spawn logic (harvesters, defenders, suppliers, lab bots, demolition/attack/tower drain crews), emergency cases, role counts, delays, and global targets.
-- **Dynamic Creep Scaling** – Body tiers per room energy; emergency spawns when energy low.
-- **Emergency Harvesters** – Spawned when no harvesters exist.
-- **Low‑Energy Spawn Dampening** – Delays spawns when total energy < 800.
-- **CPU & Performance Profiling** – `screeps-profiler` integrated, toggleable.
-- **Analytics** – GCL/RCL ETA, per‑room creep stats, CPU usage logs, energy‑income tracking, daily kill counter.
+- **Factory Manager** – FIFO per room orders, multi‑input recipes, new high‑tier commodities (Composite, Crystal, Liquid) with factory level enforcement, max batch calculator, automatic factory‑bot spawn.
+- **Lab Manager** – Reaction chain planner, layout caching, evacuation logic, per‑step queue, console helpers, auto lab bot requests.
+- **Terminal Manager** – Unified transfers, local storage↔terminal hauling (`storageToTerminal`, `terminalToStorage`), wait detection, single bot per room, marketSell integration.
+- **Market Automation** – Live profitability (`marketAnalysis`), buy/sell orchestration (`marketBuyer`, `marketSell`), local refine pipeline (`marketRefine`), opportunistic buy requests.
+- **Maintenance Scanner** – Room decay audit by structure class (roads, ramparts, containers, tunnels).
 
 ---
 
-## ✨ New Features (since previous Version)
+### 4️⃣ Colony Management
 
-- **Lab Manager** (`labManager.js`) – Automated lab reaction manager with layout discovery, chain planning, throttled validation, evacuation logic, and console tools.
-- **Market Automation** (`marketAnalysis.js`, `marketBuyer.js`, `marketSell.js`, `marketQuery.js`, `marketUpdate.js`, `opportunisticBuy.js`) – Energy decay analytics, commodity profitability, automated buy/sell flows, price lookups.
-- **Room State Caching** (`getRoomState.js`) – Per‑tick cached snapshots feeding rapid lookups across all systems.
-- **Link Manager** (`linkManager.js`) – Replaces inline link handler with cached classification and cost‑aware sends.
-- **Tower Manager** (`towerManager.js`) – Cached hostile/injured/damaged/wall scans, special targeting, rate‑limited repairs.
-- **Spawn Manager** (`spawnManager.js`) – Centralizes all spawn logic and role orchestration.
-- **Mineral Manager** (`mineralManager.js`) – Post‑mining processing and sales.
-- **Maintenance Scanner** (`maintenanceScanner.js`) – Infrastructure upkeep tracking.
-- **Mineral Collector Role** (`roleMineralCollector.js`) – Dedicated collector for non‑energy minerals.
-- **Squad Module Enhancements** (`squadModule.js`) – Quad formation packing, cost‑matrix transformation, per‑member healing.
-- **Enhanced Harvester** (`roleHarvester.js`) – Balanced source assignments, regeneration‑aware waiting, robust stuck handling.
-- **Enhanced Builder** (`roleBuilder.js`) – Global job queue with urgency‑based selection, cached room data, smart energy acquisition.
-- **Enhanced Supplier** (`roleSupplier.js`) – Prioritized task system, mineral deliveries, anti‑stuck logic.
-- **Enhanced Factory Bot** (`roleFactoryBot.js`) – Multi‑input recipes, startup drain, post‑order evacuation.
-- **Enhanced Remote Harvesters** (`roleRemoteHarvesters.js`) – Tiered body selection, flee logic, smarter deposit targeting.
-- **Global Orders Console** (`globalOrders.js`) – Consolidated commands for wall repair, thieves, tower drains, demolition, squads, attacks, signers, lab bots with dependency checks.
+- **Centralized Spawn Manager** – Coordinates core creeps plus demolition, tower drain, thief, market refine, lab, nuke fill, and squad requests. Per‑room spawn delay for low energy thresholds.
+- **Dynamic Harvester Bodies** – Source distance & harvest slot aware body builder with emergency fallback.
+- **Attack Pipeline** – Multi‑room attacker staging with rally timers, partial spawn handling, resource‑aware body selection.
+- **Terminal Workforce** – Single bot per room, auto‑assignment or request, market sell/resource deficits detection.
+- **CPU & Analytics** – Profiler integration, per‑room energy totals, GCL ETA, RCL projection, kill logs.
+- **Room Balance** – Cross‑room energy balancing via terminal transfers (100k bursts).
+
+---
+
+## ✨ New Highlights (since previous version)
+
+- **High‑Tier Factory Recipes** – Factory manager now handles Composite/Crystal/Liquid with level gating and max batch calculus.
+- **Expanded Terminal Ops** – Full local shuttle support, operation wait introspection (`whyTerminal`), single bot cap per room, market sell intents.
+- **Market Refinery Pipeline** – `marketRefine` orchestrates buy → refine → sell loops, leverages `opportunisticBuy`, factory orders, and terminal automation.
+- **Nuke Suite** – Automated nuker filling (`nukeFill`), range checks (`nukeUtils.nukeInRange`), staged launches with observer vision (`nukeLaunch`).
+- **Observer Scanner CLI** – `scanRoomsStart`, `scanRoomsStep`, `scanRoomsStatus`, `scanRoomsPrint`, `scanRoomsNow`.
+- **Spawn Coverage** – Spawn manager now handles demolition teams, tower drain, thieves, extractors, lab bots, nuke fill, and emergency harvester logic.
+- **Tower AI Overhaul** – Intent budgets, road exclusion, healer prioritization, wall/rampart hysteresis, central run cache.
+- **Harvester Cache** – Per‑room source metadata with spawn distance and open slot count, distance‑scaled body planner.
+- **Terminal Bots Auto‑Switch** – Determine next needed resource (transfer + market sell), dynamic retasking, network aware cleanup.
+- **Wall Repair Orders** – `orderWallRepair`/`wallRepairStatus`/`cancelWallRepair` queue targeted wall ramps to custom thresholds.
 
 ---
 
 ## 🚀 Console Command Reference
 
-All console commands return a short status string and log details to the console. Use the exact case shown (Screeps is case‑sensitive).
-
 ### Factory Manager
 
 ```javascript
-orderFactory('W1N1', 'Oxidant', 1000);          // FIFO per room
-cancelFactoryOrder('W1N1');                      // cancel all orders in W1N1
-cancelFactoryOrder('W1N1', 'Oxidant');            // cancel only Oxidant orders
-factoryOrders();                                  // list active orders
-listFactoryOrders();                              // detailed factory order display
+orderFactory('W1N1', 'Oxidant', 1000);
+orderFactory('W1N1', 'Composite', 'max');  // uses current room stock
+cancelFactoryOrder('W1N1', 'Composite');
+listFactoryOrders('W1N1');
 ```
 
 ### Lab Manager
 
 ```javascript
-orderLabReaction('W1N1', 'product', targetAmount);   // queue lab reaction
-cancelLabReaction('W1N1');                           // cancel lab orders in room
-showLabStatus('W1N1');                               // display lab state
-debugLabLayout('W1N1');                              // show lab positions
-labReactionStats('W1N1');                            // reaction statistics
+orderLabs('W1N1', 'XGH2O', 2000);
+cancelLabs('W1N1');
+showLabs('W1N1');
+labsDebugOn(); labsDebugOff();
+labsStats();
 ```
 
 ### Terminal Manager & Market
 
 ```javascript
-// Market buy – optional spawn flag
-marketBuy('E1S1', RESOURCE_ENERGY, 10000, 0.5, 'spawn');  // spawn bot
-marketBuy('E1S1', RESOURCE_ENERGY, 10000, 0.5);             // no bot
+// Market transfer
+transferStuff('E1S1', 'E3S3', RESOURCE_ZYNTHIUM, 5000);
+storageToTerminal('E1S1', RESOURCE_CATALYST, 2000);   // local move
+terminalToStorage('E1S1', RESOURCE_ENERGY, 5000);
 
-// Sell – optional spawn flag
-marketSell('E2S2', RESOURCE_HYDROGEN, 5000, 2.0, 'spawn');  // spawn bot
-marketSell('E2S2', RESOURCE_HYDROGEN, 5000, 2.0);               // no bot
+// Diagnostics & control
+terminalStatus();
+whyTerminal('E1S1');
+cancelTerminalOperation('transfer_1691900000_abc123');
 
-// Transfer (always requests a bot if needed)
-transferStuff('E1S1', 'E3S3', RESOURCE_ENERGY, 3000);
-
-terminalStatus();                              // show all terminal operations
-cancelTerminalOperation('buy_1691900000_abc123'); // cancel by internal ID
-checkMarketStatus();                           // debug market order status
+// Market operations
+marketBuy('E1S1', RESOURCE_ENERGY, 10000, 0.6);
+marketSell('E2S2', RESOURCE_HYDROGEN, 5000);
+marketRefine('W1N1', 'Zynthium bar');   // buy→refine→sell pipeline
+marketRefineStatus();
+marketPrice('RESOURCE_HYDROXIDE', 'sell');
+marketAnalysis('sell', 'avg');
 ```
 
-### Market Analysis & Pricing
+### Observer Scanner
 
 ```javascript
-analyzeCommodityProfit(RESOURCE_ENERGY);        // profitability report
-checkMarketPrice(RESOURCE_HYDROGEN);             // current market price
-updateMarketData();                              // refresh price cache
+scanRoomsStart('E3N46');   // begin BFS observer sweep
+scanRoomsStep();           // run each tick until complete
+scanRoomsStatus();
+scanRoomsPrint();          // JSON report
+scanRoomsNow('E3N46');     // visible rooms only (no observer)
 ```
 
-### Scout
+### Combat & Specialists
 
 ```javascript
-orderExplore('W1N8');                // send scout to explore
-orderCheckRoom('E2N3', 'E9N44');       // check path
-orderAutonomousScout();              // fire‑and‑forget explorer
-orderPathfinder('W1N8', 'E5N8');       // safe path (returns mission ID)
-```
+orderAttack('E3N44', 5, 'E3N45');
+cancelAttackOrder('E3N44');
 
-### Attacker
-
-```javascript
-orderAttack('E3N44', 5);               // auto‑rally
-orderAttack('E3N44', 5, 'E3N45');        // explicit rally room
-cancelAttackOrder('E3N44');               // cancel attack
-```
-
-### Squad
-
-```javascript
-orderSquad('E1S1', 'W1N1', 2);           // spawn 2 squads (4 creeps each)
-cancelSquadOrder('W1N1');                  // cancel all squads targeting W1N1
-```
-
-### Tower Drain
-
-```javascript
-orderTowerDrain('E1S1', 'E2S1', 2);        // 2 drain bots
+orderTowerDrain('E1S1', 'E2S1', 2);
 cancelTowerDrainOrder('E1S1', 'E2S1');
-```
 
-### Demolition
-
-```javascript
-orderDemolition('E1S1', 'E2S2', 2);          // 2 demolition teams
+orderDemolition('E1S1', 'E2S2', 2);
 cancelDemolitionOrder('E2S2');
-```
 
-### Thief
-
-```javascript
-orderThieves('W1N1', 'W2N1', 3);           // 3 thieves
+orderThieves('W1N1', 'W2N1', 3);
 cancelThiefOrder('W2N1');
+
+orderWallRepair('W1N1', 500000);
+wallRepairStatus('W1N1');
+cancelWallRepair('W1N1');
+
+orderSquad('E1S1', 'W1N1', 2);
+cancelSquadOrder('W1N1');
+
+nukeFill('W1N1', { maxPrice: 1.5 });   // fill nuker + optional ghodium buy
+nukeInRange('W1N1', 'W3N3');
+launchNuke('W1N1', 'W3N3', 'spawn');
 ```
 
-### Miner & Mineral Collector
+### Support Roles
 
 ```javascript
-orderMineralCollect('W8N3');               // spawn mineral collector
-```
-
-### Signbot
-
-```javascript
+orderMineralCollect('W8N3');
 orderSign('W1N1', 'W2N2', 'Hello from my colony!');
+orderCheckRoom('E2N3', 'E9N44');
+orderAutonomousScout();
+orderPathfinder('W1N8', 'E5N8');
 ```
 
 ---
 
 ## 📦 Installation & Usage
 
-1. **Clone** the repository into your Screeps `src` folder.
-2. **Run** the main loop (`module.exports.loop`) from `main.js`.
-3. **Enable** the profiler (optional):
+1. **Clone** into your Screeps `src` directory.
+2. **Run** the main loop in `main.js`.
+3. **Profiler** (optional):
 
    ```javascript
    const profiler = require('screeps-profiler');
-   profiler.enable();   // place before the main loop
+   profiler.enable();
    ```
 
-4. **Configure** per‑room settings (e.g., `SUPPLIER_ENABLED`, `MAX_REMOTE_HARVESTERS`) by editing the corresponding module files.
+4. **Configure** per‑module settings (e.g., `HEAL_BUDGET_PER_ROOM`, `LOW_RCL_SPAWN_DELAY_TICKS`) by editing respective files.
 
 ---
 
 ## 📂 Module Structure
 
 **Managers:**
-- `getRoomState.js` – Central room state cache
-- `factoryManager.js` – Factory order orchestration
-- `labManager.js` – Lab reaction automation
-- `linkManager.js` – Link network coordination
-- `towerManager.js` – Tower priority and targeting
-- `terminalManager.js` – Terminal + market operations
-- `spawnManager.js` – Centralized spawn orchestration
+- `getRoomState.js` – Central room cache with 25‑tick structure TTL.
+- `factoryManager.js` – FIFO orders, max batches, high‑tier recipes.
+- `labManager.js` – Reaction chains, evacuation, console tooling.
+- `terminalManager.js` – Transfers, local shuttles, bot orchestration, diagnostics.
+- `spawnManager.js` – Core creep + specialist spawn coordination (demolition, thieves, tower drain, nuke fill, lab bots, attackers).
+- `towerManager.js` – Budgeted towers with hysteresis.
+- `roomObserver.js` – Observer scan orchestration.
 
 **Market & Resources:**
-- `marketAnalysis.js` – Commodity profitability
-- `marketBuyer.js` – Automated buy orders
-- `marketSell.js` – Automated sell orders
-- `marketQuery.js` – Price lookups
-- `marketUpdate.js` – Market data upkeep
-- `opportunisticBuy.js` – Price‑sensitive purchasing
-- `mineralManager.js` – Post‑mining processing
+- `marketAnalysis.js`, `marketBuy.js`, `marketSell.js`, `marketQuery.js`, `marketUpdate.js`, `opportunisticBuy.js`.
+- `marketRefine.js` – Buy→refine→sell pipeline.
+- `mineralManager.js` – Stockpile processing + sell triggers.
+- `maintenanceScanner.js` – Decay & upkeep metrics.
+
+**Economy Extensions:**
+- `marketRefine`, `opportunisticBuy`, `terminalManager`, `marketBuyer`, `marketSell`, `marketUpdate`.
+
+**Nuke Suite:**
+- `nukeFill.js`, `nukeUtils.js`, `nukeLaunch.js`.
 
 **Utility:**
-- `maintenanceScanner.js` – Infrastructure upkeep tracking
-- `globalOrders.js` – Consolidated console commands
-- `roadTracker.js` – Road usage visualization
-- `iff.js` – Whitelist and helper functions
+- `globalOrders.js` – Aggregated console commands (attack, demolition, thieves, wall repair, etc.).
+- `iff.js` – Whitelist & hostile detection.
+- `roomBalance.js` – Auto energy rebalancing.
+- `roadTracker.js` – Usage heatmap (optional).
+- `marketRefine.js`, `opportunisticBuy.js`.
 
-**Roles:** (each in `role*.js`)
-- `roleHarvester`, `roleBuilder`, `roleSupplier`, `roleAttacker`, `roleDefender`, `roleClaimbot`, `roleFactory​Bot`, `roleThief`, `roleTowerDrain`, `roleRemoteHarvesters`, `roleMineralCollector`, `squadModule`, and others.
+**Roles:** (`role*.js`, `squadModule.js`, etc.)  
+Includes harvesters, suppliers, defenders, attackers, lab/factory bots, demolition teams, thieves, tower drain, wall repair, nuke fill, scavengers, signers, scouts, claimbots, squad members, remote harvesters (disabled), extractor/mineral collectors.
 
 ---
 
 ## 🤝 Contributing
 
-- Follow the repository's coding style (no optional chaining, plain `if/else`, `const`/`let`).
-- Add new features as separate modules and register them in `main.js`.
-- Write unit‑style tests in the `test/` folder (if using `screeps-test`).
-- Submit PRs with clear descriptions and any performance impact.
+- Follow project style (no optional chaining, explicit `if/else`, `const/let`).
+- Add new features as modules, register in `main.js`.
+- Write tests under `test/` if using `screeps-test`.
+- Submit PRs describing functionality and CPU/impact metrics.
 
 ---
 
-*Happy colonising!* 🚀
+*Happy colonizing—and now nuking!* 🚀

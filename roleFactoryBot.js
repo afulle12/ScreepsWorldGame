@@ -4,13 +4,22 @@
 // it drains remaining product from the Factory before suiciding.
 
 const RECIPES = Object.freeze({
-  [RESOURCE_OXIDANT]:       { input: RESOURCE_OXYGEN,   inAmt: 500, energy: 200, out: 100 },
-  [RESOURCE_REDUCTANT]:     { input: RESOURCE_HYDROGEN, inAmt: 500, energy: 200, out: 100 },
-  [RESOURCE_ZYNTHIUM_BAR]:  { input: RESOURCE_ZYNTHIUM, inAmt: 500, energy: 200, out: 100 },
-  [RESOURCE_LEMERGIUM_BAR]: { input: RESOURCE_LEMERGIUM,inAmt: 500, energy: 200, out: 100 },
-  [RESOURCE_UTRIUM_BAR]:    { input: RESOURCE_UTRIUM,   inAmt: 500, energy: 200, out: 100 },
-  [RESOURCE_KEANIUM_BAR]:   { input: RESOURCE_KEANIUM,  inAmt: 500, energy: 200, out: 100 },
-  [RESOURCE_PURIFIER]:      { input: RESOURCE_CATALYST, inAmt: 500, energy: 200, out: 100 }
+  // Compressing commodities
+  [RESOURCE_OXIDANT]:       { inputs: { [RESOURCE_OXYGEN]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
+  [RESOURCE_REDUCTANT]:     { inputs: { [RESOURCE_HYDROGEN]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
+  [RESOURCE_ZYNTHIUM_BAR]:  { inputs: { [RESOURCE_ZYNTHIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
+  [RESOURCE_LEMERGIUM_BAR]: { inputs: { [RESOURCE_LEMERGIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
+  [RESOURCE_UTRIUM_BAR]:    { inputs: { [RESOURCE_UTRIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
+  [RESOURCE_KEANIUM_BAR]:   { inputs: { [RESOURCE_KEANIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
+  [RESOURCE_GHODIUM_MELT]:  { inputs: { [RESOURCE_GHODIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
+  [RESOURCE_PURIFIER]:      { inputs: { [RESOURCE_CATALYST]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
+  [RESOURCE_BATTERY]:       { inputs: { [RESOURCE_ENERGY]: 600 }, out: 50 },
+
+  // Basic regional commodities
+  [RESOURCE_WIRE]:         { inputs: { [RESOURCE_UTRIUM_BAR]: 20,  [RESOURCE_SILICON]: 100, [RESOURCE_ENERGY]: 40 }, out: 20 },
+  [RESOURCE_CELL]:         { inputs: { [RESOURCE_LEMERGIUM_BAR]: 20, [RESOURCE_BIOMASS]: 100, [RESOURCE_ENERGY]: 40 }, out: 20 },
+  [RESOURCE_ALLOY]:        { inputs: { [RESOURCE_ZYNTHIUM_BAR]: 20, [RESOURCE_METAL]: 100,   [RESOURCE_ENERGY]: 40 }, out: 20 },
+  [RESOURCE_CONDENSATE]:   { inputs: { [RESOURCE_KEANIUM_BAR]: 20,  [RESOURCE_MIST]: 100,    [RESOURCE_ENERGY]: 40 }, out: 20 }
 });
 
 function findFactory(room) {
@@ -18,22 +27,23 @@ function findFactory(room) {
 }
 
 function deliverToBest(creep) {
-  const room = creep.room;
-  const targets = [];
+  var room = creep.room;
+  var targets = [];
   if (room.storage && room.storage.store.getFreeCapacity() > 0) targets.push(room.storage);
   if (room.terminal && room.terminal.store.getFreeCapacity() > 0) targets.push(room.terminal);
-  const containers = room.find(FIND_STRUCTURES, {
+  var containers = room.find(FIND_STRUCTURES, {
     filter: s => s.structureType === STRUCTURE_CONTAINER && s.store.getFreeCapacity() > 0
   });
-  targets.push(...containers);
+  for (var i = 0; i < containers.length; i++) targets.push(containers[i]);
 
-  const target = targets[0];
+  var target = targets[0];
   if (!target) return false;
 
   if (creep.pos.isNearTo(target)) {
-    for (const r in creep.store) {
-      const amt = creep.store[r] || 0;
-      if (amt > 0) creep.transfer(target, r);
+    // One action per tick — transfer a single resource kind each tick.
+    for (var r in creep.store) {
+      var amt = creep.store[r] || 0;
+      if (amt > 0) { creep.transfer(target, r); break; }
     }
   } else {
     creep.moveTo(target, { range: 1, reusePath: 10, visualizePathStyle: { stroke: '#aaffaa' } });
@@ -42,19 +52,20 @@ function deliverToBest(creep) {
 }
 
 function withdrawFromBest(room, creep, resource, amount) {
-  const sources = [];
+  var sources = [];
   if (room.storage && (room.storage.store[resource] || 0) > 0) sources.push(room.storage);
   if (room.terminal && (room.terminal.store[resource] || 0) > 0) sources.push(room.terminal);
-  const containers = room.find(FIND_STRUCTURES, {
+  var containers = room.find(FIND_STRUCTURES, {
     filter: s => s.structureType === STRUCTURE_CONTAINER && (s.store[resource] || 0) > 0
   });
-  sources.push(...containers);
+  for (var i = 0; i < containers.length; i++) sources.push(containers[i]);
 
-  for (const s of sources) {
+  for (var j = 0; j < sources.length; j++) {
+    var s = sources[j];
     if (creep.pos.isNearTo(s)) {
-      const amt = Math.min(amount, s.store[resource] || 0, creep.store.getFreeCapacity());
+      var amt = Math.min(amount, s.store[resource] || 0, creep.store.getFreeCapacity());
       if (amt <= 0) continue;
-      const res = creep.withdraw(s, resource, amt);
+      var res = creep.withdraw(s, resource, amt);
       if (res === OK) return true;
     } else {
       creep.moveTo(s, { reusePath: 10, range: 1, visualizePathStyle: { stroke: '#99ccff' } });
@@ -76,26 +87,79 @@ function getTargetProduct(creep, myOrder) {
   if (myOrder && myOrder.product) return myOrder.product;
   if (creep.memory.product) return creep.memory.product;
   // Fallback: infer from carried goods
-  for (const res in RECIPES) {
+  for (var res in RECIPES) {
     if ((creep.store[res] || 0) > 0) return res;
   }
   return null;
 }
 
+function computeInputNeeds(factory, recipe) {
+  var needs = {};
+  for (var res in recipe.inputs) {
+    var req = recipe.inputs[res] || 0;
+    var have = (factory && factory.store && factory.store[res]) || 0;
+    needs[res] = Math.max(0, req - have);
+  }
+  return needs;
+}
+
+// Helpers to drain any leftover from the factory (not only the target product).
+function firstResourceInStore(store) {
+  for (var r in store) {
+    var amt = store[r];
+    if (typeof amt === 'number' && amt > 0) return r;
+  }
+  return null;
+}
+
+function drainFactoryAny(creep, factory) {
+  if (!factory) return false;
+  var res = firstResourceInStore(factory.store);
+  if (!res) return false;
+
+  if (creep.pos.isNearTo(factory)) {
+    var amt = Math.min(factory.store[res] || 0, creep.store.getFreeCapacity());
+    if (amt > 0) creep.withdraw(factory, res, amt);
+  } else {
+    creep.moveTo(factory, { range: 1, reusePath: 10, visualizePathStyle: { stroke: '#ffaa00' } });
+  }
+  return true;
+}
+
 module.exports = {
   run(creep) {
-    const orders = Memory.factoryOrders || [];
-    const myOrder = orders.find(o => o && o.id === creep.memory.orderId);
-    const room = Game.rooms[creep.memory.homeRoom || creep.room.name];
-    const factory = findFactory(room);
+    var orders = Memory.factoryOrders || [];
+    var myOrder = orders.find(function(o){ return o && o.id === creep.memory.orderId; });
+    var room = Game.rooms[creep.memory.homeRoom || creep.room.name];
+    var factory = findFactory(room);
+
+    // Remember product once per order so we can still clean up if the order entry is removed.
+    if (myOrder && myOrder.product && !creep.memory.product) creep.memory.product = myOrder.product;
+
+    // TTL check - evacuate everything and only suicide when both creep and factory are empty
+    if (creep.ticksToLive < 50) {
+      creep.memory.lowTTL = true;
+      creep.memory.closing = true;
+
+      if (creep.store.getUsedCapacity() > 0) {
+        deliverToBest(creep);
+        return;
+      }
+
+      if (drainFactoryAny(creep, factory)) {
+        return;
+      }
+
+      creep.suicide();
+      return;
+    }
 
     // Determine product we care about (works even after order is removed)
-    const product = getTargetProduct(creep, myOrder);
+    var product = getTargetProduct(creep, myOrder);
 
-    // Post-completion/cleanup phase: drain product then suicide
-    const orderDone = !myOrder || myOrder.status === 'done' || myOrder.status === 'cancelled';
+    // Post-completion/cleanup phase: drain everything from the Factory then suicide
+    var orderDone = !myOrder || myOrder.status === 'done' || myOrder.status === 'cancelled';
     if (orderDone) {
-      // Persist intent
       creep.memory.closing = true;
 
       // 1) If carrying anything, deliver it first.
@@ -104,83 +168,120 @@ module.exports = {
         return;
       }
 
-      // 2) Then drain remaining product from the Factory.
-      if (factory && product && (factory.store[product] || 0) > 0) {
-        if (creep.pos.isNearTo(factory)) {
-          const amt = Math.min(factory.store[product], creep.store.getFreeCapacity());
-          creep.withdraw(factory, product, amt);
-        } else {
-          creep.moveTo(factory, { range: 1, reusePath: 10, visualizePathStyle: { stroke: '#ffaa00' } });
-        }
+      // 2) Drain any remaining resource from the Factory (not only the target product).
+      if (drainFactoryAny(creep, factory)) {
         return;
       }
 
-      // 3) Nothing left to evacuate.
+      // 3) Nothing left to evacuate anywhere; safe to suicide.
       creep.suicide();
       return;
     }
 
     // Only operate if this is the active order for the room (FIFO per room).
-    const firstActive = orders.find(o => o.room === myOrder.room && o.status === 'active');
+    var firstActive = orders.find(function(o){ return o && o.room === myOrder.room && o.status === 'active'; });
     if (!firstActive || firstActive.id !== myOrder.id) {
-      const anchor = room.storage || room.terminal || creep;
+      var anchor = room.storage || room.terminal || creep;
       if (!creep.pos.inRangeTo(anchor, 3)) creep.moveTo(anchor, { range: 3, reusePath: 20 });
       return;
     }
 
+    // --- one-time startup drain of any leftovers in the Factory ---
+    if (!creep.memory.startupDrainDone) {
+      // Deliver anything we are already carrying first
+      if (creep.store.getUsedCapacity() > 0) {
+        deliverToBest(creep);
+        return;
+      }
+
+      if (factory) {
+        // Prefer to clear the target product first (unblocks produce),
+        // otherwise pull any resource that exists.
+        var resToPull = null;
+
+        if (product && (factory.store[product] || 0) > 0) {
+          resToPull = product;
+        } else {
+          for (var r in factory.store) {
+            if ((factory.store[r] || 0) > 0) { resToPull = r; break; }
+          }
+        }
+
+        if (resToPull) {
+          if (creep.pos.isNearTo(factory)) {
+            var amtPull = Math.min(factory.store[resToPull] || 0, creep.store.getFreeCapacity());
+            if (amtPull > 0) creep.withdraw(factory, resToPull, amtPull);
+          } else {
+            creep.moveTo(factory, { range: 1, reusePath: 10, visualizePathStyle: { stroke: '#ffaa00' } });
+          }
+          return; // keep draining until empty, then mark done
+        }
+      }
+
+      // Nothing left inside; mark startup drain complete
+      creep.memory.startupDrainDone = true;
+    }
+    // --- END startup drain ---
+
     if (!factory || !product) return;
 
-    const recipe = RECIPES[product];
+    var recipe = RECIPES[product];
 
     // Evacuate finished product first to keep factory clear
-    const productInFactory = factory.store[product] || 0;
+    var productInFactory = (factory.store && factory.store[product]) || 0;
     if ((creep.store[product] || 0) > 0) {
       deliverToBest(creep);
       return;
     }
     if (productInFactory > 0 && creep.store.getFreeCapacity() > 0) {
       if (creep.pos.isNearTo(factory)) {
-        const amt = Math.min(productInFactory, creep.store.getFreeCapacity());
-        creep.withdraw(factory, product, amt);
+        var pull = Math.min(productInFactory, creep.store.getFreeCapacity());
+        creep.withdraw(factory, product, pull);
       } else {
         creep.moveTo(factory, { range: 1, reusePath: 10, visualizePathStyle: { stroke: '#ffaa00' } });
       }
       return;
     }
 
-    // Feed inputs
-    const needIn = Math.max(0, recipe.inAmt - (factory.store[recipe.input] || 0));
-    const needE  = Math.max(0, recipe.energy - (factory.store[RESOURCE_ENERGY] || 0));
+    // Feed inputs (multi-input aware)
+    var needs = computeInputNeeds(factory, recipe);
 
-    const carryIn = creep.store[recipe.input] || 0;
-    const carryE  = creep.store[RESOURCE_ENERGY] || 0;
-
-    // If carrying inputs/energy, deliver to factory when needed; otherwise return them.
-    if (carryIn > 0 || carryE > 0) {
-      if (carryIn > 0 && needIn > 0) {
-        transferToFactory(creep, factory, recipe.input);
-        return;
+    // If carrying inputs, deliver any that are still needed; otherwise return them.
+    var carryingSomething = creep.store.getUsedCapacity() > 0;
+    if (carryingSomething) {
+      // Prefer delivering needed inputs to the factory; if nothing needed, unload.
+      for (var resInCarry in creep.store) {
+        var carryAmt = creep.store[resInCarry] || 0;
+        if (carryAmt <= 0) continue;
+        if (recipe.inputs[resInCarry] && (needs[resInCarry] || 0) > 0) {
+          transferToFactory(creep, factory, resInCarry);
+          return;
+        }
       }
-      if (carryE > 0 && needE > 0) {
-        transferToFactory(creep, factory, RESOURCE_ENERGY);
-        return;
-      }
-      // Factory doesn't need what we have anymore
+      // Nothing the factory needs anymore
       deliverToBest(creep);
       return;
     }
 
-    // If empty and inputs are needed, fetch whichever is more lacking (by %)
-    if (needIn > 0 || needE > 0) {
-      const pctIn = recipe.inAmt ? (needIn / recipe.inAmt) : 0;
-      const pctE  = recipe.energy ? (needE / recipe.energy) : 0;
-      if (pctIn >= pctE && needIn > 0) {
-        if (!withdrawFromBest(room, creep, recipe.input, needIn)) {
-          withdrawFromBest(room, creep, RESOURCE_ENERGY, needE);
-        }
-      } else if (needE > 0) {
-        if (!withdrawFromBest(room, creep, RESOURCE_ENERGY, needE)) {
-          withdrawFromBest(room, creep, recipe.input, needIn);
+    // If empty and inputs are needed, fetch whichever is most lacking by percentage
+    var bestRes = null;
+    var bestPct = -1;
+    for (var resNeeded in recipe.inputs) {
+      var req = recipe.inputs[resNeeded] || 0;
+      var need = needs[resNeeded] || 0;
+      if (req <= 0 || need <= 0) continue;
+      var pct = need / req;
+      if (pct > bestPct) { bestPct = pct; bestRes = resNeeded; }
+    }
+
+    if (bestRes) {
+      // Try to withdraw the most lacking input; if that fails, try another input that is needed.
+      if (!withdrawFromBest(room, creep, bestRes, needs[bestRes])) {
+        for (var alt in recipe.inputs) {
+          if (alt === bestRes) continue;
+          if ((needs[alt] || 0) > 0) {
+            if (withdrawFromBest(room, creep, alt, needs[alt])) return;
+          }
         }
       }
       return;
