@@ -15,8 +15,8 @@
 const terminalManager = require('terminalManager');
 
 const LOW_STORAGE_THRESHOLD = 300000;
-const HIGH_STORAGE_THRESHOLD = 450000;
-const TRANSFER_AMOUNT = 100000;
+const HIGH_STORAGE_THRESHOLD = 400000;
+const TRANSFER_AMOUNT = 15000;
 
 function isSuccess(result) {
   // Accept common "success" indicators; we can tighten this if your terminalManager differs.
@@ -95,7 +95,7 @@ const roomBalance = {
         var res1 = terminalManager.transferStuff(from1, to1, 'energy', TRANSFER_AMOUNT);
         console.log('[RoomBalance] ' + from1 + ' -> ' + to1 + ' x ' + TRANSFER_AMOUNT + ' ENERGY | ' + res1);
         if (isSuccess(res1)) {
-          notifyTransfer(from1, to1, TRANSFER_AMOUNT);
+          //notifyTransfer(from1, to1, TRANSFER_AMOUNT);
         }
       }
     }
@@ -108,7 +108,7 @@ const roomBalance = {
         var res2 = terminalManager.transferStuff(from2, to2, 'energy', TRANSFER_AMOUNT);
         console.log('[RoomBalance] ' + from2 + ' -> ' + to2 + ' x ' + TRANSFER_AMOUNT + ' ENERGY | ' + res2);
         if (isSuccess(res2)) {
-          notifyTransfer(from2, to2, TRANSFER_AMOUNT);
+          //notifyTransfer(from2, to2, TRANSFER_AMOUNT);
         }
       }
     }

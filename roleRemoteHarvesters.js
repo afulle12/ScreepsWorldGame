@@ -1,4 +1,8 @@
 // roleRemoteHarvesters.js
+// remoteBuilder('W1N1','W1N2',2) Deploy 2 builders from W1N1 to W1N2
+// cancelRemoteBuilder('W1N1','W1N2') Cancel W1N1→W1N2 order
+// listRemoteBuilders() Show active orders with current counts
+
 
 const LOGGING_ENABLED = false; // Set to true for debugging
 

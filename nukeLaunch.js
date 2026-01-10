@@ -11,6 +11,7 @@
 // - No optional chaining used, per your environment requirement.
 
 // Memory layout: Memory.nukeOps = { [opId]: { donor, recipient, targetType, state, scheduledAt } }
+//launchNuke('DonorRoom','RecipientRoom','spawn|tower|storage')
 
 function _ensureMemory() {
   if (!Memory.nukeOps) Memory.nukeOps = {};

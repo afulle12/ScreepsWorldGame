@@ -20,7 +20,7 @@
 // CONFIGURATION
 // =================================================================
 const DETAILED_LOGGING = true; // Set to false to disable verbose scout console logs.
-const FRIENDLY_PLAYERS = ['tarenty', 'Player1', 'AnotherFriend']; // Add friendly usernames here
+const FRIENDLY_PLAYERS = ['tarenty', 'AlFe', 'AnotherFriend']; // Add friendly usernames here
 // =================================================================
 
 const log = (message) => {

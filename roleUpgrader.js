@@ -1,25 +1,33 @@
 // role.upgrader.nearestControllerSource.js
-// Purpose: Upgrader that withdraws from room energy storage if available; otherwise harvests from the Source nearest to the controller.
-// Changes:
-//   - Energy target selection by range (no path search).
-//   - Path visuals behind global flag SHOW_PATHS.
-//   - Cached closest-by-path source per room with invalidation via Memory.rooms[roomName].layoutVersion.
-//   - Removed "any spawn is spawning" guard; added "skip if only upgrader is spawning".
-
 var getRoomState = require('getRoomState');
 
-var RCL8_THROTTLE_TICKS = 25;
+var RCL8_THROTTLE_TICKS = 1;
+var LINK_WAIT_TICKS = 10;
 
-// Global path-visual flag (default false). Set to true for debugging.
 if (typeof global.SHOW_PATHS !== 'boolean') {
   global.SHOW_PATHS = false;
 }
 
 function moveOpts(color) {
+  var opts = { reusePath: 20 };
+
   if (global.SHOW_PATHS) {
-    return { reusePath: 20, visualizePathStyle: { stroke: color || '#ffaa00' } };
+    opts.visualizePathStyle = { stroke: color || '#ffaa00' };
   }
-  return { reusePath: 20 };
+
+  // UPDATED: Cost callback to avoid room edges (0 and 49)
+  opts.costCallback = function(roomName, costMatrix) {
+    // Loop through 0 to 49 to set the edges as unwalkable (cost 255)
+    for (var i = 0; i < 50; i++) {
+      costMatrix.set(i, 0, 255);  // Top edge
+      costMatrix.set(i, 49, 255); // Bottom edge
+      costMatrix.set(0, i, 255);  // Left edge
+      costMatrix.set(49, i, 255); // Right edge
+    }
+    return costMatrix;
+  };
+
+  return opts;
 }
 
 function structureHasEnergy(structure) {
@@ -34,79 +42,98 @@ function structureHasEnergy(structure) {
   return false;
 }
 
-// Skip role processing in a room when the only upgrader is currently spawning.
-function onlyUpgraderIsSpawning(roomName) {
+// --- FIX 1: Optimized Spawning Check (via getRoomState) ---
+// Now accepts the pre-cached 'myCreeps' array from getRoomState.
+// No room.find() or Game.creeps iteration required.
+function onlyUpgraderIsSpawning(myCreeps) {
+  if (!myCreeps || myCreeps.length === 0) return false;
+
   var count = 0;
   var spawning = false;
-  for (var name in Game.creeps) {
-    var c = Game.creeps[name];
-    if (!c) continue;
-    if (!c.memory || c.memory.role !== 'upgrader') continue;
-    if (!c.room || c.room.name !== roomName) continue;
-    count++;
-    if (c.spawning) spawning = true;
+
+  for (var i = 0; i < myCreeps.length; i++) {
+    var c = myCreeps[i];
+    // getRoomState filters by room already, so we just check role/spawning
+    if (c.memory && c.memory.role === 'upgrader') {
+      count++;
+      if (c.spawning) spawning = true;
+    }
   }
   return count === 1 && spawning;
 }
 
+// --- FIX 2 Helper: Cache Controller Structures ---
+// Finds structures <= 3 range from controller and saves IDs to memory.
+function getControllerStructIds(roomName, controllerPos, structuresByType) {
+    // 1. Try to read from memory cache
+    if (!Memory.rooms[roomName]) Memory.rooms[roomName] = {};
+    var mem = Memory.rooms[roomName];
+
+    // Check if cache exists and matches current layout version
+    if (mem.controllerStructs && mem.controllerStructs.version === mem.layoutVersion) {
+        return mem.controllerStructs.ids;
+    }
+
+    // 2. Cache miss: Find them manually using structuresByType from getRoomState
+    var candidates = [];
+    var typesToCheck = [STRUCTURE_LINK, STRUCTURE_CONTAINER];
+
+    if (structuresByType) {
+      typesToCheck.forEach(function(type) {
+          var structs = structuresByType[type] || [];
+          for(var i=0; i<structs.length; i++) {
+              if (controllerPos.getRangeTo(structs[i]) <= 3) {
+                  candidates.push(structs[i].id);
+              }
+          }
+      });
+    }
+
+    // 3. Save to cache
+    mem.controllerStructs = {
+        ids: candidates,
+        version: mem.layoutVersion || 0
+    };
+
+    return candidates;
+}
+
+// --- FIX 2: Updated Target Finder ---
 function findEnergyWithdrawTarget(creep, state) {
   if (!state || !state.controller) return null;
 
-  var controllerPos = state.controller.pos;
-  var candidates = [];
-
-  // 1) Containers near controller (range <= 3) with energy
-  var containers = state.structuresByType && state.structuresByType[STRUCTURE_CONTAINER]
-    ? state.structuresByType[STRUCTURE_CONTAINER]
-    : [];
-  for (var i = 0; i < containers.length; i++) {
-    var cont = containers[i];
-    if (!cont) continue;
-    if (controllerPos.getRangeTo(cont.pos) <= 3 && structureHasEnergy(cont)) {
-      candidates.push(cont);
-    }
+  // PRIORITY 1: Local Controller Energy
+  // Uses cached IDs + state.structuresByType to avoid recalculation
+  var candidateIds = getControllerStructIds(state.name, state.controller.pos, state.structuresByType);
+   
+  var localCandidates = [];
+  for (var i = 0; i < candidateIds.length; i++) {
+      var s = Game.getObjectById(candidateIds[i]);
+      if (s && structureHasEnergy(s)) {
+          localCandidates.push(s);
+      }
   }
 
-  // 2) Storage with energy
+  // Pick closest of the valid local candidates
+  if (localCandidates.length > 0) {
+    return creep.pos.findClosestByRange(localCandidates);
+  }
+
+  // PRIORITY 2: Storage with energy
+  // state.storage is provided directly by getRoomState
   var storage = state.storage;
   if (storage && structureHasEnergy(storage)) {
-    candidates.push(storage);
+    return storage;
   }
 
-  // 3) Links near controller (range <= 3) with energy
-  var links = state.structuresByType && state.structuresByType[STRUCTURE_LINK]
-    ? state.structuresByType[STRUCTURE_LINK]
-    : [];
-  for (var j = 0; j < links.length; j++) {
-    var link = links[j];
-    if (!link) continue;
-    if (controllerPos.getRangeTo(link.pos) <= 3 && structureHasEnergy(link)) {
-      candidates.push(link);
-    }
-  }
-
-  if (candidates.length === 0) return null;
-
-  // Choose closest by range to the creep (cheap)
-  var best = null;
-  var bestRange = 9999;
-  for (var k = 0; k < candidates.length; k++) {
-    var s = candidates[k];
-    var r = creep.pos.getRangeTo(s.pos);
-    if (r < bestRange) {
-      bestRange = r;
-      best = s;
-    }
-  }
-  return best;
+  return null;
 }
 
-// Cached closest-by-path source from controller, invalidated by room layoutVersion.
 function getClosestControllerSourceId(roomState) {
   if (!roomState || !roomState.controller) return null;
 
   var roomName = roomState.name;
-  var sources = roomState.sources;
+  var sources = roomState.sources; // Provided by getRoomState
   if (!sources || sources.length === 0) return null;
 
   if (!Memory.rooms) Memory.rooms = {};
@@ -118,10 +145,8 @@ function getClosestControllerSourceId(roomState) {
     return cached.id;
   }
 
-  // Compute once per layoutVersion change: closest by path from controller
-  var closest = roomState.controller.pos.findClosestByPath(sources);
+  var closest = roomState.controller.pos.findClosestByRange(sources);
 
-  // Fallback: closest by range if path search fails
   if (!closest) {
     var best = null;
     var bestRange = 9999;
@@ -143,8 +168,29 @@ function getClosestControllerSourceId(roomState) {
 
 function withdrawEnergy(creep, target) {
   if (!target) return;
+
   if (creep.pos.isNearTo(target)) {
-    creep.withdraw(target, RESOURCE_ENERGY);
+    var result = creep.withdraw(target, RESOURCE_ENERGY);
+
+    if (target.structureType === STRUCTURE_LINK) {
+      if (result === ERR_NOT_ENOUGH_RESOURCES) {
+        creep.memory.linkDryId = target.id;
+        creep.memory.linkDryUntil = Game.time + LINK_WAIT_TICKS;
+        return;
+      }
+
+      if (result === OK) {
+        if (!structureHasEnergy(target)) {
+          creep.memory.linkDryId = target.id;
+          creep.memory.linkDryUntil = Game.time + LINK_WAIT_TICKS;
+        }
+
+        if (creep.store.getFreeCapacity() > 0) {
+          creep.memory.working = true;
+          creep.say('⚡ upgrade');
+        }
+      }
+    }
   } else {
     creep.moveTo(target, moveOpts('#ffaa00'));
   }
@@ -170,30 +216,29 @@ function doUpgrade(creep, controller) {
 
 var role = {
   run: function (creep) {
-    // Skip if this creep is still spawning.
     if (creep.spawning) return;
 
-    // Build room cache for this tick (ensure it's called once globally if possible).
-    getRoomState.init();
+    getRoomState.init(); // Build cache for this tick
 
     var state = getRoomState.get(creep.room.name);
     if (!state || !state.controller) return;
 
-    // New guard: if the only upgrader in this room is spawning, skip processing.
-    if (onlyUpgraderIsSpawning(state.name)) return;
+    // FIX 1 APPLIED: Using optimized check with state.myCreeps
+    if (onlyUpgraderIsSpawning(state.myCreeps)) return;
 
-    // RCL8 throttle: if owned RCL8, only run every N ticks.
+    // RETAINED #4 (RCL8 Throttle Logic)
     if (state.controller.my && state.controller.level === 8) {
       if (Game.time % RCL8_THROTTLE_TICKS !== 0) return;
     }
 
-    // State toggle
     if (creep.memory.working && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
       creep.memory.working = false;
+      // RETAINED #3 (Say)
       creep.say('🔄 energy');
     }
     if (!creep.memory.working && creep.store.getFreeCapacity() === 0) {
       creep.memory.working = true;
+      // RETAINED #3 (Say)
       creep.say('⚡ upgrade');
     }
 
@@ -202,14 +247,34 @@ var role = {
       return;
     }
 
-    // Not working (refill energy): try storage first, then harvest if none available
+    if (creep.memory.linkDryId && typeof creep.memory.linkDryUntil === 'number') {
+      if (Game.time < creep.memory.linkDryUntil) {
+        var dryLink = Game.getObjectById(creep.memory.linkDryId);
+        if (dryLink) {
+          if (structureHasEnergy(dryLink)) {
+            withdrawEnergy(creep, dryLink);
+            delete creep.memory.linkDryId;
+            delete creep.memory.linkDryUntil;
+          } else {
+            if (!creep.pos.isNearTo(dryLink)) {
+              creep.moveTo(dryLink, moveOpts('#ffaa00'));
+            }
+          }
+          return;
+        }
+      } else {
+        delete creep.memory.linkDryId;
+        delete creep.memory.linkDryUntil;
+      }
+    }
+
+    // FIX 2 APPLIED: Using optimized cached target finder
     var withdrawTarget = findEnergyWithdrawTarget(creep, state);
     if (withdrawTarget) {
       withdrawEnergy(creep, withdrawTarget);
       return;
     }
 
-    // No energy storage with energy: harvest from nearest-to-controller Source (cached)
     var srcId = getClosestControllerSourceId(state);
     if (!srcId) return;
 

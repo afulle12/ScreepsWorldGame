@@ -8,7 +8,7 @@
 // - Uses opportunisticBuy to request GHODIUM if the room is short
 // - No optional chaining
 //
-// Screeps API reference for Nuker and resource handling (capacities, transactions)【2】【1】
+// Screeps API reference for Nuker and resource handling (capacities, transactions)【0】【1】
 
 const getRoomState = require('getRoomState');
 const opportunisticBuy = require('opportunisticBuy');
@@ -233,6 +233,14 @@ function run(creep) {
     // Idle/park if nothing to do
     var storage = rs.storage;
     if (storage) creep.moveTo(storage, { range: 2 });
+    return;
+  }
+
+  // Check if the order has expired (100,000 ticks)
+  if (Game.time - order.createdAt > 100000) {
+    order.completed = true;
+    delete Memory.nukeFillOrders[roomName];
+    console.log('[NukeFill] Order for ' + roomName + ' expired after 100,000 ticks.');
     return;
   }
 

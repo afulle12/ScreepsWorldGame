@@ -967,35 +967,70 @@ const terminalManager = {
             var terminal = room.terminal;
 
             if (request.task === 'collect') {
+                // FIX: consider transfer ops when operationId is present, not only local toTerminal
                 var outsideP = this.getRoomAvailableOutsideTerminal(request.roomName, request.resourceType);
+                var haveP = (terminal && terminal.store && terminal.store[request.resourceType]) ? terminal.store[request.resourceType] : 0;
+
+                var netNeed = 0;
+                var handledByOpId = false;
 
                 if (request.operationId) {
                     var opsP = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-                    var remP = 0;
                     for (var kp = 0; kp < opsP.length; kp++) {
                         var opP = opsP[kp];
                         if (!opP) continue;
-                        if (opP.id === request.operationId &&
-                            opP.type === 'toTerminal' &&
+                        if (opP.id !== request.operationId) continue;
+
+                        // Local toTerminal op: need is remaining to move (do not subtract terminal stock)
+                        if (opP.type === 'toTerminal' &&
                             opP.roomName === request.roomName &&
                             opP.resourceType === request.resourceType) {
+                            handledByOpId = true;
                             var movedP = opP.amountMoved || 0;
-                            remP = Math.max(0, opP.amount - movedP);
+                            var remainLocal = Math.max(0, opP.amount - movedP);
+                            netNeed = remainLocal;
+                            break;
+                        }
+
+                        // Transfer op: need depends on requested resource (payload vs energy)
+                        if (opP.type === 'transfer' &&
+                            opP.fromRoom === request.roomName) {
+                            handledByOpId = true;
+
+                            if (request.resourceType === RESOURCE_ENERGY) {
+                                var remainingT = Math.max(0, opP.amount - (opP.amountTransferred || 0));
+                                if (remainingT > 0) {
+                                    var costT = Game.market.calcTransactionCost(remainingT, opP.fromRoom, opP.toRoom);
+                                    if (opP.resourceType === RESOURCE_ENERGY) {
+                                        netNeed = Math.max(0, (remainingT + costT) - haveP);
+                                    } else {
+                                        netNeed = Math.max(0, costT - haveP);
+                                    }
+                                } else {
+                                    netNeed = 0;
+                                }
+                            } else if (request.resourceType === opP.resourceType) {
+                                var remainingPayload = Math.max(0, opP.amount - (opP.amountTransferred || 0));
+                                netNeed = Math.max(0, remainingPayload - haveP);
+                            } else {
+                                netNeed = 0;
+                            }
                             break;
                         }
                     }
-                    if (remP <= 0 || outsideP <= 0) {
-                        request.status = 'completed';
-                        continue;
-                    }
-                } else {
-                    var haveP = (terminal && terminal.store && terminal.store[request.resourceType]) ? terminal.store[request.resourceType] : 0;
-                    var needP = Math.max(0, this.getResourceNeeded(request.roomName, request.resourceType) - haveP);
-                    if (needP <= 0 || outsideP <= 0) {
-                        request.status = 'completed';
-                        continue;
-                    }
                 }
+
+                if (!handledByOpId) {
+                    // Aggregated fallback (transfer + local needs)
+                    var totalNeed = this.getResourceNeeded(request.roomName, request.resourceType);
+                    netNeed = Math.max(0, totalNeed - haveP);
+                }
+
+                if (netNeed <= 0 || outsideP <= 0) {
+                    request.status = 'completed';
+                    continue;
+                }
+
             } else if (request.task === 'drain') {
                 var inTerm = (terminal && terminal.store && terminal.store[request.resourceType]) ? terminal.store[request.resourceType] : 0;
                 if (inTerm <= 0) {
@@ -1874,7 +1909,7 @@ const terminalManager = {
 
     sendNotification: function(message) {
         if (Memory.terminalManager.settings.emailNotifications) {
-            Game.notify(message);
+            //Game.notify(message);
         }
         console.log('[Terminal Notification] ' + message);
     },

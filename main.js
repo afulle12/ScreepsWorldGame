@@ -1,4 +1,3 @@
-
 // === PROFILER INTEGRATION ===
 const profiler = require('screeps-profiler');
 
@@ -31,7 +30,8 @@ const roleExtractor = require('roleExtractor');
 const iff = require('iff');
 const roleScavenger = require('roleScavenger');
 const roleThief = require('roleThief');
-const squad = require('squadModule');
+// const squad = require('squadModule'); // Removed squad functionality
+const roleSquad = require('roleSquad'); // <--- IMPORTANT: Squad Module Import
 const roleTowerDrain = require('roleTowerDrain');
 const roleDemolition = require('roleDemolition');
 const roleMineralCollector = require('roleMineralCollector');
@@ -53,9 +53,22 @@ const marketBuyer = require('marketBuy');
 const marketUpdater = require('marketUpdate');
 const opportunisticBuy = require('opportunisticBuy');
 const marketRefine = require('marketRefine');
+const localRefine = require('localRefine'); 
 const roleNukeFill = require('roleNukeFill');
 const nukeUtils = require('nukeUtils');
-const nukeLaunch = require('nukeLaunch'); // provides launchNuke(...) and run()
+const nukeLaunch = require('nukeLaunch');
+const marketRoomOrders = require('marketRoomOrders'); 
+const roleRemoteBuilder = require('roleRemoteBuilder');
+const memoryProfiler = require('memoryProfiler');
+const depositObserver = require('depositObserver');
+const roleDepositHarvester = require('roleDepositHarvester');
+const rolePowerBot = require('rolePowerBot');
+const powerManager = require('powerManager');
+const marketReport = require('marketReport');
+
+// --- NEW IMPORT ---
+const roleMaintainer = require('roleMaintainer');
+
 
 // === GLOBAL MODULE EXPOSURE FOR CONSOLE ACCESS ===
 global.opportunisticBuy = opportunisticBuy;
@@ -63,6 +76,10 @@ global.nukeFill = roleNukeFill.order;
 global.nukeInRange = nukeUtils.nukeInRange;
 // Expose the console command: launchNuke('DonorRoom', 'RecipientRoom', 'structureType')
 global.launchNuke = nukeLaunch.launchNuke;
+global.listRoomMarketOrders = marketRoomOrders.listRoomMarketOrders;
+global.memoryProfile = memoryProfiler.profile;
+global.harvestResources = depositObserver.harvestResources;
+global.launchClaimbot = require('roleClaimbot').spawn;
 
 // Centralized spawn manager
 const spawnManager = require('spawnManager');
@@ -81,7 +98,8 @@ profiler.registerObject(roleExtractor, 'roleExtractor');
 profiler.registerObject(iff, 'iff');
 profiler.registerObject(roleScavenger, 'roleScavenger');
 profiler.registerObject(roleThief, 'roleThief');
-profiler.registerObject(squad, 'squad');
+// profiler.registerObject(squad, 'squad'); // Removed squad functionality
+profiler.registerObject(roleSquad, 'roleSquad'); // <--- Register Profiler
 profiler.registerObject(roleTowerDrain, 'roleTowerDrain');
 profiler.registerObject(roleDemolition, 'roleDemolition');
 profiler.registerObject(roleMineralCollector, 'roleMineralCollector');
@@ -100,10 +118,19 @@ profiler.registerObject(spawnManager, 'spawnManager');
 profiler.registerObject(marketUpdater, 'marketUpdater');
 profiler.registerObject(opportunisticBuy, 'opportunisticBuy');
 profiler.registerObject(marketRefine, 'marketRefine');
+profiler.registerObject(localRefine, 'localRefine'); 
 profiler.registerObject(roleNukeFill, 'roleNukeFill');
 profiler.registerObject(nukeUtils, 'nukeUtils');
 // Profiler registration for nukeLaunch
 profiler.registerObject(nukeLaunch, 'nukeLaunch');
+profiler.registerObject(marketRoomOrders, 'marketRoomOrders'); 
+profiler.registerObject(roleRemoteBuilder, 'roleRemoteBuilder');
+profiler.registerObject(roleDepositHarvester, 'roleDepositHarvester');
+profiler.registerObject(depositObserver, 'depositObserver');
+profiler.registerObject(rolePowerBot, 'rolePowerBot');
+profiler.registerObject(powerManager, 'powerManager');
+profiler.registerObject(roleMaintainer, 'roleMaintainer'); // <--- REGISTER MAINTAINER
+
 
 // =================================================================
 /* === CREEP MANAGEMENT ============================================ */
@@ -126,29 +153,41 @@ function runCreeps() {
     if (ENABLE_CPU_LOGGING) cpuBefore = Game.cpu.getUsed();
 
     switch (role) {
-      case 'harvester':      roleHarvester.run(creep);       break;
-      case 'upgrader':       roleUpgrader.run(creep);        break;
-      case 'builder':        roleBuilder.run(creep);         break;
-      case 'scout':          roleScout.run(creep);           break;
-      case 'defender':       roleDefender.run(creep);        break;
-      case 'supplier':       roleSupplier.run(creep);        break;
-      case 'claimbot':       roleClaimbot.run(creep);        break;
+      case 'harvester':      roleHarvester.run(creep);        break;
+      case 'upgrader':       roleUpgrader.run(creep);         break;
+      case 'builder':        roleBuilder.run(creep);          break;
+      case 'scout':          roleScout.run(creep);            break;
+      case 'defender':       roleDefender.run(creep);         break;
+      case 'supplier':       roleSupplier.run(creep);         break;
+      case 'claimbot':       roleClaimbot.run(creep);         break;
       // case 'remoteHarvester':roleRemoteHarvester.run(creep); break; // disabled
-      case 'attacker':       roleAttacker.run(creep);        break;
-      case 'extractor':      roleExtractor.run(creep);       break;
-      case 'scavenger':      roleScavenger.run(creep);       break;
-      case 'thief':          roleThief.run(creep);           break;
-      case 'towerDrain':     roleTowerDrain.run(creep);      break;
-      case 'demolition':     roleDemolition.run(creep);      break;
-      case 'squadMember':    squad.run(creep);               break;
+      case 'attacker':       roleAttacker.run(creep);         break;
+      case 'extractor':      roleExtractor.run(creep);        break;
+      case 'scavenger':      roleScavenger.run(creep);        break;
+      case 'thief':          roleThief.run(creep);            break;
+      case 'towerDrain':     roleTowerDrain.run(creep);       break;
+      case 'demolition':     roleDemolition.run(creep);       break;
+      // case 'squadMember':        squad.run(creep);                   break; // Removed squad functionality
+      
+      // --- Explicit case for 'quad' ---
+      case 'quad':           roleSquad.run(creep);            break; 
+      
       case 'mineralCollector': roleMineralCollector.run(creep); break;
       case 'terminalBot':    terminalManager.runTerminalBot(creep); break;
-      case 'signbot':        roleSignbot.run(creep);         break;
-      case 'factoryBot':     roleFactoryBot.run(creep);      break;
-      case 'wallRepair':     roleWallRepair.run(creep);      break;
-      case 'labBot':         roleLabBot.run(creep);          break;
-      case 'nukeFill':      roleNukeFill.run(creep);         break;
+      case 'signbot':        roleSignbot.run(creep);          break;
+      case 'factoryBot':     roleFactoryBot.run(creep);       break;
+      case 'wallRepair':     roleWallRepair.run(creep);       break;
+      case 'labBot':         roleLabBot.run(creep);           break;
+      case 'nukeFill':       roleNukeFill.run(creep);         break;
+      case 'remoteBuilder':  roleRemoteBuilder.run(creep);  break;
+      case 'depositHarvester': roleDepositHarvester.run(creep); break;
+      case 'powerBot':         rolePowerBot.run(creep);         break;
+      
+      // --- NEW ROLE ---
+      case 'maintainer':       roleMaintainer.run(creep);       break;
+
       default:
+        // Default fallback to harvester
         creep.memory.role = 'harvester';
         roleHarvester.run(creep);
         break;
@@ -217,18 +256,6 @@ function cleanMemory() {
         }
       }
 
-      if (creepMemory.role === 'squadMember') {
-        if (Memory.squadPackingAreas && creepMemory.squadId) {
-          const remainingMembers = _.filter(Game.creeps, function(c){
-            return c.memory.role === 'squadMember' && c.memory.squadId === creepMemory.squadId;
-          });
-          if (remainingMembers.length <= 1) {
-            delete Memory.squadPackingAreas[creepMemory.squadId];
-            console.log("[Squad] Squad " + creepMemory.squadId + " eliminated. Cleaning up packing area.");
-          }
-        }
-      }
-
       delete Memory.creeps[name];
     }
   }
@@ -241,8 +268,10 @@ function getPerRoomRoleCounts() {
     if(room.controller && room.controller.my) {
       perRoomCounts[roomName] = {
         harvester: 0, upgrader: 0, builder: 0, scout: 0, defender: 0, supplier: 0,
-        claimbot: 0, attacker: 0, scavenger: 0, thief: 0, squadMember: 0, towerDrain: 0, demolition: 0, wallRepair: 0
-      };
+        claimbot: 0, attacker: 0, scavenger: 0, thief: 0, towerDrain: 0, demolition: 0, 
+        wallRepair: 0, depositHarvester: 0, powerBot: 0, quad: 0,
+        maintainer: 0 // <--- ADDED MAINTAINER TRACKING
+       };
     }
   }
   for(const name in Game.creeps) {
@@ -256,54 +285,13 @@ function getPerRoomRoleCounts() {
   return perRoomCounts;
 }
 
-function cacheRoomData() {
-  if(!Memory.roomData) Memory.roomData = {};
-  const cache = {};
-  for(const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if(!room.controller || !room.controller.my) continue;
-
-    var rs = getRoomState.get(roomName);
-
-    const shouldUpdate = !Memory.roomData[roomName] || Game.time % 100 === 0;
-    if(shouldUpdate) {
-      if(!Memory.roomData[roomName]) Memory.roomData[roomName] = {};
-      const roomMemory = Memory.roomData[roomName];
-
-      var sources = (rs && rs.sources) ? rs.sources : room.find(FIND_SOURCES);
-      roomMemory.sources = sources.map(function(s){ return s.id; });
-
-      var constructionSitesCount = (rs && rs.constructionSites) ? rs.constructionSites.length : room.find(FIND_CONSTRUCTION_SITES).length;
-      roomMemory.constructionSitesCount = constructionSitesCount;
-
-      roomMemory.energyCapacity = room.energyCapacityAvailable;
-      roomMemory.energyAvailable = room.energyAvailable;
-
-      var spawns = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) ? rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my; }) : room.find(FIND_MY_SPAWNS);
-      roomMemory.spawnIds = spawns.map(function(s){ return s.id; });
-
-      var extensions = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_EXTENSION]) ? rs.structuresByType[STRUCTURE_EXTENSION].filter(function(s){ return s.my; }) : room.find(FIND_MY_STRUCTURES, { filter: { structureType: STRUCTURE_EXTENSION } });
-      roomMemory.extensionIds = extensions.map(function(s){ return s.id; });
-
-      const storage = rs ? rs.storage : room.storage;
-      roomMemory.storageId = storage ? storage.id : null;
-
-      var containers = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_CONTAINER]) ? rs.structuresByType[STRUCTURE_CONTAINER] : room.find(FIND_STRUCTURES, { filter: function(s){ return s.structureType === STRUCTURE_CONTAINER; } });
-      roomMemory.containerIds = containers.map(function(s){ return s.id; });
-    }
-    cache[roomName] = Memory.roomData[roomName];
-  }
-  return cache;
-}
-
 // =================================================================
 /* === STATUS & TRACKING FUNCTIONS ================================= */
 // =================================================================
 
 function displayStatus(perRoomRoleCounts) {
   const GCL_WINDOW   = 5000;
-  const GCL_INTERVAL = 50;
-  const TICK_WINDOW  = 500;
+  const GCL_INTERVAL = 100;
   let gclEta = null;
 
   if (!Memory.gclTracker) Memory.gclTracker = { history: [] };
@@ -352,176 +340,200 @@ function displayStatus(perRoomRoleCounts) {
     }
   }
 
+  // --- CALCULATE CREEP STATS ---
   const perRoomStats = {};
   for (const name in Game.creeps) {
     const creep = Game.creeps[name];
     const assignedRoom = creep.memory.homeRoom || creep.memory.assignedRoom || creep.room.name;
 
     if (!perRoomStats[assignedRoom]) {
-      perRoomStats[assignedRoom] = {
-        totalBodyParts: 0,
-        totalCreeps:    0,
-        totalTTL:       0,
-        oldestCreepTTL: Infinity
-      };
+      perRoomStats[assignedRoom] = { totalCreeps: 0 };
     }
-
-    const stats = perRoomStats[assignedRoom];
-    stats.totalBodyParts += creep.body.length;
-    stats.totalCreeps++;
-    if (creep.ticksToLive) {
-      stats.totalTTL += creep.ticksToLive;
-      if (creep.ticksToLive < stats.oldestCreepTTL) {
-        stats.oldestCreepTTL = creep.ticksToLive;
-      }
-    }
+    perRoomStats[assignedRoom].totalCreeps++;
   }
 
-  console.log("=== COLONY STATUS ===");
-  for (const roomName in perRoomRoleCounts) {
-    const counts = perRoomRoleCounts[roomName];
-    const stats  = perRoomStats[roomName] || { totalBodyParts: 0, totalCreeps: 0, totalTTL: 0, oldestCreepTTL: 0 };
+  console.log("======================== COLONY STATUS =========================");
 
-    const avgBodyParts = stats.totalCreeps > 0 ? (stats.totalBodyParts / stats.totalCreeps).toFixed(1) : 0;
-    const avgTTL = stats.totalCreeps > 0 ? Math.round(stats.totalTTL / stats.totalCreeps) : 0;
-
-    const roomObj = Game.rooms[roomName];
-    let storageEnergy = 0;
-    if (roomObj && roomObj.storage && roomObj.storage.store) {
-      storageEnergy = roomObj.storage.store[RESOURCE_ENERGY] || 0;
-    }
-
-    console.log(
-      roomName + ": 🧑‍🌾" + counts.harvester +
-      " ⚡" + counts.upgrader +
-      " 🔨" + counts.builder +
-      " 🔭" + counts.scout +
-      " 🛡" + counts.defender +
-      " ⚔️" + counts.attacker +
-      " 🦹" + counts.thief +
-      " 🔋" + counts.supplier +
-      " 🚀" + counts.squadMember +
-      " | Avg Parts: " + avgBodyParts +
-      " | Avg TTL: " + avgTTL +
-      " | Storage: " + storageEnergy
-    );
-  }
-
-  const perfData      = getPerformanceData();
-  const currentEnergy = calculateTotalEnergy();
-
-  if (!Memory.stats) Memory.stats = {};
-  var prevEnergy = (typeof Memory.stats.lastTotalEnergy === 'number') ? Memory.stats.lastTotalEnergy : null;
-  var deltaStr = '';
-  if (prevEnergy !== null) {
-    var delta = currentEnergy - prevEnergy;
-    deltaStr = ' (' + (delta >= 0 ? '+' : '') + delta + ')';
-  }
-  Memory.stats.lastTotalEnergy = currentEnergy;
-
+  // --- CPU STATUS ---
+  const perfData = getPerformanceData();
   if (!ENABLE_CPU_LOGGING || !DISABLE_CPU_CONSOLE) {
     const bucketPercent = Math.round((Game.cpu.bucket / 10000) * 100);
     const bucketStatus = Game.cpu.bucket >= 10000 ? '(FULL)' : '(' + bucketPercent + '%)';
 
     console.log(
-      "🖥️ CPU: " + Math.round(perfData.cpuUsed) + "/" + perfData.cpuLimit +
-      " (" + Math.round(perfData.cpuPercent) + "%) | Avg: " + Math.round(perfData.cpuAverage) +
-      " | Bucket: " + Game.cpu.bucket + "/10000 " + bucketStatus +
-      " | Tick Limit: " + Game.cpu.tickLimit
+      "🖥️ CPU: Min: " + Math.round(perfData.cpuMin) +
+      " | Avg: " + Math.round(perfData.cpuAverage) +
+      " | Max: " + Math.round(perfData.cpuMax) +
+      " | Bucket: " + Game.cpu.bucket + "/10000 " + bucketStatus
     );
   }
 
   if (!Memory.progressTracker) Memory.progressTracker = {};
 
-  for (const roomName in Game.rooms) {
+  const myRooms = Object.keys(Game.rooms).sort();
+
+  for (const roomName of myRooms) {
     const room = Game.rooms[roomName];
     if (!room.controller || !room.controller.my) continue;
 
-    const percent       = room.controller.progress / room.controller.progressTotal * 100;
-    const energyPercent = room.energyAvailable / room.energyCapacityAvailable * 100;
-
+    // --- 1. PROGRESS & ETA CALCULATION ---
+    const percent = room.controller.progress / room.controller.progressTotal * 100;
+      
     if (!Memory.progressTracker[roomName]) {
       Memory.progressTracker[roomName] = { level: room.controller.level, history: [] };
     }
-
+      
     const tracker = Memory.progressTracker[roomName];
     if (tracker.level !== room.controller.level) {
-      tracker.level   = room.controller.level;
+      tracker.level       = room.controller.level;
       tracker.history = [{ tick: Game.time, percent: percent }];
     }
-
     tracker.history.push({ tick: Game.time, percent: percent });
     while (tracker.history.length > 0 && tracker.history[0].tick < Game.time - 500) {
       tracker.history.shift();
     }
 
-    let etaString = '';
-    if (tracker.history.length > 1) {
-      const hist         = tracker.history;
-      const oldest       = hist[0];
-      const newest       = hist[hist.length - 1];
-      const tickDelta    = newest.tick - oldest.tick;
+    let etaText = '';
+    if (tracker.history.length > 1 && room.controller.level < 8) {
+      const hist           = tracker.history;
+      const oldest         = hist[0];
+      const newest         = hist[hist.length - 1];
+      const tickDelta      = newest.tick - oldest.tick;
       const percentDelta = newest.percent - oldest.percent;
 
-      if (tickDelta >= 500 && percentDelta > 0) {
-        const percentRemaining = 100 - newest.percent;
-        const rate             = percentDelta / tickDelta;
-        const etaTicks         = Math.ceil(percentRemaining / rate);
-        const etaMinutes       = etaTicks * 4 / 60;
-        etaString = " | ETA: " + etaTicks + " ticks (~" + formatTime(etaMinutes) + ")";
-      }
-      else if (tickDelta >= 500) {
-        etaString = ' | ETA: ∞ (no progress)';
+      if (tickDelta >= 100 && percentDelta > 0) {
+        const remaining = 100 - newest.percent;
+        const rate      = percentDelta / tickDelta;
+        const etaTicks  = Math.ceil(remaining / rate);
+        const etaMinutes= etaTicks * 4 / 60;
+        etaText = "ETA: ~" + formatTime(etaMinutes);
       }
     }
 
+    // --- 2. GATHER DATA FOR LINE ---
+    const counts = perRoomRoleCounts[roomName] || {};
+    const stats  = perRoomStats[roomName] || { totalCreeps: 0 };
+
+    // RCL String
+    let rclDisplay = "RCL" + room.controller.level;
+
+    // Energy String
+    const enAvail = room.energyAvailable >= 1000 ? (room.energyAvailable/1000).toFixed(1) + 'k' : room.energyAvailable;
+    const enCap = room.energyCapacityAvailable >= 1000 ? (room.energyCapacityAvailable/1000).toFixed(1) + 'k' : room.energyCapacityAvailable;
+    const enDisplay = "Energy: " + enAvail + "/" + enCap;
+
+    // Storage String
+    let storageDisplay = "NoSto";
+    if (room.storage && room.storage.store) {
+      const sVal = room.storage.store[RESOURCE_ENERGY];
+      storageDisplay = "Storage: " + (sVal >= 1000 ? (sVal/1000).toFixed(0) + 'k' : sVal);
+    }
+
+    // Creep Icons String
+    let creepDisplay = "";
+    if (stats.totalCreeps === 0) {
+      creepDisplay = "Idle";
+    } else {
+      creepDisplay = 
+        "🧑‍🌾" + (counts.harvester||0) +
+        " ⚡" + (counts.upgrader||0) +
+        " 🔨" + (counts.builder||0) +
+        " 🔋" + (counts.supplier||0);
+    }
+
+    // --- 3. PAD COLUMNS FOR ALIGNMENT ---
+    const col1 = (roomName + ": " + rclDisplay).padEnd(14);
+    const col2 = enDisplay.padEnd(21);
+    const col3 = storageDisplay.padEnd(15);
+    const col4 = creepDisplay.padEnd(24);
+
+    // --- 4. END OF LINE ---
+    let endOfLine = "";
+    if (room.controller.level < 8) {
+        const percentStr = "(" + percent.toFixed(1) + "%)";
+        if (etaText) {
+            endOfLine = " | " + etaText + " " + percentStr;
+        } else {
+            endOfLine = " | " + percentStr;
+        }
+    }
+
+    // --- 5. PRINT UNIFIED LINE ---
     console.log(
-      "Room " + roomName + ": RCL " + room.controller.level +
-      " - Progress: " + percent.toFixed(1) + "%" +
-      " | Energy: " + room.energyAvailable + "/" + room.energyCapacityAvailable +
-      " (" + energyPercent.toFixed(1) + "%)" + etaString
+        col1 + " | " + 
+        col2 + " | " + 
+        col3 + " | " + 
+        col4 + 
+        endOfLine
     );
   }
 
-  if (Memory.exploration && Memory.exploration.rooms) {
-    console.log("Explored rooms: " + Object.keys(Memory.exploration.rooms).length);
-    console.log('==============================================================');
-  }
-
+  // --- TOTAL ENERGY TRACKING (Background) ---
+  const currentEnergy = calculateTotalEnergy();
+  if (!Memory.stats) Memory.stats = {};
+  Memory.stats.lastTotalEnergy = currentEnergy;
+    
+  console.log('================================================================');
   return gclEta;
 }
 
+// UPDATED: Now uses getRoomState live objects instead of cached Memory IDs
 function calculateTotalEnergy() {
   let totalEnergy = 0;
-  if (!Memory.roomData) return 0;
+  const allRooms = getRoomState.all();
 
-  for (const roomName in Memory.roomData) {
-    const roomCache = Memory.roomData[roomName];
-    if (!roomCache) continue;
-    const allIds = []
-      .concat(roomCache.spawnIds || [])
-      .concat(roomCache.extensionIds || [])
-      .concat(roomCache.containerIds || []);
-    if (roomCache.storageId) allIds.push(roomCache.storageId);
+  for (const roomName in allRooms) {
+    const state = allRooms[roomName];
+    // If we have no structure cache for this room yet, skip
+    if (!state.structuresByType) continue;
 
-    totalEnergy += allIds.reduce(function(sum, id){
-      const structure = Game.getObjectById(id);
-      if (structure && structure.store) {
-        return sum + structure.store.getUsedCapacity(RESOURCE_ENERGY);
+    // Helper to sum up energy in a list of structure objects
+    function sumStore(type) {
+      const list = state.structuresByType[type];
+      if (!list || list.length === 0) return 0;
+      let sum = 0;
+      for (let i = 0; i < list.length; i++) {
+        const s = list[i];
+        if (s.store) {
+          sum += s.store.getUsedCapacity(RESOURCE_ENERGY);
+        }
       }
       return sum;
-    }, 0);
+    }
+
+    totalEnergy += sumStore(STRUCTURE_SPAWN);
+    totalEnergy += sumStore(STRUCTURE_EXTENSION);
+    totalEnergy += sumStore(STRUCTURE_CONTAINER);
+
+    if (state.storage && state.storage.store) {
+      totalEnergy += state.storage.store.getUsedCapacity(RESOURCE_ENERGY);
+    }
   }
   return totalEnergy;
 }
 
 function getPerformanceData() {
-  const cpuUsed    = Game.cpu.getUsed();
-  const cpuAverage = (Memory.cpuStats && Memory.cpuStats.average) ? Memory.cpuStats.average : 0;
-  const cpuLimit   = Game.cpu.limit;
-  const cpuPercent = ((cpuUsed / cpuLimit) * 100).toFixed(1);
+  const cpuUsed = Game.cpu.getUsed();
+  const cpuLimit = Game.cpu.limit;
+    
+  let cpuMin = cpuUsed;
+  let cpuMax = cpuUsed;
+  let cpuAverage = 0;
 
-  return { cpuUsed: cpuUsed, cpuAverage: Math.round(cpuAverage), cpuPercent: cpuPercent, cpuLimit: cpuLimit };
+  if (Memory.cpuStats && Memory.cpuStats.history && Memory.cpuStats.history.length > 0) {
+    const history = Memory.cpuStats.history;
+    cpuMin = Math.min.apply(null, history);
+    cpuMax = Math.max.apply(null, history);
+    cpuAverage = history.reduce(function(sum, val){ return sum + val; }, 0) / history.length;
+  }
+
+  return { 
+    cpuUsed: cpuUsed, 
+    cpuAverage: cpuAverage, 
+    cpuMin: cpuMin, 
+    cpuMax: cpuMax, 
+    cpuLimit: cpuLimit 
+  };
 }
 
 function formatTime(totalMinutes) {
@@ -543,7 +555,7 @@ function trackCPUUsage() {
   }
   const cpuUsed = Game.cpu.getUsed();
   Memory.cpuStats.history.push(cpuUsed);
-  if(Memory.cpuStats.history.length > 50) Memory.cpuStats.history.shift();
+  if(Memory.cpuStats.history.length > 100) Memory.cpuStats.history.shift();
   Memory.cpuStats.average = Memory.cpuStats.history.reduce(function(sum, cpu){ return sum + cpu; }, 0) / Memory.cpuStats.history.length;
 }
 
@@ -551,7 +563,7 @@ function trackCPUUsage() {
 globalOrders.init({
   getRoomState: getRoomState,
   iff: iff,
-  squad: squad,
+  // squad: squad, // Removed squad functionality
   getCreepBody: spawnManager.getCreepBody,
   bodyCost: spawnManager.bodyCost
 });
@@ -562,7 +574,7 @@ globalOrders.init({
 
 module.exports.loop = function() {
   profiler.wrap(function() {
-    // --- GLOBAL CREEP CACHE BY ROLE (Problem #1 Fix) ---
+    // --- GLOBAL CREEP CACHE BY ROLE ---
     global.creepsByRole = {};
     for (const name in Game.creeps) {
       const creep = Game.creeps[name];
@@ -595,17 +607,18 @@ module.exports.loop = function() {
 
     // --- MEMORY & SYSTEM MANAGEMENT ---
     if (!Memory.stats) Memory.stats = {};
-    if (Game.time % 5 === 0) roleScout.handleDeadCreeps();
-    if (Game.time % 20 === 0)   cleanMemory();
+    if (Game.time % 30 === 0) roleScout.handleDeadCreeps();
+    if (Game.time % 1000 === 0)   cleanMemory();
     if (Game.time % 1000 === 0) cleanCpuProfileMemory();
-
+      
 
     // --- BUILD PER-TICK ROOM STATE EARLY ---
+    // This builds the global.__roomState cache for the tick
     profileSection('getRoomState.init', function() { getRoomState.init(); });
 
     // --- CACHING & COUNTS ---
     const perRoomRoleCounts = getPerRoomRoleCounts();
-    const roomDataCache     = cacheRoomData();
+    // REMOVED: const roomDataCache = cacheRoomData(); -- No longer using Memory cache
 
     // --- ROOM OBSERVER SCAN PROGRESSION ---
     if (Memory.roomObserverState && Memory.roomObserverState.active === true) {
@@ -623,7 +636,7 @@ module.exports.loop = function() {
     if (Game.time % 3 === 0) profileSection('linkManager.run', function(){ linkManager.run(); });
 
     // --- MAINTENANCE & MANAGERS ---
-    if (Game.time % 1000 === 0) {
+    if (Game.time % 100 === 0) {
       profileSection('roomBalance', function() { roomBalance.run(); });
     }
 
@@ -632,9 +645,18 @@ module.exports.loop = function() {
     profileSection('factoryManager', function(){ factoryManager.run(); });
     profileSection('marketUpdater', function(){ marketUpdater.run(); });
     profileSection('marketRefine.run', function(){ marketRefine.run(); });
+    profileSection('localRefine.run', function(){ localRefine.run(); }); 
     if (Game.time % 10 === 0) profileSection('opportunisticBuy', function(){ opportunisticBuy.process(); });
+    profileSection('powerManager', function() {
+        for (const roomName in Game.rooms) {
+            if (Game.rooms[roomName].controller && Game.rooms[roomName].controller.my) {
+                powerManager.run(roomName);
+            }
+        }
+    });
+    profileSection('depositObserver.run', function(){ depositObserver.run(); });
 
-    // --- NUKE LAUNCH PIPELINE (runs every tick; observer vision is next-tick) ---
+    // --- NUKE LAUNCH PIPELINE ---
     profileSection('nukeLaunch.run', function(){ nukeLaunch.run(); });
 
     profileSection('labManager', function() {
@@ -648,7 +670,8 @@ module.exports.loop = function() {
     // --- SPAWNING (centralized) ---
     if (Game.time % 10 === 0) {
       profileSection('spawnManager.run', function() {
-        spawnManager.run(perRoomRoleCounts, roomDataCache);
+        // UPDATED: Passing getRoomState module instead of the old ID cache
+        spawnManager.run(perRoomRoleCounts, getRoomState);
       });
     }
 
@@ -659,7 +682,7 @@ module.exports.loop = function() {
     profileSection('trackCPUUsage', trackCPUUsage);
 
     // --- STATUS DISPLAY (LESS OFTEN) ---
-    if (Game.time % 50 === 0) {
+    if (Game.time % 100 === 0) {
       profileSection('displayStatus', function(){ displayStatus(perRoomRoleCounts); });
       if (ENABLE_CPU_LOGGING && !DISABLE_CPU_CONSOLE) {
         for (const key in Memory.cpuProfile) {

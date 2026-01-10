@@ -3,7 +3,7 @@
 // Dependency: getRoomState (see getRoomState.js)
 // Intent/CPU notes (from your resources):
 // - When an action method returns OK, it schedules an intent (typically ~0.2 CPU), plus engine checks.
-// - Not every API method creates an intent; check the API "A" icon/CPU bars.
+// - Not every API method creates an intent, check the API "A" icon/CPU bars.
 // - creep.say() does not create an intent.
 // - Helpers like moveTo perform pathfinding; the actual intent is move.
 
@@ -76,12 +76,6 @@ var roleHarvester = {
             creep.memory.harvesting = true;
         }
 
-        // If we're next to the source and all adjacent (to the creep) buffers are full, start a short idle
-        if (creep.pos.isNearTo(source) && this.shouldIdleAtSource(creep, source, state)) {
-            this.startIdle(creep);
-            return;
-        }
-
         // Early exit optimization:
         // When fatigued and in delivery mode, allow only in-range transfers (no moves/pathing/target searches).
         if (creep.fatigue > 0 && !creep.memory.harvesting) {
@@ -107,7 +101,7 @@ var roleHarvester = {
                         reusePath: 50,
                         // visualizePathStyle: { stroke: '#ffaa00' },
                         maxOps: 200,
-                        ignoreCreeps: true
+                        ignoreCreeps: false
                     });
                 }
                 return;
@@ -142,7 +136,7 @@ var roleHarvester = {
                         reusePath: 50,
                         // visualizePathStyle: { stroke: '#ffaa00' },
                         maxOps: 200,
-                        ignoreCreeps: true
+                        ignoreCreeps: false
                     });
                 }
             } else if (typeof source.ticksToRegeneration === 'number') {
@@ -152,8 +146,16 @@ var roleHarvester = {
     },
 
     // Intent-first: reuse target, avoid transfer when out of range, distance-only selection, high reusePath
+    // OPTIMIZED: Added per-tick caching of target object to reduce Game.getObjectById calls
     deliverEnergy: function(creep, source, state) {
-        // If adjacent to source and all adjacent (to the creep) buffers are full, idle instead of walking energy away
+        // Early exit if creep has no energy (defensive optimization)
+        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+            delete creep.memory.deliveryId;
+            delete creep._deliveryTarget;
+            return;
+        }
+
+        // If adjacent to source and all adjacent (to the creep) buffers are full, start a short idle
         if (creep.pos.isNearTo(source) && this.shouldIdleAtSource(creep, source, state)) {
             this.startIdle(creep);
             return;
@@ -161,11 +163,23 @@ var roleHarvester = {
 
         // Reuse an existing delivery target if it still wants energy
         let target = null;
+
         if (creep.memory.deliveryId) {
-            target = Game.getObjectById(creep.memory.deliveryId);
+            // Use per-tick cache to avoid repeated Game.getObjectById calls
+            if (creep._deliveryTarget && creep._deliveryTarget.id === creep.memory.deliveryId) {
+                target = creep._deliveryTarget;
+            } else {
+                target = Game.getObjectById(creep.memory.deliveryId);
+                if (target) {
+                    creep._deliveryTarget = target; // Cache for this tick
+                }
+            }
+
+            // Validate target still exists and wants energy
             if (!target || this.freeEnergyCapacity(target) <= 0) {
                 target = null;
                 delete creep.memory.deliveryId;
+                delete creep._deliveryTarget;
             }
         }
 
@@ -174,6 +188,7 @@ var roleHarvester = {
             target = this.pickDeliveryTargetQuick(creep, state, source);
             if (target) {
                 creep.memory.deliveryId = target.id;
+                creep._deliveryTarget = target; // Cache for this tick
             }
         }
 
@@ -184,7 +199,7 @@ var roleHarvester = {
                     reusePath: 50,
                     // visualizePathStyle: { stroke: '#ffaa00' },
                     maxOps: 200,
-                    ignoreCreeps: true
+                    ignoreCreeps: false
                 });
             }
             return;
@@ -197,7 +212,7 @@ var roleHarvester = {
                     reusePath: 50,
                     // visualizePathStyle: { stroke: '#ffffff' },
                     maxOps: 300,
-                    ignoreCreeps: true
+                    ignoreCreeps: false
                 });
             }
             return;
@@ -206,8 +221,10 @@ var roleHarvester = {
         // In range: transfer once
         const tr = creep.transfer(target, RESOURCE_ENERGY);
         if (tr === OK) {
+            // Check if target is full or creep is empty
             if (this.freeEnergyCapacity(target) <= 0 || creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
                 delete creep.memory.deliveryId;
+                delete creep._deliveryTarget;
             }
             return;
         }
@@ -215,6 +232,7 @@ var roleHarvester = {
         // Target rejected energy; clear and retry next tick
         if (tr === ERR_FULL || tr === ERR_INVALID_TARGET || tr === ERR_NOT_ENOUGH_RESOURCES) {
             delete creep.memory.deliveryId;
+            delete creep._deliveryTarget;
         }
     },
 
@@ -248,8 +266,7 @@ var roleHarvester = {
         }
         for (let i = 0; i < links.length; i++) {
             const s = links[i];
-            if (!s.my) continue;
-            if (this.freeEnergyCapacity(s) <= 0) continue;
+            if (s.my && this.freeEnergyCapacity(s) <= 0) continue;
             const r = creep.pos.getRangeTo(s);
             if (r <= 3 && r < bestRange) { best = s; bestRange = r; }
         }
@@ -292,10 +309,13 @@ var roleHarvester = {
     // - Return true (idle) only if: creep is near the source AND at least one adjacent buffer exists AND all such buffers are full.
     // - Per-tick cache on the creep object to avoid duplicate work.
     shouldIdleAtSource: function(creep, source, state) {
-        if (creep._idleCheckTick === Game.time) return !!creep._idleCheckResult;
+        // Add per-creep per-tick cache
+        if (creep._idleCheckTick === Game.time) {
+            return !!creep._idleCheckResult;
+        }
+        creep._idleCheckTick = Game.time;
 
         if (!creep.pos.isNearTo(source)) {
-            creep._idleCheckTick = Game.time;
             creep._idleCheckResult = false;
             return false;
         }
@@ -305,29 +325,25 @@ var roleHarvester = {
         const links = byType[STRUCTURE_LINK] || [];
 
         let sawAny = false;
-
-        // Single loop combining both structure types
         const allBuffers = [];
         for (let i = 0; i < containers.length; i++) allBuffers.push(containers[i]);
         for (let i = 0; i < links.length; i++) {
             const s = links[i];
             if (s.my) allBuffers.push(s);
         }
+
         for (let i = 0; i < allBuffers.length; i++) {
             const s = allBuffers[i];
             if (creep.pos.getRangeTo(s) > 1) continue;
             sawAny = true;
             if (this.freeEnergyCapacity(s) > 0) {
-                creep._idleCheckTick = Game.time;
                 creep._idleCheckResult = false;
                 return false;
             }
         }
 
-        const result = sawAny;
-        creep._idleCheckTick = Game.time;
-        creep._idleCheckResult = result;
-        return result;
+        creep._idleCheckResult = sawAny;
+        return sawAny;
     },
 
     // Try a single, in-range transfer to any adjacent structure that can accept energy.

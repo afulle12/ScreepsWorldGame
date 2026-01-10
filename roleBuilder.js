@@ -1,8 +1,10 @@
-// role.builder.js
+// roleBuilder.js
 // Notes:
 // - All direct room.find calls replaced with getRoomState reads.
 // - No optional chaining used.
 // - Initializes getRoomState once per tick before queue generation.
+// - In-room navigation avoids room edges; builders step inward if sitting on an edge.
+// - Pathing wrapper uses maxRooms: 1 and edge penalties to prevent edge pulsing.
 
 var getRoomState = require('getRoomState');
 
@@ -16,10 +18,15 @@ const PRIORITIES = [
   {
     type: 'repair',
     filter: function(s) {
+      // Ramparts: repair only until they reach 1000 hits
+      if (s.structureType === STRUCTURE_RAMPART) {
+        return s.hits < 1000;
+      }
+
+      // Other structures: original criteria
       return (
         s.structureType !== STRUCTURE_CONTAINER &&
         s.structureType !== STRUCTURE_WALL &&
-        s.structureType !== STRUCTURE_RAMPART &&
         (s.hits / s.hitsMax < 0.25) &&
         s.hits < s.hitsMax
       );
@@ -105,6 +112,22 @@ function flattenStructures(structuresByType) {
     for (var i = 0; i < arr.length; i++) out.push(arr[i]);
   }
   return out;
+}
+
+// Helper: choose closest by range using getRangeTo (avoid findClosestByRange/profiler recursion)
+function closestByRange(creepPos, list) {
+  var best = null;
+  var bestR = 999;
+  for (var i = 0; i < list.length; i++) {
+    var o = list[i];
+    var pos = (o.pos && o.pos.x !== undefined) ? o.pos : o;
+    var r = creepPos.getRangeTo(pos);
+    if (r < bestR) {
+      bestR = r;
+      best = o;
+    }
+  }
+  return best;
 }
 
 // == GLOBAL JOB QUEUE GENERATION (Suggestions #3, #5) ==
@@ -256,6 +279,10 @@ function findIdleSpotNearRoad(creep) {
       var y = road.pos.y + dy;
       if (x < 0 || x > 49 || y < 0 || y > 49) continue;
       var pos = new RoomPosition(x, y, road.pos.roomName);
+
+      // Avoid positions too close to room edge
+      if (isNearRoomEdge(pos, 1)) continue;
+
       var structs = pos.lookFor(LOOK_STRUCTURES);
       var hasRoad = false;
       var hasObs = false;
@@ -265,14 +292,14 @@ function findIdleSpotNearRoad(creep) {
         if (OBSTACLE_OBJECT_TYPES.indexOf(s.structureType) !== -1) hasObs = true;
       }
       var hasCreep = pos.lookFor(LOOK_CREEPS).length > 0;
-      var terrain = pos.lookFor(LOOK_TERRAIN)[0];
+      var terrain = pos.lookFor(LOOK_TERRAIN); // Screeps API returns a string here
       if (terrain === 'wall' || hasRoad || hasCreep || hasObs) continue;
       positions.push(pos);
     }
   }
 
   if (positions.length) {
-    return creep.pos.findClosestByPath(positions);
+    return closestByRange(creep.pos, positions);
   }
   return null;
 }
@@ -288,81 +315,272 @@ function isNearRoomEdge(pos, margin) {
   );
 }
 
-// == ENERGY ACQUISITION (Suggestion #1 and #5) ==
+// == Helper: nudge off room edges (single-step inward) ==
+function nudgeOffRoomEdge(creep) {
+  // If we're exactly on an outer border tile, take a single step inward.
+  // This avoids cross-room pulsing when we are not intentionally exiting.
+  if (creep.pos.y === 0) {
+    var mv = creep.move(BOTTOM);
+    if (mv === OK) return true;
+    if (creep.pos.x > 0 && creep.move(BOTTOM_LEFT) === OK) return true;
+    if (creep.pos.x < 49 && creep.move(BOTTOM_RIGHT) === OK) return true;
+  } else if (creep.pos.y === 49) {
+    var mv2 = creep.move(TOP);
+    if (mv2 === OK) return true;
+    if (creep.pos.x > 0 && creep.move(TOP_LEFT) === OK) return true;
+    if (creep.pos.x < 49 && creep.move(TOP_RIGHT) === OK) return true;
+  } else if (creep.pos.x === 0) {
+    var mv3 = creep.move(RIGHT);
+    if (mv3 === OK) return true;
+    if (creep.pos.y > 0 && creep.move(BOTTOM_RIGHT) === OK) return true;
+    if (creep.pos.y < 49 && creep.move(TOP_RIGHT) === OK) return true;
+  } else if (creep.posx === 49) {
+    var mv4 = creep.move(LEFT);
+    if (mv4 === OK) return true;
+    if (creep.pos.y > 0 && creep.move(BOTTOM_LEFT) === OK) return true;
+    if (creep.pos.y < 49 && creep.move(TOP_LEFT) === OK) return true;
+  }
+  return false;
+}
+
+// == Pathing: discourage edge tiles for in-room navigation ==
+function applyEdgePenalty(roomName, costMatrix) {
+  // Penalize the outer ring heavily and inner ring lightly to keep routes away from borders.
+  for (var x = 0; x < 50; x++) {
+    costMatrix.set(x, 0, 255);
+    costMatrix.set(x, 49, 255);
+    var c1 = costMatrix.get(x, 1);
+    var c48 = costMatrix.get(x, 48);
+    costMatrix.set(x, 1, Math.max(c1, 10));
+    costMatrix.set(x, 48, Math.max(c48, 10));
+  }
+  for (var y = 0; y < 50; y++) {
+    costMatrix.set(0, y, 255);
+    costMatrix.set(49, y, 255);
+    var c2 = costMatrix.get(1, y);
+    var c47 = costMatrix.get(48, y);
+    costMatrix.set(1, y, Math.max(c2, 10));
+    costMatrix.set(48, y, Math.max(c47, 10));
+  }
+}
+
+// == Wrapper: in-room move that avoids edges unless target is on the edge ==
+function moveToWithinRoom(creep, target, opts) {
+  // If sitting on an edge, step inward first to prevent room pulsing.
+  if (isNearRoomEdge(creep.pos, 1)) {
+    if (nudgeOffRoomEdge(creep)) return;
+  }
+
+  var mopts = opts || {};
+  mopts.maxRooms = 1; // never leave the room for normal builder navigation
+
+  var targetOnEdge = false;
+  // If target is an object in same room, check its edge status
+  if (target && target.pos && target.pos.roomName === creep.room.name) {
+    targetOnEdge = isNearRoomEdge(target.pos, 1);
+  }
+
+  mopts.costCallback = function(roomName, costMatrix) {
+    if (roomName === creep.room.name && !targetOnEdge) {
+      applyEdgePenalty(roomName, costMatrix);
+    }
+  };
+
+  creep.moveTo(target, mopts);
+}
+
+// == ENERGY ACQUISITION (no recursion; avoid findClosestByRange) ==
 function acquireEnergy(creep) {
-  // Reuse cached energy target if valid
+  var rs = getRoomState.get(creep.room.name);
+  var need = creep.store.getFreeCapacity(RESOURCE_ENERGY);
+
+  // Get storage and containers in the room
+  var storArr = [];
+  var contArr = [];
+  if (rs && rs.structuresByType) {
+    storArr = rs.structuresByType[STRUCTURE_STORAGE] || [];
+    contArr = rs.structuresByType[STRUCTURE_CONTAINER] || [];
+  }
+
+  var hasStorage = storArr.length > 0;
+
+  // Determine storage state
+  var storageWithEnergy = [];
+  for (var si = 0; si < storArr.length; si++) {
+    var st = storArr[si];
+    if (st && st.store && st.store[RESOURCE_ENERGY] > 0) {
+      storageWithEnergy.push(st);
+    }
+  }
+  var hasStorageWithEnergy = storageWithEnergy.length > 0;
+  var storageEmptyMode = hasStorage && !hasStorageWithEnergy;
+
+  // Reuse cached energy target if valid and allowed by current priority rules
   if (creep.memory.energyTargetId) {
     var t = Game.getObjectById(creep.memory.energyTargetId);
+
+    // Ensure cached energy target is in the same room; otherwise clear it
+    if (t && t.pos && t.pos.roomName && t.pos.roomName !== creep.room.name) {
+      delete creep.memory.energyTargetId;
+      t = null;
+    }
+
+    // Enforce new priority rules on cached targets
+    if (t) {
+      // If storage in room has energy, only storage is allowed as a cached target
+      if (hasStorageWithEnergy && (!t.structureType || t.structureType !== STRUCTURE_STORAGE)) {
+        delete creep.memory.energyTargetId;
+        t = null;
+      }
+      // If there is storage but it's empty, we always harvest: clear any cached target
+      else if (storageEmptyMode) {
+        delete creep.memory.energyTargetId;
+        t = null;
+      }
+    }
+
     if (t) {
       // Structure withdraw
       if (t.structureType && t.store && t.store[RESOURCE_ENERGY] > 0) {
         if (!creep.pos.inRangeTo(t, 1)) {
-          creep.moveTo(t, { range: 1, reusePath: 15 });
+          moveToWithinRoom(creep, t, { range: 1, reusePath: 15 });
           return true;
         }
         var wr = creep.withdraw(t, RESOURCE_ENERGY);
         if (wr === OK) return true;
+        if (wr === ERR_NOT_ENOUGH_RESOURCES || wr === ERR_INVALID_TARGET) {
+          delete creep.memory.energyTargetId;
+        }
+        return true; // attempted this tick
       }
       // Dropped pickup
-      if (!t.structureType && t.resourceType === RESOURCE_ENERGY) {
+      if (!t.structureType && t.resourceType === RESOURCE_ENERGY && t.amount > 0) {
         if (!creep.pos.inRangeTo(t, 1)) {
-          creep.moveTo(t, { range: 1, reusePath: 15 });
+          moveToWithinRoom(creep, t, { range: 1, reusePath: 15 });
           return true;
         }
         var pk = creep.pickup(t);
         if (pk === OK) return true;
+        if (pk === ERR_INVALID_TARGET) {
+          delete creep.memory.energyTargetId;
+        }
+        return true; // attempted this tick
       }
     }
-    // Clear invalid/empty target and reselect
+
+    // Clear invalid/empty target; continue to selection below
     delete creep.memory.energyTargetId;
   }
 
-  // Prefer containers/storage (cheap withdraw)
-  var rs = getRoomState.get(creep.room.name);
-  var stores = [];
-  if (rs && rs.structuresByType) {
-    var storArr = rs.structuresByType[STRUCTURE_STORAGE] || [];
-    var contArr = rs.structuresByType[STRUCTURE_CONTAINER] || [];
-    var combined = [];
-    for (var i1 = 0; i1 < storArr.length; i1++) combined.push(storArr[i1]);
-    for (var i2 = 0; i2 < contArr.length; i2++) combined.push(contArr[i2]);
-    for (var i3 = 0; i3 < combined.length; i3++) {
-      var s = combined[i3];
-      if (s.store && s.store[RESOURCE_ENERGY] > 0) {
-        stores.push(s);
+  // === SELECTION PHASE ===
+
+  // 1) If there is storage with energy, always use storage (ignore containers/drops/harvest)
+  if (hasStorageWithEnergy) {
+    var storesAny = storageWithEnergy;
+    var storesRich = [];
+    for (var rsi = 0; rsi < storesAny.length; rsi++) {
+      var ss = storesAny[rsi];
+      if (ss.store && ss.store[RESOURCE_ENERGY] >= need) {
+        storesRich.push(ss);
       }
     }
-  }
-  if (stores.length) {
-    var pickStore = creep.pos.findClosestByRange(stores);
+    var poolStore = storesRich.length ? storesRich : storesAny;
+    var pickStore = closestByRange(creep.pos, poolStore);
     if (pickStore) {
       creep.memory.energyTargetId = pickStore.id;
-      return acquireEnergy(creep);
+      return true;
+    }
+  }
+
+  // 2) If there is storage in the room but all storages are empty,
+  //    ALWAYS harvest directly (do not use containers or dropped energy).
+  if (storageEmptyMode) {
+    var srcEmptyMode = creep.pos.findClosestByPath(FIND_SOURCES_ACTIVE);
+    if (srcEmptyMode) {
+      if (!creep.pos.inRangeTo(srcEmptyMode, 1)) {
+        moveToWithinRoom(creep, srcEmptyMode, { range: 1, reusePath: 15 });
+      } else {
+        creep.harvest(srcEmptyMode);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // 3) No storage exists in the room: use containers, then dropped, then harvest.
+
+  // Containers first
+  var contWithEnergy = [];
+  for (var ci = 0; ci < contArr.length; ci++) {
+    var c = contArr[ci];
+    if (c && c.store && c.store[RESOURCE_ENERGY] > 0) {
+      contWithEnergy.push(c);
+    }
+  }
+  if (contWithEnergy.length) {
+    var contRich = [];
+    for (var cri = 0; cri < contWithEnergy.length; cri++) {
+      var cc = contWithEnergy[cri];
+      if (cc.store && cc.store[RESOURCE_ENERGY] >= need) {
+        contRich.push(cc);
+      }
+    }
+    var poolCont = contRich.length ? contRich : contWithEnergy;
+    var pickCont = closestByRange(creep.pos, poolCont);
+    if (pickCont) {
+      creep.memory.energyTargetId = pickCont.id;
+      return true;
     }
   }
 
   // Then sizeable dropped energy (avoid 2-tile room edge)
-  var drops = [];
-  var dropped = rs && rs.dropped ? rs.dropped : [];
+  var dropsAny = [];
+  var dropped = (rs && rs.dropped) ? rs.dropped : [];
   for (var d = 0; d < dropped.length; d++) {
-    var r = dropped[d];
-    if (r.resourceType === RESOURCE_ENERGY && r.amount > 50 && !isNearRoomEdge(r.pos, 2)) {
-      drops.push(r);
+    var rsrc = dropped[d];
+    if (rsrc && rsrc.resourceType === RESOURCE_ENERGY && !isNearRoomEdge(rsrc.pos, 2)) {
+      dropsAny.push(rsrc);
     }
   }
-  if (drops.length) {
-    var pickDrop = creep.pos.findClosestByRange(drops);
-    if (pickDrop) {
-      creep.memory.energyTargetId = pickDrop.id;
-      return acquireEnergy(creep);
+  if (dropsAny.length) {
+    var dropsRich = [];
+    for (var di = 0; di < dropsAny.length; di++) {
+      if (dropsAny[di].amount >= need) dropsRich.push(dropsAny[di]);
+    }
+
+    var poolDrops;
+    if (dropsRich.length) {
+      poolDrops = dropsRich;
+    } else {
+      // Prefer medium+ piles, but if nothing qualifies, just use all
+      poolDrops = [];
+      for (var fj = 0; fj < dropsAny.length; fj++) {
+        if (dropsAny[fj].amount > 50) {
+          poolDrops.push(dropsAny[fj]);
+        }
+      }
+      if (!poolDrops.length) {
+        poolDrops = dropsAny;
+      }
+    }
+
+    if (poolDrops.length) {
+      var pickDrop = closestByRange(creep.pos, poolDrops);
+      if (pickDrop) {
+        creep.memory.energyTargetId = pickDrop.id;
+        return true;
+      }
     }
   }
 
-  // Last resort: harvest (using FIND_SOURCES_ACTIVE on position is OK)
+  // Last resort: harvest (using FIND_SOURCES_ACTIVE)
   var src = creep.pos.findClosestByPath(FIND_SOURCES_ACTIVE);
   if (src) {
-    if (!creep.pos.inRangeTo(src, 1)) creep.moveTo(src, { range: 1, reusePath: 15 });
-    else creep.harvest(src);
+    if (!creep.pos.inRangeTo(src, 1)) {
+      moveToWithinRoom(creep, src, { range: 1, reusePath: 15 });
+    } else {
+      creep.harvest(src);
+    }
     return true;
   }
 
@@ -387,7 +605,7 @@ var roleBuilder = {
       if (!acquireEnergy(creep)) {
         var spot = findIdleSpotNearRoad(creep);
         if (spot && !creep.pos.isEqualTo(spot)) {
-          creep.moveTo(spot);
+          moveToWithinRoom(creep, spot, { reusePath: 15 });
         }
       }
       return;
@@ -467,7 +685,7 @@ var roleBuilder = {
         case 'build': {
           var workRange = 3;
           if (!creep.pos.inRangeTo(target, workRange)) {
-            creep.moveTo(target, { range: workRange, reusePath: 15 });
+            moveToWithinRoom(creep, target, { range: workRange, reusePath: 15 });
           } else {
             creep.build(target);
           }
@@ -477,7 +695,7 @@ var roleBuilder = {
         case 'reinforce': {
           var repairRange = 3;
           if (!creep.pos.inRangeTo(target, repairRange)) {
-            creep.moveTo(target, { range: repairRange, reusePath: 15 });
+            moveToWithinRoom(creep, target, { range: repairRange, reusePath: 15 });
           } else {
             creep.repair(target);
           }
@@ -487,7 +705,7 @@ var roleBuilder = {
         default: {
           var idle = findIdleSpotNearRoad(creep);
           if (idle && !creep.pos.isEqualTo(idle)) {
-            creep.moveTo(idle, { visualizePathStyle: { stroke: '#888888' } });
+            moveToWithinRoom(creep, idle, { visualizePathStyle: { stroke: '#888888' }, reusePath: 15 });
           }
           break;
         }

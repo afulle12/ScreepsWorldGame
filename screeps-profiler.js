@@ -178,7 +178,7 @@ function hookUpPrototypes() {
 function profileObjectFunctions(object, label) {
   if (!object || !(typeof object === 'object' || typeof object === 'function')) {
     throw new ProfilerError(`Asked to profile non-object ${object} for ${label}
-     (${typeof object})`);
+      (${typeof object})`);
   }
 
   if (object.prototype) {
@@ -247,6 +247,13 @@ function profileFunction(fn, functionName) {
 const Profiler = {
   printProfile() {
     console.log(Profiler.output());
+
+    // Only perform these actions if the profiling session has reached its end tick.
+    // This prevents memory from being cleared prematurely if you are using stream().
+    if (Memory.profiler.disableTick === Game.time) {
+      Game.notify(Profiler.output(1000));
+      resetMemory();
+    }
   },
 
   emailProfile() {

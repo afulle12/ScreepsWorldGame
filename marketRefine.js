@@ -1,5 +1,5 @@
 // marketRefine.js
-// Orchestrates a buy(50k) -> refine(max) -> sell pipeline for simple bar/melt/purifier/oxidant/reductant and Battery.
+// Orchestrates a buy(50k) -> refine(max) -> sell pipeline for simple bar/melt/purifier/oxidant/reductant.
 // REQUIRED console API (two params):
 //   marketRefine('W1N1', 'Zynthium bar')
 //   marketRefine('W1N1', RESOURCE_ZYNTHIUM_BAR)
@@ -58,8 +58,8 @@ function normalizeOutput(p) {
     'UTRIUM BAR': RESOURCE_UTRIUM_BAR, UTRIUM_BAR: RESOURCE_UTRIUM_BAR,
     'KEANIUM BAR': RESOURCE_KEANIUM_BAR, KEANIUM_BAR: RESOURCE_KEANIUM_BAR,
     'GHODIUM MELT': RESOURCE_GHODIUM_MELT, GHODIUM_MELT: RESOURCE_GHODIUM_MELT,
-    PURIFIER: RESOURCE_PURIFIER,
-    BATTERY: RESOURCE_BATTERY
+    PURIFIER: RESOURCE_PURIFIER
+    //BATTERY: RESOURCE_BATTERY
   };
   if (map[s]) return map[s];
   if (global[s]) return global[s];
@@ -76,7 +76,7 @@ OUTPUT_TO_INPUT[RESOURCE_UTRIUM_BAR]     = RESOURCE_UTRIUM;
 OUTPUT_TO_INPUT[RESOURCE_KEANIUM_BAR]    = RESOURCE_KEANIUM;
 OUTPUT_TO_INPUT[RESOURCE_GHODIUM_MELT]   = RESOURCE_GHODIUM;
 // Battery: input is ENERGY
-OUTPUT_TO_INPUT[RESOURCE_BATTERY]        = RESOURCE_ENERGY;
+//OUTPUT_TO_INPUT[RESOURCE_BATTERY]        = RESOURCE_ENERGY;
 
 // ===== WRAPPERS FOR EXTERNAL HELPERS =====
 function getMarketPriceStr(resourceType, mode) {
@@ -253,7 +253,7 @@ global.marketRefine = function(roomName, outputLike) {
 
   var output = normalizeOutput(outputLike);
   if (!output || !OUTPUT_TO_INPUT[output]) {
-    return '[MarketRefine] Unsupported output: ' + outputLike + '. Allowed: Oxidant, Reductant, Purifier, Zynthium bar, Lemergium bar, Utrium bar, Keanium bar, Ghodium melt, Battery.';
+    return '[MarketRefine] Unsupported output: ' + outputLike + '. Allowed: Oxidant, Reductant, Purifier, Zynthium bar, Lemergium bar, Utrium bar, Keanium bar, Ghodium melt.';
   }
 
   var inputRes = OUTPUT_TO_INPUT[output];
@@ -281,24 +281,12 @@ global.marketRefine = function(roomName, outputLike) {
     phase: 'buying',
     started: Game.time,
     lastUpdate: Game.time,
-    buyRequestCreated: false,
-    notes: []
+    buyRequestCreated: false
   };
 
   // Enqueue buy (first and only attempt)
   var buyMsg = invokeOpportunisticBuy(roomName, inputRes, buyAmount, ceiling);
-  op.notes.push('opportunisticBuy setup: ' + buyMsg);
-  op.notes.push('opBuy methods: ' + opBuyMethodsString());
   op.buyRequestCreated = true;
-
-  // Optional visibility: list active requests if available
-  try {
-    var ob = getOpBuy();
-    if (ob && typeof ob.listActiveRequests === 'function') {
-      var listed = ob.listActiveRequests();
-      if (listed) op.notes.push('activeRequests:\n' + listed);
-    }
-  } catch (e) {}
 
   Memory.marketRefine.ops.push(op);
   return '[MarketRefine] Started ' + id + ' | buy ' + buyAmount + ' ' + inputRes + ' @ ' + ceiling + ' -> refine ' + output + ' (max) -> sell.';
@@ -319,7 +307,6 @@ global.marketRefineStatus = function(id) {
         s.push('  output: ' + o.output + (o.factoryOrderId ? (' orderId=' + o.factoryOrderId) : ''));
         s.push('  baseInput=' + o.baseInputCount + ' currentInput=' + countInRoom(o.room, o.input));
         s.push('  baseOutput=' + o.baseOutputCount + ' currentOutput=' + countInRoom(o.room, o.output));
-        if (o.notes && o.notes.length) for (var n = 0; n < o.notes.length; n++) s.push('  note: ' + o.notes[n]);
         return s.join('\n');
       }
     }
@@ -374,7 +361,15 @@ function run() {
   for (var i = ops.length - 1; i >= 0; i--) {
     var op = ops[i];
     if (!op) { ops.splice(i, 1); continue; }
+
     op.lastUpdate = Game.time;
+
+    // --- AUTO CLEANUP ---
+    // If op was marked done/error in a previous tick, remove it now.
+    if (op.phase === 'done' || op.phase === 'error') {
+        ops.splice(i, 1);
+        continue;
+    }
 
     if (op.phase === 'buying') {
       // OpportunisticBuy module handles purchasing elsewhere; we just observe completion.
@@ -383,7 +378,6 @@ function run() {
       if (acquired < 0) acquired = 0;
       if (acquired >= op.targetBuy) {
         op.phase = 'refining';
-        op.notes.push('buy complete: acquired ' + acquired);
       }
       continue;
     }
@@ -391,7 +385,6 @@ function run() {
     if (op.phase === 'refining') {
       if (!op.factoryStarted) {
         var ret = startFactoryMax(op.room, op.output);
-        op.notes.push(ret.message);
         if (typeof ret.message === 'string' && ret.message.indexOf('REFUSED') >= 0) {
           op.phase = 'error';
           op.error = 'factory refused';
@@ -410,7 +403,6 @@ function run() {
 
       if (!stillPresent) {
         op.phase = 'selling';
-        op.notes.push('factory done');
       }
       continue;
     }
@@ -420,17 +412,11 @@ function run() {
       var delta = nowOut - (op.outputBaseAtFactoryStart || op.baseOutputCount || 0);
       if (delta <= 0) {
         op.phase = 'done';
-        op.notes.push('no new product to sell; finishing');
         continue;
       }
 
       var msg = callMarketSell(op.room, op.output, delta);
-      op.notes.push(msg);
       op.phase = 'done';
-      continue;
-    }
-
-    if (op.phase === 'done' || op.phase === 'error') {
       continue;
     }
   }

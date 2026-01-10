@@ -1,27 +1,101 @@
 // towerManager.js
-// Intent-first tower manager: minimizes expensive tower intents, uses runtime caching, adds repair/heal budgets and hysteresis.
+// Intent-first tower manager with combat short-circuit, per-room intent budgets, and cached repair targets.
 
 const getRoomState = require('getRoomState');
 const iff = require('iff');
+const spawnManager = require('spawnManager');
 
-// Runtime-only, per-tick flags (not stored in Memory)
-const runtimeTowerOnce = {}; // { [roomName]: { tick, repaired, healedTargets: {}, healCount } }
+const REPAIR_RESERVE_FRAC = 0.50;
+const HEAL_RESERVE_FRAC     = 0.10;
+const WALL_MAX_TARGET_HITS      = 2000000;
+const RAMPART_MAX_TARGET_HITS   = 2000000;
 
-// Runtime multi-tick state (not serialized to Memory)
-const runtimeTowerState = {}; // { [roomName]: { searchCache, lastHostileTick, wallRepairActive, lastRepairTick } }
+// Optional hysteresis margins (start/stop thresholds)
+const REPAIR_START_FRAC = 0.60;
+const REPAIR_STOP_FRAC  = 0.45;
+const HEAL_START_FRAC   = 0.15;
+const HEAL_STOP_FRAC    = 0.08;
 
-// Intent-budgeting and hysteresis config
-const REPAIR_COOLDOWN_TICKS = 10;            // Minimum ticks between any repair intent in a room
-const HOSTILE_SUPPRESS_REPAIR_TICKS = 5;     // Suppress repairs for X ticks after hostiles seen
-const HEAL_BUDGET_PER_ROOM = 1;              // Max heals per room per tick
-const WALL_REPAIR_START_THRESHOLD = 0.90;    // Start walls/ramparts repair when all towers >= 90% energy
-const WALL_REPAIR_STOP_THRESHOLD = 0.85;     // Stop when any tower drops below 85% energy
-const WALL_MAX_TARGET_HITS = 500000;         // Cap for walls
-const RAMPART_MAX_TARGET_HITS = 1000000;     // Cap for ramparts
+// Per-room budgets when no hostiles
+const MAX_HEAL_INTENTS_PER_TICK   = 1;
+const MAX_REPAIR_INTENTS_PER_TICK = 1;
+
+// How often to rescan for a repair target if the cached one is still valid
+const REPAIR_SCAN_INTERVAL = 20; // ticks
+// How often to re-check if we need a supplier (to determine if we can repair walls)
+const SUPPLIER_CHECK_INTERVAL = 25; // ticks
+
+// Minimal additions to let defenses get time-slice without raising CPU:
+const CONTAINER_PRIORITY_UNDER = 0.60;
+const NONDEF_PRIORITY_UNDER    = 0.85;
+
+// Run lightweight memory cleanup every 50 ticks.
+function gcMemory() {
+  // 1) Top-level towerTargets pruning
+  if (Memory.towerTargets) {
+    for (var tid in Memory.towerTargets) {
+      var rec = Memory.towerTargets[tid];
+      var towerObj = Game.getObjectById(tid);
+
+      if (!towerObj || towerObj.structureType !== STRUCTURE_TOWER || !towerObj.my) {
+        delete Memory.towerTargets[tid];
+        continue;
+      }
+
+      var sameHpZeroOrUndef = (typeof rec === 'object') ? (typeof rec.sameHp === 'undefined' || rec.sameHp === 0) : true;
+      var empty = !rec || (rec.targetId == null && rec.lastHp === 0 && rec.sameHpTicks === 0 && sameHpZeroOrUndef);
+      if (empty) delete Memory.towerTargets[tid];
+    }
+    var anyTowerTarget = false;
+    for (var k in Memory.towerTargets) { anyTowerTarget = true; break; }
+    if (!anyTowerTarget) delete Memory.towerTargets;
+  }
+
+  // 2) Per-room tower sub-memory pruning
+  if (Memory.rooms) {
+    for (var rn in Memory.rooms) {
+      var rmem = Memory.rooms[rn];
+      if (!rmem || !rmem.tower) continue;
+
+      var roomObj = Game.rooms[rn];
+      if (!roomObj || !roomObj.controller || !roomObj.controller.my) {
+        delete rmem.tower;
+        continue;
+      }
+
+      var towersNow = roomObj.find(FIND_MY_STRUCTURES, {
+        filter: function(s) { return s.structureType === STRUCTURE_TOWER; }
+      });
+
+      if (towersNow.length === 0) {
+        delete rmem.tower;
+        continue;
+      }
+
+      var idSet = {};
+      for (var i0 = 0; i0 < towersNow.length; i0++) idSet[towersNow[i0].id] = true;
+
+      if (rmem.tower.healEnabledById) {
+        for (var id1 in rmem.tower.healEnabledById) {
+          if (!idSet[id1]) delete rmem.tower.healEnabledById[id1];
+        }
+      }
+      if (rmem.tower.repairEnabledById) {
+        for (var id2 in rmem.tower.repairEnabledById) {
+          if (!idSet[id2]) delete rmem.tower.repairEnabledById[id2];
+        }
+      }
+    }
+  }
+}
 
 function runTowers() {
-  if (!Memory.towerCache) Memory.towerCache = {};
-  if (!Memory.towerTargets) Memory.towerTargets = {};
+  if (!Memory.rooms) {
+    Memory.rooms = {};
+  }
+
+  // Periodic GC
+  if (Game.time % 50 === 0) gcMemory();
 
   for (var roomName in Game.rooms) {
     var room = Game.rooms[roomName];
@@ -30,329 +104,306 @@ function runTowers() {
     var rs = getRoomState.get(roomName);
     if (!rs) continue;
 
-    if (!Memory.towerCache[roomName]) {
-      Memory.towerCache[roomName] = { towers: [], lastUpdate: 0, cacheValidUntil: 0 };
-    }
-
-    var roomCache = Memory.towerCache[roomName];
-    var currentTick = Game.time;
-
-    // Per-tick flags
-    var onceFlags = runtimeTowerOnce[roomName];
-    if (!onceFlags || onceFlags.tick !== currentTick) {
-      onceFlags = { tick: currentTick, repaired: false, healedTargets: {}, healCount: 0 };
-      runtimeTowerOnce[roomName] = onceFlags;
-    }
-
-    // Multi-tick runtime state
-    var rt = runtimeTowerState[roomName];
-    if (!rt) {
-      rt = { searchCache: {}, lastHostileTick: 0, wallRepairActive: false, lastRepairTick: 0 };
-      runtimeTowerState[roomName] = rt;
-    }
-
-    // Update tower cache every 50 ticks or if empty
-    if (currentTick >= roomCache.cacheValidUntil || roomCache.towers.length === 0) {
-      var towerObjs = [];
-      if (rs.structuresByType && rs.structuresByType[STRUCTURE_TOWER]) {
-        towerObjs = rs.structuresByType[STRUCTURE_TOWER].filter(function(t){ return t.my; });
-      }
-      roomCache.towers = towerObjs.map(function(t){ return t.id; });
-      roomCache.lastUpdate = currentTick;
-      roomCache.cacheValidUntil = currentTick + 50;
-    }
-
-    if (roomCache.towers.length === 0) continue;
-
-    var towers = roomCache.towers.map(function(id){ return Game.getObjectById(id); }).filter(function(t){ return t; });
-    if (towers.length === 0) continue;
-
-    // Hysteresis for wall/rampart repair based on tower energy
-    var minEnergyFrac = 1;
-    for (var ti = 0; ti < towers.length; ti++) {
-      var frac = towers[ti].store[RESOURCE_ENERGY] / towers[ti].store.getCapacity(RESOURCE_ENERGY);
-      if (frac < minEnergyFrac) minEnergyFrac = frac;
-    }
-    if (rt.wallRepairActive) {
-      if (minEnergyFrac < WALL_REPAIR_STOP_THRESHOLD) {
-        rt.wallRepairActive = false;
-      }
-    } else {
-      if (minEnergyFrac >= WALL_REPAIR_START_THRESHOLD) {
-        rt.wallRepairActive = true;
+    var towers = [];
+    if (rs.structuresByType && rs.structuresByType[STRUCTURE_TOWER]) {
+      var tArr = rs.structuresByType[STRUCTURE_TOWER];
+      for (var ti = 0; ti < tArr.length; ti++) {
+        if (tArr[ti].my) towers.push(tArr[ti]);
       }
     }
 
-    // Rotate search types; store in runtime cache (not in Memory)
-    var tickMod = currentTick % 4;
-    var searchType = null;
-    var searchResults = null;
+    // Prepare per-room memory
+    var mem = Memory.rooms[roomName] || (Memory.rooms[roomName] = {});
+    if (towers.length === 0) {
+      if (mem.tower) delete mem.tower;
+      continue;
+    }
+    
+    // Ensure tower memory block exists
+    var tmem = mem.tower || (mem.tower = { repairTargetId: null, lastRepairScan: 0 });
+    if (!tmem.healEnabledById) tmem.healEnabledById = {};
+    if (!tmem.repairEnabledById) tmem.repairEnabledById = {};
 
-    if (tickMod === 0) {
-      // Hostiles (still allow ally filter)
-      var hostiles = rs.hostiles || [];
-      searchResults = hostiles.filter(function(creep){ return iff.isHostileCreep(creep); });
-      searchType = 'hostiles';
-      if (searchResults.length > 0) {
-        rt.lastHostileTick = currentTick;
+    // Looser thresholds for single-tower rooms
+    var singleTower = (towers.length === 1);
+    var repairStart = singleTower ? 0.35 : REPAIR_START_FRAC;
+    var repairStop  = singleTower ? 0.15 : REPAIR_STOP_FRAC;
+    var repairReserve = singleTower ? 0.30 : REPAIR_RESERVE_FRAC;
+
+    var healStart = singleTower ? 0.12 : HEAL_START_FRAC;
+    var healStop  = singleTower ? 0.06 : HEAL_STOP_FRAC;
+    var rescanInterval = singleTower ? Math.max(5, Math.floor(REPAIR_SCAN_INTERVAL / 2)) : REPAIR_SCAN_INTERVAL;
+
+    var twoTowers = (towers.length === 2);
+    if (twoTowers) {
+      repairStart = 0.50;
+      repairStop = 0.30;
+      repairReserve = 0.45;
+    }
+
+    function hysteresisAllow(frac, start, stop, prev) {
+      if (prev) return frac > stop;
+      return frac >= start;
+    }
+
+    // Hostiles logic
+    var hostilesList = [];
+    var healers = [];
+    var rawHostiles = rs.hostiles || [];
+    for (var h = 0; h < rawHostiles.length; h++) {
+      var hc = rawHostiles[h];
+      if (!iff.isHostileCreep(hc)) continue;
+      hostilesList.push(hc);
+      var healParts = hc.getActiveBodyparts(HEAL) || 0;
+      if (healParts > 0) healers.push(hc);
+    }
+
+    // Combat short-circuit
+    if (hostilesList.length) {
+      var specialTargeting = false;
+      var healerOnly = null;
+      var workerAttacker = null;
+
+      if (hostilesList.length === 2 && towers.length > 1) {
+        var e1 = hostilesList[0];
+        var e2 = hostilesList[1];
+        var e1Heal = e1.getActiveBodyparts(HEAL);
+        var e1Attack = e1.getActiveBodyparts(ATTACK);
+        var e1Work = e1.getActiveBodyparts(WORK);
+        var e2Heal = e2.getActiveBodyparts(HEAL);
+        var e2Attack = e2.getActiveBodyparts(ATTACK);
+        var e2Work = e2.getActiveBodyparts(WORK);
+        if (e1Heal > 0 && e1Attack === 0 && e2Heal === 0 && (e2Work > 0 || e2Attack > 0)) {
+          specialTargeting = true; healerOnly = e1; workerAttacker = e2;
+        } else if (e2Heal > 0 && e2Attack === 0 && e1Heal === 0 && (e1Work > 0 || e1Attack > 0)) {
+          specialTargeting = true; healerOnly = e2; workerAttacker = e1;
+        }
       }
-    } else if (tickMod === 1) {
-      // Injured my creeps
-      var injured = [];
-      var myC = rs.myCreeps || [];
-      for (var i1 = 0; i1 < myC.length; i1++) {
-        var c = myC[i1];
-        if (c.hits < c.hitsMax) injured.push(c);
+
+      var primaryHealer = null;
+      var primaryHostile = null;
+      if (!specialTargeting) {
+        if (healers.length) primaryHealer = towers[0].pos.findClosestByRange(healers);
+        if (!primaryHealer && hostilesList.length) primaryHostile = towers[0].pos.findClosestByRange(hostilesList);
       }
-      searchResults = injured;
-      searchType = 'injured';
-    } else if (tickMod === 2) {
-      // Damaged non-walls, exclude roads
-      var damaged = [];
+
+      for (var i = 0; i < towers.length; i++) {
+        var tower = towers[i];
+        var attackTarget = null;
+        if (specialTargeting) {
+          attackTarget = (i % 2 === 0) ? healerOnly : workerAttacker;
+        } else if (primaryHealer) {
+          attackTarget = primaryHealer;
+        } else if (primaryHostile) {
+          attackTarget = primaryHostile;
+        }
+        if (attackTarget) tower.attack(attackTarget);
+      }
+      continue;
+    }
+
+    // No hostiles
+    var healIntentsLeft = MAX_HEAL_INTENTS_PER_TICK;
+    var repairIntentsLeft = MAX_REPAIR_INTENTS_PER_TICK;
+
+    var healTarget = null;
+    var minHealFrac = 1;
+    var hasSupplier = false; // Track if we have a supplier spawned in the room
+    var myC = rs.myCreeps || [];
+    for (var i1 = 0; i1 < myC.length; i1++) {
+      var c = myC[i1];
+      // Check for supplier role
+      if (c.memory && c.memory.role === 'supplier') {
+        hasSupplier = true;
+      }
+      if (c.hits < c.hitsMax) {
+        var fracH = c.hits / c.hitsMax;
+        if (fracH < minHealFrac) { minHealFrac = fracH; healTarget = c; }
+      }
+    }
+
+    // --- CHECK & CACHE: ALLOW WALL REPAIRS? ---
+    // Perform check only if cache is missing or expired (every 25 ticks)
+    if (typeof tmem.supplierNeeded === 'undefined' || 
+        typeof tmem.lastSupplierCheck === 'undefined' || 
+        (Game.time - tmem.lastSupplierCheck >= SUPPLIER_CHECK_INTERVAL)) {
+        
+        tmem.supplierNeeded = spawnManager.shouldSpawnSupplier(roomName);
+        tmem.lastSupplierCheck = Game.time;
+    }
+
+    // If result is 1, we allow wall repairs. If 0, we do not.
+    var allowWallRepairs = (tmem.supplierNeeded === 1);
+
+    // Resolve cached repair target
+    var repairTarget = null;
+    if (tmem.repairTargetId) {
+      repairTarget = Game.getObjectById(tmem.repairTargetId);
+      
+      // Validity check
+      if (!repairTarget || !repairTarget.hits || repairTarget.hits >= repairTarget.hitsMax ||
+          (repairTarget.structureType === STRUCTURE_WALL && repairTarget.hits >= WALL_MAX_TARGET_HITS) ||
+          (repairTarget.structureType === STRUCTURE_RAMPART && repairTarget.hits >= RAMPART_MAX_TARGET_HITS)) {
+        repairTarget = null;
+        tmem.repairTargetId = null;
+      }
+      // If we disallowed walls but the cached target IS a wall, drop it.
+      else if (!allowWallRepairs && (repairTarget.structureType === STRUCTURE_WALL || repairTarget.structureType === STRUCTURE_RAMPART)) {
+        repairTarget = null;
+        tmem.repairTargetId = null;
+      }
+    }
+
+    // Scan for new targets if needed
+    if (!repairTarget && (Game.time - tmem.lastRepairScan >= rescanInterval)) {
+      var containerTarget = null;
+      var containerRatio = 1;
+
+      var roadTarget = null;
+      var roadRatio = 1;
+
+      var otherTarget = null;
+      var otherRatio = 1;
+
+      var rampartTarget = null;
+      var rampartHits = Infinity;
+
+      var wallTarget = null;
+      var wallHits = Infinity;
+
       if (rs.structuresByType) {
+        // First pass: non-wall / non-rampart structures
         for (var st in rs.structuresByType) {
-          // Skip walls, ramparts, and roads
-          if (st === STRUCTURE_WALL || st === STRUCTURE_RAMPART || st === STRUCTURE_ROAD) continue;
           var arr = rs.structuresByType[st];
-          for (var ii = 0; ii < arr.length; ii++) {
-            var s = arr[ii];
-            if (typeof s.hits === 'number' && typeof s.hitsMax === 'number' && s.hits < s.hitsMax) {
-              damaged.push(s);
+          for (var di = 0; di < arr.length; di++) {
+            var s = arr[di];
+
+            if (typeof s.hits !== 'number' || typeof s.hitsMax !== 'number') continue;
+            if (s.hits >= s.hitsMax) continue;
+
+            if (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) continue;
+
+            var ratio = s.hitsMax > 0 ? (s.hits / s.hitsMax) : 1;
+
+            if (s.structureType === STRUCTURE_CONTAINER) {
+              // If no supplier is spawned, do not heal containers unless they are below 25% health
+              if (!hasSupplier && ratio >= 0.25) continue;
+
+              if (ratio < containerRatio) {
+                containerRatio = ratio;
+                containerTarget = s;
+              }
+            } else if (s.structureType === STRUCTURE_ROAD) {
+              if (ratio < roadRatio) {
+                roadRatio = ratio;
+                roadTarget = s;
+              }
+            } else {
+              if (ratio < otherRatio) {
+                otherRatio = ratio;
+                otherTarget = s;
+              }
             }
           }
         }
+
+        // Second pass: defensive structures (ONLY if allowed)
+        if (allowWallRepairs) {
+            
+            // Ramparts
+            if (rs.structuresByType[STRUCTURE_RAMPART]) {
+              var ramps = rs.structuresByType[STRUCTURE_RAMPART];
+              for (var r1 = 0; r1 < ramps.length; r1++) {
+                var rp = ramps[r1];
+                if (typeof rp.hits !== 'number') continue;
+                if (rp.hits >= RAMPART_MAX_TARGET_HITS) continue;
+    
+                if (rp.hits < rampartHits) {
+                  rampartHits = rp.hits;
+                  rampartTarget = rp;
+                }
+              }
+            }
+    
+            // Walls
+            if (rs.structuresByType[STRUCTURE_WALL]) {
+              var walls = rs.structuresByType[STRUCTURE_WALL];
+              for (var w1 = 0; w1 < walls.length; w1++) {
+                var wObj = walls[w1];
+                if (typeof wObj.hits !== 'number') continue;
+                if (wObj.hits >= WALL_MAX_TARGET_HITS) continue;
+    
+                if (wObj.hits < wallHits) {
+                  wallHits = wObj.hits;
+                  wallTarget = wObj;
+                }
+              }
+            }
+        }
       }
-      searchResults = damaged;
-      searchType = 'damaged';
-    } else {
-      // Weak walls/ramparts if hysteresis says active
-      if (rt.wallRepairActive) {
-        var walls = [];
-        if (rs.structuresByType && rs.structuresByType[STRUCTURE_WALL]) {
-          for (var w1 = 0; w1 < rs.structuresByType[STRUCTURE_WALL].length; w1++) {
-            var wObj = rs.structuresByType[STRUCTURE_WALL][w1];
-            if (wObj.hits < WALL_MAX_TARGET_HITS) walls.push(wObj);
-          }
+
+      repairTarget =
+        containerTarget ||
+        roadTarget ||
+        otherTarget ||
+        rampartTarget ||
+        wallTarget ||
+        null;
+
+      tmem.repairTargetId = repairTarget ? repairTarget.id : null;
+      tmem.lastRepairScan = Game.time;
+    }
+
+    // HEAL
+    var healTower = null;
+    if (healTarget && healIntentsLeft > 0) {
+      var bestTower = null, bestDist = Infinity;
+      for (var i2 = 0; i2 < towers.length; i2++) {
+        var t = towers[i2];
+        var energy = t.store[RESOURCE_ENERGY];
+        var capacity = t.store.getCapacity(RESOURCE_ENERGY);
+        var fracE = capacity > 0 ? (energy / capacity) : 0;
+
+        var prev = !!tmem.healEnabledById[t.id];
+        var enabled = hysteresisAllow(fracE, healStart, healStop, prev);
+        
+        if (enabled && fracE >= HEAL_RESERVE_FRAC) {
+          var d = t.pos.getRangeTo(healTarget);
+          if (d < bestDist) { bestDist = d; bestTower = t; }
         }
-        if (rs.structuresByType && rs.structuresByType[STRUCTURE_RAMPART]) {
-          for (var r1 = 0; r1 < rs.structuresByType[STRUCTURE_RAMPART].length; r1++) {
-            var rp = rs.structuresByType[STRUCTURE_RAMPART][r1];
-            if (rp.hits < RAMPART_MAX_TARGET_HITS) walls.push(rp);
-          }
-        }
-        searchResults = walls;
-        searchType = 'walls';
+        tmem.healEnabledById[t.id] = enabled;
+      }
+      healTower = bestTower;
+      if (healTower) {
+        healTower.heal(healTarget);
+        healIntentsLeft--;
       }
     }
 
-    if (searchResults !== null) {
-      if (!rt.searchCache) rt.searchCache = {};
-      rt.searchCache[searchType] = {
-        results: searchResults.map(function(obj) {
-          var rec = { id: obj.id, pos: { x: obj.pos.x, y: obj.pos.y }, hits: obj.hits, hitsMax: obj.hitsMax };
-          if (searchType === 'hostiles') {
-            rec.healParts = obj.getActiveBodyparts(HEAL);
-            rec.attackParts = obj.getActiveBodyparts(ATTACK);
-            rec.workParts = obj.getActiveBodyparts(WORK);
-          }
-          return rec;
-        }),
-        lastUpdate: currentTick,
-        validUntil: currentTick + 4
-      };
-    }
+    // REPAIR
+    if (repairIntentsLeft > 0 && repairTarget) {
+      var bestTower = null, bestDist = Infinity;
+      for (var i3 = 0; i3 < towers.length; i3++) {
+        var t = towers[i3];
+        var energy = t.store[RESOURCE_ENERGY];
+        var capacity = t.store.getCapacity(RESOURCE_ENERGY);
+        var fracE = capacity > 0 ? (energy / capacity) : 0;
 
-    // Prepare mapped lists once per room
-    var cache = rt.searchCache || {};
-    var hostilesCache = cache.hostiles;
-    var injuredCache = cache.injured;
-    var damagedCache = cache.damaged;
-    var wallsCache = cache.walls;
-
-    var hostilesList = [];
-    var hostileInfoById = {};
-    var healers = [];
-
-    if (hostilesCache && currentTick < hostilesCache.validUntil) {
-      for (var h = 0; h < hostilesCache.results.length; h++) {
-        var data = hostilesCache.results[h];
-        var obj = Game.getObjectById(data.id);
-        if (!obj) continue;
-        hostilesList.push(obj);
-        hostileInfoById[data.id] = { heal: data.healParts, attack: data.attackParts, work: data.workParts };
-      }
-      for (var hl = 0; hl < hostilesList.length; hl++) {
-        var c = hostilesList[hl];
-        var info = hostileInfoById[c.id];
-        if (info && info.heal > 0) healers.push(c);
-      }
-    }
-
-    var injuredList = [];
-    if (injuredCache && currentTick < injuredCache.validUntil) {
-      for (var ic = 0; ic < injuredCache.results.length; ic++) {
-        var d = injuredCache.results[ic];
-        var o = Game.getObjectById(d.id);
-        if (o && o.hits < o.hitsMax && !onceFlags.healedTargets[o.id]) {
-          injuredList.push(o);
+        var prev = !!tmem.repairEnabledById[t.id];
+        var enabled = hysteresisAllow(fracE, repairStart, repairStop, prev);
+        
+        if (enabled && fracE >= repairReserve) {
+          var d = t.pos.getRangeTo(repairTarget);
+          if (d < bestDist) { bestDist = d; bestTower = t; }
         }
+        tmem.repairEnabledById[t.id] = enabled;
       }
-    }
-
-    var damagedList = [];
-    if (damagedCache && currentTick < damagedCache.validUntil) {
-      for (var dc = 0; dc < damagedCache.results.length; dc++) {
-        var dd = damagedCache.results[dc];
-        var oo = Game.getObjectById(dd.id);
-        // Ensure roads are never considered even if present in cache
-        if (oo && oo.hits < oo.hitsMax && oo.structureType !== STRUCTURE_ROAD) {
-          damagedList.push(oo);
-        }
-      }
-    }
-
-    var wallsList = [];
-    if (wallsCache && currentTick < wallsCache.validUntil) {
-      for (var wc = 0; wc < wallsCache.results.length; wc++) {
-        var wd = wallsCache.results[wc];
-        var wo = Game.getObjectById(wd.id);
-        if (wo) {
-          if (wo.structureType === STRUCTURE_WALL && wo.hits < WALL_MAX_TARGET_HITS) {
-            wallsList.push(wo);
-          } else if (wo.structureType === STRUCTURE_RAMPART && wo.hits < RAMPART_MAX_TARGET_HITS) {
-            wallsList.push(wo);
-          }
-        }
-      }
-    }
-
-    // Special targeting pairs
-    var specialTargeting = false;
-    var healerOnly = null;
-    var workerAttacker = null;
-
-    if (hostilesList.length === 2 && towers.length > 1) {
-      var enemy1 = hostilesList[0];
-      var enemy2 = hostilesList[1];
-      var info1 = hostileInfoById[enemy1.id] || { heal: enemy1.getActiveBodyparts(HEAL), attack: enemy1.getActiveBodyparts(ATTACK), work: enemy1.getActiveBodyparts(WORK) };
-      var info2 = hostileInfoById[enemy2.id] || { heal: enemy2.getActiveBodyparts(HEAL), attack: enemy2.getActiveBodyparts(ATTACK), work: enemy2.getActiveBodyparts(WORK) };
-
-      if (info1.heal > 0 && info1.attack === 0 && info2.heal === 0 && (info2.work > 0 || info2.attack > 0)) {
-        specialTargeting = true; healerOnly = enemy1; workerAttacker = enemy2;
-      } else if (info2.heal > 0 && info2.attack === 0 && info1.heal === 0 && (info1.work > 0 || info1.attack > 0)) {
-        specialTargeting = true; healerOnly = enemy2; workerAttacker = enemy1;
-      }
-    }
-
-    // Pre-calc closest targets once
-    var closestHealer = null;
-    var closestHostile = null;
-
-    if (!specialTargeting) {
-      if (healers.length && towers.length) {
-        closestHealer = towers[0].pos.findClosestByRange(healers);
-      }
-      if (hostilesList.length && towers.length && !closestHealer) {
-        closestHostile = towers[0].pos.findClosestByRange(hostilesList);
-      }
-    }
-
-    // Budgets and suppression
-    var recentHostiles = (currentTick - rt.lastHostileTick) <= HOSTILE_SUPPRESS_REPAIR_TICKS;
-    var canRepairThisTick = (!recentHostiles) && (currentTick - rt.lastRepairTick >= REPAIR_COOLDOWN_TICKS);
-    var roomRepairAssigned = false;
-
-    // Tower loop
-    for (var i = 0; i < towers.length; i++) {
-      var tower = towers[i];
-      var mem = Memory.towerTargets[tower.id] ||
-        (Memory.towerTargets[tower.id] = { targetId: null, lastHp: 0, sameHp: 0 });
-
-      var target = null;
-
-      if (specialTargeting) {
-        target = (i % 2 === 0) ? healerOnly : workerAttacker;
-      } else if (closestHealer) {
-        target = closestHealer;
-      } else if (closestHostile) {
-        target = closestHostile;
-      }
-
-      if (target) {
-        if (mem.targetId === target.id) {
-          mem.sameHp = (mem.lastHp === target.hits) ? mem.sameHp + 1 : 0;
-        } else {
-          mem.targetId = target.id;
-          mem.sameHp = 0;
-        }
-        mem.lastHp = target.hits;
-
-        if (!specialTargeting && mem.sameHp >= 5) {
-          var others = [];
-          for (var oi = 0; oi < hostilesList.length; oi++) {
-            var hobj = hostilesList[oi];
-            if (hobj.id !== target.id) others.push(hobj);
-          }
-          if (others.length) {
-            target = tower.pos.findClosestByRange(others);
-            mem.targetId = target.id;
-            mem.lastHp = target.hits;
-            mem.sameHp = 0;
-          }
-        }
-
-        tower.attack(target);
-        continue;
-      }
-
-      mem.targetId = null;
-      mem.lastHp = 0;
-      mem.sameHp = 0;
-
-      // Healing budget: max one heal per room per tick
-      if (injuredList.length && onceFlags.healCount < HEAL_BUDGET_PER_ROOM) {
-        var healTarget = tower.pos.findClosestByRange(injuredList);
-        if (healTarget) {
-          tower.heal(healTarget);
-          onceFlags.healedTargets[healTarget.id] = true;
-          onceFlags.healCount++;
-          continue;
-        }
-      }
-
-      // Non-wall repair: cooldown-based and single intent per room (roads excluded)
-      if (!roomRepairAssigned && canRepairThisTick && damagedList.length) {
-        var weakest = damagedList[0];
-        for (var j = 1; j < damagedList.length; j++) {
-          if (damagedList[j].hits < weakest.hits) {
-            weakest = damagedList[j];
-          }
-        }
-        tower.repair(weakest);
-        roomRepairAssigned = true;
-        onceFlags.repaired = true;
-        rt.lastRepairTick = currentTick;
-        continue;
-      }
-
-      // Walls/ramparts repair: hysteresis, cooldown, single intent per room
-      if (!roomRepairAssigned && canRepairThisTick && rt.wallRepairActive && wallsList.length) {
-        var weakestWall = wallsList[0];
-        for (var k = 1; k < wallsList.length; k++) {
-          if (wallsList[k].hits < weakestWall.hits) {
-            weakestWall = wallsList[k];
-          }
-        }
-        tower.repair(weakestWall);
-        roomRepairAssigned = true;
-        onceFlags.repaired = true;
-        rt.lastRepairTick = currentTick;
-        continue;
+      if (bestTower) {
+        bestTower.repair(repairTarget);
+        repairIntentsLeft--;
       }
     }
   }
 }
 
-module.exports = {
-  run: runTowers
-};
+module.exports = { run: runTowers };

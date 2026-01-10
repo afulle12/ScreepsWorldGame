@@ -189,15 +189,22 @@ module.exports = {
       }
     };
 
-    global.orderDemolition = function(homeRoom, targetRoom, teamCount) {
+    // In your Global Orders Module, replace the existing orderDemolition with this:
+
+    global.orderDemolition = function(homeRoom, targetRoom, teamCount, focus) {
+      // Optional 4th param "focus": currently supports 'controller'
+      // Usage:
+      // - orderDemolition('E1S1', 'E2S2', 2)                       -> normal demolition
+      // - orderDemolition('E1S1', 'E2S2', 2, 'controller')         -> prioritize walls/ramparts in range 1 of controller
       var count = (teamCount === undefined) ? 1 : teamCount;
       if (!Game.rooms[homeRoom] || !Game.rooms[homeRoom].controller || !Game.rooms[homeRoom].controller.my) {
         return "[Demolition] Invalid home room: " + homeRoom + ". Must be a room you own.";
       }
       if (!targetRoom || count <= 0) {
-        return "[Demolition] Invalid order. Use: orderDemolition('homeRoomName', 'targetRoomName', teamCount)";
+        return "[Demolition] Invalid order. Use: orderDemolition('homeRoomName', 'targetRoomName', teamCount, [focus])";
       }
-
+    
+      // Validate target ownership
       var targetRoomObj = Game.rooms[targetRoom];
       if (targetRoomObj && targetRoomObj.controller && targetRoomObj.controller.owner) {
         if (iff && typeof iff.isAlly === 'function' && iff.isAlly(targetRoomObj.controller.owner.username)) {
@@ -207,21 +214,32 @@ module.exports = {
           return "[Demolition] Cannot demolish " + targetRoom + " - it's your own room!";
         }
       }
-
+    
       if (!Memory.demolitionOrders) Memory.demolitionOrders = [];
       var existingOrder = Memory.demolitionOrders.find(function(o){ return o.targetRoom === targetRoom; });
       if (existingOrder) {
         return "[Demolition] An operation against " + targetRoom + " is already active. Cancel it first to create a new one.";
       }
-
+    
+      // Normalize/validate focus
+      var normalizedFocus = null;
+      if (typeof focus === 'string' && focus.toLowerCase() === 'controller') {
+        normalizedFocus = 'controller';
+      }
+    
       Memory.demolitionOrders.push({
         homeRoom: homeRoom,
         targetRoom: targetRoom,
         teamCount: parseInt(count, 10),
-        teamsSpawned: 0
+        teamsSpawned: 0,
+        // Optional: 'controller' makes teams prioritize walls/ramparts adjacent to the controller
+        focus: normalizedFocus
       });
-      return "[Demolition] Order placed for " + count + " demolition team(s) to demolish " + targetRoom + " from " + homeRoom + ".";
+    
+      return "[Demolition] Order placed for " + count + " demolition team(s) to demolish " + targetRoom +
+             " from " + homeRoom + (normalizedFocus ? (" with focus='" + normalizedFocus + "'") : "") + ".";
     };
+
 
     global.cancelDemolitionOrder = function(targetRoom) {
       if (!targetRoom) {
@@ -397,6 +415,29 @@ module.exports = {
       }
       return "[Attack] Assigned target " + targetId + " to " + assignedCount + " attackers in room " + roomName + ".";
     };
+    
+    global.orderSquad = function(formRoom, attackRoom) {
+      if (!Game.rooms[formRoom] || !Game.rooms[formRoom].controller || !Game.rooms[formRoom].controller.my) {
+        return "[Squad] Invalid form room: " + formRoom;
+      }
+      if (!attackRoom) return "[Squad] Target room required.";
+
+      if (!Memory.squadOrders) Memory.squadOrders = [];
+      
+      Memory.squadOrders.push({
+          homeRoom: formRoom,
+          targetRoom: attackRoom,
+          spawnedCount: 0,
+          squadId: "Squad_" + attackRoom + "_" + Game.time
+      });
+
+      return "[Squad] Order placed: Quad from " + formRoom + " to attack " + attackRoom;
+    };
+    
+    global.cancelSquadOrders = function() {
+        Memory.squadOrders = [];
+        return "[Squad] All squad orders cleared.";
+    };
 
     global.cancelAttackOrder = function (targetRoom) {
       if (!Memory.attackOrders || Memory.attackOrders.length === 0) return '[Attack] No active attack orders.';
@@ -482,6 +523,78 @@ module.exports = {
 
       return result === OK ? 'LabBot spawn queued' : 'LabBot spawn failed: ' + result;
     };
+    // ===========================================
+// Remote Builder Orders (console commands)
+// ===========================================
+
+global.remoteBuilder = function(homeRoom, targetRoom, count) {
+  if (!homeRoom || !targetRoom || !count || parseInt(count, 10) <= 0) {
+    return "[RemoteBuilder] Invalid command. Use: remoteBuilder('homeRoom', 'targetRoom', count)";
+  }
+
+  var home = Game.rooms[homeRoom];
+  if (!home || !home.controller || !home.controller.my) {
+    return "[RemoteBuilder] Invalid home room: " + homeRoom + ". Must be a room you own.";
+  }
+
+  if (!Memory.remoteBuilderOrders) Memory.remoteBuilderOrders = {};
+  var key = homeRoom + '->' + targetRoom;
+
+  var existing = Memory.remoteBuilderOrders[key];
+  if (existing) {
+    existing.count = parseInt(count, 10);
+    existing.updatedAt = Game.time;
+    return "[RemoteBuilder] Updated order " + key + " to count=" + existing.count;
+  } else {
+    Memory.remoteBuilderOrders[key] = {
+      homeRoom: homeRoom,
+      targetRoom: targetRoom,
+      count: parseInt(count, 10),
+      createdAt: Game.time,
+      updatedAt: Game.time
+    };
+    return "[RemoteBuilder] Order created: " + key + " with count=" + count;
+  }
+};
+
+global.cancelRemoteBuilder = function(homeRoom, targetRoom) {
+  if (!homeRoom || !targetRoom) {
+    return "[RemoteBuilder] Invalid command. Use: cancelRemoteBuilder('homeRoom', 'targetRoom')";
+  }
+  if (!Memory.remoteBuilderOrders) return "[RemoteBuilder] No remote builder orders exist.";
+
+  var key = homeRoom + '->' + targetRoom;
+  if (!Memory.remoteBuilderOrders[key]) {
+    return "[RemoteBuilder] No order found for " + key + ".";
+  }
+
+  delete Memory.remoteBuilderOrders[key];
+  return "[RemoteBuilder] Cancelled order for " + key + ". Existing creeps will not be replaced.";
+};
+
+global.listRemoteBuilders = function() {
+  if (!Memory.remoteBuilderOrders || Object.keys(Memory.remoteBuilderOrders).length === 0) {
+    return "[RemoteBuilder] No active remote builder orders.";
+  }
+
+  var lines = [];
+  for (var key in Memory.remoteBuilderOrders) {
+    var o = Memory.remoteBuilderOrders[key];
+    var living = _.filter(Game.creeps, function(c) {
+      return c.memory &&
+             c.memory.role === 'remoteBuilder' &&
+             c.memory.homeRoom === o.homeRoom &&
+             c.memory.targetRoom === o.targetRoom;
+    }).length;
+
+    lines.push(o.homeRoom + " -> " + o.targetRoom +
+               " | desired=" + o.count +
+               " | living=" + living +
+               " | key=" + key);
+  }
+  return lines.join(" || ");
+};
+
 
     global.orderMineralCollect = function (roomName) {
       var missing = ensureDeps([

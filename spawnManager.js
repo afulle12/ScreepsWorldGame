@@ -1,31 +1,47 @@
-
 // spawnManager.js
 // ============================================================================
 // Spawn Manager
 // Centralizes all spawn-related logic pulled from main.js.
-//
-// Integration options:
-//  - Option A (single entry): call spawnManager.run(perRoomRoleCounts, roomDataCache)
-//  - Option B (piecemeal): call individual exported functions where you already do
-//
-// Notes:
-//  - No optional chaining used
-//  - Uses Screeps API only
-//  - Requires: getRoomState, squadModule (same modules as your main)
+// Updated to use getRoomState (Live Objects) instead of Memory.roomData
 // ============================================================================
+// To spawn 2 upgraders in a room
+// doubleUpgrade('ROOMNAME', true) to enable doubleUpgrade('ROOM_NAME', false) to disable
+
 
 const getRoomState = require('getRoomState');
-const squad = require('squadModule');
 
-// --- CONSTANTS (copied from main where needed) ---
+// --- CONSTANTS ---
 const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
-const BASIC_DEFENDER   = [TOUGH, MOVE, RANGED_ATTACK];
-const SCOUT_BODY       = [MOVE, MOVE, MOVE, MOVE, MOVE];
-const SCAVENGER_BODY   = [MOVE, CARRY, CARRY, MOVE];
-const TOWER_DRAIN_BODY = [TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, HEAL, HEAL, HEAL, HEAL, MOVE];
+const BASIC_DEFENDER = [TOUGH, MOVE, RANGED_ATTACK];
+const SCOUT_BODY = [MOVE, MOVE, MOVE, MOVE, MOVE];
+const SCAVENGER_BODY = [MOVE, CARRY, CARRY, MOVE];
+const MAINTAINER_BODY = [WORK, CARRY, CARRY, MOVE]; // Fixed body for maintainer
+const TOWER_DRAIN_BODY = [TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, HEAL, HEAL, HEAL, HEAL, HEAL, HEAL, HEAL, HEAL, MOVE];
 
-const LOW_RCL_SPAWN_DELAY_TICKS = 100;
-const LOW_RCL_ENERGY_FILL_THRESHOLD = 0.75;
+const LOW_RCL_SPAWN_DELAY_TICKS = 300;
+const RCL8_UPGRADER_SPAWN_DELAY_TICKS = 5000;
+
+// ============================================================================
+// Console Commands
+// ============================================================================
+
+global.doubleUpgrade = function(roomName, enable) {
+  if (!Memory.doubleUpgradeRooms) { Memory.doubleUpgradeRooms = {}; }
+
+  if (enable) {
+    var room = Game.rooms[roomName];
+    if (room && room.controller && room.controller.level >= 8) {
+      return "Command Rejected: Room " + roomName + " is RCL 8. Double upgrade only allowed for RCL 7 and lower.";
+    }
+    Memory.doubleUpgradeRooms[roomName] = true;
+    return "Double Upgrade ENABLED for " + roomName + ". Max Upgraders: 2 (Active only if RCL <= 7).";
+  } else {
+    if (Memory.doubleUpgradeRooms[roomName]) {
+      delete Memory.doubleUpgradeRooms[roomName];
+    }
+    return "Double Upgrade DISABLED for " + roomName + ". Max Upgraders: 1.";
+  }
+};
 
 // ============================================================================
 // Helper / utility (local to spawn module)
@@ -49,6 +65,11 @@ function getCreepBody(role, energy) {
     return b;
   }
 
+  // --- Maintainer Body ---
+  if (role === 'maintainer') {
+      return MAINTAINER_BODY;
+  }
+
   if (role === 'attacker') {
     const costPerSet = 390;
     const numSets = Math.min(16, Math.floor(energy / costPerSet));
@@ -64,13 +85,33 @@ function getCreepBody(role, energy) {
   }
 
   const bodyConfigs = {
+    // --- SQUAD (QUAD) CONFIGURATION ---
+    quad: {
+      1300: [TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, HEAL, HEAL, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      1800: [TOUGH, TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, HEAL, HEAL, HEAL, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      2300: [TOUGH, TOUGH, TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, HEAL, HEAL, HEAL, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      5000: [TOUGH, TOUGH, TOUGH, TOUGH, TOUGH, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, HEAL, HEAL, HEAL, HEAL, HEAL, HEAL, HEAL, HEAL, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
+    },
+    powerBot: {
+      300: [CARRY, CARRY, MOVE, MOVE],
+      500: [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
+      800: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      1600: [CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, 
+             MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE]
+    },
     upgrader: {
-      200: [WORK, CARRY, MOVE],
-      300: [WORK, WORK, CARRY, MOVE],
-      500: [WORK, WORK, WORK, WORK, CARRY, MOVE],
-      550: [WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
-      800: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE],
-      1100: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE]
+      200:  [WORK, CARRY, MOVE],
+      300:  [WORK, WORK, CARRY, MOVE],
+      500:  [WORK, WORK, WORK, WORK, CARRY, MOVE],
+      550:  [WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE],
+      800:  [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE],
+      1100: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
+      1300: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      1800: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      2300: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      2800: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      3300: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      3600: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
     },
     builder: {
       300: [WORK, CARRY, CARRY, MOVE, MOVE],
@@ -78,6 +119,14 @@ function getCreepBody(role, energy) {
       450: [WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE],
       550: [WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE],
       750: [WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE]
+    },
+    remoteBuilder: {
+      300: [WORK, CARRY, CARRY, MOVE, MOVE],
+      400: [WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
+      550: [WORK, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE], 
+      800: [WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE], 
+      1300:[WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      1800:[WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
     },
     wallRepair: {
       300: [WORK, CARRY, CARRY, MOVE, MOVE],
@@ -113,14 +162,14 @@ function getCreepBody(role, energy) {
       1600:[CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
       1800:[CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
       2000:[CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
-      2200:[CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
+      2200:[CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
       2400:[CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE]
     },
     scout: { 300: SCOUT_BODY }
   };
 
   if (role === 'scout') return SCOUT_BODY;
-  if (energy <= 300 && role !== 'defender' && role !== 'supplier') return BASIC_HARVESTER;
+  if (energy <= 300 && role !== 'defender' && role !== 'supplier' && role !== 'powerBot' && role !== 'remoteBuilder' && role !== 'quad' && role !== 'maintainer') return BASIC_HARVESTER;
 
   const configs = bodyConfigs[role] || bodyConfigs.harvester;
   return getBestBody(configs, energy);
@@ -220,7 +269,22 @@ function costOf(part) {
   }
 }
 
-// In spawnManager.js (top section already has getRoomState imported)
+function buildExtractorBody(energyAvailable) {
+  var setCost = costOf(WORK) + costOf(WORK) + costOf(MOVE);
+  if (energyAvailable < setCost) return null;
+
+  var maxSetsByParts = Math.floor(48 / 3);
+  var setsByEnergy = Math.floor(energyAvailable / setCost);
+  var sets = Math.min(maxSetsByParts, setsByEnergy);
+  if (sets <= 0) return null;
+
+  var body = [];
+  for (var i = 0; i < sets; i++) {
+    body.push(WORK, WORK, MOVE);
+  }
+  return body;
+}
+
 function manageNukeFillSpawns() {
   if (!Memory.nukeFillOrders) return;
 
@@ -234,7 +298,6 @@ function manageNukeFillSpawns() {
     var rs = getRoomState.get(roomName);
     if (!rs) continue;
 
-    // Verify nuker still exists
     var nuker = null;
     if (order.nukerId) nuker = Game.getObjectById(order.nukerId);
     if (!nuker && rs.structuresByType && rs.structuresByType[STRUCTURE_NUKER] && rs.structuresByType[STRUCTURE_NUKER].length > 0) {
@@ -243,7 +306,6 @@ function manageNukeFillSpawns() {
     }
     if (!nuker) continue;
 
-    // Alive worker?
     var exists = _.some(Game.creeps, function(c) {
       if (!c || !c.memory) return false;
       if (c.memory.role !== 'nukeFill') return false;
@@ -252,7 +314,6 @@ function manageNukeFillSpawns() {
     });
     if (exists) continue;
 
-    // Find a free spawn in this room
     var freeSpawn = null;
     if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
       for (var i = 0; i < rs.structuresByType[STRUCTURE_SPAWN].length; i++) {
@@ -288,8 +349,8 @@ function manageNukeFillSpawns() {
 function buildHarvesterBodyForDistance(distance, energyBudget) {
   if (energyBudget < 200) return null;
 
-  var body = [];
-  var cost = 0;
+  var body  = [];
+  var cost  = 0;
   var parts = 0;
 
   function canAdd(part) {
@@ -299,6 +360,20 @@ function buildHarvesterBodyForDistance(distance, energyBudget) {
     body.push(part);
     cost += costOf(part);
     parts++;
+  }
+  function removePart(part) {
+    for (var i = body.length - 1; i >= 0; i--) {
+      if (body[i] === part) {
+        body.splice(i, 1);
+        cost -= costOf(part);
+        parts--;
+        if (part === WORK) workCount--;
+        else if (part === CARRY) carryCount--;
+        else if (part === MOVE) moveCount--;
+        return true;
+      }
+    }
+    return false;
   }
 
   function gcd(a, b) {
@@ -317,13 +392,58 @@ function buildHarvesterBodyForDistance(distance, energyBudget) {
   }
   function carryNeededFor(workCount) {
     var twoW = workCount * 2;
+    if (twoW === 0) return 0;
     return lcm(50, twoW) / 50;
   }
 
-  var maxWork = 15;
-  var workCount = 0;
+  var maxWork      = 15;
+  var workCount    = 0;
   var carryCount = 0;
-  var moveCount = 0;
+  var moveCount    = 0;
+
+  function rebalanceCarry() {
+    if (workCount === 0) return;
+    var safety = 0;
+    while (safety < 100) {
+      safety++;
+      var required = carryNeededFor(workCount);
+      if (carryCount >= required) break;
+      if (canAdd(CARRY)) {
+        add(CARRY);
+        carryCount++;
+        continue;
+      }
+      var removed = removePart(WORK);
+      if (!removed) break; 
+    }
+  }
+
+  function ensureBaseline() {
+    if (carryCount === 0) {
+      if (canAdd(CARRY)) {
+        add(CARRY); carryCount++;
+      } else if (removePart(WORK)) {
+        if (canAdd(CARRY)) { add(CARRY); carryCount++; }
+      } else if (removePart(MOVE)) {
+        if (canAdd(CARRY)) { add(CARRY); carryCount++; }
+      }
+    }
+    if (moveCount === 0) {
+      if (canAdd(MOVE)) {
+        add(MOVE); moveCount++;
+      } else if (removePart(WORK)) {
+        if (canAdd(MOVE)) { add(MOVE); moveCount++; }
+      } else {
+        var carrySeen = 0;
+        for (var i = 0; i < body.length; i++) {
+          if (body[i] === CARRY) carrySeen++;
+        }
+        if (carrySeen > 1 && removePart(CARRY)) {
+          if (canAdd(MOVE)) { add(MOVE); moveCount++; }
+        }
+      }
+    }
+  }
 
   if (distance < 4) {
     while (workCount < maxWork && canAdd(WORK)) {
@@ -333,16 +453,18 @@ function buildHarvesterBodyForDistance(distance, energyBudget) {
     while (carryCount < neededCarry && canAdd(CARRY)) {
       add(CARRY); carryCount++;
     }
-    if (canAdd(MOVE)) {
-      add(MOVE); moveCount++;
-    }
+    if (canAdd(MOVE)) { add(MOVE); moveCount++; }
+    rebalanceCarry();
+    ensureBaseline();
     return body;
   }
 
   if (distance > 25) {
-    while ((parts + 2 <= 50) &&
-           (cost + costOf(MOVE) + costOf(WORK) <= energyBudget) &&
-           workCount < maxWork) {
+    while (
+      (parts + 2 <= 50) &&
+      (cost + costOf(MOVE) + costOf(WORK) <= energyBudget) &&
+      workCount < maxWork
+    ) {
       add(MOVE); moveCount++;
       add(WORK); workCount++;
     }
@@ -350,22 +472,31 @@ function buildHarvesterBodyForDistance(distance, energyBudget) {
     while (carryCount < neededCarryFar && canAdd(CARRY)) {
       add(CARRY); carryCount++;
     }
+    rebalanceCarry();
+    ensureBaseline();
     return body;
   }
 
   while (workCount < maxWork && canAdd(WORK)) {
-    add(WORK); workCount++;
+    add(WORK);
+    workCount++;
     if (workCount % 3 === 0 && canAdd(MOVE)) {
-      add(MOVE); moveCount++;
+      add(MOVE);
+      moveCount++;
     }
   }
+
   var neededCarryMid = carryNeededFor(workCount);
   while (carryCount < neededCarryMid && canAdd(CARRY)) {
     add(CARRY); carryCount++;
   }
+
   if (moveCount === 0 && canAdd(MOVE)) {
     add(MOVE); moveCount++;
   }
+
+  rebalanceCarry();
+  ensureBaseline();
   return body;
 }
 
@@ -427,16 +558,29 @@ function manageHarvesterSpawns() {
 
     needsHarvester.sort(function(a, b) { return a.range - b.range; });
 
-    var spawn = availableSpawns[0];
     var sourceToSpawn = needsHarvester[0];
     var smeta = sourceToSpawn.meta;
-    var distance = smeta.range || 10;
+    var sourcePos = new RoomPosition(smeta.pos.x, smeta.pos.y, smeta.pos.roomName);
 
-    var body = buildHarvesterBodyForDistance(distance, room.energyAvailable);
+    var spawn = null;
+    var bestSpawnRange = Infinity;
+    for (var si = 0; si < availableSpawns.length; si++) {
+      var sp = availableSpawns[si];
+      var r = sp.pos.getRangeTo(sourcePos);
+      if (r < bestSpawnRange) {
+        bestSpawnRange = r;
+        spawn = sp;
+      }
+    }
+    if (!spawn) continue;
+
+    var distance = bestSpawnRange < Infinity ? bestSpawnRange : (smeta.range || 10);
+    var energyBudget = spawn.room.energyAvailable;
+    var body = buildHarvesterBodyForDistance(distance, energyBudget);
     if (!body) continue;
 
     var shortId = sourceToSpawn.id.slice(-6);
-    var name = 'H_' + roomName + '_' + shortId + '_' + Game.time;
+    var hName = 'H_' + roomName + '_' + shortId + '_' + Game.time;
     var memory = {
       role: 'harvester',
       assignedRoom: room.name,
@@ -445,11 +589,15 @@ function manageHarvesterSpawns() {
     };
 
     var cost = bodyCost(body);
-    var res = spawn.spawnCreep(body, name, { memory: memory });
+    var res = spawn.spawnCreep(body, hName, { memory: memory });
 
     if (res === OK) {
-      console.log("Spawning harvester in " + room.name + " for source " + shortId +
-                  " (dist: " + distance + ") | Parts: " + body.length + " | Cost: " + cost);
+      console.log(
+        "Spawning harvester in " + room.name +
+        " for source " + shortId +
+        " (distFromSpawn: " + distance + ") | Parts: " + body.length +
+        " | Cost: " + cost
+      );
     } else if (res !== ERR_BUSY && res !== ERR_NOT_ENOUGH_ENERGY) {
       console.log("Failed to spawn harvester in " + room.name + " for " + shortId + ": " + res);
     }
@@ -474,8 +622,7 @@ function spawnEmergencyHarvester(room, spawn) {
 
   var smeta = meta.byId[pickSid];
   var distance = smeta.range || 10;
-  var body = buildHarvesterBodyForDistance(distance, room.energyAvailable);
-  if (!body) return false;
+  var body = [WORK, CARRY, MOVE];
 
   var shortId = pickSid.slice(-6);
   var name = 'H_EMG_' + room.name + '_' + shortId + '_' + Game.time;
@@ -602,32 +749,218 @@ function spawnScavengers() {
   }
 }
 
-function processSquadSpawnQueues() {
-  if (!Memory.squadQueues || Memory.squadQueues.length === 0) return;
+function manageRemoteBuilderSpawns() {
+  var orders = Memory.remoteBuilderOrders;
+  if (!orders) return;
 
-  var formRooms = null;
-  for (var i = 0; i < Memory.squadQueues.length; i++) {
-    var q = Memory.squadQueues[i];
-    if (q && q.formRoom) {
-      if (!formRooms) formRooms = {};
-      formRooms[q.formRoom] = true;
+  var normalized = [];
+
+  if (Array.isArray(orders)) {
+    for (var i = 0; i < orders.length; i++) {
+      var o = orders[i];
+      if (!o) continue;
+      var homeA = o.homeRoom;
+      var targetA = o.targetRoom || o.workRoom;
+      var countA = parseInt(o.count, 10) || 1;
+      var activeA = (o.active === false) ? false : true;
+      if (!homeA || !targetA || !activeA) continue;
+      normalized.push({ homeRoom: homeA, targetRoom: targetA, count: countA });
+    }
+  } else {
+    for (var key in orders) {
+      var o2 = orders[key];
+      if (!o2) continue;
+
+      var homeB = o2.homeRoom;
+      var targetB = o2.targetRoom || o2.workRoom;
+
+      if ((!homeB || !targetB) && typeof key === 'string') {
+        var parts = key.split('->');
+        if (!homeB && parts.length > 0) homeB = parts[0];
+        if (!targetB && parts.length > 1) targetB = parts[1];
+      }
+
+      var countB = parseInt(o2.count, 10) || 1;
+      var activeB = (o2.active === false) ? false : true;
+      if (!homeB || !targetB || !activeB) continue;
+      normalized.push({ homeRoom: homeB, targetRoom: targetB, count: countB });
     }
   }
 
-  for (var roomName in Game.rooms) {
-    var room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
+  if (normalized.length === 0) return;
 
-    var rs = getRoomState.get(roomName);
+  for (var n = 0; n < normalized.length; n++) {
+    var order = normalized[n];
+    var homeRoom = order.homeRoom;
+    var targetRoom = order.targetRoom;
+    var desired = order.count;
+
+    var living = [];
+    for (var name in Game.creeps) {
+      var c = Game.creeps[name];
+      if (!c || !c.memory) continue;
+      if (c.memory.role !== 'remoteBuilder') continue;
+      if (c.memory.homeRoom === homeRoom && c.memory.targetRoom === targetRoom) {
+        living.push(c);
+      }
+    }
+    if (living.length >= desired) continue;
+
+    var rs = getRoomState.get(homeRoom);
     if (!rs) continue;
 
-    var spawns = [];
+    var spawn = null;
     if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
-      spawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my; });
+      for (var s = 0; s < rs.structuresByType[STRUCTURE_SPAWN].length; s++) {
+        var sp = rs.structuresByType[STRUCTURE_SPAWN][s];
+        if (sp.my && !sp.spawning) { spawn = sp; break; }
+      }
     }
-    if (spawns.length === 0) continue;
+    if (!spawn) continue;
 
-    squad.processSpawnQueue(roomName);
+    var body = getCreepBody('remoteBuilder', spawn.room.energyAvailable);
+    if (!body) continue;
+
+    var newName = 'RemoteBuilder_' + homeRoom + '_' + targetRoom + '_' + (Game.time % 10000);
+    var mem = {
+      role: 'remoteBuilder',
+      homeRoom: homeRoom,
+      targetRoom: targetRoom,
+      assignedRoom: homeRoom
+    };
+
+    var cost = bodyCost(body);
+    var res = spawn.spawnCreep(body, newName, { memory: mem });
+    if (res === OK) {
+      console.log('[RemoteBuilder] Spawning ' + newName + ' at ' + homeRoom + ' for work in ' + targetRoom + ' (' + body.length + ' parts, cost=' + cost + ')');
+    } else if (res === ERR_NOT_ENOUGH_ENERGY) {
+      if (Game.time % 25 === 0) {
+        console.log('[RemoteBuilder] Not enough energy in ' + homeRoom + ' for ' + newName + '. Have: ' + spawn.room.energyAvailable + ', Need: ' + cost);
+      }
+    } else if (res !== ERR_BUSY) {
+      console.log('[RemoteBuilder] Failed to spawn in ' + homeRoom + ': ' + res);
+    }
+  }
+}
+
+// ============================================================================
+// SQUAD SPAWN LOGIC (FIXED FOR PRIORITY)
+// ============================================================================
+
+function manageSquadSpawns(perRoomRoleCounts) {
+  if (!Memory.squadOrders) return;
+
+  // Cleanup fulfilled orders
+  for (var i = Memory.squadOrders.length - 1; i >= 0; i--) {
+    var ord = Memory.squadOrders[i];
+    if (ord.spawnedCount >= 4) {
+      console.log("[Squad] Order fulfilled for target " + ord.targetRoom);
+      Memory.squadOrders.splice(i, 1);
+      continue;
+    }
+  }
+
+  if (Memory.squadOrders.length === 0) return;
+
+  var order = Memory.squadOrders[0]; // Process one order at a time
+  var homeRoom = order.homeRoom;
+
+  var room = Game.rooms[homeRoom];
+  if (!room || !room.controller || !room.controller.my) {
+    if (Game.time % 20 === 0) console.log("[Squad] Invalid home room " + homeRoom);
+    return;
+  }
+
+  // --- CRITICAL PRIORITY CHECK ---
+  // Ensure we do not starve the room. Squads are expensive.
+  // We need Harvesters and Suppliers BEFORE we even think about spawning a squad member.
+   
+  var counts = perRoomRoleCounts[homeRoom] || {};
+  var targets = getRoomTargets(homeRoom, room);
+   
+  var meta = ensureSourceMetaCache(room);
+  var expectedHarvesters = meta && meta.byId ? Object.keys(meta.byId).length : 2;
+
+  // If Harvesters exist but are dead (0), or Suppliers are below target:
+  if (counts.harvester < expectedHarvesters || counts.supplier < targets.supplier) {
+      if (Game.time % 10 === 0) console.log("[Squad] Paused: Room " + homeRoom + " needs economy (Harv/Supp) first.");
+      return; // YIELD to economy spawns
+  }
+   
+  var rs = getRoomState.get(homeRoom);
+  if (!rs) return;
+
+  var freeSpawn = null;
+  if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
+     for(var s=0; s<rs.structuresByType[STRUCTURE_SPAWN].length; s++){
+         var sp = rs.structuresByType[STRUCTURE_SPAWN][s];
+         if(sp.my && !sp.spawning) { freeSpawn = sp; break; }
+     }
+  }
+   
+  if (!freeSpawn) return; // No spawn available, retry next tick
+
+  var squadId = order.squadId || ("Squad_" + order.targetRoom + "_" + Game.time);
+  if (!order.squadId) order.squadId = squadId;
+
+  // --- ROBUST POSITION CHECK ---
+  // Iterate 0..3 to find the first missing member. This prevents skipping.
+  var spawnIndex = -1;
+  var allAlive = true;
+
+  for (var i = 0; i < 4; i++) {
+      var creepName = "Quad_" + i + "_" + squadId;
+      var creep = Game.creeps[creepName];
+      
+      // Check if this specific squad member is currently spawning
+      var isSpawning = false;
+      var spawns = room.find(FIND_MY_SPAWNS);
+      for(var k=0; k<spawns.length; k++) {
+          if (spawns[k].spawning && spawns[k].spawning.name === creepName) {
+              isSpawning = true;
+              break;
+          }
+      }
+
+      if (isSpawning) {
+          if (Game.time % 10 === 0) console.log("[Squad] Member " + i + " is spawning. Waiting.");
+          return; // WAIT! Do not check next index.
+      }
+
+      if (!creep) {
+          spawnIndex = i;
+          allAlive = false;
+          break; // Found the gap. Stop looking.
+      }
+  }
+
+  if (allAlive) return;
+
+  var body = getCreepBody('quad', freeSpawn.room.energyAvailable);
+   
+  // If energy is too low for a quad, we WAIT. We do NOT cancel.
+  if (!body) {
+      if (Game.time % 10 === 0) console.log("[Squad] Waiting for energy in " + homeRoom + " to spawn squad member.");
+      return; 
+  }
+
+  var name = "Quad_" + spawnIndex + "_" + squadId;
+   
+  var mem = {
+      role: 'quad',
+      homeRoom: order.homeRoom,
+      targetRoom: order.targetRoom,
+      squadId: squadId,
+      quadPos: spawnIndex
+  };
+
+  var cost = bodyCost(body);
+  var res = freeSpawn.spawnCreep(body, name, { memory: mem });
+   
+  if (res === OK) {
+      console.log("[Squad] Spawning Member " + spawnIndex + " | Cost: " + cost);
+      // We do not increment 'spawnedCount' anymore, logic relies on checking existence.
+      order.spawnedCount = (order.spawnedCount || 0) + 1;
   }
 }
 
@@ -733,50 +1066,6 @@ function manageTowerDrainSpawns() {
 
 function manageDemolitionSpawns() {
   if (!Memory.demolitionOrders || Memory.demolitionOrders.length === 0) return;
-  if (!Memory.demolitionCollectorQueue) Memory.demolitionCollectorQueue = [];
-
-  for (let i = Memory.demolitionCollectorQueue.length - 1; i >= 0; i--) {
-    const queueItem = Memory.demolitionCollectorQueue[i];
-    const home = Game.rooms[queueItem.homeRoom];
-    if (!home) { Memory.demolitionCollectorQueue.splice(i, 1); continue; }
-
-    var rs = getRoomState.get(queueItem.homeRoom);
-    if (!rs) continue;
-
-    var freeSpawn = null;
-    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
-      for (var s = 0; s < rs.structuresByType[STRUCTURE_SPAWN].length; s++) {
-        var sp = rs.structuresByType[STRUCTURE_SPAWN][s];
-        if (sp.my && !sp.spawning) { freeSpawn = sp; break; }
-      }
-    }
-    if (!freeSpawn) continue;
-
-    const cost = bodyCost(queueItem.collectorBody);
-    if (cost > freeSpawn.room.energyAvailable) {
-      if (Game.time % 20 === 0) {
-        console.log("[Demolition] Not enough energy in " + queueItem.homeRoom + " for collector. Have: " + freeSpawn.room.energyAvailable + ", Need: " + cost);
-      }
-      continue;
-    }
-
-    const collectorMemory = {
-      role: 'demolition',
-      demolitionRole: 'collector',
-      homeRoom: queueItem.homeRoom,
-      targetRoom: queueItem.targetRoom,
-      partnerName: queueItem.demolisherName,
-      teamId: queueItem.teamId
-    };
-
-    const result = freeSpawn.spawnCreep(queueItem.collectorBody, queueItem.collectorName, { memory: collectorMemory });
-    if (result === OK) {
-      console.log("[Demolition] Spawning collector '" + queueItem.collectorName + "' from " + queueItem.homeRoom + " for " + queueItem.targetRoom + ".");
-      Memory.demolitionCollectorQueue.splice(i, 1);
-    } else if (result !== ERR_BUSY) {
-      console.log("[Demolition] Failed to spawn collector '" + queueItem.collectorName + "': " + result);
-    }
-  }
 
   for (const order of Memory.demolitionOrders) {
     const homeRoom = order.homeRoom;
@@ -798,79 +1087,55 @@ function manageDemolitionSpawns() {
     }
     if (spawns.length === 0) continue;
 
-    const existingCreeps = _.filter(Game.creeps, function(c){
-      return c.memory.role === 'demolition' &&
-             c.memory.targetRoom === targetRoom &&
-             c.memory.homeRoom === homeRoom;
+    const existingDemolishers = _.filter(Game.creeps, function(c){
+      if (c.memory.role !== 'demolition') return false;
+      if (c.memory.targetRoom !== targetRoom) return false;
+      if (c.memory.homeRoom !== homeRoom) return false;
+      if (c.memory.demolitionRole && c.memory.demolitionRole !== 'demolisher') return false;
+      return true;
     });
 
-    const existingDemolishers = existingCreeps.filter(function(c){ return c.memory.demolitionRole === 'demolisher'; });
-    const existingCollectors = existingCreeps.filter(function(c){ return c.memory.demolitionRole === 'collector'; });
+    const activeDemolishers = existingDemolishers.length;
+    const needed = teamCount - activeDemolishers;
 
-    const teamIds = new Set();
-    const completePairs = new Set();
-    existingCreeps.forEach(function(creep){ if (creep.memory.teamId) teamIds.add(creep.memory.teamId); });
-    teamIds.forEach(function(teamId){
-      const teamDemolisher = existingDemolishers.find(function(c){ return c.memory.teamId === teamId; });
-      const teamCollector = existingCollectors.find(function(c){ return c.memory.teamId === teamId; });
-      if (teamDemolisher && teamCollector) completePairs.add(teamId);
-    });
-
-    const activeTeams = completePairs.size;
-    const teamsNeeded = teamCount - activeTeams;
-
-    if (Game.time % 20 === 0 && teamsNeeded > 0) {
-      console.log("[Demolition] Order " + homeRoom + "->" + targetRoom + ": Need " + teamsNeeded + " teams, have " + activeTeams + " complete pairs");
+    if (Game.time % 20 === 0 && needed > 0) {
+      console.log("[Demolition] Order " + homeRoom + "->" + targetRoom + ": Need " + needed + " demolishers, have " + activeDemolishers);
     }
 
-    for (let i = 0; i < teamsNeeded; i++) {
-      const spawn = spawns[0];
+    for (var i = 0; i < needed; i++) {
+      var spawn = spawns.shift();
       if (!spawn) break;
 
       const demolisherBody = [
         WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK,
-        CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY,
         MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE
       ];
-      const collectorBody = getCreepBody('supplier', spawn.room.energyAvailable);
       const demolisherCost = bodyCost(demolisherBody);
 
       if (demolisherCost > spawn.room.energyAvailable) {
         if (Game.time % 20 === 0) {
           console.log("[Demolition] Not enough energy in " + homeRoom + " for demolisher. Have: " + spawn.room.energyAvailable + ", Need: " + demolisherCost);
         }
+        if (spawn) spawns.unshift(spawn);
         break;
       }
 
       const teamId = targetRoom + "_" + Game.time + "_" + Math.floor(Math.random() * 1000);
       const demolisherName = "Demolisher_" + teamId;
-      const collectorName = "Collector_" + teamId;
 
       const demolisherMemory = {
         role: 'demolition',
         demolitionRole: 'demolisher',
         homeRoom: homeRoom,
         targetRoom: targetRoom,
-        partnerName: collectorName,
         teamId: teamId
       };
 
-      const demolisherResult = spawn.spawnCreep(demolisherBody, demolisherName, { memory: demolisherMemory });
+      const demolisherResult = spawn.spawnCreep(demolisherBody, demolisherName, { memory: demolisherMemory }); // 
       if (demolisherResult === OK) {
-        console.log("[Demolition] Spawning replacement demolisher '" + demolisherName + "' from " + homeRoom + " for " + targetRoom + ".");
-
-        Memory.demolitionCollectorQueue.push({
-          homeRoom: homeRoom,
-          collectorName: collectorName,
-          demolisherName: demolisherName,
-          targetRoom: targetRoom,
-          teamId: teamId,
-          collectorBody: collectorBody
-        });
-
-        break;
+        console.log("[Demolition] Spawning demolisher '" + demolisherName + "' from " + homeRoom + " for " + targetRoom + ".");
       } else if (demolisherResult !== ERR_BUSY) {
-        console.log("[Demolition] Failed to spawn replacement demolisher '" + demolisherName + "': " + demolisherResult);
+        console.log("[Demolition] Failed to spawn demolisher '" + demolisherName + "': " + demolisherResult);
         break;
       }
     }
@@ -1018,24 +1283,34 @@ function manageThiefSpawns() {
   }
 }
 
+// UPDATED: Now uses getRoomState to calculate total energy
 function calculateRoomTotalEnergy(roomName) {
-  const roomCache = Memory.roomData && Memory.roomData[roomName];
-  if (!roomCache) return 0;
-
-  const allIds = []
-    .concat(roomCache.spawnIds || [])
-    .concat(roomCache.extensionIds || [])
-    .concat(roomCache.containerIds || []);
-
-  if (roomCache.storageId) allIds.push(roomCache.storageId);
+  const rs = getRoomState.get(roomName);
+  if (!rs || !rs.structuresByType) return 0;
 
   let total = 0;
-  for (let i = 0; i < allIds.length; i++) {
-    const obj = Game.getObjectById(allIds[i]);
-    if (obj && obj.store) {
-      total += obj.store.getUsedCapacity(RESOURCE_ENERGY);
+
+  // Helper to sum energy for a list of structures
+  function sumType(type) {
+    const list = rs.structuresByType[type];
+    if (!list) return 0;
+    let sum = 0;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].store) {
+        sum += list[i].store.getUsedCapacity(RESOURCE_ENERGY);
+      }
     }
+    return sum;
   }
+
+  total += sumType(STRUCTURE_SPAWN);
+  total += sumType(STRUCTURE_EXTENSION);
+  total += sumType(STRUCTURE_CONTAINER);
+
+  if (rs.storage && rs.storage.store) {
+    total += rs.storage.store.getUsedCapacity(RESOURCE_ENERGY);
+  }
+
   return total;
 }
 
@@ -1068,9 +1343,9 @@ function manageAttackerSpawns() {
     } else if (rallyPhase === 'rallying') {
       const attackersAtRally = _.filter(Game.creeps, function(c){
         return c.memory.role === 'attacker' &&
-               c.memory.targetRoom === targetRoom &&
-               c.room.name === rallyRoom &&
-               c.pos.getRangeTo(order.rallyPoint.x, order.rallyPoint.y) <= 3;
+                c.memory.targetRoom === targetRoom &&
+                c.room.name === rallyRoom &&
+                c.pos.getRangeTo(order.rallyPoint.x, order.rallyPoint.y) <= 3;
       });
 
       const rallyTimeElapsed = Game.time - order.rallyStartTime;
@@ -1237,12 +1512,14 @@ function manageExtractorSpawns() {
     }
     if (!spawn) continue;
 
-    const body   = [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, MOVE];
-    const name   = "extractor_" + roomName + "_" + (Game.time % 1000);
-    const memory = { role: 'extractor', roomName: roomName, extractorId: extractor.id };
-    const result = spawn.spawnCreep(body, name, { memory: memory });
+    var body = buildExtractorBody(spawn.room.energyAvailable);
+    if (!body) continue;
+
+    var name    = "extractor_" + roomName + "_" + (Game.time % 1000);
+    var memory = { role: 'extractor', roomName: roomName, extractorId: extractor.id };
+    var result = spawn.spawnCreep(body, name, { memory: memory });
     if (result === OK) {
-      console.log("[Spawn] extractor for " + roomName);
+      console.log("[Spawn] extractor for " + roomName + " | parts=" + body.length);
     }
   }
 }
@@ -1281,7 +1558,7 @@ function manageClaimbotSpawns() {
   }
   if (!closestSpawn) return;
 
-  const claimBody = [MOVE, MOVE, ATTACK, CLAIM, MOVE];
+  const claimBody = [MOVE, MOVE, ATTACK, CLAIM, MOVE, MOVE];
   const cost = bodyCost(claimBody);
   const availableEnergy = closestSpawn.room.energyAvailable;
   const result = closestSpawn.spawnCreep(
@@ -1297,37 +1574,10 @@ function manageClaimbotSpawns() {
   }
 }
 
-// --- Spawn delay helpers for low RCL and low energy fill ---
-function shouldApplySpawnDelay(room) {
-  if (!room || !room.controller || !room.controller.my) return false;
-  if (room.controller.level > 6) return false;
-  if (room.energyCapacityAvailable <= 0) return false;
-  const ratio = room.energyAvailable / room.energyCapacityAvailable;
-  return ratio < LOW_RCL_ENERGY_FILL_THRESHOLD;
-}
-
-function handleRoomSpawnDelay(roomName, room) {
-  if (!Memory.spawnDelayUntil) Memory.spawnDelayUntil = {};
-  const existing = Memory.spawnDelayUntil[roomName];
-
-  if (existing && Game.time < existing) return true;
-
-  if (existing && Game.time >= existing) delete Memory.spawnDelayUntil[roomName];
-
-  if (!Memory.spawnDelayUntil[roomName] && shouldApplySpawnDelay(room)) {
-    Memory.spawnDelayUntil[roomName] = Game.time + LOW_RCL_SPAWN_DELAY_TICKS;
-    if (Game.time % 10 === 0) {
-      const percent = Math.round((room.energyAvailable / room.energyCapacityAvailable) * 100);
-      console.log("[SpawnDelay] " + roomName + ": RCL " + room.controller.level + ", energy " + percent + "% < " + Math.round(LOW_RCL_ENERGY_FILL_THRESHOLD * 100) + "% -> delaying spawns for " + LOW_RCL_SPAWN_DELAY_TICKS + " ticks");
-    }
-    return true;
-  }
-  return false;
-}
-
 function spawnCreepInRoom(role, body, spawn, roomName) {
   const newName = role + "_" + roomName + "_" + Game.time;
-  const memory  = { role: role, assignedRoom: roomName };
+  // --- MODIFIED: Added homeRoom to generic spawn memory for compatibility with new roles (like powerBot) ---
+  const memory = { role: role, assignedRoom: roomName, homeRoom: roomName };
   const availableEnergy = spawn.room.energyAvailable;
   const cost = bodyCost(body);
   const result = spawn.spawnCreep(body, newName, { memory: memory });
@@ -1343,33 +1593,206 @@ function spawnCreepInRoom(role, body, spawn, roomName) {
   }
 }
 
-function getRoomTargets(roomName, roomData, room) {
+function shouldSpawnSupplier(roomName) {
+  var room = Game.rooms[roomName];
+  if (!room || !room.controller || !room.controller.my) return 0;
+
+  if (room.controller.level !== 8) return 1;
+
+  for (var name in Game.creeps) {
+    var c = Game.creeps[name];
+    if (!c || !c.memory) continue;
+    if (c.room && c.room.name === roomName && c.memory.role !== 'supplier') {
+      return 1;
+    }
+  }
+
+  var rs = getRoomState.get(roomName);
+  if (!rs) return 0;
+
+  var towers = (rs.structuresByType && rs.structuresByType[STRUCTURE_TOWER]) ? rs.structuresByType[STRUCTURE_TOWER] : [];
+  if (towers.length > 0) {
+    var allBelowThreshold = true;
+    for (var t = 0; t < towers.length; t++) {
+      var tw = towers[t];
+      if (!tw || !tw.store) { allBelowThreshold = false; break; }
+      var twEnergy = tw.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+      if (twEnergy >= 500) { allBelowThreshold = false; break; }
+    }
+    if (allBelowThreshold) return 1;
+  }
+
+  var terminals = (rs.structuresByType && rs.structuresByType[STRUCTURE_TERMINAL]) ? rs.structuresByType[STRUCTURE_TERMINAL] : [];
+  for (var k = 0; k < terminals.length; k++) {
+    var term = terminals[k];
+    if (!term || !term.store) continue;
+    var termEnergy = term.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+    if (termEnergy < 5000) return 1;
+  }
+
+  var totalEnergy = 0;
+  var totalCapacity = 0;
+
+  var extensions = (rs.structuresByType && rs.structuresByType[STRUCTURE_EXTENSION]) ? rs.structuresByType[STRUCTURE_EXTENSION] : [];
+  for (var e = 0; e < extensions.length; e++) {
+    var ex = extensions[e];
+    if (!ex || !ex.store) continue;
+    totalEnergy += ex.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+    totalCapacity += ex.store.getCapacity(RESOURCE_ENERGY) || 0;
+  }
+
+  var spawns = (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) ? rs.structuresByType[STRUCTURE_SPAWN] : [];
+  for (var s = 0; s < spawns.length; s++) {
+    var sp = spawns[s];
+    if (!sp || !sp.store) continue;
+    totalEnergy += sp.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+    totalCapacity += sp.store.getCapacity(RESOURCE_ENERGY) || 0;
+  }
+
+  if (totalCapacity > 0) {
+    var ratio = totalEnergy / totalCapacity;
+    if (ratio < 0.5) return 1;
+  }
+
+  return 0;
+}
+
+// --- Spawn delay helpers for low RCL and low energy fill ---
+function handleRoomSpawnDelay(roomName, room) {
+  if (!Memory.spawnDelayUntil) Memory.spawnDelayUntil = {};
+  const existing = Memory.spawnDelayUntil[roomName];
+
+  // If a delay exists and is in the future, it is active
+  if (existing && Game.time < existing) return true;
+
+  // If the delay has passed, clear it
+  if (existing && Game.time >= existing) delete Memory.spawnDelayUntil[roomName];
+
+  return false;
+}
+
+// --- RCL8 Upgrader spawn cooldown helpers ---
+function shouldDelayUpgraderAtRCL8(roomName, room) {
+  if (!room || !room.controller || !room.controller.my) return false;
+  if (room.controller.level !== 8) return false;
+
+  if (!Memory.rcl8UpgraderDelayUntil) Memory.rcl8UpgraderDelayUntil = {};
+  var until = Memory.rcl8UpgraderDelayUntil[roomName];
+
+  if (!until) return false;
+
+  if (Game.time < until) return true;
+
+  delete Memory.rcl8UpgraderDelayUntil[roomName];
+  return false;
+}
+
+function scheduleUpgraderDelayRCL8(roomName) {
+  var room = Game.rooms[roomName];
+  if (!room) return;
+
+  var minerals = room.find(FIND_MINERALS);
+  var mineral = minerals.length > 0 ? minerals[0] : null;
+
+  if (!mineral) {
+    if (!Memory.rcl8UpgraderDelayUntil) Memory.rcl8UpgraderDelayUntil = {};
+    Memory.rcl8UpgraderDelayUntil[roomName] = Game.time + 5000;
+    return;
+  }
+
+  if (mineral.mineralAmount > 0) {
+    if (Memory.rcl8UpgraderDelayUntil && Memory.rcl8UpgraderDelayUntil[roomName]) {
+      delete Memory.rcl8UpgraderDelayUntil[roomName];
+    }
+  } 
+  else {
+    var regenTime = mineral.ticksToRegeneration;
+    if (regenTime === undefined || regenTime === null) {
+       regenTime = 100; 
+    }
+
+    if (!Memory.rcl8UpgraderDelayUntil) Memory.rcl8UpgraderDelayUntil = {};
+    Memory.rcl8UpgraderDelayUntil[roomName] = Game.time + regenTime;
+      
+    console.log('[RCL8] ' + roomName + ': Minerals exhausted. Pausing upgraders for ' + regenTime + ' ticks.');
+  }
+}
+
+// UPDATED: Now uses getRoomState logic instead of roomDataCache
+function getRoomTargets(roomName, room) {
   var rs = getRoomState.get(roomName);
 
   var containers = [];
   if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_CONTAINER]) {
     containers = rs.structuresByType[STRUCTURE_CONTAINER];
   }
-  const storage = rs ? rs.storage : null;
-  const hasStorageStructures = containers.length > 0 || !!storage;
-
+   
+  // Checking construction sites from getRoomState
   var constructionSitesCount = 0;
   if (rs && rs.constructionSites) {
     constructionSitesCount = rs.constructionSites.length;
   }
   let builderTarget = +(constructionSitesCount > 0);
 
+  // --- Determine Source Count ---
+  var sourceCount = 0;
+  if (rs && rs.sources) {
+      sourceCount = rs.sources.length;
+  } else {
+      // Fallback
+      var sources = room.find(FIND_SOURCES);
+      sourceCount = sources.length;
+  }
+
+  // --- Logic for Upgrader Target ---
+  var upgraderTarget = 1;
+
+  // RCL 8 + Single Source -> 0 Upgraders (Save energy, rely on Maintainer if needed)
+  if (room.controller && room.controller.level === 8 && sourceCount === 1) {
+      upgraderTarget = 0;
+  }
+
+  // --- Logic for Double Upgrade ---
+  if (Memory.doubleUpgradeRooms && Memory.doubleUpgradeRooms[roomName]) {
+      // Only permit double upgraders if RCL is 7 or lower
+      if (room.controller && room.controller.level <= 7) {
+          upgraderTarget = 2;
+      }
+  }
+
+  // --- Logic for Maintainer (RCL8, 1 Source, < 150k ticks) ---
+  var maintainerTarget = 0;
+  if (room.controller && room.controller.level === 8) {
+      if (room.controller.ticksToDowngrade < 150000) {
+          // Check source count. Use getRoomState if available for speed
+          var sourceCount = 0;
+          if (rs && rs.sources) {
+              sourceCount = rs.sources.length;
+          } else {
+              // Fallback
+              var sources = room.find(FIND_SOURCES);
+              sourceCount = sources.length;
+          }
+
+          if (sourceCount === 1) {
+              maintainerTarget = 1;
+          }
+      }
+  }
+
   return {
     harvester:   0,
-    upgrader:    1,
+    upgrader:    upgraderTarget,
     builder:     builderTarget,
     scout:       0,
     defender:    0,
-    supplier:    hasStorageStructures ? 1 : 0
+    supplier:    shouldSpawnSupplier(roomName),
+    maintainer:  maintainerTarget
   };
 }
 
-function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
+// UPDATED: Removed roomDataCache parameter
+function manageSpawnsPerRoom(perRoomRoleCounts) {
   if (Memory.claimOrders && Memory.claimOrders.length > 0) return;
 
   manageHarvesterSpawns();
@@ -1387,9 +1810,8 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
     }
     if (availableSpawns.length === 0) continue;
 
-    var roomData = roomDataCache[roomName] || {};
     var roleCounts = perRoomRoleCounts[roomName] || {};
-    var roomTargets = getRoomTargets(roomName, roomData, room);
+    var roomTargets = getRoomTargets(roomName, room);
 
     if (roleCounts.harvester === 0) {
       var minHarvesterCost = bodyCost(BASIC_HARVESTER);
@@ -1418,6 +1840,19 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
     var spawnQueue = [];
     if (roleCounts.defender  < roomTargets.defender)  spawnQueue.push('defender');
     if (roleCounts.supplier  < roomTargets.supplier)  spawnQueue.push('supplier');
+    
+    // Maintainer logic (Placed after supplier to ensure room energy flow, but before upgraders)
+    if (roleCounts.maintainer < roomTargets.maintainer) spawnQueue.push('maintainer');
+
+    // --- POWER BOT QUEUE CHECK ---
+    if (Memory.spawnRequests && Memory.spawnRequests[roomName] && Memory.spawnRequests[roomName].needPowerBot) {
+       var existingPower = _.filter(Game.creeps, function(c) { return c.memory.role === 'powerBot' && c.memory.homeRoom === roomName; });
+       if (existingPower.length === 0) {
+           spawnQueue.push('powerBot');
+       }
+    }
+    // ------------------------------------
+
     if (roleCounts.upgrader  < roomTargets.upgrader)  spawnQueue.push('upgrader');
     if (roleCounts.builder   < roomTargets.builder)   spawnQueue.push('builder');
     if (roleCounts.scout     < roomTargets.scout)     spawnQueue.push('scout');
@@ -1428,14 +1863,21 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
 
       var roleToSpawn = spawnQueue[i];
 
+      // If delay is active, skip all roles except suppliers
       if (delayActive && roleToSpawn !== 'supplier') continue;
 
+      if (roleToSpawn === 'upgrader' && shouldDelayUpgraderAtRCL8(roomName, room)) {
+        continue;
+      }
+
       var energyForSpawn = room.energyAvailable;
-      if (roleToSpawn === 'upgrader') {
-        var rcl = room.controller ? room.controller.level : 0;
-        if (rcl === 8) {
-          energyForSpawn = Math.min(energyForSpawn, 300);
-        }
+
+      if (roleToSpawn === 'upgrader' &&
+          room.controller &&
+          room.controller.my &&
+          room.controller.level === 8 &&
+          energyForSpawn > 2300) {
+        energyForSpawn = 2300;
       }
 
       var body = getCreepBody(roleToSpawn, energyForSpawn);
@@ -1444,19 +1886,30 @@ function manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache) {
       var success = spawnCreepInRoom(roleToSpawn, body, availableSpawns[spawnsUsed], roomName);
       if (success) {
         spawnsUsed++;
-        if (roleCounts[roleToSpawn] === undefined) roleCounts[roleToSpawn] = 0;
-        roleCounts[roleToSpawn]++;
+        if (roleCounts[roleToSpawn] === undefined) roleCounts[roleToSpawn]++;
+
+        // --- SPAWN DELAY LOGIC ---
+        // If the room is Low RCL (<=6), trigger a delay after ANY spawn.
+        if (room.controller && room.controller.level <= 6) {
+             Memory.spawnDelayUntil[roomName] = Game.time + LOW_RCL_SPAWN_DELAY_TICKS;
+             console.log("[SpawnDelay] " + roomName + ": Spawn complete. Pausing non-supplier spawns for " + LOW_RCL_SPAWN_DELAY_TICKS + " ticks.");
+        }
+
+        if (roleToSpawn === 'upgrader' && room.controller && room.controller.level === 8) {
+          scheduleUpgraderDelayRCL8(roomName);
+        }
       }
     }
   }
 }
 
 // ============================================================================
-// One-call orchestrator for spawn systems (optional)
-// Call this once per tick if you want this module to manage cadence internally.
+// One-call orchestrator for spawn systems
 // ============================================================================
 
-function run(perRoomRoleCounts, roomDataCache) {
+// UPDATED: Ignores the second argument (since getRoomState is global/required)
+function run(perRoomRoleCounts) {
+  // 1. Run low-priority spawns
   if (Game.time % 5 === 0)  manageDemolitionSpawns();
   if (Game.time % 10 === 0) manageClaimbotSpawns();
   if (Game.time % 5 === 0)  manageAttackerSpawns();
@@ -1465,16 +1918,19 @@ function run(perRoomRoleCounts, roomDataCache) {
   if (Game.time % 5 === 0)  manageExtractorSpawns();
   if (Game.time % 10 === 0) spawnScavengers();
   if (Game.time % 2 === 0)  manageLabBotSpawns();
-  if (Game.time % 2 === 0)  processSquadSpawnQueues();
   if (Game.time % 10 === 0) manageWallRepairSpawns();
   if (Game.time % 10 === 0) manageNukeFillSpawns();
+  if (Game.time % 5 === 0) manageRemoteBuilderSpawns();
 
+  // 2. Run High Priority (Room Economy)
   if (needsNewCreeps(perRoomRoleCounts) || Game.time % 10 === 0) {
-    manageSpawnsPerRoom(perRoomRoleCounts, roomDataCache);
+    manageSpawnsPerRoom(perRoomRoleCounts);
   }
+
+  // 3. Run Squad Spawns (AFTER economy)
+  if (Game.time % 5 === 0)  manageSquadSpawns(perRoomRoleCounts); 
 }
 
-// Minimal helper to mirror main’s behavior
 function needsNewCreeps(perRoomRoleCounts) {
   for (const roomName in perRoomRoleCounts) {
     const counts = perRoomRoleCounts[roomName];
@@ -1505,15 +1961,15 @@ module.exports = {
   manageExtractorSpawns,
   manageLabBotSpawns,
   manageWallRepairSpawns,
-  processSquadSpawnQueues,
+  manageSquadSpawns,
   spawnScavengers,
   manageNukeFillSpawns,
+  manageRemoteBuilderSpawns,
 
   // Utilities you use elsewhere
   getCreepBody,
   bodyCost,
-
-  // Rarely called helpers
+  shouldSpawnSupplier,
   spawnEmergencyHarvester,
   getRoomTargets,
   handleRoomSpawnDelay

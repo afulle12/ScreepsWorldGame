@@ -15,6 +15,7 @@
 //orderFactory('W1N1', 'Oxidant', 'max'); // computes the maximum producible amount from room resources
 //    Show all factory orders: listFactoryOrders()
 //    Show orders for a specific room: listFactoryOrders('W1N1')
+//cancelFactoryOrder('W1N1_Oxidant_1234567');
 
 const getRoomState = require('getRoomState');
 
