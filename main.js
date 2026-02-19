@@ -54,6 +54,8 @@ const marketUpdater = require('marketUpdate');
 const opportunisticBuy = require('opportunisticBuy');
 const marketRefine = require('marketRefine');
 const localRefine = require('localRefine'); 
+const marketLabReverse = require('marketLabReverse');
+const marketLabForward = require('marketLabForward');
 const roleNukeFill = require('roleNukeFill');
 const nukeUtils = require('nukeUtils');
 const nukeLaunch = require('nukeLaunch');
@@ -64,14 +66,27 @@ const depositObserver = require('depositObserver');
 const roleDepositHarvester = require('roleDepositHarvester');
 const rolePowerBot = require('rolePowerBot');
 const powerManager = require('powerManager');
+const roleOperator = require('roleOperator');
 const marketReport = require('marketReport');
-
-// --- NEW IMPORT ---
+const roomIntel = require('roomIntel');
 const roleMaintainer = require('roleMaintainer');
+const roleContestedDemolisher = require('roleContestedDemolisher');
+const autoEnergyBuyer = require('autoEnergyBuyer');
+const wideScan = require('wideScan');
+const playerAnalysis = require('playerAnalysis');
+const autoTrader = require('autoTrader');
+const roomNavigation = require('roomNavigation');
+const memoryQuery = require('memoryQuery');
+const dailyFinance = require('dailyFinance');
+const marketPricing = require('marketPricing');
+const marketArbitrage = require('marketArbitrage');
 
 
 // === GLOBAL MODULE EXPOSURE FOR CONSOLE ACCESS ===
 global.opportunisticBuy = opportunisticBuy;
+global.intel = roomIntel.intel;
+global.listIntel = roomIntel.listIntel;
+global.getCachedIntel = roomIntel.getCachedIntel;
 global.nukeFill = roleNukeFill.order;
 global.nukeInRange = nukeUtils.nukeInRange;
 // Expose the console command: launchNuke('DonorRoom', 'RecipientRoom', 'structureType')
@@ -80,6 +95,20 @@ global.listRoomMarketOrders = marketRoomOrders.listRoomMarketOrders;
 global.memoryProfile = memoryProfiler.profile;
 global.harvestResources = depositObserver.harvestResources;
 global.launchClaimbot = require('roleClaimbot').spawn;
+global.orderClaim = require('roleClaimbot').orderClaim;
+global.cancelClaimOrder = require('roleClaimbot').cancelClaimOrder;
+global.listClaimOrders = require('roleClaimbot').listClaimOrders;
+
+// Thief order commands
+global.orderThieves = require('roleThief').orderThieves;
+global.cancelThiefOrder = require('roleThief').cancelThiefOrder;
+global.listThiefOrders = require('roleThief').listThiefOrders;
+global.financeReport = dailyFinance.report;
+global.prices = marketPricing.printPrices;
+global.marketArbitrage = marketArbitrage;
+
+// Room navigation debug
+global.setNavDebug = require('roomNavigation').setDebug;
 
 // Centralized spawn manager
 const spawnManager = require('spawnManager');
@@ -119,6 +148,8 @@ profiler.registerObject(marketUpdater, 'marketUpdater');
 profiler.registerObject(opportunisticBuy, 'opportunisticBuy');
 profiler.registerObject(marketRefine, 'marketRefine');
 profiler.registerObject(localRefine, 'localRefine'); 
+profiler.registerObject(marketLabReverse, 'marketLabReverse');
+profiler.registerObject(marketLabReverse, 'marketLabForward');
 profiler.registerObject(roleNukeFill, 'roleNukeFill');
 profiler.registerObject(nukeUtils, 'nukeUtils');
 // Profiler registration for nukeLaunch
@@ -129,8 +160,18 @@ profiler.registerObject(roleDepositHarvester, 'roleDepositHarvester');
 profiler.registerObject(depositObserver, 'depositObserver');
 profiler.registerObject(rolePowerBot, 'rolePowerBot');
 profiler.registerObject(powerManager, 'powerManager');
+profiler.registerObject(roleOperator, 'roleOperator');
 profiler.registerObject(roleMaintainer, 'roleMaintainer'); // <--- REGISTER MAINTAINER
-
+profiler.registerObject(roleContestedDemolisher, 'roleContestedDemolisher'); // <--- REGISTER CONTESTED DEMOLISHER
+profiler.registerObject(roomIntel, 'roomIntel');
+profiler.registerObject(autoEnergyBuyer, 'autoEnergyBuyer');
+profiler.registerObject(wideScan, 'wideScan');
+profiler.registerObject(playerAnalysis, 'playerAnalysis');
+profiler.registerObject(autoTrader, 'autoTrader');
+profiler.registerObject(roomNavigation, 'roomNavigation');
+profiler.registerObject(dailyFinance, 'dailyFinance');
+profiler.registerObject(marketPricing, 'marketPricing');
+profiler.registerObject(marketArbitrage, 'marketArbitrage');
 
 // =================================================================
 /* === CREEP MANAGEMENT ============================================ */
@@ -168,10 +209,10 @@ function runCreeps() {
       case 'towerDrain':     roleTowerDrain.run(creep);       break;
       case 'demolition':     roleDemolition.run(creep);       break;
       // case 'squadMember':        squad.run(creep);                   break; // Removed squad functionality
-      
+
       // --- Explicit case for 'quad' ---
       case 'quad':           roleSquad.run(creep);            break; 
-      
+
       case 'mineralCollector': roleMineralCollector.run(creep); break;
       case 'terminalBot':    terminalManager.runTerminalBot(creep); break;
       case 'signbot':        roleSignbot.run(creep);          break;
@@ -182,9 +223,10 @@ function runCreeps() {
       case 'remoteBuilder':  roleRemoteBuilder.run(creep);  break;
       case 'depositHarvester': roleDepositHarvester.run(creep); break;
       case 'powerBot':         rolePowerBot.run(creep);         break;
-      
-      // --- NEW ROLE ---
+
+      // --- NEW ROLES ---
       case 'maintainer':       roleMaintainer.run(creep);       break;
+      case 'contestedDemolisher': roleContestedDemolisher.run(creep); break;
 
       default:
         // Default fallback to harvester
@@ -200,6 +242,33 @@ function runCreeps() {
       Memory.cpuProfileCreeps[role].push(cpuAfter - cpuBefore);
       if (Memory.cpuProfileCreeps[role].length > 50) {
         Memory.cpuProfileCreeps[role].shift();
+      }
+    }
+  }
+
+  // --- POWER CREEPS (separate loop - they live in Game.powerCreeps, not Game.creeps) ---
+  if (Memory.operators) {
+    for (const name in Memory.operators) {
+      const pc = Game.powerCreeps[name];
+      if (!pc) continue;
+      if (!pc.ticksToLive) {
+        roleOperator.trySpawn(pc, Memory.operators[name].homeRoom);
+        continue;
+      }
+
+      let cpuBefore;
+      if (ENABLE_CPU_LOGGING) cpuBefore = Game.cpu.getUsed();
+
+      roleOperator.runCreep(pc, Memory.operators[name]);
+
+      if (ENABLE_CPU_LOGGING) {
+        const cpuAfter = Game.cpu.getUsed();
+        if (!Memory.cpuProfileCreeps) Memory.cpuProfileCreeps = {};
+        if (!Memory.cpuProfileCreeps['operator']) Memory.cpuProfileCreeps['operator'] = [];
+        Memory.cpuProfileCreeps['operator'].push(cpuAfter - cpuBefore);
+        if (Memory.cpuProfileCreeps['operator'].length > 50) {
+          Memory.cpuProfileCreeps['operator'].shift();
+        }
       }
     }
   }
@@ -270,7 +339,7 @@ function getPerRoomRoleCounts() {
         harvester: 0, upgrader: 0, builder: 0, scout: 0, defender: 0, supplier: 0,
         claimbot: 0, attacker: 0, scavenger: 0, thief: 0, towerDrain: 0, demolition: 0, 
         wallRepair: 0, depositHarvester: 0, powerBot: 0, quad: 0,
-        maintainer: 0 // <--- ADDED MAINTAINER TRACKING
+        maintainer: 0, contestedDemolisher: 0 // <--- ADDED MAINTAINER & CONTESTED DEMOLISHER TRACKING
        };
     }
   }
@@ -378,11 +447,11 @@ function displayStatus(perRoomRoleCounts) {
 
     // --- 1. PROGRESS & ETA CALCULATION ---
     const percent = room.controller.progress / room.controller.progressTotal * 100;
-      
+
     if (!Memory.progressTracker[roomName]) {
       Memory.progressTracker[roomName] = { level: room.controller.level, history: [] };
     }
-      
+
     const tracker = Memory.progressTracker[roomName];
     if (tracker.level !== room.controller.level) {
       tracker.level       = room.controller.level;
@@ -429,6 +498,59 @@ function displayStatus(perRoomRoleCounts) {
       storageDisplay = "Storage: " + (sVal >= 1000 ? (sVal/1000).toFixed(0) + 'k' : sVal);
     }
 
+    // Wall/Rampart Progress with ETA (target: 299M average hits, RCL8 only)
+    let wallEtaText = "";
+    if (room.controller.level === 8) {
+      const TARGET_HITS = 20000000;
+      const WALL_INTERVAL = 50000;
+      if (!Memory.wallTracker) Memory.wallTracker = {};
+      if (!Memory.wallTracker[roomName]) Memory.wallTracker[roomName] = {};
+      const wt = Memory.wallTracker[roomName];
+
+      const walls = room.find(FIND_STRUCTURES, {
+        filter: function(s) {
+          return s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART;
+        }
+      });
+
+      if (walls.length > 0) {
+        let totalHits = 0;
+        for (let i = 0; i < walls.length; i++) {
+          totalHits += walls[i].hits;
+        }
+        const avgHits = totalHits / walls.length;
+        const wallPercent = avgHits / TARGET_HITS * 100;
+
+        // Take a new reading every WALL_INTERVAL ticks
+        if (!wt.lastTick || Game.time - wt.lastTick >= WALL_INTERVAL) {
+          wt.prevPercent = wt.currentPercent || null;
+          wt.prevTick = wt.lastTick || null;
+          wt.currentPercent = wallPercent;
+          wt.lastTick = Game.time;
+        }
+
+        // Calculate ETA if we have two readings
+        if (wt.prevPercent !== undefined && wt.prevPercent !== null && wt.prevTick !== null) {
+          const dPerc = wt.currentPercent - wt.prevPercent;
+          const dTicks = wt.lastTick - wt.prevTick;
+          if (dPerc > 0 && dTicks > 0) {
+            const rate = dPerc / dTicks;
+            const remaining = 100 - wallPercent;
+            const etaTicks = Math.ceil(remaining / rate);
+            const etaMinutes = etaTicks * 4 / 60;
+            wallEtaText = "ETA: ~" + formatTime(etaMinutes) + " (" + wallPercent.toFixed(2) + "%)";
+          } else {
+            wallEtaText = "ETA: ∞ (" + wallPercent.toFixed(2) + "%)";
+          }
+        } else {
+          wallEtaText = "ETA: pending (" + wallPercent.toFixed(2) + "%)";
+        }
+
+      } else {
+        // No walls in room
+      }
+    }
+
     // Creep Icons String
     let creepDisplay = "";
     if (stats.totalCreeps === 0) {
@@ -456,6 +578,8 @@ function displayStatus(perRoomRoleCounts) {
         } else {
             endOfLine = " | " + percentStr;
         }
+    } else if (wallEtaText) {
+        endOfLine = " | " + wallEtaText;
     }
 
     // --- 5. PRINT UNIFIED LINE ---
@@ -472,7 +596,7 @@ function displayStatus(perRoomRoleCounts) {
   const currentEnergy = calculateTotalEnergy();
   if (!Memory.stats) Memory.stats = {};
   Memory.stats.lastTotalEnergy = currentEnergy;
-    
+
   console.log('================================================================');
   return gclEta;
 }
@@ -515,7 +639,7 @@ function calculateTotalEnergy() {
 function getPerformanceData() {
   const cpuUsed = Game.cpu.getUsed();
   const cpuLimit = Game.cpu.limit;
-    
+
   let cpuMin = cpuUsed;
   let cpuMax = cpuUsed;
   let cpuAverage = 0;
@@ -610,7 +734,7 @@ module.exports.loop = function() {
     if (Game.time % 30 === 0) roleScout.handleDeadCreeps();
     if (Game.time % 1000 === 0)   cleanMemory();
     if (Game.time % 1000 === 0) cleanCpuProfileMemory();
-      
+
 
     // --- BUILD PER-TICK ROOM STATE EARLY ---
     // This builds the global.__roomState cache for the tick
@@ -641,12 +765,23 @@ module.exports.loop = function() {
     }
 
     profileSection('terminalManager', function(){ terminalManager.run(); });
+    profileSection('roleTowerDrain', function(){ roleTowerDrain.run(); });
     profileSection('mineralManager', function(){ mineralManager.run(); });
     profileSection('factoryManager', function(){ factoryManager.run(); });
     profileSection('marketUpdater', function(){ marketUpdater.run(); });
     profileSection('marketRefine.run', function(){ marketRefine.run(); });
     profileSection('localRefine.run', function(){ localRefine.run(); }); 
+    profileSection('marketLabReverse.run', function(){ marketLabReverse.run(); });
+    profileSection('marketLabForward.run', function(){ marketLabForward.run(); });
+    profileSection('playerAnalysis.run', function(){ playerAnalysis.run(); });
+    profileSection('autoTrader.run', function(){ autoTrader.run(); });
+    profileSection('roleContestedDemolisher', function(){ roleContestedDemolisher.run(); });
+    profileSection('dailyFinance', function(){ dailyFinance.run(); });
+    profileSection('marketArbitrage', function(){ marketArbitrage.run(); });
     if (Game.time % 10 === 0) profileSection('opportunisticBuy', function(){ opportunisticBuy.process(); });
+    if (Game.time % 100 === 0) roomIntel.cleanExpiredIntel();
+    if (Game.time % 1 === 0) roomIntel.processPendingIntel();
+    
     profileSection('powerManager', function() {
         for (const roomName in Game.rooms) {
             if (Game.rooms[roomName].controller && Game.rooms[roomName].controller.my) {
@@ -675,11 +810,19 @@ module.exports.loop = function() {
       });
     }
 
-    // --- CREEP ACTIONS ---
+    // --- CREEP ACTIONS (includes power creeps via roleOperator) ---
     profileSection('runCreeps', runCreeps);
 
     // --- TRACKING & VISUALS ---
     profileSection('trackCPUUsage', trackCPUUsage);
+    profileSection('wideScan.run', function(){ wideScan.run(); });
+    //profileSection('roomNavigation', function(){ roomNavigation; });
+    // Auto energy buying - runs every 100 ticks
+    if (Game.time % 1050 === 0) {
+        profileSection('autoEnergyBuyer', function() {
+            autoEnergyBuyer.run(); // Will scan all owned rooms
+        });
+    }
 
     // --- STATUS DISPLAY (LESS OFTEN) ---
     if (Game.time % 100 === 0) {
