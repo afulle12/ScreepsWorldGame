@@ -1,5 +1,5 @@
 # Screeps Colony – README
-Version: 2026-02-18 (Expanded Build)
+Version: 2026-05-28 (Expanded Build)
 
 ## Overview
 
