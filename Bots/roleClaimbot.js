@@ -7,7 +7,7 @@ const enableLogging = true;  // Set false to silence logs
 
 // == BANNED ROOMS (keep in sync with demolition) ==
 const BANNED_ROOMS = [
-  'E8N49', 'E3N47'
+  'E8N49', 'W8N49'
 ];
 
 // == Helper: is a room banned? ==

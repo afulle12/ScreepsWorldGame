@@ -8,6 +8,9 @@
 // Check status of all transfer operations and active terminal bots
 // terminalStatus()
 //
+// broadcastEnergy('E5N10')           // sends 10k energy from all rooms
+// broadcastEnergy('E5N10', 5000)     // sends a custom amount instead
+//
 // Debug why a terminal in a room is waiting / not sending
 // whyTerminal('E3N46')
 //
@@ -20,28 +23,9 @@
 //
 // Move 5000 energy from Terminal into Storage (or a container fallback)
 // terminalToStorage('E1S1', RESOURCE_ENERGY, 5000)
-//
-// NOTE:
-// - No optional chaining used, compatible with Screeps runtime.
-// - Exactly one terminal bot per room (alive + spawning + requested).
-// - Terminal bot auto-switches to ENERGY when needed (single bot can finish transfers).
-// - Terminal bots are reusable: they watch for new transfer operations and pick them up automatically.
-// - Transfers send only what the terminal can afford, considering transaction cost and cooldown,
-//   and only mark progress on OK from Terminal.send. This avoids "false completed" transfers.
-// - Operations that sit in 'waiting' for >5000 ticks are auto-cancelled every 50 ticks.
-//   Local ops (toTerminal/toStorage) with no supply are auto-cancelled after 1000 ticks.
-// - Local move ops (toTerminal/toStorage) use the terminal bot to haul within a room.
-//   Progress is tracked cumulatively (amountMoved). Bots are assigned or retasked automatically.
-// - Local toTerminal moves always target the requested amount, regardless of existing terminal stock.
-//   They only wait if there is no outside supply or the terminal has no free capacity.
-//
-// Terminal Manager (reduced scope: transfers + terminalBot management only)
-// - Removed: marketBuy/marketSell and all market order maintenance.
-// - Kept: transfer operations, terminal bot request/spawn/runner, utilities.
-//
-// Measurement system: Irrelevant for code; all in-game units.
 
 const getRoomState = require('getRoomState'); // use room state cache instead of room.find
+var singleSourceRoom = require('singleSourceRoom');
 
 const terminalManager = {
 
@@ -56,7 +40,9 @@ const terminalManager = {
                     botBodyType: 'supplier',
                     maxBotsPerRoom: 1,
                     // Set true only if you do NOT run terminalBots from your main loop by role
-                    runBotsFromManager: false
+                    runBotsFromManager: false,
+                    energyHighThreshold: 100000,
+                    energyTargetLevel: 20000
                 }
             };
         } else {
@@ -65,6 +51,8 @@ const terminalManager = {
             if (!Memory.terminalManager.settings.botBodyType) Memory.terminalManager.settings.botBodyType = 'supplier';
             if (typeof Memory.terminalManager.settings.maxBotsPerRoom !== 'number') Memory.terminalManager.settings.maxBotsPerRoom = 1;
             if (typeof Memory.terminalManager.settings.runBotsFromManager !== 'boolean') Memory.terminalManager.settings.runBotsFromManager = false;
+            if (typeof Memory.terminalManager.settings.energyHighThreshold !== 'number') Memory.terminalManager.settings.energyHighThreshold = 100000;
+            if (typeof Memory.terminalManager.settings.energyTargetLevel !== 'number') Memory.terminalManager.settings.energyTargetLevel = 20000;
             if (!Array.isArray(Memory.terminalManager.operations)) Memory.terminalManager.operations = [];
             if (!Array.isArray(Memory.terminalManager.bots)) Memory.terminalManager.bots = [];
         }
@@ -82,6 +70,11 @@ const terminalManager = {
         // Local ops with no supply are cancelled after 1000 ticks
         if (Game.time % 50 === 0) {
             this.checkAndCancelStuckWaits(5000);
+        }
+
+        // Auto-balance: drain terminals with too much energy (runs every 50 ticks)
+        if (Game.time % 50 === 0) {
+            this.autoBalanceTerminalEnergy();
         }
 
         this.processOperations();
@@ -679,6 +672,21 @@ const terminalManager = {
             return;
         }
 
+        // FIX: For auto-balance energy drain ops, complete early if terminal energy
+        // is already at or below the target level (e.g. supplier drained it first).
+        if (operation.autoBalance && operation.resourceType === RESOURCE_ENERGY) {
+            var targetLevel = (Memory.terminalManager.settings && typeof Memory.terminalManager.settings.energyTargetLevel === 'number')
+                ? Memory.terminalManager.settings.energyTargetLevel : 20000;
+            var currentEnergy = (terminal.store && terminal.store[RESOURCE_ENERGY]) ? terminal.store[RESOURCE_ENERGY] : 0;
+            if (currentEnergy <= targetLevel) {
+                if (operation.status !== 'completed') {
+                    operation.status = 'completed';
+                    console.log('[Terminal] Auto-balance completed early: terminal energy in ' + operation.roomName + ' is ' + currentEnergy + ' (target: ' + targetLevel + ')');
+                }
+                return;
+            }
+        }
+
         var moved = operation.amountMoved || 0;
         var remaining = operation.amount - moved;
         if (remaining <= 0) {
@@ -840,6 +848,7 @@ const terminalManager = {
     // requestBot always honors automatic spawning. operationId remains for linking. (collect tasks)
     requestBot: function(roomName, task, resourceType, operationId) {
         var room = Game.rooms[roomName];
+        if (singleSourceRoom.isSingleSourceActive(roomName)) return false;
         if (!room || !room.controller || !room.controller.my) return false;
 
         // 1) Calculate net need and bail if nothing is needed
@@ -900,9 +909,12 @@ const terminalManager = {
         return true;
     },
 
-    // NEW: Assign an existing bot if present; otherwise create/adjust a spawn request (works for collect or drain)
+    // Assign an existing bot if present; otherwise create/adjust a spawn request (works for collect or drain).
+    // FIX: Will NOT retask a bot that is currently carrying cargo (mid-delivery).
     assignTerminalBot: function(roomName, task, resourceType, operationId) {
         var room = Game.rooms[roomName];
+        // In single-source rooms, ComboBot handles terminal duties — don't spawn bots
+        if (singleSourceRoom.isSingleSourceActive(roomName)) return false;
         if (!room || !room.controller || !room.controller.my) return false;
 
         // 0) Try to retask an alive terminalBot in this room
@@ -911,6 +923,11 @@ const terminalManager = {
             var c = creeps[name];
             if (!c || !c.memory) continue;
             if (c.memory.role === 'terminalBot' && c.memory.terminalRoom === roomName) {
+                // FIX: Don't retask a bot that is carrying cargo — let it finish
+                // its current delivery so progress is credited to the correct op.
+                if (c.store && c.store.getUsedCapacity() > 0) {
+                    return true; // bot exists and is busy; no new spawn needed
+                }
                 c.memory.terminalTask = task;
                 c.memory.terminalResource = resourceType;
                 c.memory.terminalRoom = roomName;
@@ -1245,12 +1262,12 @@ const terminalManager = {
         return null;
     },
 
-    // Idle helper: choose a non-road tile within range 10 of controller if possible, cache it, and park there.
+    // Idle helper: choose a non-road tile within range 2 of the controller, cache it, and park there.
     idleNearController: function(creep, room) {
         var controller = room.controller;
         if (!controller) return false;
 
-        if (creep.pos.getRangeTo(controller) <= 10) {
+        if (creep.pos.getRangeTo(controller) <= 2) {
             var onRoad = false;
             var structsHere = creep.pos.lookFor(LOOK_STRUCTURES);
             for (var i = 0; i < structsHere.length; i++) {
@@ -1297,12 +1314,12 @@ const terminalManager = {
         var cx = controller.pos.x;
         var cy = controller.pos.y;
 
-        for (var dx = -10; dx <= 10; dx++) {
-            for (var dy = -10; dy <= 10; dy++) {
+        for (var dx = -2; dx <= 2; dx++) {
+            for (var dy = -2; dy <= 2; dy++) {
                 var x = cx + dx;
                 var y = cy + dy;
                 if (x < 1 || x > 48 || y < 1 || y > 48) continue;
-                if (dx*dx + dy*dy > 100) continue;
+                if (dx*dx + dy*dy > 4) continue;
                 var pos = room.getPositionAt(x, y);
                 if (!pos) continue;
 
@@ -1382,14 +1399,37 @@ const terminalManager = {
                         if (tr === OK) {
                             // If linked to a local toTerminal operation, record progress
                             var opIdD = creep.memory.terminalOperationId;
+                            var opsD = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+                            var credited = false;
+
+                            // First try: credit the linked operation (fast path)
                             if (opIdD) {
-                                var opsD = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
                                 for (var oiD = 0; oiD < opsD.length; oiD++) {
                                     var opD = opsD[oiD];
                                     if (!opD || opD.id !== opIdD) continue;
                                     if (opD.type === 'toTerminal' && opD.roomName === roomName && opD.resourceType === depositRes) {
                                         if (typeof opD.amountMoved !== 'number') opD.amountMoved = 0;
                                         opD.amountMoved += depositAmt;
+                                        credited = true;
+                                    }
+                                    break; // found the linked op either way
+                                }
+                            }
+
+                            // FIX: Fallback — if linked op didn't match (bot was retasked
+                            // mid-carry), credit any active toTerminal op for this room+resource.
+                            if (!credited) {
+                                for (var oiF = 0; oiF < opsD.length; oiF++) {
+                                    var opF = opsD[oiF];
+                                    if (!opF) continue;
+                                    if (opF.type === 'toTerminal' &&
+                                        opF.roomName === roomName &&
+                                        opF.resourceType === depositRes &&
+                                        opF.status !== 'completed' &&
+                                        opF.status !== 'failed') {
+                                        if (typeof opF.amountMoved !== 'number') opF.amountMoved = 0;
+                                        opF.amountMoved += depositAmt;
+                                        break;
                                     }
                                 }
                             }
@@ -1441,7 +1481,7 @@ const terminalManager = {
                         creep.moveTo(spot, { reusePath: 20 });
                     }
                 }
-                creep.say('Idle');
+                if (Game.time % 10 === 0) creep.say('Idle');
                 return;
             }
         }
@@ -1531,7 +1571,7 @@ const terminalManager = {
                     creep.moveTo(waitingSpot, { reusePath: 20 });
                 }
             }
-            creep.say('wait');
+            if (Game.time % 10 === 0) creep.say('wait');
         }
     },
 
@@ -1564,7 +1604,7 @@ const terminalManager = {
                     var spot = this.getWaitingSpot(room);
                     if (spot && !creep.pos.isEqualTo(spot)) creep.moveTo(spot, { reusePath: 20 });
                 }
-                creep.say('no tgt');
+                if (Game.time % 10 === 0) creep.say('no tgt');
                 return;
             }
             if (creep.pos.isNearTo(target)) {
@@ -1586,14 +1626,37 @@ const terminalManager = {
                         // Record progress for toStorage operations if this was the target resource
                         if (res === resourceType) {
                             var opId = creep.memory.terminalOperationId;
+                            var ops = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+                            var credited = false;
+
+                            // First try: credit the linked operation (fast path)
                             if (opId) {
-                                var ops = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
                                 for (var oi = 0; oi < ops.length; oi++) {
                                     var op = ops[oi];
                                     if (!op || op.id !== opId) continue;
                                     if (op.type === 'toStorage' && op.roomName === roomName && op.resourceType === res) {
                                         if (typeof op.amountMoved !== 'number') op.amountMoved = 0;
                                         op.amountMoved += depositAmt;
+                                        credited = true;
+                                    }
+                                    break; // found the linked op either way
+                                }
+                            }
+
+                            // FIX: Fallback — if linked op didn't match (bot was retasked),
+                            // credit any active toStorage op for this room+resource.
+                            if (!credited) {
+                                for (var oiF = 0; oiF < ops.length; oiF++) {
+                                    var opF = ops[oiF];
+                                    if (!opF) continue;
+                                    if (opF.type === 'toStorage' &&
+                                        opF.roomName === roomName &&
+                                        opF.resourceType === res &&
+                                        opF.status !== 'completed' &&
+                                        opF.status !== 'failed') {
+                                        if (typeof opF.amountMoved !== 'number') opF.amountMoved = 0;
+                                        opF.amountMoved += depositAmt;
+                                        break;
                                     }
                                 }
                             }
@@ -1645,13 +1708,27 @@ const terminalManager = {
                 var w = this.getWaitingSpot(room);
                 if (w && !creep.pos.isEqualTo(w)) creep.moveTo(w, { reusePath: 20 });
             }
-            creep.say('wait');
+            if (Game.time % 10 === 0) creep.say('wait');
             return;
         }
 
         var amtToWithdraw = Math.min(available, creep.store.getFreeCapacity(), remaining);
+
+        // FIX: When draining energy, never withdraw below the target energy level.
+        // This prevents the terminalBot from fighting with the supplier over energy.
+        if (resourceType === RESOURCE_ENERGY) {
+            var targetLevel = (Memory.terminalManager && Memory.terminalManager.settings && typeof Memory.terminalManager.settings.energyTargetLevel === 'number')
+                ? Memory.terminalManager.settings.energyTargetLevel : 20000;
+            var drainableEnergy = Math.max(0, available - targetLevel);
+            amtToWithdraw = Math.min(amtToWithdraw, drainableEnergy);
+        }
+
         if (amtToWithdraw <= 0) {
-            creep.say('cap');
+            if (!this.idleNearController(creep, room)) {
+                var w = this.getWaitingSpot(room);
+                if (w && !creep.pos.isEqualTo(w)) creep.moveTo(w, { reusePath: 20 });
+            }
+            if (Game.time % 10 === 0) creep.say('idle');
             return;
         }
 
@@ -1660,11 +1737,11 @@ const terminalManager = {
             if (resW !== OK && resW !== ERR_FULL && resW !== ERR_NOT_ENOUGH_RESOURCES) {
                 creep.say('w err');
             } else {
-                creep.say('take');
+                //creep.say('take');
             }
         } else {
             creep.moveTo(terminal, { reusePath: 10, visualizePathStyle: { stroke: '#ffaa00' } });
-            creep.say('get');
+            //creep.say('get');
         }
     },
 
@@ -1781,6 +1858,48 @@ const terminalManager = {
             }
         }
     },
+    broadcastEnergy: function(toRoom, amount) {
+        amount = amount || 10000;
+    
+        if (!toRoom || typeof toRoom !== 'string') {
+            return '[Terminal] broadcastEnergy requires a destination room name.';
+        }
+    
+        var destRoom = Game.rooms[toRoom];
+        if (destRoom && !destRoom.terminal) {
+            return '[Terminal] No terminal visible in destination room: ' + toRoom;
+        }
+    
+        var queued = [];
+        var skipped = [];
+    
+        for (var rn in Game.rooms) {
+            var room = Game.rooms[rn];
+            if (!room || !room.controller || !room.controller.my) continue;
+            if (rn === toRoom) continue;
+    
+            var terminal = room.terminal;
+            if (!terminal) { skipped.push(rn + ' (no terminal)'); continue; }
+    
+            var termEnergy = (terminal.store && terminal.store[RESOURCE_ENERGY]) ? terminal.store[RESOURCE_ENERGY] : 0;
+            var cost = Game.market.calcTransactionCost(amount, rn, toRoom);
+            var required = amount + cost;
+    
+            if (termEnergy < required) {
+                skipped.push(rn + ' (have ' + termEnergy + ', need ' + required + ' incl. cost ' + cost + ')');
+                continue;
+            }
+    
+            var result = this.transferStuff(rn, toRoom, RESOURCE_ENERGY, amount);
+            queued.push(rn + ' -> cost ' + cost);
+        }
+    
+        console.log('[Terminal] broadcastEnergy: queued ' + queued.length + ' transfer(s) of ' + amount + ' energy to ' + toRoom);
+        for (var i = 0; i < queued.length; i++) console.log('  [OK] ' + queued[i]);
+        for (var j = 0; j < skipped.length; j++) console.log('  [SKIP] ' + skipped[j]);
+    
+        return '[Terminal] Done. ' + queued.length + ' queued, ' + skipped.length + ' skipped.';
+    },
 
     // ===== UTILITY FUNCTIONS =====
     // Check if a room is involved in any active transfer operations
@@ -1794,6 +1913,81 @@ const terminalManager = {
                 (op.fromRoom === roomName || op.toRoom === roomName)) return true;
         }
         return false;
+    },
+
+    // Auto-balance: if a terminal has more energy than the high threshold,
+    // create a toStorage operation to drain down to the target level.
+    // Skips rooms that already have an active energy drain operation or
+    // an active outbound energy transfer (which will naturally consume the energy).
+    autoBalanceTerminalEnergy: function() {
+        var threshold = Memory.terminalManager.settings.energyHighThreshold || 100000;
+        var target    = Memory.terminalManager.settings.energyTargetLevel   || 20000;
+
+        var rooms = Game.rooms;
+        for (var rn in rooms) {
+            var room = rooms[rn];
+            if (!room || !room.controller || !room.controller.my) continue;
+            var terminal = room.terminal;
+            if (!terminal) continue;
+
+            var termEnergy = (terminal.store && terminal.store[RESOURCE_ENERGY])
+                ? terminal.store[RESOURCE_ENERGY] : 0;
+
+            if (termEnergy <= threshold) continue;
+
+            // Skip if there is already an active energy drain (toStorage) op for this room
+            var ops = Memory.terminalManager.operations;
+            var alreadyDraining = false;
+            for (var i = 0; i < ops.length; i++) {
+                var op = ops[i];
+                if (!op) continue;
+                if (op.type === 'toStorage' &&
+                    op.roomName === rn &&
+                    op.resourceType === RESOURCE_ENERGY &&
+                    op.status !== 'completed' &&
+                    op.status !== 'failed') {
+                    alreadyDraining = true;
+                    break;
+                }
+            }
+            if (alreadyDraining) continue;
+
+            // Skip if an outbound energy transfer exists (it will consume the surplus)
+            var outboundTransfer = false;
+            for (var j = 0; j < ops.length; j++) {
+                var op2 = ops[j];
+                if (!op2) continue;
+                if (op2.type === 'transfer' &&
+                    op2.fromRoom === rn &&
+                    op2.resourceType === RESOURCE_ENERGY &&
+                    op2.status !== 'completed' &&
+                    op2.status !== 'failed') {
+                    outboundTransfer = true;
+                    break;
+                }
+            }
+            if (outboundTransfer) continue;
+
+            var excess = termEnergy - target;
+            if (excess <= 0) continue;
+
+            // Create a toStorage operation to drain the excess
+            var drainOp = {
+                id: 'autobalance_' + Game.time + '_' + Math.random().toString(36).substr(2, 9),
+                type: 'toStorage',
+                roomName: rn,
+                resourceType: RESOURCE_ENERGY,
+                amount: excess,
+                amountMoved: 0,
+                status: 'pending',
+                created: Game.time,
+                autoBalance: true
+            };
+
+            Memory.terminalManager.operations.push(drainOp);
+            this.assignTerminalBot(rn, 'drain', RESOURCE_ENERGY, drainOp.id);
+            console.log('[Terminal] Auto-balance: draining ' + excess + ' energy from terminal in ' + rn + ' (have ' + termEnergy + ', target ' + target + ')');
+        }
     },
 
     // Auto-cancel operations stuck in 'waiting' longer than threshold.
@@ -1881,7 +2075,7 @@ const terminalManager = {
             RESOURCE_GHODIUM_ACID, RESOURCE_GHODIUM_ALKALIDE,
             RESOURCE_GHODIUM, RESOURCE_BIOMASS,
             RESOURCE_METAL, RESOURCE_MIST,
-            RESOURCE_SILICON
+            RESOURCE_SILICON, RESOURCE_OPS
         ];
         for (var i = 0; i < validResources.length; i++) {
             if (validResources[i] === resourceType) return true;
@@ -1967,22 +2161,29 @@ const terminalManager = {
                 200:  [CARRY, CARRY, MOVE, MOVE],
                 300:  [CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
                 400:  [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
-                600:  [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
+                600:  [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+                800:  [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+                1000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+                1200: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+                1500: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+                1800: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+                2000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+                2500: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
             }
         };
-
+    
         var configs = bodyConfigs[role] || bodyConfigs.supplier;
         var tiers = [];
         for (var key in configs) tiers.push(Number(key));
         tiers.sort(function(a, b){ return a - b; });
-
+    
         var bestTier = tiers[0];
         for (var i = 0; i < tiers.length; i++) {
             var tier = tiers[i];
             if (energy >= tier) bestTier = tier;
             else break;
         }
-
+    
         return configs[bestTier];
     },
 
@@ -2163,6 +2364,10 @@ global.cancelTerminalOperation = function(operationId) {
 
 global.isRoomBusy = function(roomName) {
     return terminalManager.isRoomBusyWithTransfer(roomName);
+};
+
+global.broadcastEnergy = function(toRoom, amount) {
+    return terminalManager.broadcastEnergy(toRoom, amount);
 };
 
 // NEW globals

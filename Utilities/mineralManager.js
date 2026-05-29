@@ -1,16 +1,21 @@
 // mineralManager.js
 // Automates processing minerals into bars and selling them.
 // Behavior:
-// - When a mineral vein depletes, orders the factory to process its stock into bars.
+// - When a mineral vein depletes, checks whether refining into bars is profitable
+//   by comparing (bar sell price) vs (mineral sell price + energy BUY price per bar).
+//   Energy uses the buy price (replacement cost) since it's consumed by the factory.
+//   Only orders factory processing if refining yields more credits.
+//   If refining is NOT profitable, sells the raw mineral directly instead.
 // - Once processing completes, immediately attempts to create a sell order via marketSell
 //   if no ACTIVE sell order exists for the same bar in the same room.
 // - Scans STORAGE for all bar types and sells any that aren't reserved by an active/queued factory order.
 // - Every 5000 ticks, checks storage for highway deposits (mist, biomass, metal, silicon) and sells them.
+// - Sells excess OPS from storage, keeping a 5000 reserve.
 // - Selling rules:
 //   - Do not attempt direct buy-order deals here; rely on marketSell to create/price the sell order.
 //   - Always call marketSell(roomName, resourceType, amount) to handle order creation.
 //   - Pricing is delegated to marketSell's dynamic pricing.
-// Important note: marketSell creates NEW orders but does NOT maintain existing ones. 
+// Important note: marketSell creates NEW orders but does NOT maintain existing ones.
 // MineralManager only creates orders when needed (not on every tick).
 // Safeguards:
 // - Runs every 100 ticks.
@@ -19,14 +24,15 @@
 // - Exceptions in marketSell are caught and logged; selling stays active to retry next cycle.
 
 var getRoomState = require('getRoomState');
-// Ensure global.marketSell is available
-require('marketSell');
+// Ensure global.marketSell is available AND get the module for computePrice access
+var marketSeller = require('marketSell');
+var marketBuyer = require('marketBuy');
 
 // Highway deposit resource types
 var HIGHWAY_DEPOSITS = [
     RESOURCE_MIST,
-    RESOURCE_BIOMASS,
-    RESOURCE_METAL,
+    //RESOURCE_BIOMASS,
+    //RESOURCE_METAL,
     RESOURCE_SILICON
 ];
 
@@ -42,6 +48,12 @@ var ALL_BAR_TYPES = [
     RESOURCE_PURIFIER
 ];
 
+// Factory recipes for mineral -> bar compression (Screeps constants):
+// 500 mineral + 200 energy -> 100 bars
+// Per unit of bar: 5 mineral + 2 energy
+var MINERAL_PER_BAR = 5;
+var ENERGY_PER_BAR = 2;
+
 // Helper to map mineral to bar
 function getBarTypeFromMineral(mineralType) {
     switch (mineralType) {
@@ -55,6 +67,63 @@ function getBarTypeFromMineral(mineralType) {
         case RESOURCE_CATALYST: return RESOURCE_PURIFIER;
         default: return null;
     }
+}
+
+// Check whether refining mineralType into barType is profitable.
+// Returns an object: { profitable: bool, barPrice, mineralPrice, energyPrice, costPerBar, detail }
+function checkRefiningProfitability(mineralType, barType) {
+    var result = {
+        profitable: false,
+        barPrice: 0,
+        mineralPrice: 0,
+        energyPrice: 0,
+        costPerBar: 0,
+        detail: ''
+    };
+
+    if (!barType || !mineralType) {
+        result.detail = 'missing mineral or bar type';
+        return result;
+    }
+
+    // Bar and mineral use SELL prices (what we'd earn on the market).
+    // Energy uses the BUY price (what it costs to replace the energy consumed by the factory).
+    if (!marketSeller || typeof marketSeller.computePrice !== 'function') {
+        // Can't compute prices — default to refining so we don't break existing behavior
+        result.profitable = true;
+        result.detail = 'marketSeller.computePrice unavailable; defaulting to refine';
+        return result;
+    }
+
+    var barPrice = marketSeller.computePrice(barType);
+    var mineralPrice = marketSeller.computePrice(mineralType);
+
+    // Energy is a consumed input — use the buy price (replacement cost).
+    var energyPrice;
+    if (marketBuyer && typeof marketBuyer.computeBuyPrice === 'function') {
+        energyPrice = marketBuyer.computeBuyPrice(RESOURCE_ENERGY);
+    } else {
+        // Fallback: use sell price if marketBuyer unavailable (conservative — buy >= sell)
+        energyPrice = marketSeller.computePrice(RESOURCE_ENERGY);
+    }
+
+    result.barPrice = barPrice;
+    result.mineralPrice = mineralPrice;
+    result.energyPrice = energyPrice;
+
+    // Cost to produce 1 bar = (MINERAL_PER_BAR * mineral sell price) + (ENERGY_PER_BAR * energy buy price)
+    // mineral sell price = opportunity cost of not selling the raw mineral
+    // energy buy price   = replacement cost of the energy consumed by the factory
+    var costPerBar = (MINERAL_PER_BAR * mineralPrice) + (ENERGY_PER_BAR * energyPrice);
+    result.costPerBar = costPerBar;
+
+    result.profitable = (barPrice > costPerBar);
+    result.detail = barType + ' @ ' + barPrice.toFixed(3) +
+        ' vs cost ' + costPerBar.toFixed(3) +
+        ' (mineral sell ' + mineralPrice.toFixed(3) + ' x' + MINERAL_PER_BAR +
+        ' + energy buy ' + energyPrice.toFixed(3) + ' x' + ENERGY_PER_BAR + ')';
+
+    return result;
 }
 
 function init() {
@@ -94,7 +163,9 @@ function getStorageAmount(rs, resourceType) {
     return 0;
 }
 
-// Find an existing ACTIVE sell order for a given room and resource
+// Find an existing sell order with remaining amount for a given room and resource.
+// Does NOT filter on ord.active — an order waiting for terminal stock (active:false)
+// should still block new orders since a bot is hauling resources to fulfill it.
 function findActiveSellOrder(roomName, resourceType) {
     var mine = Game.market.orders || {};
     for (var id in mine) {
@@ -103,7 +174,6 @@ function findActiveSellOrder(roomName, resourceType) {
         if (ord.type !== ORDER_SELL) continue;
         if (ord.resourceType !== resourceType) continue;
         if (ord.roomName !== roomName) continue;
-        if (ord.active === false) continue; // ignore inactive orders so they don't block new ones
         if ((ord.remainingAmount || 0) <= 0) continue;
         return ord;
     }
@@ -142,20 +212,44 @@ function attemptAutoSell(roomName, rs, resourceType, amount, state, skipCooldown
     if (!terminal) return;
 
     var coolDownTicks = 300; // ~3 cycles at 100-tick cadence
-    if (!skipCooldown && state.lastSellCreateTick && (Game.time - state.lastSellCreateTick) < coolDownTicks) return;
+
+    // FIX 2: cooldown is tracked per-resource rather than per-room.
+    // Previously, one successful sell order would set state.lastSellCreateTick and
+    // block ALL other resource types in the same room for 300 ticks.
+    if (!state.lastSellCreateTicks) state.lastSellCreateTicks = {};
+    var lastTick = state.lastSellCreateTicks[resourceType] || 0;
+    if (!skipCooldown && (Game.time - lastTick) < coolDownTicks) return;
 
     if (!amount || amount <= 0) return;
 
     var existing = findActiveSellOrder(roomName, resourceType);
     if (existing) return;
 
-    if (typeof marketSell === 'function') {
+    // FIX 1: fall back to the already-required marketSeller module when the
+    // global marketSell function hasn't been registered (e.g. not re-exported
+    // from main.js as a global). Previously this check silently failed every
+    // time marketSell wasn't a global, so no orders were ever created.
+    var sellFn = (typeof marketSell === 'function')
+        ? marketSell
+        : (typeof marketSeller === 'function' ? marketSeller : null);
+
+    if (sellFn) {
         try {
             // 3-arg call: price delegated to marketSell
-            var res = marketSell(roomName, resourceType, amount);
-            if (typeof res === 'string' && res.indexOf('[MarketSell] Created SELL order') === 0) {
-                console.log('[MineralManager] ' + res);
-                state.lastSellCreateTick = Game.time;
+            var res = sellFn(roomName, resourceType, amount);
+            // FIX 1 (cont): Accept any truthy non-error response rather than
+            // matching a specific log prefix string. A log format change in
+            // marketSell would previously have silently stopped the cooldown
+            // from being set, causing orders to be spammed every cycle.
+            var failed = !res
+                || (typeof res === 'string' && (
+                    res.indexOf('error') !== -1 ||
+                    res.indexOf('Error') !== -1 ||
+                    res.indexOf('ERR') !== -1
+                ));
+            if (!failed) {
+                console.log('[MineralManager] Sell order created in ' + roomName + ' for ' + resourceType + ': ' + res);
+                state.lastSellCreateTicks[resourceType] = Game.time;
             } else {
                 // keep trying next cycle
                 console.log('[MineralManager] marketSell did not create order in ' + roomName + ' for ' + resourceType + ': ' + res);
@@ -190,10 +284,12 @@ function sellHighwayDeposits() {
                 lastAmount: 0,
                 processingOrderId: null,
                 selling: false,
-                lastSellCreateTick: 0
+                lastSellCreateTicks: {}
             };
         }
         var state = Memory.mineralManager.roomStates[roomName];
+        // Migrate old single-tick field to per-resource map if needed
+        if (!state.lastSellCreateTicks) state.lastSellCreateTicks = {};
 
         // Check each highway deposit type
         for (var i = 0; i < HIGHWAY_DEPOSITS.length; i++) {
@@ -244,10 +340,12 @@ function run() {
                 lastAmount: mineral ? mineral.mineralAmount : 0,
                 processingOrderId: null,
                 selling: false,
-                lastSellCreateTick: 0
+                lastSellCreateTicks: {}
             };
         }
         var state = Memory.mineralManager.roomStates[roomName];
+        // Migrate old single-tick field to per-resource map if needed
+        if (!state.lastSellCreateTicks) state.lastSellCreateTicks = {};
 
         // --- Scan STORAGE only for all bar types; sell any not reserved by factory orders ---
         if (rs.terminal && rs.storage) {
@@ -263,6 +361,17 @@ function run() {
             }
         }
 
+        // --- Sell excess OPS (keep 5000 reserve) ---
+        if (rs.terminal && rs.storage) {
+            var opsAmount = getStorageAmount(rs, RESOURCE_OPS);
+            if (opsAmount > 5000) {
+                var opsToSell = opsAmount - 5000;
+                if (!isReservedByFactoryOrder(roomName, RESOURCE_OPS)) {
+                    attemptAutoSell(roomName, rs, RESOURCE_OPS, opsToSell, state, false);
+                }
+            }
+        }
+
         // Processing trigger only requires extractor; if not present, skip processing logic.
         var extractorList = (rs.structuresByType && rs.structuresByType[STRUCTURE_EXTRACTOR]) ? rs.structuresByType[STRUCTURE_EXTRACTOR] : [];
         var extractor = null;
@@ -271,22 +380,54 @@ function run() {
             if (ex && ex.my) { extractor = ex; break; }
         }
 
+        // Check for an owned factory in this room
+        var factoryList = (rs.structuresByType && rs.structuresByType[STRUCTURE_FACTORY]) ? rs.structuresByType[STRUCTURE_FACTORY] : [];
+        var hasFactory = false;
+        for (var fi = 0; fi < factoryList.length; fi++) {
+            if (factoryList[fi] && factoryList[fi].my) { hasFactory = true; break; }
+        }
+
         if (mineral && extractor) {
             // Detect depletion: last > 0 and now == 0
             if (state.lastAmount > 0 && mineral.mineralAmount === 0) {
                 if (!state.processingOrderId && barTypeRoom) {
-                    var orderResult = (typeof orderFactory === 'function')
-                        ? orderFactory(roomName, barTypeRoom, 'max')
-                        : 'error: orderFactory not available';
 
-                    if (orderResult && orderResult.indexOf('accepted') !== -1) {
-                        var idMatch = orderResult.match(/\[#([^\]]+)\]/);
-                        if (idMatch) {
-                            state.processingOrderId = idMatch[1];
-                            console.log('[MineralManager] Started processing ' + mineral.mineralType + ' into ' + barTypeRoom + ' in ' + roomName + ' (order ' + state.processingOrderId + ')');
+                    // No factory in room — can't refine, sell raw mineral directly
+                    if (!hasFactory) {
+                        console.log('[MineralManager] No factory in ' + roomName + '; selling raw ' + mineral.mineralType);
+                        var rawAmountNoFac = getTotalResourceInRoomState(rs, mineral.mineralType);
+                        if (rawAmountNoFac > 0) {
+                            attemptAutoSell(roomName, rs, mineral.mineralType, rawAmountNoFac, state, true);
                         }
                     } else {
-                        console.log('[MineralManager] Failed to order processing in ' + roomName + ': ' + orderResult);
+                        // === PROFITABILITY CHECK ===
+                        // Compare bar sell price vs opportunity cost of selling raw mineral + energy.
+                        var profCheck = checkRefiningProfitability(mineral.mineralType, barTypeRoom);
+                        console.log('[MineralManager] Profitability check in ' + roomName + ': ' + profCheck.detail);
+
+                        if (profCheck.profitable) {
+                            // Refining is worth it — send to factory
+                            var orderResult = (typeof orderFactory === 'function')
+                                ? orderFactory(roomName, barTypeRoom, 'max')
+                                : 'error: orderFactory not available';
+
+                            if (orderResult && orderResult.indexOf('accepted') !== -1) {
+                                var idMatch = orderResult.match(/\[#([^\]]+)\]/);
+                                if (idMatch) {
+                                    state.processingOrderId = idMatch[1];
+                                    console.log('[MineralManager] Started processing ' + mineral.mineralType + ' into ' + barTypeRoom + ' in ' + roomName + ' (order ' + state.processingOrderId + ')');
+                                }
+                            } else {
+                                console.log('[MineralManager] Failed to order processing in ' + roomName + ': ' + orderResult);
+                            }
+                        } else {
+                            // Refining is NOT profitable — sell raw mineral directly
+                            console.log('[MineralManager] Skipping refining in ' + roomName + '; selling raw ' + mineral.mineralType + ' instead');
+                            var rawAmount = getTotalResourceInRoomState(rs, mineral.mineralType);
+                            if (rawAmount > 0) {
+                                attemptAutoSell(roomName, rs, mineral.mineralType, rawAmount, state, true);
+                            }
+                        }
                     }
                 }
             }

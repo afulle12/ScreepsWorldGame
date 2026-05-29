@@ -1,18 +1,11 @@
 // roleBuilder.js
-// Notes:
-// - All direct room.find calls replaced with getRoomState reads.
-// - No optional chaining used.
-// - Initializes getRoomState once per tick before job selection.
-// - In-room navigation avoids room edges; builders step inward if sitting on an edge.
-// - Pathing wrapper uses maxRooms: 1 and edge penalties to prevent edge pulsing.
-// - Job selection: prioritize spawn construction, then closest job to storage > spawn > creep.
-// - When building ramparts, task isn't complete until rampart reaches 50k hits.
 
 var getRoomState = require('getRoomState');
 
 const BUILDER_LOGGING = false;
 const BUILDER_LOG_INTERVAL = 5;
 const RAMPART_REINFORCE_TARGET = 100000;
+const TERMINAL_ENERGY_RESERVE = 1000; // Don't drain terminal below this for market use
 
 // == TASK PRIORITIES ==
 const PRIORITIES = [
@@ -75,7 +68,7 @@ function flattenStructures(structuresByType) {
   return out;
 }
 
-// Helper: choose closest by range using getRangeTo
+// Helper: choose closest by Chebyshev range — O(N), no pathfinding
 function closestByRange(pos, list) {
   var best = null;
   var bestR = Infinity;
@@ -89,6 +82,51 @@ function closestByRange(pos, list) {
     }
   }
   return best;
+}
+
+/**
+ * Resolves a stored game-object ID, falling back to room.find when
+ * getObjectById returns null (object left the visible range or was GC'd).
+ *
+ * @param {string}  id    - The stored object ID.
+ * @param {Room}    room  - The creep's current room.
+ * @param {string}  hint  - 'dropped' | a STRUCTURE_* constant | 'build' | 'repair' | 'reinforce' | null.
+ * @returns {RoomObject|null}
+ */
+function resolveById(id, room, hint) {
+  if (!id) return null;
+
+  var obj = Game.getObjectById(id);
+  if (obj) return obj;
+
+  // getObjectById failed — attempt a room.find recovery
+  if (hint === 'dropped') {
+    var drops = room.find(FIND_DROPPED_RESOURCES, {
+      filter: function(r) { return r.resourceType === RESOURCE_ENERGY; }
+    });
+    if (!drops.length) return null;
+    var refPos = room.controller ? room.controller.pos : drops[0].pos;
+    return closestByRange(refPos, drops);
+  }
+
+  if (hint === STRUCTURE_STORAGE || hint === STRUCTURE_TERMINAL ||
+      hint === STRUCTURE_CONTAINER) {
+    var structs = room.find(FIND_STRUCTURES, {
+      filter: function(s) {
+        return s.structureType === hint &&
+               s.store && s.store[RESOURCE_ENERGY] > 0;
+      }
+    });
+    if (!structs.length) return null;
+    var refPos2 = room.controller ? room.controller.pos : structs[0].pos;
+    return closestByRange(refPos2, structs);
+  }
+
+  // For build/repair/reinforce the specific target object matters.
+  // A missing ID means it was completed, cancelled, or destroyed — the task
+  // logic above must handle null to work correctly (e.g. build→reinforce
+  // rampart transition). Never substitute a different object.
+  return null;
 }
 
 // == FIND BEST JOB ==
@@ -118,6 +156,10 @@ function findBestJob(creep) {
       targets = [];
       for (var sIdx = 0; sIdx < allStructures.length; sIdx++) {
         var s = allStructures[sIdx];
+
+        // Skip stale cached objects whose engine reference is dead
+        if (!s || !s.id || !Game.getObjectById(s.id)) continue;
+
         if (prio.filter(s)) targets.push(s);
       }
     }
@@ -208,12 +250,23 @@ function logBuilderTasks(room, creep) {
 
 // == FIND IDLE SPOT NEAR ROAD ==
 function findIdleSpotNearRoad(creep) {
-  var rs = getRoomState.get(creep.room.name);
-  var roads = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_ROAD]) ? rs.structuresByType[STRUCTURE_ROAD] : [];
-  var road = null;
-  if (roads.length > 0) {
-    road = creep.pos.findClosestByPath(roads);
+  // Return cached spot if it's still valid (unoccupied, no obstacle)
+  if (creep.memory.idleSpotPos) {
+    var cached = creep.memory.idleSpotPos;
+    var cachedPos = new RoomPosition(cached.x, cached.y, cached.roomName);
+    var hasCreep = cachedPos.lookFor(LOOK_CREEPS).length > 0;
+    if (!hasCreep || creep.pos.isEqualTo(cachedPos)) {
+      return cachedPos;
+    }
+    // Spot occupied by someone else — recompute
+    delete creep.memory.idleSpotPos;
   }
+
+  var rs = getRoomState.get(creep.room.name);
+  var roads = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_ROAD]) || [];
+  if (!roads.length) return null;
+
+  var road = closestByRange(creep.pos, roads);
   if (!road) return null;
 
   var positions = [];
@@ -225,7 +278,6 @@ function findIdleSpotNearRoad(creep) {
       if (x < 0 || x > 49 || y < 0 || y > 49) continue;
       var pos = new RoomPosition(x, y, road.pos.roomName);
 
-      // Avoid positions too close to room edge
       if (isNearRoomEdge(pos, 1)) continue;
 
       var structs = pos.lookFor(LOOK_STRUCTURES);
@@ -238,16 +290,18 @@ function findIdleSpotNearRoad(creep) {
       }
       var hasCreep = pos.lookFor(LOOK_CREEPS).length > 0;
       var terrain = pos.lookFor(LOOK_TERRAIN);
-      // lookFor returns an array, check first element
       if ((terrain[0] === 'wall') || hasRoad || hasCreep || hasObs) continue;
       positions.push(pos);
     }
   }
 
-  if (positions.length) {
-    return closestByRange(creep.pos, positions);
+  if (!positions.length) return null;
+
+  var spot = closestByRange(creep.pos, positions);
+  if (spot) {
+    creep.memory.idleSpotPos = { x: spot.x, y: spot.y, roomName: spot.roomName };
   }
-  return null;
+  return spot;
 }
 
 // == Helper: is a position within N tiles of the room edge? ==
@@ -272,7 +326,7 @@ function nudgeOffRoomEdge(creep) {
     var mv2 = creep.move(TOP);
     if (mv2 === OK) return true;
     if (creep.pos.x > 0 && creep.move(TOP_LEFT) === OK) return true;
-    if (creep.pos.x < 49 && creep.move(BOTTOM_RIGHT) === OK) return true;
+    if (creep.pos.x < 49 && creep.move(TOP_RIGHT) === OK) return true;
   } else if (creep.pos.x === 0) {
     var mv3 = creep.move(RIGHT);
     if (mv3 === OK) return true;
@@ -330,6 +384,23 @@ function moveToWithinRoom(creep, target, opts) {
   creep.moveTo(target, mopts);
 }
 
+// == Helper: count open (non-wall) tiles adjacent to a source ==
+// Uses Room.Terrain — a single cached memory read, no pathfinding.
+function countOpenAdjacentTiles(source) {
+  var terrain = new Room.Terrain(source.pos.roomName);
+  var open = 0;
+  for (var ox = -1; ox <= 1; ox++) {
+    for (var oy = -1; oy <= 1; oy++) {
+      if (ox === 0 && oy === 0) continue;
+      var nx = source.pos.x + ox;
+      var ny = source.pos.y + oy;
+      if (nx < 1 || nx > 48 || ny < 1 || ny > 48) continue;
+      if (terrain.get(nx, ny) !== TERRAIN_MASK_WALL) open++;
+    }
+  }
+  return open;
+}
+
 // == ENERGY ACQUISITION ==
 function acquireEnergy(creep) {
   var rs = getRoomState.get(creep.room.name);
@@ -337,9 +408,11 @@ function acquireEnergy(creep) {
 
   var storArr = [];
   var contArr = [];
+  var termArr = [];
   if (rs && rs.structuresByType) {
     storArr = rs.structuresByType[STRUCTURE_STORAGE] || [];
     contArr = rs.structuresByType[STRUCTURE_CONTAINER] || [];
+    termArr = rs.structuresByType[STRUCTURE_TERMINAL] || [];
   }
 
   var hasStorage = storArr.length > 0;
@@ -354,21 +427,49 @@ function acquireEnergy(creep) {
   var hasStorageWithEnergy = storageWithEnergy.length > 0;
   var storageEmptyMode = hasStorage && !hasStorageWithEnergy;
 
+  // Terminal with energy above reserve threshold
+  var termWithEnergy = [];
+  for (var ti = 0; ti < termArr.length; ti++) {
+    var term = termArr[ti];
+    if (term && term.store && term.store[RESOURCE_ENERGY] > TERMINAL_ENERGY_RESERVE) {
+      termWithEnergy.push(term);
+    }
+  }
+  var hasTerminalWithEnergy = termWithEnergy.length > 0;
+
   // Reuse cached energy target if valid
   if (creep.memory.energyTargetId) {
-    var t = Game.getObjectById(creep.memory.energyTargetId);
+    var t = resolveById(
+      creep.memory.energyTargetId,
+      creep.room,
+      creep.memory.energyTargetType || null
+    );
 
     if (t && t.pos && t.pos.roomName && t.pos.roomName !== creep.room.name) {
       delete creep.memory.energyTargetId;
+      delete creep.memory.energyTargetType;
       t = null;
     }
 
     if (t) {
-      if (hasStorageWithEnergy && (!t.structureType || t.structureType !== STRUCTURE_STORAGE)) {
+      // If storage has energy, prefer storage over non-storage/non-terminal targets
+      if (hasStorageWithEnergy && t.structureType &&
+          t.structureType !== STRUCTURE_STORAGE && t.structureType !== STRUCTURE_TERMINAL) {
         delete creep.memory.energyTargetId;
+        delete creep.memory.energyTargetType;
         t = null;
-      } else if (storageEmptyMode) {
+      } else if (storageEmptyMode && !hasTerminalWithEnergy) {
         delete creep.memory.energyTargetId;
+        delete creep.memory.energyTargetType;
+        t = null;
+      }
+    }
+
+    // Invalidate terminal target if it dropped below reserve
+    if (t && t.structureType === STRUCTURE_TERMINAL) {
+      if (!t.store || t.store[RESOURCE_ENERGY] <= TERMINAL_ENERGY_RESERVE) {
+        delete creep.memory.energyTargetId;
+        delete creep.memory.energyTargetType;
         t = null;
       }
     }
@@ -383,6 +484,7 @@ function acquireEnergy(creep) {
         if (wr === OK) return true;
         if (wr === ERR_NOT_ENOUGH_RESOURCES || wr === ERR_INVALID_TARGET) {
           delete creep.memory.energyTargetId;
+          delete creep.memory.energyTargetType;
         }
         return true;
       }
@@ -396,12 +498,14 @@ function acquireEnergy(creep) {
         if (pk === OK) return true;
         if (pk === ERR_INVALID_TARGET) {
           delete creep.memory.energyTargetId;
+          delete creep.memory.energyTargetType;
         }
         return true;
       }
     }
 
     delete creep.memory.energyTargetId;
+    delete creep.memory.energyTargetType;
   }
 
   // === SELECTION PHASE ===
@@ -418,14 +522,57 @@ function acquireEnergy(creep) {
     var poolStore = storesRich.length ? storesRich : storageWithEnergy;
     var pickStore = closestByRange(creep.pos, poolStore);
     if (pickStore) {
-      creep.memory.energyTargetId = pickStore.id;
+      creep.memory.energyTargetId   = pickStore.id;
+      creep.memory.energyTargetType = STRUCTURE_STORAGE;
       return true;
     }
   }
 
-  // 2) Storage exists but empty - harvest directly
+  // 2) Terminal with energy above reserve - use when storage is empty or absent
+  if (hasTerminalWithEnergy) {
+    var termRich = [];
+    for (var tri = 0; tri < termWithEnergy.length; tri++) {
+      var tt = termWithEnergy[tri];
+      var available = tt.store[RESOURCE_ENERGY] - TERMINAL_ENERGY_RESERVE;
+      if (available >= need) {
+        termRich.push(tt);
+      }
+    }
+    var poolTerm = termRich.length ? termRich : termWithEnergy;
+    var pickTerm = closestByRange(creep.pos, poolTerm);
+    if (pickTerm) {
+      creep.memory.energyTargetId   = pickTerm.id;
+      creep.memory.energyTargetType = STRUCTURE_TERMINAL;
+      return true;
+    }
+  }
+
+  // 3) Storage exists but empty (and no terminal energy) - harvest directly
   if (storageEmptyMode) {
-    var srcEmptyMode = creep.pos.findClosestByPath(FIND_SOURCES_ACTIVE);
+    var sources = (rs && rs.sources) ? rs.sources : [];
+    var activeSources = [];
+    for (var ai = 0; ai < sources.length; ai++) {
+      if (sources[ai] && sources[ai].energy > 0) activeSources.push(sources[ai]);
+    }
+
+    // Filter to sources that still have open harvesting slots.
+    // findInRange is a cheap C++ primitive; countOpenAdjacentTiles uses
+    // Room.Terrain (cached memory read) — no pathfinding involved.
+    var availableSourcesEM = [];
+    for (var avi = 0; avi < activeSources.length; avi++) {
+      var srcCandidate = activeSources[avi];
+      var harvesters = srcCandidate.pos.findInRange(FIND_CREEPS, 1);
+      var occupants = 0;
+      for (var hi = 0; hi < harvesters.length; hi++) {
+        if (harvesters[hi].id !== creep.id) occupants++;
+      }
+      if (occupants < countOpenAdjacentTiles(srcCandidate)) {
+        availableSourcesEM.push(srcCandidate);
+      }
+    }
+    var srcPoolEM = availableSourcesEM.length ? availableSourcesEM : activeSources;
+
+    var srcEmptyMode = closestByRange(creep.pos, srcPoolEM);
     if (srcEmptyMode) {
       if (!creep.pos.inRangeTo(srcEmptyMode, 1)) {
         moveToWithinRoom(creep, srcEmptyMode, { range: 1, reusePath: 15 });
@@ -437,7 +584,7 @@ function acquireEnergy(creep) {
     return false;
   }
 
-  // 3) No storage - use containers, then dropped, then harvest
+  // 4) No storage and no terminal - use containers, then dropped, then harvest
 
   // Containers
   var contWithEnergy = [];
@@ -458,7 +605,8 @@ function acquireEnergy(creep) {
     var poolCont = contRich.length ? contRich : contWithEnergy;
     var pickCont = closestByRange(creep.pos, poolCont);
     if (pickCont) {
-      creep.memory.energyTargetId = pickCont.id;
+      creep.memory.energyTargetId   = pickCont.id;
+      creep.memory.energyTargetType = STRUCTURE_CONTAINER;
       return true;
     }
   }
@@ -496,14 +644,40 @@ function acquireEnergy(creep) {
     if (poolDrops.length) {
       var pickDrop = closestByRange(creep.pos, poolDrops);
       if (pickDrop) {
-        creep.memory.energyTargetId = pickDrop.id;
+        creep.memory.energyTargetId   = pickDrop.id;
+        creep.memory.energyTargetType = 'dropped';
         return true;
       }
     }
   }
 
-  // Last resort: harvest
-  var src = creep.pos.findClosestByPath(FIND_SOURCES_ACTIVE);
+  // Last resort: harvest from nearest active source with open adjacency slots.
+  // findInRange(FIND_CREEPS, 1) is a cheap C++ primitive (3x3 scan).
+  // countOpenAdjacentTiles uses Room.Terrain (cached memory read).
+  // No pathfinding is used. Falls back to all sources if every source is
+  // fully saturated (edge case) so the creep never hard-idles.
+  var allSources = (rs && rs.sources) ? rs.sources : [];
+  var allActiveSources = [];
+  for (var li = 0; li < allSources.length; li++) {
+    if (allSources[li] && allSources[li].energy > 0) allActiveSources.push(allSources[li]);
+  }
+
+  var availableSources = [];
+  for (var vi = 0; vi < allActiveSources.length; vi++) {
+    var srcCand = allActiveSources[vi];
+    var nearCreeps = srcCand.pos.findInRange(FIND_CREEPS, 1);
+    var occupantCount = 0;
+    for (var oi = 0; oi < nearCreeps.length; oi++) {
+      if (nearCreeps[oi].id !== creep.id) occupantCount++;
+    }
+    if (occupantCount < countOpenAdjacentTiles(srcCand)) {
+      availableSources.push(srcCand);
+    }
+  }
+
+  // Graceful degradation: if every source is saturated, use all active sources
+  var srcPool = availableSources.length ? availableSources : allActiveSources;
+  var src = closestByRange(creep.pos, srcPool);
   if (src) {
     if (!creep.pos.inRangeTo(src, 1)) {
       moveToWithinRoom(creep, src, { range: 1, reusePath: 15 });
@@ -525,6 +699,7 @@ var roleBuilder = {
     // State machine
     if (creep.memory.filling && creep.store.getFreeCapacity() === 0) {
       creep.memory.filling = false;
+      delete creep.memory.idleSpotPos; // clear idle cache when switching to work mode
     }
     if (!creep.memory.filling && creep.store[RESOURCE_ENERGY] === 0) {
       creep.memory.filling = true;
@@ -542,7 +717,9 @@ var roleBuilder = {
 
     // Work logic
     var task = creep.memory.task || {};
-    var target = task.targetId ? Game.getObjectById(task.targetId) : null;
+    var target = task.targetId
+      ? resolveById(task.targetId, creep.room, task.type)
+      : null;
 
     // Unassign completed/invalid tasks
     var done = false;
@@ -561,7 +738,6 @@ var roleBuilder = {
             }
           }
           if (newRampart && newRampart.hits < RAMPART_REINFORCE_TARGET) {
-            // Transition to reinforcing the newly built rampart
             creep.memory.task = {
               type: 'reinforce',
               targetId: newRampart.id,
@@ -585,10 +761,16 @@ var roleBuilder = {
     if (task.type === 'reinforce') {
       if (!target) {
         done = true;
-      } else if (target.structureType === STRUCTURE_RAMPART && target.hits >= RAMPART_REINFORCE_TARGET) {
-        done = true;
-      } else if (target.hits >= target.hitsMax) {
-        done = true;
+      } else if (target.structureType === STRUCTURE_RAMPART) {
+        if (target.hits >= RAMPART_REINFORCE_TARGET) {
+          done = true;
+        } else if (target.hits >= target.hitsMax) {
+          done = true;
+        }
+      } else {
+        if (target.hits >= target.hitsMax) {
+          done = true;
+        }
       }
     }
 
@@ -608,7 +790,6 @@ var roleBuilder = {
           targetId: job.target.id,
           label: job.label
         };
-        // Store position and structure type for build tasks (needed for rampart transition)
         if (job.type === 'build' && job.target.pos) {
           newTask.structureType = job.target.structureType;
           newTask.targetPos = {
@@ -623,7 +804,9 @@ var roleBuilder = {
       }
 
       task = creep.memory.task;
-      target = task.targetId ? Game.getObjectById(task.targetId) : null;
+      target = task.targetId
+        ? resolveById(task.targetId, creep.room, task.type)
+        : null;
     }
 
     // Execute task

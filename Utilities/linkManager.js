@@ -10,6 +10,11 @@
  */
 
 var getRoomState = require('getRoomState');
+var singleSourceRoom = require('singleSourceRoom');
+
+// Heap cache: survives between ticks, never serialized to Memory.
+// Structure: { [roomName]: { donors: [], storage: [], recipients: [], lastUpdated: tick } }
+var _linkCache = {};
 
 function runLinks() {
   const MIN_TRANSFER = 200;
@@ -65,57 +70,74 @@ function runLinks() {
     // Skip if no links
     if (allLinks.length === 0) continue;
 
-    // Cache link classifications (refresh every CACHE_DURATION ticks)
+    // === CHAIN MODE for single-source rooms ===
+    if (singleSourceRoom.isSingleSourceActive(roomName)) {
+        var chain = singleSourceRoom.getLinkChain(roomName);
+        if (chain && chain.length >= 2) {
+            for (var ci = 0; ci < chain.length - 1; ci++) {
+                var sender = Game.getObjectById(chain[ci]);
+                var receiver = Game.getObjectById(chain[ci + 1]);
+                if (!sender || !receiver) continue;
+                if (sender.cooldown && sender.cooldown > 0) continue;
+                if (energyOf(sender) < MIN_TRANSFER) continue;
+                if (freeOf(receiver) < MIN_TRANSFER) continue;
+                var chainRes = sender.transferEnergy(receiver);
+                if (chainRes === OK) break; // one transfer per room per tick
+            }
+            continue;
+        }
+    }
+
     var room = Game.rooms[roomName];
     if (!room) continue;
 
-    if (!room._linkCache || Game.time % CACHE_DURATION === 0) {
-      var cache = { donors: [], storage: [], recipients: [] };
+    // Rebuild heap cache if missing or stale
+    var cached = _linkCache[roomName];
+    if (!cached || (Game.time - cached.lastUpdated) >= CACHE_DURATION) {
+      cached = { donors: [], storage: [], recipients: [], lastUpdated: Game.time };
 
       for (var i = 0; i < allLinks.length; i++) {
         var link = allLinks[i];
 
         // Classify as recipient (near controller)
         if (controller && link.pos.inRangeTo(controller, 2)) {
-          cache.recipients.push(link.id);
+          cached.recipients.push(link.id);
         }
         // Classify as storage link
         else if (storage && link.pos.inRangeTo(storage, 2)) {
-          cache.storage.push(link.id);
+          cached.storage.push(link.id);
         }
         // Classify as donor (near source)
         else {
-          var nearSource = false;
           for (var s = 0; s < sources.length; s++) {
             if (link.pos.inRangeTo(sources[s], 3)) {
-              nearSource = true;
+              cached.donors.push(link.id);
               break;
             }
           }
-          if (nearSource) cache.donors.push(link.id);
         }
       }
 
-      room._linkCache = cache;
+      _linkCache[roomName] = cached;
     }
 
-    // Retrieve cached links by ID
+    // Resolve IDs to live objects each tick (getObjectById is cheap)
     var donors = [];
     var storageLinks = [];
     var recipients = [];
 
-    for (var d = 0; d < room._linkCache.donors.length; d++) {
-      var donorLink = Game.getObjectById(room._linkCache.donors[d]);
+    for (var d = 0; d < cached.donors.length; d++) {
+      var donorLink = Game.getObjectById(cached.donors[d]);
       if (donorLink) donors.push(donorLink);
     }
 
-    for (var st = 0; st < room._linkCache.storage.length; st++) {
-      var storageLink = Game.getObjectById(room._linkCache.storage[st]);
+    for (var st = 0; st < cached.storage.length; st++) {
+      var storageLink = Game.getObjectById(cached.storage[st]);
       if (storageLink) storageLinks.push(storageLink);
     }
 
-    for (var r = 0; r < room._linkCache.recipients.length; r++) {
-      var recipientLink = Game.getObjectById(room._linkCache.recipients[r]);
+    for (var r = 0; r < cached.recipients.length; r++) {
+      var recipientLink = Game.getObjectById(cached.recipients[r]);
       if (recipientLink) recipients.push(recipientLink);
     }
 
@@ -187,6 +209,12 @@ function runLinks() {
   }
 }
 
+// Expose cache invalidation for when structures change (e.g. new link placed)
+function invalidateRoom(roomName) {
+  delete _linkCache[roomName];
+}
+
 module.exports = {
-  run: runLinks
+  run: runLinks,
+  invalidateRoom: invalidateRoom
 };

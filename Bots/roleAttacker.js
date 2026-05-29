@@ -1,13 +1,48 @@
-// Attack with auto-selected rally room (closest to target)
-//global.orderAttack('E3N44', 5)
-
-// Attack with specific rally room
-//global.orderAttack('E3N44', 5, 'E3N45')
+// Spawn and rally attackers in spawnRoom, then send them to targetRoom
+// global.orderAttack('E3N45', 'E3N44', 5)
 const iff = require('iff');
+
+// ============================================================================
+// Console Command
+// ============================================================================
+
+global.orderAttack = function(spawnRoom, targetRoom, count) {
+  if (!spawnRoom || !targetRoom || !count || count <= 0) {
+    return "[Attack] Usage: global.orderAttack('spawnRoom', 'targetRoom', count)";
+  }
+
+  if (!Game.rooms[spawnRoom] || !Game.rooms[spawnRoom].controller || !Game.rooms[spawnRoom].controller.my) {
+    return "[Attack] Invalid spawn room: " + spawnRoom + ". Must be a room you control.";
+  }
+
+  if (!Memory.attackOrders) Memory.attackOrders = [];
+
+  var existingOrder = Memory.attackOrders.find(function(o){
+  return o.targetRoom === targetRoom &&
+         (o.rallyPhase === 'spawning' || o.rallyPhase === 'rallying');
+  });
+  if (existingOrder) {
+    return "[Attack] Attack order for " + targetRoom + " already exists and is still forming (phase: " + existingOrder.rallyPhase + "). Wait until it reaches the attacking phase.";
+  }
+
+  Memory.attackOrders.push({
+    targetRoom: targetRoom,
+    spawnRoom: spawnRoom,
+    rallyRoom: spawnRoom,
+    count: count,
+    spawned: 0,
+    startTime: Game.time,
+    rallyPoint: { x: 25, y: 25 },
+    rallyPhase: 'spawning'
+  });
+
+  console.log("[Attack] Order created: " + count + " attackers spawning in " + spawnRoom + " -> " + targetRoom);
+  return "[Attack] Order created: " + count + " attackers spawning in " + spawnRoom + " -> " + targetRoom;
+};
 
 const roleAttacker = {
   /** @param {Creep} creep **/
-  run: function(creep) {
+run: function(creep) {
     const targetRoom = creep.memory.targetRoom;
     const rallyRoom = creep.memory.rallyRoom;
 
@@ -63,7 +98,7 @@ const roleAttacker = {
       if (!rallyResult) return; // Still rallying
     }
 
-    // Phase 3: Move to target room - FIXED: Now uses custom avoidance movement
+    // Phase 3: Move to target room
     if (creep.room.name !== targetRoom) {
       this.moveToAvoidingBlacklist(creep, new RoomPosition(25, 25, targetRoom), {
         visualizePathStyle: { stroke: '#ff0000', lineStyle: 'dashed' },
@@ -185,7 +220,13 @@ const roleAttacker = {
           }
         }
 
-        if (blockers.length) {
+        // Do not bust walls/ramparts in owned or friendly rooms
+        const isOwnedOrFriendly = creep.room.controller && (
+          creep.room.controller.my ||
+          (creep.room.controller.owner && iff.IFF_WHITELIST.includes(creep.room.controller.owner.username))
+        );
+
+        if (blockers.length && !isOwnedOrFriendly) {
           target = blockers.reduce((weakest, s) => s.hits < weakest.hits ? s : weakest, blockers[0]);
         }
       }
@@ -204,13 +245,19 @@ const roleAttacker = {
       return;
     }
 
+    // Do not bust walls/ramparts in owned or friendly rooms
+    const isFriendlyOrOwnedRoom = creep.room.controller && (
+      creep.room.controller.my ||
+      (creep.room.controller.owner && iff.IFF_WHITELIST.includes(creep.room.controller.owner.username))
+    );
+
     const allBarriers = creep.room.find(FIND_STRUCTURES, {
       filter: s =>
         s.structureType === STRUCTURE_WALL ||
         s.structureType === STRUCTURE_RAMPART
     });
 
-    if (allBarriers.length) {
+    if (allBarriers.length && !isFriendlyOrOwnedRoom) {
       const edgeBarriers = allBarriers.filter(s =>
         s.pos.x === 0 ||
         s.pos.x === 49 ||
@@ -234,9 +281,6 @@ const roleAttacker = {
     }
 
     delete creep.memory.targetId;
-    creep.moveTo(new RoomPosition(25, 25, targetRoom), {
-      visualizePathStyle: { stroke: '#cccccc' }
-    });
     creep.say('⚔️ IDLE');
   },
 
@@ -515,7 +559,7 @@ const roleAttacker = {
       const attackersAtRally = _.filter(Game.creeps, c => 
         c.memory.role === 'attacker' && 
         c.memory.targetRoom === order.targetRoom &&
-        c.room.name === order.rallyRoom
+        c.room.name === creep.memory.rallyRoom
       );
 
       const rallyTimeElapsed = order.rallyStartTime ? Game.time - order.rallyStartTime : 0;

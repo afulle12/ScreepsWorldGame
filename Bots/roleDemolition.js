@@ -1,32 +1,43 @@
 //    orderDemolition('E1S1', 'E2S2', 2) - Orders 2 demolition teams from E1S1 to demolish E2S2
 //    orderDemolition('E1S1', 'E2S2', 2, 'controller') - Prioritize dismantling walls/ramparts within range 1 of the controller
 //    orderDemolition('E1S1', 'E2S2', 2, 'wall') - Prioritize dismantling ALL STRUCTURE_WALL in the target room (mission ends when none remain)
+//    orderDemolition('E1S1', 'E2S2', 2, 'rampart') - Prioritize dismantling ALL STRUCTURE_RAMPART in the target room (mission ends when none remain)
 //    cancelDemolitionOrder('E2S2') - Cancels the demolition operation against E2S2
+//    showDemolitionOrders() - Lists all active demolition orders in the console
+//    setDemolitionFocus('E2S2', 'rampart')
 // Notes:
 // - Adds banned rooms list at top.
 // - Optional focus:
 //   - 'controller' -> prioritize walls/ramparts within range 1 of target room controller.
-//   - 'wall' -> dismantle ONLY STRUCTURE_WALL in the target room; do not dismantle other structures; mission is complete only when the room has zero STRUCTURE_WALL.
+//   - 'wall'       -> dismantle ONLY STRUCTURE_WALL in the target room; mission is complete only when the room has zero STRUCTURE_WALL.
+//   - 'rampart'    -> dismantle ONLY STRUCTURE_RAMPART in the target room; mission is complete only when the room has zero STRUCTURE_RAMPART.
 // - No optional chaining used.
 // - In-room navigation avoids room edges; creeps step inward if sitting on an edge.
-// - Pathing wrapper uses maxRooms: 1 and bans edge tiles (except the specific edge exit tile used to cross rooms).
-// - If in-room pathing returns ERR_NO_PATH, a controlled cross-room fallback is attempted to route around terrain partitions.
-// - Cross-room routing avoids banned rooms using routeCallback.
+// - Navigation system unified with Attacker (uses dynamic tower blacklisting, retreats, and PathFinder).
 // - Demolishers have NO CARRY parts. All carry/withdraw/transfer/pickup/drop logic removed.
 // - Mission completion attempts to delete the matching demolition order from Memory.demolitionOrders.
 // - Console logging reduced (only important one-time events are logged).
 // - IMPORTANT: Completed demolishers idle in place (they do NOT auto-return home).
+// - Boosted demolishers: if creep memory contains needsBoost=true, the creep will seek a
+//   boost lab in homeRoom before travelling. No unboost is performed — creeps die in the
+//   target room and compound is reclaimed via stopBoost / labBot cleanup.
 
 const iff = require('iff');
 
 // == BANNED ROOMS (edit this list to keep demolition teams out) ==
 const BANNED_ROOMS = [
-  'E8N49', 'E3N47', 'E9N51'
+  'E8N49', 'E9N51'
 ];
 
-function isRoomBanned(roomName) {
+/**
+ * Checks if a room is banned via hardcode OR dynamic creep tower blacklist
+ */
+function isRoomBanned(roomName, creep) {
   for (var i = 0; i < BANNED_ROOMS.length; i++) {
     if (BANNED_ROOMS[i] === roomName) return true;
+  }
+  if (creep && creep.memory.blacklistedRooms && creep.memory.blacklistedRooms.indexOf(roomName) !== -1) {
+    return true;
   }
   return false;
 }
@@ -59,6 +70,86 @@ function removeOrdersFromArray(arr, targetRoom) {
   return removed;
 }
 
+global.setDemolitionFocus = function(targetRoom, focus) {
+  var validFocus = ['wall', 'rampart', 'controller'];
+  if (focus && validFocus.indexOf(focus) === -1) {
+    console.log('[Demolition] Invalid focus "' + focus + '". Valid options: ' + validFocus.join(', '));
+    return;
+  }
+
+  // Update the order in memory
+  var orders = Memory.demolitionOrders;
+  var found = false;
+  if (orders && orders.length) {
+    for (var i = 0; i < orders.length; i++) {
+      if (orders[i] && orders[i].targetRoom === targetRoom) {
+        orders[i].focus = focus || null;
+        found = true;
+      }
+    }
+  }
+
+  if (!found) {
+    console.log('[Demolition] No active order found for ' + targetRoom);
+    return;
+  }
+
+  // Patch all active creeps on this order so they re-evaluate immediately
+  var patched = 0;
+  for (var name in Game.creeps) {
+    var c = Game.creeps[name];
+    if (c.memory.role === 'demolition' && c.memory.targetRoom === targetRoom) {
+      c.memory.demolitionFocus = focus || null;
+      delete c.memory.targetId; // Drop cached target so they pick up the new focus next tick
+      patched++;
+    }
+  }
+
+  console.log('[Demolition] Focus for ' + targetRoom + ' set to "' + (focus || 'default') + '" — ' + patched + ' creep(s) updated');
+};
+
+global.showDemolitionOrders = function() {
+  var orders = Memory.demolitionOrders;
+  if (!orders || !orders.length) {
+    console.log('[Demolition] No active demolition orders.');
+    return;
+  }
+
+  console.log('[Demolition] Active orders (' + orders.length + '):');
+  for (var i = 0; i < orders.length; i++) {
+    var o = orders[i];
+    if (!o) continue;
+
+    var assignedCreeps = [];
+    for (var name in Game.creeps) {
+      var c = Game.creeps[name];
+      if (c.memory.role === 'demolition' && c.memory.targetRoom === o.targetRoom) {
+        var status;
+        if (c.memory.missionComplete) {
+          status = '✅ done';
+        } else if (c.memory.retreating) {
+          status = '🏃 retreating';
+        } else if (c.memory.needsBoost) {
+          status = '⚗️ boosting';
+        } else if (c.room.name === o.targetRoom) {
+          var currentTarget = c.memory.targetId ? Game.getObjectById(c.memory.targetId) : null;
+          status = '⚒️ ' + (currentTarget ? currentTarget.structureType : 'searching');
+        } else {
+          status = '🚶 ' + c.room.name + ' → ' + o.targetRoom;
+        }
+        assignedCreeps.push(c.name + ' [' + status + ']');
+      }
+    }
+
+    var line = '  #' + (i + 1) + ': ' + o.homeRoom + ' → ' + o.targetRoom;
+    if (o.focus) line += ' (focus: ' + o.focus + ')';
+    line += '\n       Creeps (' + assignedCreeps.length + '): ';
+    line += assignedCreeps.length ? assignedCreeps.join(', ') : 'none assigned';
+
+    console.log(line);
+  }
+};
+
 function purgeDemolitionMemory(targetRoom) {
   var removed = false;
 
@@ -85,17 +176,21 @@ function completeDemolitionMission(creep, targetRoom, note) {
     var msg = '[Demolition] Order complete: ' + roomToClear;
     if (note) msg = msg + ' (' + note + ')';
     console.log(msg);
-  }
-}
 
-function isNearRoomEdge(pos, margin) {
-  margin = margin || 2;
-  return (
-    pos.x < margin ||
-    pos.x > 49 - margin ||
-    pos.y < margin ||
-    pos.y > 49 - margin
-  );
+    // Auto-stop boost order so labBot stops refilling unused labs
+    var homeRoom = creep.memory.homeRoom;
+    if (homeRoom &&
+        Memory.boostManager &&
+        Memory.boostManager.orders &&
+        Memory.boostManager.orders[homeRoom] &&
+        Memory.boostManager.orders[homeRoom].demolisher) {
+
+      var boostOrder = Memory.boostManager.orders[homeRoom].demolisher;
+      boostOrder.stopping = true;
+      boostOrder.active = false;
+      console.log('[Demolition] Auto-stopping demolisher boost in ' + homeRoom);
+    }
+  }
 }
 
 function isEdgeTile(pos) {
@@ -105,13 +200,6 @@ function isEdgeTile(pos) {
   if (pos.y === 0) return true;
   if (pos.y === 49) return true;
   return false;
-}
-
-function getTargetPos(target) {
-  if (!target) return null;
-  if (target.pos) return target.pos;
-  if (typeof target.x === 'number' && typeof target.y === 'number' && target.roomName) return target;
-  return null;
 }
 
 function nudgeOffRoomEdge(creep) {
@@ -137,175 +225,6 @@ function nudgeOffRoomEdge(creep) {
     if (creep.pos.y < 49 && creep.move(TOP_LEFT) === OK) return true;
   }
   return false;
-}
-
-function applyEdgeBan(costMatrix, allowedEdgePos) {
-  for (var x = 0; x < 50; x++) {
-    costMatrix.set(x, 0, 255);
-    costMatrix.set(x, 49, 255);
-  }
-  for (var y = 0; y < 50; y++) {
-    costMatrix.set(0, y, 255);
-    costMatrix.set(49, y, 255);
-  }
-
-  if (allowedEdgePos && isEdgeTile(allowedEdgePos)) {
-    var cur = costMatrix.get(allowedEdgePos.x, allowedEdgePos.y);
-    if (cur < 255) costMatrix.set(allowedEdgePos.x, allowedEdgePos.y, 1);
-  }
-}
-
-function stampTerrainToMatrix(roomName, matrix) {
-  var terrain = Game.map.getRoomTerrain(roomName);
-  for (var x = 0; x < 50; x++) {
-    for (var y = 0; y < 50; y++) {
-      var terrainType = terrain.get(x, y);
-      if (terrainType === TERRAIN_MASK_WALL) {
-        matrix.set(x, y, 255);
-      }
-    }
-  }
-}
-
-function stampStructuresToMatrix(room, matrix) {
-  if (!room) return;
-
-  var structures = room.find(FIND_STRUCTURES);
-  for (var i = 0; i < structures.length; i++) {
-    var s = structures[i];
-
-    if (s.structureType === STRUCTURE_ROAD) {
-      var cur = matrix.get(s.pos.x, s.pos.y);
-      if (cur > 1) matrix.set(s.pos.x, s.pos.y, 1);
-      continue;
-    }
-
-    if (s.structureType === STRUCTURE_CONTAINER) {
-      var cur2 = matrix.get(s.pos.x, s.pos.y);
-      if (cur2 < 5) matrix.set(s.pos.x, s.pos.y, 5);
-      continue;
-    }
-
-    if (s.structureType === STRUCTURE_RAMPART) {
-      if (s.my || s.isPublic) {
-        continue;
-      } else {
-        matrix.set(s.pos.x, s.pos.y, 255);
-        continue;
-      }
-    }
-
-    if (s.structureType === STRUCTURE_WALL) {
-      if (typeof s.hits === 'undefined') {
-        continue;
-      }
-      matrix.set(s.pos.x, s.pos.y, 255);
-      continue;
-    }
-
-    matrix.set(s.pos.x, s.pos.y, 255);
-  }
-}
-
-function moveToWithinRoom(creep, target, opts) {
-  if (isNearRoomEdge(creep.pos, 1)) {
-    if (nudgeOffRoomEdge(creep)) return;
-  }
-
-  var mopts = opts || {};
-  mopts.maxRooms = 1;
-
-  var tpos = getTargetPos(target);
-
-  var targetOnEdge = false;
-  if (tpos && tpos.roomName === creep.room.name) targetOnEdge = isEdgeTile(tpos);
-
-  var isStructure = false;
-  if (target && target.structureType) isStructure = true;
-
-  if (typeof mopts.range === 'undefined' || mopts.range === null) {
-    if (isStructure) mopts.range = 1;
-    else mopts.range = 0;
-  }
-
-  var allowEdgeTarget = false;
-  if (mopts.allowEdgeTarget === true) allowEdgeTarget = true;
-
-  mopts.costCallback = function(roomName, costMatrix) {
-    stampTerrainToMatrix(roomName, costMatrix);
-
-    var room = Game.rooms[roomName];
-    if (room) stampStructuresToMatrix(room, costMatrix);
-
-    if (roomName === creep.room.name) {
-      var allowed = null;
-      if (allowEdgeTarget && targetOnEdge && tpos && tpos.roomName === roomName) allowed = tpos;
-      applyEdgeBan(costMatrix, allowed);
-    }
-  };
-
-  mopts.ignoreDestructibleStructures = false;
-
-  var mv = creep.moveTo(target, mopts);
-
-  if (mv === ERR_NO_PATH && mopts.allowCrossRoomFallback) {
-    var mr = 4;
-    if (mopts.maxRoomsFallback && mopts.maxRoomsFallback > 1) mr = mopts.maxRoomsFallback;
-
-    var fb = {
-      maxRooms: mr,
-      visualizePathStyle: mopts.visualizePathStyle,
-      reusePath: mopts.reusePath || 5,
-      range: mopts.range,
-      ignoreDestructibleStructures: false,
-      costCallback: function(roomName, costMatrix) {
-        stampTerrainToMatrix(roomName, costMatrix);
-
-        var room2 = Game.rooms[roomName];
-        if (room2) stampStructuresToMatrix(room2, costMatrix);
-      }
-    };
-    creep.moveTo(target, fb);
-  }
-}
-
-function moveToRoomAvoidingBanned(creep, targetRoom, opts) {
-  if (creep.room.name === targetRoom) return false;
-
-  if (isRoomBanned(targetRoom)) {
-    creep.say('BAN');
-    logOnce(creep, 'banTarget:' + targetRoom, '[Demolition] ' + creep.name + ': Target room ' + targetRoom + ' is banned; aborting travel');
-    return true;
-  }
-
-  var route = Game.map.findRoute(creep.room.name, targetRoom, {
-    routeCallback: function(roomName) {
-      if (isRoomBanned(roomName)) return Infinity;
-      return 1;
-    }
-  });
-
-  if (route === ERR_NO_PATH || !route || !route.length) {
-    logOnce(creep, 'noRoute:' + creep.room.name + '->' + targetRoom, '[Demolition] ' + creep.name + ': No safe route to ' + targetRoom);
-    return true;
-  }
-
-  var nextHop = route[0];
-  var exitDir = Game.map.findExit(creep.room, nextHop.room);
-  if (exitDir === ERR_NO_PATH) {
-    logOnce(creep, 'noExit:' + creep.room.name + '->' + nextHop.room, '[Demolition] ' + creep.name + ': No exit toward ' + nextHop.room);
-    return true;
-  }
-
-  var exit = creep.pos.findClosestByRange(exitDir);
-  if (exit) {
-    var mopts = opts || {};
-    mopts.allowEdgeTarget = true;
-    moveToWithinRoom(creep, exit, mopts);
-    return true;
-  }
-
-  return true;
 }
 
 function getOrderForRoom(targetRoom) {
@@ -350,6 +269,21 @@ function findAllWalls(room) {
   return out;
 }
 
+function findAllRamparts(room) {
+  var out = [];
+  if (!room) return out;
+
+  var all = room.find(FIND_STRUCTURES, {
+    filter: function(s) {
+      if (s.structureType === STRUCTURE_RAMPART) return true;
+      return false;
+    }
+  });
+
+  for (var i = 0; i < all.length; i++) out.push(all[i]);
+  return out;
+}
+
 const roleDemolition = {
   run: function(creep) {
     this.runDemolisher(creep);
@@ -365,24 +299,64 @@ const roleDemolition = {
       return;
     }
 
-    // Hard rule: if we are sitting on an edge tile, step inward and do nothing else this tick
-    if (isEdgeTile(creep.pos)) {
+    // =========================================================================
+    // BOOST PHASE — hold in home room until all compounds are applied.
+    // Runs before travel so the creep never leaves without its boosts.
+    // No unboost is performed; creeps die in the target room.
+    // =========================================================================
+    if (creep.memory.needsBoost) {
+      this.handleBoosting(creep);
+      return;
+    }
+
+    // Force new pathfinding if flag is set
+    if (creep.memory.forceNewPath) {
+      delete creep.memory.forceNewPath;
+      console.log(`[Demolition] ${creep.name}: Forcing new pathfinding calculation`);
+    }
+
+    // Store current room for next tick's previous room tracking
+    if (!creep.memory.previousRoom) {
+      creep.memory.previousRoom = creep.room.name;
+    }
+
+    // If we just entered the target room on an edge tile, step inward before acting.
+    // Do NOT apply this during inter-room travel - it would trap the creep at the exit forever.
+    if (isEdgeTile(creep.pos) && creep.room.name === targetRoom) {
       nudgeOffRoomEdge(creep);
       return;
     }
 
-    // If we are in a banned room, leave toward home if possible
-    if (isRoomBanned(creep.room.name)) {
-      creep.say('OUT');
-      if (homeRoom && !isRoomBanned(homeRoom)) {
-        moveToRoomAvoidingBanned(creep, homeRoom, { reusePath: 10 });
-      } else {
-        nudgeOffRoomEdge(creep);
-      }
-      return;
+    // Handle retreat state
+    if (creep.memory.retreating) {
+      return this.handleRetreat(creep);
     }
 
-    // Determine focus mode: prefer creep memory, then order memory
+    // Check for hostile towers in current room (unless it's the target room)
+    const shouldAvoidRoom = this.checkForHostileTowers(creep);
+    if (shouldAvoidRoom) {
+      creep.say('🚨 RETREAT!');
+      creep.memory.retreating = true;
+      creep.memory.retreatTarget = creep.memory.previousRoom || homeRoom;
+      this.clearAllMovementCache(creep);
+      return this.handleRetreat(creep);
+    }
+
+    // Update previous room tracking
+    if (creep.memory.previousRoom !== creep.room.name) {
+      creep.memory.previousRoom = creep.room.name;
+    }
+
+    // Check if current room is hard-banned (and we aren't retreating yet)
+    if (isRoomBanned(creep.room.name, creep) && creep.room.name !== targetRoom) {
+      creep.say('BAN');
+      creep.memory.retreating = true;
+      creep.memory.retreatTarget = homeRoom;
+      this.clearAllMovementCache(creep);
+      return this.handleRetreat(creep);
+    }
+
+    // Determine focus mode
     var focus = creep.memory.demolitionFocus;
     if (!focus) {
       var order = getOrderForRoom(targetRoom);
@@ -390,14 +364,17 @@ const roleDemolition = {
       if (focus) creep.memory.demolitionFocus = focus;
     }
 
-    // Move to target room via safe route
+    // Phase 1: Move to target room - mirrors Attacker Phase 3 exactly
     if (targetRoom && creep.room.name !== targetRoom) {
-      var moved = moveToRoomAvoidingBanned(creep, targetRoom, { reusePath: 10 });
-      if (moved) return;
+      this.moveToAvoidingBlacklist(creep, new RoomPosition(25, 25, targetRoom), {
+        visualizePathStyle: { stroke: '#ff0000', lineStyle: 'dashed' },
+        range: 23
+      });
+      creep.say(`⚒️ ${targetRoom}`);
+      return;
     }
 
-    var room = null;
-    if (targetRoom) room = Game.rooms[targetRoom];
+    var room = Game.rooms[targetRoom];
 
     // Safety check - do not demolish friendly rooms
     if (room && room.controller && room.controller.owner) {
@@ -414,158 +391,549 @@ const roleDemolition = {
       }
     }
 
-    // Focus: wall
-    // Mission is complete only when we have visibility of the target room AND there are zero STRUCTURE_WALL.
+    // =========================================================================
+    // Phase 2: In-room dismantle logic
+    // =========================================================================
+
+    // Heal self if damaged and has heal parts
+    const hasHealParts = creep.body.some(part => part.type === HEAL && part.hits > 0);
+    if (hasHealParts && creep.hits < creep.hitsMax) {
+      creep.heal(creep);
+      creep.say('🩹 HEAL');
+    }
+
+    // Recall cached target from last tick
+    if (creep.memory.targetId && Game.time % 5 !== 0) {
+      const cached = Game.getObjectById(creep.memory.targetId);
+      if (cached) {
+        this.dismantleTarget(creep, cached);
+        return;
+      } else {
+        delete creep.memory.targetId;
+      }
+    }
+
+    let target = null;
+
+    // ── Focus: wall ────────────────────────────────────────────────────────
+    // Dismantle ONLY STRUCTURE_WALL; mission ends when none remain.
     if (focus === 'wall') {
-      if (!targetRoom) {
-        // No target means we cannot make progress
-        creep.say('NO');
-        return;
-      }
-
-      if (creep.room.name !== targetRoom) {
-        // Travel handled above, but keep this guard
-        return;
-      }
-
-      // If for some reason room object is not available yet, do not complete
       if (!room) {
-        var mid = new RoomPosition(25, 25, targetRoom);
-        moveToWithinRoom(creep, mid, { reusePath: 5 });
+        creep.moveTo(new RoomPosition(25, 25, targetRoom), { maxRooms: 1, range: 20 });
         creep.say('WALL');
         return;
       }
 
-      var walls = findAllWalls(room);
+      const walls = findAllWalls(room);
       if (walls.length > 0) {
-        var wTarget = creep.pos.findClosestByPath(walls);
-        if (!wTarget) wTarget = creep.pos.findClosestByRange(walls);
-
-        if (!wTarget) {
-          // We see walls but cannot pick one, do not complete
-          var mid2 = new RoomPosition(25, 25, targetRoom);
-          moveToWithinRoom(creep, mid2, { reusePath: 5 });
+        target = creep.pos.findClosestByPath(walls) || creep.pos.findClosestByRange(walls);
+        if (target) {
+          creep.memory.targetId = target.id;
           creep.say('WALL');
+          this.dismantleTarget(creep, target);
           return;
         }
-
-        var dmw = creep.dismantle(wTarget);
-        if (dmw === ERR_NOT_IN_RANGE) {
-          moveToWithinRoom(creep, wTarget, {
-            allowCrossRoomFallback: true,
-            maxRoomsFallback: 4,
-            range: 1,
-            reusePath: 5
-          });
-          creep.say('WALL');
-          return;
-        }
-
-        if (dmw === ERR_NO_BODYPART) {
-          logOnce(creep, 'noWork:' + creep.name, '[Demolition] ' + creep.name + ': Cannot dismantle (no WORK parts)');
-          creep.say('WORK');
-          return;
-        }
-
-        if (dmw === OK) {
-          creep.say('HIT');
-          return;
-        }
-
-        return;
       }
 
-      // Only here is the wall mission complete
       completeDemolitionMission(creep, targetRoom, 'wall');
       creep.say('DONE');
       return;
     }
 
-    // Focus: controller ring first
-    if (focus === 'controller') {
-      if (room) {
-        var ringTargets = findControllerRingTargets(room);
-        if (ringTargets.length > 0) {
-          var ringTarget = creep.pos.findClosestByPath(ringTargets);
-          if (!ringTarget) ringTarget = creep.pos.findClosestByRange(ringTargets);
+    // ── Focus: rampart ─────────────────────────────────────────────────────
+    // Dismantle ONLY STRUCTURE_RAMPART; mission ends when none remain.
+    if (focus === 'rampart') {
+      if (!room) {
+        creep.moveTo(new RoomPosition(25, 25, targetRoom), { maxRooms: 1, range: 20 });
+        creep.say('RAMP');
+        return;
+      }
 
-          var dm0 = creep.dismantle(ringTarget);
-          if (dm0 === ERR_NOT_IN_RANGE) {
-            moveToWithinRoom(creep, ringTarget, {
-              allowCrossRoomFallback: true,
-              maxRoomsFallback: 4,
-              range: 1,
-              reusePath: 5
-            });
-            creep.say('CTR');
-          } else if (dm0 === OK) {
-            creep.say('R1');
-          }
+      const ramparts = findAllRamparts(room);
+      if (ramparts.length > 0) {
+        target = creep.pos.findClosestByPath(ramparts) || creep.pos.findClosestByRange(ramparts);
+        if (target) {
+          creep.memory.targetId = target.id;
+          creep.say('🛡️ RAM');
+          this.dismantleTarget(creep, target);
+          return;
+        }
+      }
+
+      completeDemolitionMission(creep, targetRoom, 'rampart');
+      creep.say('DONE');
+      return;
+    }
+
+    // ── Focus: controller ring first, then fall through to default ─────────
+    if (focus === 'controller' && room) {
+      const ringTargets = findControllerRingTargets(room);
+      if (ringTargets.length > 0) {
+        target = creep.pos.findClosestByPath(ringTargets) || creep.pos.findClosestByRange(ringTargets);
+        if (target) {
+          creep.memory.targetId = target.id;
+          creep.say('CTR');
+          this.dismantleTarget(creep, target);
+          return;
+        }
+      }
+      // Fall through to default targeting when ring is clear
+    }
+
+    // ── Default targeting: ramparts first, then other hostile structures ───
+    if (room) {
+      const ramparts = room.find(FIND_HOSTILE_STRUCTURES, {
+        filter: s => s.structureType === STRUCTURE_RAMPART
+      });
+
+      if (ramparts.length > 0) {
+        target = creep.pos.findClosestByPath(ramparts) || creep.pos.findClosestByRange(ramparts);
+        if (target) {
+          creep.memory.targetId = target.id;
+          creep.say('RAM');
+          this.dismantleTarget(creep, target);
+          return;
+        }
+      }
+
+      const hostileStructures = room.find(FIND_HOSTILE_STRUCTURES, {
+        filter: s => s.structureType !== STRUCTURE_CONTROLLER
+      });
+
+      if (hostileStructures.length > 0) {
+        target = creep.pos.findClosestByPath(hostileStructures) || creep.pos.findClosestByRange(hostileStructures);
+        if (target) {
+          creep.memory.targetId = target.id;
+          creep.say('DIS');
+          this.dismantleTarget(creep, target);
           return;
         }
       }
     }
 
-    // Default targeting: ramparts first, then other hostile structures
-    var ramparts = [];
-    if (room) {
-      ramparts = room.find(FIND_HOSTILE_STRUCTURES, {
-        filter: function(s) {
-          if (s.structureType === STRUCTURE_RAMPART) return true;
-          return false;
-        }
-      });
-    }
-
-    if (ramparts.length > 0) {
-      var target = creep.pos.findClosestByPath(ramparts);
-      if (!target) target = creep.pos.findClosestByRange(ramparts);
-
-      var resultDis = creep.dismantle(target);
-      if (resultDis === ERR_NOT_IN_RANGE) {
-        moveToWithinRoom(creep, target, {
-          allowCrossRoomFallback: true,
-          maxRoomsFallback: 4,
-          range: 1,
-          reusePath: 5
-        });
-        creep.say('MOVE');
-      } else if (resultDis === OK) {
-        creep.say('RAM');
-      }
-      return;
-    }
-
-    var hostileStructures = [];
-    if (room) {
-      hostileStructures = room.find(FIND_HOSTILE_STRUCTURES, {
-        filter: function(s) {
-          if (s.structureType !== STRUCTURE_CONTROLLER) return true;
-          return false;
-        }
-      });
-    }
-
-    if (hostileStructures.length > 0) {
-      var target2 = creep.pos.findClosestByPath(hostileStructures);
-      if (!target2) target2 = creep.pos.findClosestByRange(hostileStructures);
-
-      var dm = creep.dismantle(target2);
-      if (dm === ERR_NOT_IN_RANGE) {
-        moveToWithinRoom(creep, target2, {
-          allowCrossRoomFallback: true,
-          maxRoomsFallback: 4,
-          range: 1,
-          reusePath: 5
-        });
-      } else if (dm === OK) {
-        creep.say('DIS');
-      }
-      return;
-    }
-
     completeDemolitionMission(creep, targetRoom, 'cleared');
     creep.say('DONE');
+  },
+
+  // ==========================================================================
+  // handleBoosting — seek boost labs and apply all compounds before leaving.
+  //
+  // Reads creep.memory.boostLabs ({ compound: [labId, ...] }) set at spawn
+  // time by boostManager.getSpawnBoostMeta(). Works through each compound
+  // one at a time; pre-selects the first lab that is actually stocked with
+  // the compound so the creep never walks toward an empty lab and bounces.
+  // Marks each compound done in creep.memory.boosted. Clears needsBoost
+  // once all compounds are handled.
+  //
+  // ERR_NOT_ENOUGH_RESOURCES means labBot hasn't finished loading yet —
+  // the creep waits at the lab. It only skips a compound if NO lab has any
+  // stock at all (boost order was cancelled or never started).
+  // ==========================================================================
+  handleBoosting: function(creep) {
+    var boostLabs = creep.memory.boostLabs;
+    if (!boostLabs) {
+      // No lab data — nothing to do, proceed normally
+      creep.memory.needsBoost = false;
+      return;
+    }
+
+    if (!creep.memory.boosted) creep.memory.boosted = {};
+
+    // Find the first compound that hasn't been boosted yet
+    var pendingCompound = null;
+    for (var compound in boostLabs) {
+      if (!creep.memory.boosted[compound]) {
+        pendingCompound = compound;
+        break;
+      }
+    }
+
+    // All compounds handled — release the creep
+    if (!pendingCompound) {
+      creep.memory.needsBoost = false;
+      console.log('[Demolition] ' + creep.name + ': fully boosted, heading to target');
+      return;
+    }
+
+    var labIds = boostLabs[pendingCompound];
+
+    // Determine how many units are required to boost all relevant body parts.
+    // Each part needs 30 units. Look up which body part type this compound
+    // boosts via the BOOSTS constant so we don't need a hardcoded mapping.
+    var boostPartType = null;
+    for (var partType in BOOSTS) {
+      if (BOOSTS[partType][pendingCompound]) {
+        boostPartType = partType;
+        break;
+      }
+    }
+
+    var partsToBoost = 0;
+    if (boostPartType) {
+      for (var b = 0; b < creep.body.length; b++) {
+        // Only count parts that haven't already been boosted with this compound
+        if (creep.body[b].type === boostPartType && creep.body[b].boost !== pendingCompound) {
+          partsToBoost++;
+        }
+      }
+    }
+
+    var requiredAmount = partsToBoost * 30;
+
+    // Pre-select the first lab that has enough stock to cover all body parts.
+    // Labs with some stock but not enough (e.g. still being loaded by labBot)
+    // are skipped here so the creep never commits to a lab it can't use.
+    var chosenLab = null;
+    var partialLab = null; // track a partial lab as fallback for waiting
+    for (var i = 0; i < labIds.length; i++) {
+      var candidate = Game.getObjectById(labIds[i]);
+      if (!candidate) continue;
+      if (candidate.mineralType !== pendingCompound) continue;
+      var stock = candidate.store[pendingCompound] || 0;
+      if (stock >= requiredAmount) {
+        chosenLab = candidate;
+        break;
+      }
+      // Remember the best partial lab (most stock) so we can wait near it
+      if (stock > 0 && (!partialLab || stock > (partialLab.store[pendingCompound] || 0))) {
+        partialLab = candidate;
+      }
+    }
+
+    // If no fully-stocked lab yet but labBot is loading one, wait near it
+    if (!chosenLab && partialLab) {
+      logOnce(creep, 'boostWait:' + pendingCompound,
+        '[Demolition] ' + creep.name + ': waiting for ' + pendingCompound +
+        ' lab to finish loading (have ' + (partialLab.store[pendingCompound] || 0) +
+        ', need ' + requiredAmount + ')');
+      creep.say('⏳ LAB');
+      if (creep.pos.getRangeTo(partialLab) > 1) {
+        creep.moveTo(partialLab, {
+          visualizePathStyle: { stroke: '#00ff00', lineStyle: 'dashed' },
+          reusePath: 5
+        });
+      }
+      return;
+    }
+
+    if (chosenLab) {
+      var result = chosenLab.boostCreep(creep);
+
+      if (result === OK) {
+        creep.memory.boosted[pendingCompound] = true;
+        creep.say('⚗️ BOOST');
+        return;
+      }
+
+      if (result === ERR_NOT_IN_RANGE) {
+        creep.moveTo(chosenLab, {
+          visualizePathStyle: { stroke: '#00ff00', lineStyle: 'dashed' },
+          reusePath: 5
+        });
+        creep.say('⚗️ GO');
+        return;
+      }
+
+      // Any other error (e.g. ERR_INVALID_TARGET): fall through to skip below
+    }
+
+    // No lab has any stock at all for this compound — the boost order was
+    // likely cancelled or never started. Skip rather than stall forever.
+    logOnce(creep, 'boostSkip:' + pendingCompound,
+      '[Demolition] ' + creep.name + ': no lab stocked for ' + pendingCompound + ', skipping');
+    creep.memory.boosted[pendingCompound] = true;
+  },
+
+  // ==========================================================================
+  // dismantleTarget - mirrors the Attacker's in-room attack logic exactly.
+  //
+  // 1. Try a direct path to the target (walls/ramparts impassable at cost 255).
+  // 2. If that path is empty (we're walled off), re-path treating walls as cost 1.
+  // 3. Walk the wall-path and collect every wall/rampart structure on each step.
+  // 4. Dismantle the weakest blocker first so we carve our own path.
+  // 5. If no blockers found, move normally toward the original target.
+  // ==========================================================================
+  dismantleTarget: function(creep, target) {
+    // Step 1: Try direct path avoiding walls
+    const standardRoomCallback = () => {
+      const matrix = new PathFinder.CostMatrix();
+      const room = Game.rooms[creep.room.name];
+      if (room) {
+        room.find(FIND_STRUCTURES).forEach(s => {
+          if (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) {
+            matrix.set(s.pos.x, s.pos.y, 255);
+          }
+        });
+      }
+      return matrix;
+    };
+
+    const standardPathRes = PathFinder.search(
+      creep.pos, { pos: target.pos, range: 1 },
+      {
+        maxOps: 1000,
+        plainCost: 10,
+        swampCost: 25,
+        roomCallback: standardRoomCallback
+      }
+    );
+
+    // Step 2: If direct path is blocked, find the blocker via wall-permissive path
+    if (standardPathRes.path.length === 0) {
+      const wallRoomCallback = () => {
+        const matrix = new PathFinder.CostMatrix();
+        const room = Game.rooms[creep.room.name];
+        if (room) {
+          room.find(FIND_STRUCTURES).forEach(s => {
+            if (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) {
+              matrix.set(s.pos.x, s.pos.y, 1);
+            }
+          });
+        }
+        return matrix;
+      };
+
+      const wallPathRes = PathFinder.search(
+        creep.pos, { pos: target.pos, range: 1 },
+        {
+          maxOps: 1000,
+          plainCost: 1,
+          swampCost: 5,
+          roomCallback: wallRoomCallback
+        }
+      );
+
+      // Step 3: Collect blocker structures along the wall-permissive path
+      const blockers = [];
+      for (const step of wallPathRes.path) {
+        const structs = creep.room.lookForAt(LOOK_STRUCTURES, step.x, step.y);
+        for (const s of structs) {
+          if (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) {
+            blockers.push(s);
+          }
+        }
+      }
+
+      // Step 4: Target the weakest blocker
+      if (blockers.length) {
+        target = blockers.reduce((weakest, s) => s.hits < weakest.hits ? s : weakest, blockers[0]);
+        creep.memory.targetId = target.id;
+        creep.say('🪨 BUST');
+      }
+    }
+
+    // Step 5: Dismantle (or move to) the resolved target
+    const result = creep.dismantle(target);
+    if (result === ERR_NOT_IN_RANGE) {
+      creep.moveTo(target, { visualizePathStyle: { stroke: '#ffaa00' } });
+    } else if (result === ERR_NO_BODYPART) {
+      logOnce(creep, 'noWork:' + creep.name, '[Demolition] ' + creep.name + ': Cannot dismantle (no WORK parts)');
+      creep.say('WORK');
+    }
+  },
+
+  // ==========================================================================
+  // NAVIGATION SYSTEM (Unified exactly with Attacker)
+  // ==========================================================================
+
+  moveToAvoidingBlacklist: function(creep, target, opts = {}) {
+    const hasBlacklist = creep.memory.blacklistedRooms && creep.memory.blacklistedRooms.length > 0;
+    const hasBanned = BANNED_ROOMS && BANNED_ROOMS.length > 0;
+
+    // Mirrors Attacker: if no banned/blacklisted rooms, use normal moveTo for efficiency
+    if (!hasBlacklist && !hasBanned) {
+      return creep.moveTo(target, opts);
+    }
+
+    const targetPos = target.pos || target;
+    const goals = [{ pos: targetPos, range: opts.range || 1 }];
+
+    const result = PathFinder.search(creep.pos, goals, {
+      maxOps: opts.maxOps || 4000,
+      maxRooms: opts.maxRooms || 16,
+      plainCost: opts.plainCost || 1,
+      swampCost: opts.swampCost || 5,
+      roomCallback: this.getAvoidanceRoomCallback(creep)
+    });
+
+    if (result.incomplete) {
+      console.log(`[Demolition] ${creep.name}: PathFinder incomplete, avoiding: ${JSON.stringify(creep.memory.blacklistedRooms)} / ${JSON.stringify(BANNED_ROOMS)}`);
+    }
+
+    if (result.path && result.path.length > 0) {
+      const nextStep = result.path[0];
+      const direction = creep.pos.getDirectionTo(nextStep);
+
+      if (opts.visualizePathStyle) {
+        // Only draw steps that are in the current room — foreign-room coordinates
+        // share the same 0-49 x/y space and would render as nonsensical crossing lines.
+        const localSteps = result.path.filter(p => p.roomName === creep.room.name);
+        if (localSteps.length > 0) {
+          creep.room.visual.poly(localSteps, opts.visualizePathStyle);
+        }
+      }
+
+      if (isRoomBanned(nextStep.roomName, creep)) {
+        console.log(`[Demolition] ${creep.name}: ERROR - PathFinder trying to go to banned room ${nextStep.roomName}!`);
+        return ERR_NO_PATH;
+      }
+
+      return creep.move(direction);
+    }
+
+    return ERR_NO_PATH;
+  },
+
+  clearAllMovementCache: function(creep) {
+    delete creep.memory._move;
+    delete creep.memory._path;
+    delete creep.memory.pathToTarget;
+    delete creep.memory.destination;
+
+    creep.memory.forceNewPath = true;
+    console.log(`[Demolition] ${creep.name}: Cleared all movement cache`);
+  },
+
+  handleRetreat: function(creep) {
+    if (!creep.memory.retreatTarget) {
+      creep.memory.retreatTarget = creep.memory.previousRoom || creep.memory.homeRoom;
+    }
+
+    // If still in a banned or blacklisted room, get out immediately
+    if (isRoomBanned(creep.room.name, creep)) {
+      const exitDir = creep.room.findExitTo(creep.memory.retreatTarget);
+      if (exitDir !== ERR_NO_PATH && exitDir !== ERR_INVALID_ARGS) {
+        const exit = creep.pos.findClosestByPath(exitDir);
+        if (exit) {
+          creep.moveTo(exit, { visualizePathStyle: { stroke: '#ff0000', lineStyle: 'solid' } });
+          creep.say('🏃 FLEE!');
+          return;
+        }
+      }
+
+      // Fallback: find any exit that doesn't lead to a banned room
+      const exits = Game.map.describeExits(creep.room.name);
+      for (const direction in exits) {
+        const neighborRoom = exits[direction];
+        if (isRoomBanned(neighborRoom, creep)) continue;
+
+        const exitDirInt = parseInt(direction, 10);
+        const exitFall = creep.pos.findClosestByPath(exitDirInt);
+        if (exitFall) {
+          creep.moveTo(exitFall, { visualizePathStyle: { stroke: '#ff0000', lineStyle: 'solid' } });
+          creep.say('🏃 FLEE!');
+          return;
+        }
+      }
+      return;
+    }
+
+    // Phase 2: Move away from the edge of the safe room
+    const distanceFromEdge = Math.min(
+      creep.pos.x,
+      creep.pos.y,
+      49 - creep.pos.x,
+      49 - creep.pos.y
+    );
+
+    if (distanceFromEdge < 5) {
+      const centerPos = new RoomPosition(25, 25, creep.room.name);
+      creep.moveTo(centerPos, { visualizePathStyle: { stroke: '#ffaa00', lineStyle: 'dotted' } });
+      creep.say('🛡️ SAFE');
+      return;
+    }
+
+    // Phase 3: Heal up if damaged
+    const hasHealParts = creep.body.some(part => part.type === HEAL && part.hits > 0);
+    if (hasHealParts && creep.hits < creep.hitsMax) {
+      creep.heal(creep);
+      creep.say('🩹 HEAL');
+      return;
+    }
+
+    // Phase 4: Wait a few ticks to ensure stable, then exit retreat mode
+    if (!creep.memory.retreatTimer) {
+      creep.memory.retreatTimer = Game.time;
+    }
+
+    if (Game.time - creep.memory.retreatTimer > 3) {
+      delete creep.memory.retreating;
+      delete creep.memory.retreatTarget;
+      delete creep.memory.retreatTimer;
+
+      this.clearAllMovementCache(creep);
+
+      creep.say('✅ READY');
+      console.log(`[Demolition] Creep ${creep.name} finished retreating.`);
+    } else {
+      creep.say(`⏳ ${3 - (Game.time - creep.memory.retreatTimer)}`);
+    }
+  },
+
+  checkForHostileTowers: function(creep) {
+    if (creep.room.name === creep.memory.targetRoom) {
+      return false;
+    }
+
+    const towers = creep.room.find(FIND_HOSTILE_STRUCTURES, {
+      filter: s => {
+        if (s.structureType !== STRUCTURE_TOWER) return false;
+        if (s.owner && iff.IFF_WHITELIST.includes(s.owner.username)) return false;
+        return true;
+      }
+    });
+
+    if (towers.length > 0) {
+      if (!creep.memory.blacklistedRooms) {
+        creep.memory.blacklistedRooms = [];
+      }
+
+      if (creep.memory.blacklistedRooms.indexOf(creep.room.name) === -1) {
+        creep.memory.blacklistedRooms.push(creep.room.name);
+        this.clearAllMovementCache(creep);
+        console.log(`[Demolition] Creep ${creep.name} blacklisted room ${creep.room.name} due to hostile towers`);
+      }
+      return true;
+    }
+    return false;
+  },
+
+  getAvoidanceRoomCallback: function(creep) {
+    return function(roomName) {
+      if (isRoomBanned(roomName, creep) && roomName !== creep.memory.targetRoom) {
+        return false; // Completely block the room
+      }
+
+      const matrix = new PathFinder.CostMatrix();
+      const room = Game.rooms[roomName];
+      if (room) {
+        room.find(FIND_STRUCTURES).forEach(s => {
+          if (s.structureType === STRUCTURE_ROAD) {
+            // Prefer roads
+            matrix.set(s.pos.x, s.pos.y, 1);
+            return;
+          }
+
+          if (s.structureType === STRUCTURE_CONTAINER) {
+            // Always walkable
+            return;
+          }
+
+          if (s.structureType === STRUCTURE_RAMPART) {
+            // Only passable if ours or explicitly public - ally ramparts that
+            // aren't public are still physically blocked to us
+            if (s.my || s.isPublic) return;
+            matrix.set(s.pos.x, s.pos.y, 255);
+            return;
+          }
+
+          // Everything else (walls, spawns, extensions, towers, storage, links,
+          // labs, terminals — including friendly and IFF-ally structures) is impassable.
+          matrix.set(s.pos.x, s.pos.y, 255);
+        });
+      }
+      return matrix;
+    };
   }
 };
 

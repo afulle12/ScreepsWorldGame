@@ -1,440 +1,266 @@
-// roomNavigation.js
-// Shared room-by-room navigation system used by deposit harvesters, thieves, etc.
-// Uses observer-scanned routes when available, falls back to Game.map.findRoute.
-
-var DEBUG = false; // Set to true to diagnose routing issues
-
-// ---------- Route Finding (A* over rooms) ----------
-
-function getRoomLinearDistance(r1, r2) {
-    return Game.map.getRoomLinearDistance(r1, r2);
-}
-
 /**
- * A* pathfinder for room corridors.
- * Respects observer's blocked rooms/edges and custom banned rooms.
- * @param {string} startRoom
- * @param {string} targetRoom
- * @param {string[]} [bannedRooms] - Additional rooms to avoid
- * @returns {string[]|null} Array of room names or null if no path
+ * roomNavigation.js
+ *
+ * Returns fully verified room-to-room paths.
+ * Output format: ['W1N1', 'W1N0', 'W2N0', 'W3N0', 'W3N1']
  */
-function findLinearRoute(startRoom, targetRoom, bannedRooms) {
-    bannedRooms = bannedRooms || [];
-    
-    var openSet = [startRoom];
-    var cameFrom = {};
-    var gScore = {};
-    gScore[startRoom] = 0;
-    
-    var fScore = {};
-    fScore[startRoom] = getRoomLinearDistance(startRoom, targetRoom) * 10;
-    
-    var visited = {};
-    var blockedEdges = (Memory.depositObserver && Memory.depositObserver.blockedEdges) || {};
+const roomNavigation = {
+    DEBUG: false,
 
-    while (openSet.length > 0) {
-        // Find node with lowest fScore
-        var current = openSet[0];
-        var minScore = fScore[current] || Infinity;
-        var minIndex = 0;
-        
-        for (var i = 1; i < openSet.length; i++) {
-            var score = fScore[openSet[i]] || Infinity;
-            if (score < minScore) {
-                minScore = score;
-                current = openSet[i];
-                minIndex = i;
-            }
+    ensureRoute: function (creep, fromRoom, toRoom, routeKey, bannedRooms) {
+        fromRoom = fromRoom.toUpperCase();
+        toRoom = toRoom.toUpperCase();
+        bannedRooms = bannedRooms || [];
+        const indexKey = routeKey + 'Index';
+
+        if (fromRoom === toRoom) {
+            const trivial = [fromRoom];
+            creep.memory[routeKey] = trivial;
+            delete creep.memory[indexKey];
+            return trivial;
         }
-        
-        if (current === targetRoom) {
-            var totalPath = [current];
-            while (current in cameFrom) {
-                current = cameFrom[current];
-                totalPath.unshift(current);
+
+        // --- Attempt to reuse cached route if it still passes validation ---
+        const cached = creep.memory[routeKey];
+        if (cached && Array.isArray(cached) && cached.length > 0) {
+            if (cached[0] === fromRoom && cached[cached.length - 1] === toRoom) {
+                let stillValid = true;
+                for (let i = 0; i < cached.length - 1; i++) {
+                    const edgeKey = cached[i] + ':' + cached[i + 1];
+                    const blockedEdges = (Memory.depositObserver && Memory.depositObserver.blockedEdges) || {};
+                    if (blockedEdges[edgeKey]) {
+                        stillValid = false;
+                        break;
+                    }
+                    // Live re-check when we have vision
+                    if (Game.rooms[cached[i]] && !this.validateEdgeLive(cached[i], cached[i + 1])) {
+                        if (!Memory.depositObserver.blockedEdges) Memory.depositObserver.blockedEdges = {};
+                        Memory.depositObserver.blockedEdges[edgeKey] = true;
+                        stillValid = false;
+                        break;
+                    }
+                }
+                if (stillValid) return cached;
             }
-            return totalPath;
+            delete creep.memory[routeKey];
+            delete creep.memory[indexKey];
         }
-        
-        openSet.splice(minIndex, 1);
-        visited[current] = true;
-        
-        var exits = Game.map.describeExits(current);
-        if (!exits) continue;
 
-        for (var dir in exits) {
-            var neighbor = exits[dir];
-            if (visited[neighbor]) continue;
+        // --- Generate candidate ---
+        const candidate = this.findLinearRoute(fromRoom, toRoom, bannedRooms);
+        if (!candidate || candidate.length === 0) {
+            if (this.DEBUG) console.log(`[RoomNav] ${creep.name} no candidate from ${fromRoom} to ${toRoom}`);
+            return null;
+        }
 
-            // Banned room check
-            if (bannedRooms.indexOf(neighbor) !== -1) continue;
+        // --- Verify every room and every edge ---
+        const verifiedPath = [];
+        if (!Memory.depositObserver) Memory.depositObserver = {};
+        const obs = Memory.depositObserver;
+        const roomStatus = obs.roomStatus || {};
+        const blockedEdges = obs.blockedEdges || {};
 
-            // Game status check (novice/respawn zones)
-            var status = Game.map.getRoomStatus(neighbor);
-            if (status && status.status !== 'normal') continue;
+        for (let i = 0; i < candidate.length; i++) {
+            const roomName = candidate[i];
+            const nextRoom = candidate[i + 1];
+            const prevRoom = candidate[i - 1];
 
-            // Observer's room status (hostile owners, etc.)
-            if (Memory.depositObserver && Memory.depositObserver.roomStatus) {
-                var memStatus = Memory.depositObserver.roomStatus[neighbor];
-                if (memStatus && memStatus.blocked) continue;
+            // 1. Must have observer status
+            const status = roomStatus[roomName];
+            if (!status) {
+                if (this.DEBUG) console.log(`[RoomNav] ${creep.name} missing observer scan: ${roomName}`);
+                this.requestObserverScan(roomName);
+                return null;
+            }
+            if (status.hostile === true || status.blocked === true) {
+                if (this.DEBUG) console.log(`[RoomNav] ${creep.name} room hostile/blocked: ${roomName}`);
+                return null;
             }
 
-            // Observer's blocked edges (impassable terrain between rooms)
-            if (blockedEdges[current + ':' + neighbor]) continue;
+            // 2. Outgoing edge must not be cached as blocked
+            if (nextRoom) {
+                const edgeKey = roomName + ':' + nextRoom;
+                if (blockedEdges[edgeKey]) {
+                    if (this.DEBUG) console.log(`[RoomNav] ${creep.name} edge blocked (cache): ${edgeKey}`);
+                    return null;
+                }
 
-            var tentative_gScore = gScore[current] + 1;
-            
-            if (typeof gScore[neighbor] === 'undefined' || tentative_gScore < gScore[neighbor]) {
-                cameFrom[neighbor] = current;
-                gScore[neighbor] = tentative_gScore;
-                fScore[neighbor] = tentative_gScore + (getRoomLinearDistance(neighbor, targetRoom) * 10);
-                
-                if (openSet.indexOf(neighbor) === -1) {
-                    openSet.push(neighbor);
+                // 3. Live validation when we have vision (catches new walls/ramparts)
+                if (Game.rooms[roomName]) {
+                    if (!this.validateEdgeLive(roomName, nextRoom)) {
+                        if (!Memory.depositObserver.blockedEdges) Memory.depositObserver.blockedEdges = {};
+                        Memory.depositObserver.blockedEdges[edgeKey] = true;
+                        if (this.DEBUG) console.log(`[RoomNav] ${creep.name} edge sealed by live scan: ${edgeKey}`);
+                        return null;
+                    }
                 }
             }
-        }
-    }
-    
-    return null;
-}
 
-// ---------- Edge Handling ----------
-
-function isOnEdge(pos) {
-    return pos.x === 0 || pos.x === 49 || pos.y === 0 || pos.y === 49;
-}
-
-// ---------- Cost Matrix that blocks wrong exits ----------
-
-/**
- * Build a cost matrix that blocks all room exits EXCEPT the one to nextRoomName.
- * This prevents moveTo() from escaping through the wrong exit.
- * 
- * @param {string} currentRoomName
- * @param {string} nextRoomName - The only room we're allowed to exit to
- * @returns {PathFinder.CostMatrix}
- */
-function buildExitConstrainedMatrix(currentRoomName, nextRoomName) {
-    var costs = new PathFinder.CostMatrix();
-    var room = Game.rooms[currentRoomName];
-    
-    if (!room) return costs;
-    
-    // Get the exit direction we WANT to use
-    var allowedExitDir = Game.map.findExit(currentRoomName, nextRoomName);
-    
-    // Block ALL edge tiles first
-    for (var x = 0; x < 50; x++) {
-        costs.set(x, 0, 255);   // Top edge
-        costs.set(x, 49, 255);  // Bottom edge
-    }
-    for (var y = 0; y < 50; y++) {
-        costs.set(0, y, 255);   // Left edge
-        costs.set(49, y, 255);  // Right edge
-    }
-    
-    // Now UNBLOCK only the exit tiles leading to our target room
-    if (allowedExitDir > 0) {
-        var allowedExits = room.find(allowedExitDir);
-        var terrain = room.getTerrain();
-        
-        for (var i = 0; i < allowedExits.length; i++) {
-            var pos = allowedExits[i];
-            // Only unblock if it's not a wall
-            if (terrain.get(pos.x, pos.y) !== TERRAIN_MASK_WALL) {
-                costs.set(pos.x, pos.y, 1); // Make it passable
-            }
-        }
-    }
-    
-    // Also mark structures
-    var structures = room.find(FIND_STRUCTURES);
-    for (var j = 0; j < structures.length; j++) {
-        var s = structures[j];
-        if (s.structureType === STRUCTURE_ROAD) {
-            // Don't override our exit blocking for roads on edges
-            if (s.pos.x > 0 && s.pos.x < 49 && s.pos.y > 0 && s.pos.y < 49) {
-                costs.set(s.pos.x, s.pos.y, 1);
-            }
-        } else if (s.structureType !== STRUCTURE_CONTAINER &&
-                   s.structureType !== STRUCTURE_RAMPART) {
-            costs.set(s.pos.x, s.pos.y, 255);
-        } else if (s.structureType === STRUCTURE_RAMPART && !s.my && !s.isPublic) {
-            costs.set(s.pos.x, s.pos.y, 255);
-        }
-    }
-    
-    // Mark hostile creeps
-    var hostileCreeps = room.find(FIND_HOSTILE_CREEPS);
-    for (var k = 0; k < hostileCreeps.length; k++) {
-        costs.set(hostileCreeps[k].pos.x, hostileCreeps[k].pos.y, 255);
-    }
-    
-    return costs;
-}
-
-// ---------- Room-by-Room Navigation ----------
-
-/**
- * Follow a room route stored in creep memory.
- * Handles edge bounce prevention by moving to room center when on boundary.
- * BLOCKS wrong exits to prevent creep from leaving through unintended rooms.
- * 
- * @param {Creep} creep
- * @param {string} routeKey - Memory key where route array is stored
- * @param {string} goalRoom - Final destination room name
- * @returns {number} OK, ERR_NOT_FOUND, or ERR_NO_PATH
- */
-function followRoomRoute(creep, routeKey, goalRoom) {
-    var route = creep.memory[routeKey];
-    var indexKey = routeKey + 'Index';
-    
-    if (!Array.isArray(route) || route.length === 0) {
-        if (DEBUG) console.log('[RoomNav] ' + creep.name + ' no route in memory key: ' + routeKey);
-        return ERR_NOT_FOUND;
-    }
-    
-    var currentRoomName = creep.room.name;
-    
-    // EXIT BOUNCE PREVENTION
-    // If on edge tile (x=0, x=49, y=0, y=49), immediately move into the room.
-    // This prevents the engine from bouncing us back to the previous room.
-    if (isOnEdge(creep.pos)) {
-        if (DEBUG) console.log('[RoomNav] ' + creep.name + ' on edge, moving to center');
-        creep.moveTo(new RoomPosition(25, 25, creep.room.name), { reusePath: 0, maxOps: 500 });
-        return OK;
-    }
-    
-    // If already in goal room, signal success - let caller handle local movement
-    if (goalRoom && currentRoomName === goalRoom) {
-        if (DEBUG) console.log('[RoomNav] ' + creep.name + ' reached goal room: ' + goalRoom);
-        return OK;
-    }
-    
-    var idx = creep.memory[indexKey];
-    
-    // Sync index with current room if needed
-    if (typeof idx !== 'number' || idx < 0 || idx >= route.length || route[idx] !== currentRoomName) {
-        var foundIdx = -1;
-        for (var i = 0; i < route.length; i++) {
-            if (route[i] === currentRoomName) {
-                foundIdx = i;
-                break;
-            }
-        }
-        
-        if (foundIdx !== -1) {
-            idx = foundIdx;
-            if (DEBUG) console.log('[RoomNav] ' + creep.name + ' synced to route index ' + idx + ' (room: ' + currentRoomName + ')');
-        } else {
-            // Off-route: snap to nearest route room by linear distance
-            if (DEBUG) console.log('[RoomNav] ' + creep.name + ' OFF ROUTE! Current: ' + currentRoomName + ', Route: ' + JSON.stringify(route));
-            var nearestIdx = 0;
-            var nearestDist = Infinity;
-            for (var j = 0; j < route.length; j++) {
-                var dist = Game.map.getRoomLinearDistance(currentRoomName, route[j]);
-                if (typeof dist === 'number' && dist < nearestDist) {
-                    nearestDist = dist;
-                    nearestIdx = j;
+            // 4. Incoming edge must not be cached as blocked
+            if (prevRoom) {
+                const prevEdgeKey = prevRoom + ':' + roomName;
+                if (blockedEdges[prevEdgeKey]) {
+                    if (this.DEBUG) console.log(`[RoomNav] ${creep.name} incoming edge blocked: ${prevEdgeKey}`);
+                    return null;
                 }
             }
-            idx = nearestIdx;
-            if (DEBUG) console.log('[RoomNav] ' + creep.name + ' snapped to nearest route room: ' + route[idx] + ' (index ' + idx + ')');
-        }
-        
-        creep.memory[indexKey] = idx;
-    }
-    
-    // Determine next room in sequence
-    var nextIdx = idx + 1;
-    if (nextIdx >= route.length) {
-        // No more rooms in route
-        if (!goalRoom || currentRoomName === goalRoom) {
-            return OK;
-        }
-        console.log('[RoomNav] ' + creep.name + ' exhausted route but not in goal room. Current: ' + currentRoomName + ', Goal: ' + goalRoom);
-        return ERR_NOT_FOUND;
-    }
-    
-    var nextRoomName = route[nextIdx];
-    
-    // Already crossed into next room (edge case)
-    if (currentRoomName === nextRoomName) {
-        creep.memory[indexKey] = nextIdx;
-        return OK;
-    }
-    
-    // Find exit direction to next room
-    var exitDir = Game.map.findExit(currentRoomName, nextRoomName);
-    if (exitDir < 0) {
-        console.log('[RoomNav] ' + creep.name + ' findExit failed: ' + currentRoomName + ' -> ' + nextRoomName + ' (error: ' + exitDir + ')');
-        return ERR_NO_PATH;
-    }
-    
-    var exitPos = creep.pos.findClosestByRange(exitDir);
-    if (!exitPos) {
-        console.log('[RoomNav] ' + creep.name + ' no exit tile found for dir ' + exitDir);
-        return ERR_NO_PATH;
-    }
-    
-    if (DEBUG) {
-        console.log('[RoomNav] ' + creep.name + ' navigating: ' + currentRoomName + ' -> ' + nextRoomName + 
-            ' (exit dir: ' + exitDir + ', target: ' + exitPos.x + ',' + exitPos.y + ')');
-        console.log('[RoomNav] ' + creep.name + ' full route: ' + JSON.stringify(route) + ' index: ' + idx);
-    }
-    
-    // Visual debugging - draw the intended path
-    if (DEBUG) {
-        creep.room.visual.line(creep.pos, exitPos, { color: '#00ff00', lineStyle: 'dashed' });
-        creep.room.visual.text('→' + nextRoomName, exitPos.x, exitPos.y - 0.5, { color: '#00ff00', font: 0.4 });
-    }
-    
-    // Build cost matrix that BLOCKS all exits except the one we want
-    var costMatrix = buildExitConstrainedMatrix(currentRoomName, nextRoomName);
-    
-    // Local pathfinding to exit tile with constrained exits
-    var moveResult = creep.moveTo(exitPos, { 
-        reusePath: 5, 
-        maxOps: 2000,
-        costCallback: function(roomName) {
-            if (roomName === currentRoomName) {
-                return costMatrix;
-            }
-            return false; // Don't path into other rooms
-        }
-    });
-    
-    if (moveResult === ERR_NO_PATH) {
-        // Clear cached path and try again next tick
-        delete creep.memory._move;
-        if (DEBUG) console.log('[RoomNav] ' + creep.name + ' ERR_NO_PATH to exit, cleared cache');
-    }
-    
-    return OK;
-}
 
-/**
- * Ensure a route exists in creep memory, computing if needed.
- * Uses observer-aware A* first, falls back to Game.map.findRoute.
- * 
- * @param {Creep} creep
- * @param {string} fromRoom - Starting room
- * @param {string} toRoom - Destination room
- * @param {string} routeKey - Memory key to store route
- * @param {string[]} [bannedRooms] - Rooms to avoid
- * @returns {string[]|null} The route array or null if no path
- */
-function ensureRoute(creep, fromRoom, toRoom, routeKey, bannedRooms) {
-    bannedRooms = bannedRooms || [];
-    var indexKey = routeKey + 'Index';
-    
-    // Normalize room names for comparison
-    fromRoom = fromRoom.toUpperCase();
-    toRoom = toRoom.toUpperCase();
-    
-    // If same room, no route needed
-    if (fromRoom === toRoom) {
-        creep.memory[routeKey] = [fromRoom];
-        return creep.memory[routeKey];
-    }
-    
-    var existingRoute = creep.memory[routeKey];
-    
-    // Check if existing route is still valid
-    if (Array.isArray(existingRoute) && existingRoute.length >= 2) {
-        var routeEnd = existingRoute[existingRoute.length - 1];
-        
-        // Route is valid if it ends at our destination
-        if (routeEnd === toRoom) {
-            // Check current room is in the route
-            var currentRoom = creep.room.name.toUpperCase();
-            var currentIdx = -1;
-            for (var i = 0; i < existingRoute.length; i++) {
-                if (existingRoute[i].toUpperCase() === currentRoom) {
-                    currentIdx = i;
-                    break;
-                }
-            }
-            
-            if (currentIdx !== -1) {
-                if (DEBUG) console.log('[RoomNav] ' + creep.name + ' using existing route: ' + JSON.stringify(existingRoute));
-                return existingRoute;
-            } else {
-                if (DEBUG) console.log('[RoomNav] ' + creep.name + ' current room ' + currentRoom + ' not in route, recalculating');
-            }
-        } else {
-            if (DEBUG) console.log('[RoomNav] ' + creep.name + ' route ends at ' + routeEnd + ' but goal is ' + toRoom + ', recalculating');
+            verifiedPath.push(roomName);
         }
-    }
-    
-    // Compute new route using observer-aware A*
-    if (DEBUG) console.log('[RoomNav] ' + creep.name + ' computing new route: ' + fromRoom + ' -> ' + toRoom);
-    var newRoute = findLinearRoute(fromRoom, toRoom, bannedRooms);
-    
-    if (newRoute && newRoute.length >= 1) {
-        creep.memory[routeKey] = newRoute;
+
+        creep.memory[routeKey] = verifiedPath;
         delete creep.memory[indexKey];
-        if (DEBUG) console.log('[RoomNav] ' + creep.name + ' new A* route: ' + JSON.stringify(newRoute));
-        return newRoute;
-    }
-    
-    // Fallback to Game.map.findRoute
-    if (DEBUG) console.log('[RoomNav] ' + creep.name + ' A* failed, trying Game.map.findRoute');
-    var routeResult = Game.map.findRoute(fromRoom, toRoom, {
-        routeCallback: function(roomName) {
-            if (bannedRooms.indexOf(roomName) !== -1) return Infinity;
-            if (Memory.depositObserver && Memory.depositObserver.roomStatus) {
-                var memStatus = Memory.depositObserver.roomStatus[roomName];
-                if (memStatus && memStatus.blocked) return Infinity;
+        if (this.DEBUG) console.log(`[RoomNav] ${creep.name} verified: ${JSON.stringify(verifiedPath)}`);
+        return verifiedPath;
+    },
+
+    /**
+     * Queues a room for observer scanning.
+     */
+    requestObserverScan: function (roomName) {
+        if (!Memory.observerQueue) Memory.observerQueue = [];
+        if (!Memory.observerQueue.includes(roomName)) {
+            Memory.observerQueue.push(roomName);
+        }
+    },
+
+    /**
+     * If we have vision, check that at least one tile on the exit edge
+     * to nextRoom is open (not a wall, not blocked by an enemy rampart).
+     * Returns true if an open path exists.
+     */
+    validateEdgeLive: function (roomName, nextRoom) {
+        const room = Game.rooms[roomName];
+        if (!room) return true; // No vision; assume open until observer confirms
+
+        const exitDir = Game.map.findExit(roomName, nextRoom);
+        if (exitDir === ERR_NO_PATH || exitDir === ERR_INVALID_ARGS) return false;
+
+        const terrain = room.getTerrain();
+        const structures = room.find(FIND_STRUCTURES);
+        const blockedPos = {};
+
+        for (let i = 0; i < structures.length; i++) {
+            const s = structures[i];
+            if (s.structureType === STRUCTURE_WALL) {
+                blockedPos[s.pos.x + ':' + s.pos.y] = true;
+            } else if (s.structureType === STRUCTURE_RAMPART) {
+                if (!s.my && !s.isPublic) {
+                    blockedPos[s.pos.x + ':' + s.pos.y] = true;
+                }
             }
-            return 1;
         }
-    });
-    
-    if (routeResult === ERR_NO_PATH || !routeResult || routeResult.length === 0) {
-        console.log('[RoomNav] ' + creep.name + ' no route from ' + fromRoom + ' to ' + toRoom);
-        return null;
-    }
-    
-    var fallbackRoute = [fromRoom];
-    for (var i = 0; i < routeResult.length; i++) {
-        if (routeResult[i] && routeResult[i].room) {
-            fallbackRoute.push(routeResult[i].room);
+
+        let xStart, xEnd, yStart, yEnd;
+        switch (exitDir) {
+            case FIND_EXIT_TOP:    xStart = 0; xEnd = 49; yStart = 0; yEnd = 0; break;
+            case FIND_EXIT_RIGHT:  xStart = 49; xEnd = 49; yStart = 0; yEnd = 49; break;
+            case FIND_EXIT_BOTTOM: xStart = 0; xEnd = 49; yStart = 49; yEnd = 49; break;
+            case FIND_EXIT_LEFT:   xStart = 0; xEnd = 0; yStart = 0; yEnd = 49; break;
+            default: return true;
         }
+
+        for (let x = xStart; x <= xEnd; x++) {
+            for (let y = yStart; y <= yEnd; y++) {
+                if (terrain.get(x, y) !== TERRAIN_MASK_WALL && !blockedPos[x + ':' + y]) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    },
+
+    /**
+     * Builds a candidate route from origin to destination.
+     * Uses observer-aware blocking so hostile/banned rooms are avoided.
+     * Returns an array of room names including the origin.
+     */
+    findLinearRoute: function (fromRoom, toRoom, bannedRooms) {
+        if (fromRoom === toRoom) return [fromRoom];
+        bannedRooms = bannedRooms || [];
+
+        const route = Game.map.findRoute(fromRoom, toRoom, {
+            routeCallback: (roomName) => {
+                if (bannedRooms.includes(roomName)) return Infinity;
+
+                const status = (Memory.depositObserver && Memory.depositObserver.roomStatus)
+                    ? Memory.depositObserver.roomStatus[roomName]
+                    : null;
+                if (status && (status.hostile === true || status.blocked === true)) return Infinity;
+
+                return 1;
+            }
+        });
+
+        if (route === ERR_NO_PATH) return null;
+        if (!route || route.length === 0) return null;
+
+        // findRoute returns the rooms you enter; prepend the origin.
+        return [fromRoom].concat(route.map(r => r.room));
+    },
+
+    /**
+     * Moves the creep along a verified room route.
+     * Call this every tick with the array returned by ensureRoute.
+     */
+    followRoomRoute: function (creep, roomRoute) {
+        if (!roomRoute || roomRoute.length === 0) return;
+
+        // Consume rooms we have already reached
+        while (roomRoute.length > 0 && creep.room.name === roomRoute[0]) {
+            roomRoute.shift();
+        }
+
+        if (roomRoute.length === 0) return;
+
+        const nextRoom = roomRoute[0];
+        if (creep.room.name === nextRoom) return; // Arrived at final room
+
+        const exitDir = creep.room.findExitTo(nextRoom);
+        if (exitDir === ERR_NO_PATH || exitDir === ERR_INVALID_ARGS) return;
+
+        const exit = creep.pos.findClosestByRange(exitDir);
+        if (exit) {
+            creep.moveTo(exit, {
+                visualizePathStyle: { stroke: '#ffffff', lineStyle: 'dashed' }
+            });
+        }
+    },
+
+    /**
+     * Utility: builds a CostMatrix for local pathfinding that treats
+     * enemy walls and non-public ramparts as impassable.
+     */
+    buildExitConstrainedMatrix: function (roomName) {
+        const room = Game.rooms[roomName];
+        if (!room) return null;
+
+        const matrix = new PathFinder.CostMatrix();
+        const terrain = room.getTerrain();
+
+        for (let x = 0; x < 50; x++) {
+            for (let y = 0; y < 50; y++) {
+                if (terrain.get(x, y) === TERRAIN_MASK_WALL) {
+                    matrix.set(x, y, 255);
+                }
+            }
+        }
+
+        const structures = room.find(FIND_STRUCTURES);
+        for (let i = 0; i < structures.length; i++) {
+            const s = structures[i];
+            if (s.structureType === STRUCTURE_WALL) {
+                matrix.set(s.pos.x, s.pos.y, 255);
+            } else if (s.structureType === STRUCTURE_RAMPART) {
+                if (!s.my && !s.isPublic) {
+                    matrix.set(s.pos.x, s.pos.y, 255);
+                }
+            }
+        }
+
+        return matrix;
     }
-    
-    creep.memory[routeKey] = fallbackRoute;
-    delete creep.memory[indexKey];
-    if (DEBUG) console.log('[RoomNav] ' + creep.name + ' fallback route: ' + JSON.stringify(fallbackRoute));
-    return fallbackRoute;
-}
-
-/**
- * Clear route data from creep memory.
- * @param {Creep} creep
- * @param {string} routeKey
- */
-function clearRoute(creep, routeKey) {
-    delete creep.memory[routeKey];
-    delete creep.memory[routeKey + 'Index'];
-    delete creep.memory._move; // Also clear cached moveTo path
-}
-
-/**
- * Enable/disable debug logging
- * @param {boolean} enabled
- */
-function setDebug(enabled) {
-    DEBUG = !!enabled;
-    console.log('[RoomNav] Debug mode: ' + (DEBUG ? 'ON' : 'OFF'));
-}
-
-module.exports = {
-    findLinearRoute: findLinearRoute,
-    followRoomRoute: followRoomRoute,
-    ensureRoute: ensureRoute,
-    clearRoute: clearRoute,
-    isOnEdge: isOnEdge,
-    setDebug: setDebug
 };
+
+module.exports = roomNavigation;

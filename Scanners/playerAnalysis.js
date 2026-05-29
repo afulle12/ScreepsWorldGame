@@ -5,38 +5,35 @@
  * CONSOLE COMMANDS:
  * ═══════════════════════════════════════════════════════════════════
  * 
- *   player('PlayerName')   - Start full analysis of a player
- *                            Scans all rooms in observer range, finds
- *                            player's rooms, runs intel on each, and
- *                            generates comprehensive report
+ *   player('PlayerName')           - Start full analysis of a player
+ *                                    Scans all rooms in observer range, finds
+ *                                    player's rooms, runs intel on each, and
+ *                                    generates comprehensive report
  * 
- *   playerStatus()         - Check progress of active analysis
- *                            Shows current phase, progress %, rooms found
+ *   playerStatus()                 - Check progress of active analysis
+ *                                    Shows current phase, progress %, rooms found
  * 
- *   playerCancel()         - Cancel active analysis
- *                            Stops scanning/intel gathering immediately
+ *   playerCancel()                 - Cancel active analysis
+ *                                    Stops scanning/intel gathering immediately
  * 
- *   playerLast()           - View last analysis report
- *                            Reprints the full report from memory
- *                            Data expires after 10,000 ticks
+ *   playerLast()                   - View last analysis report
+ *                                    Reprints the full report from memory
+ *                                    Data expires after 10,000 ticks
+ * 
+ *   playerScan('Name','CREEPCOUNT') - Lightweight creep census scan
+ *                                    Scans all rooms in observer range and
+ *                                    counts creeps by category:
+ *                                      Military  - any ATTACK/RANGED_ATTACK/HEAL parts
+ *                                      Worker    - >25% WORK parts
+ *                                      Supplier  - <10% WORK, logistics hauler
+ *                                      Claimer   - any CLAIM parts
+ *                                      Scout     - only MOVE parts
+ *                                      Other     - 10-25% WORK, hybrid creeps
+ *                                    Prints totals + per-room table
+ * 
+ *   playerScanCancel()             - Cancel active creep scan
  * 
  * ═══════════════════════════════════════════════════════════════════
- * 
- * This module will:
- * 1. Use wideScan to find all rooms owned by the target player
- * 2. Run intel on each room (suppressing normal output)
- * 3. Collect statistics and scores
- * 4. Generate a comprehensive report including:
- *    - Room strength classifications (weak/average/strong)
- *    - Aggregated player scores
- *    - Room statistics (energy, creeps, construction)
- *    - Nuclear strike capabilities (theirs vs ours)
- * 
- * INTEGRATION:
- *   const playerAnalysis = require('playerAnalysis');
- *   profiler.registerObject(playerAnalysis, 'playerAnalysis');
- *   // In main loop (MUST run every tick, no modulo):
- *   profileSection('playerAnalysis.run', function(){ playerAnalysis.run(); });
  */
 
 const NUKE_RANGE = 5;
@@ -47,6 +44,9 @@ const SCORE_THRESHOLDS = {
     weak: 40,
     strong: 70
 };
+
+// Supported lightweight scan types
+const SCAN_TYPES = ['CREEPCOUNT'];
 
 /**
  * Parse a room name into world coordinates
@@ -232,9 +232,6 @@ function findObserverForRoom(targetRoom, observerMap) {
  * Run intel silently and return data (no console output)
  */
 function runIntelSilent(room) {
-    // This is a condensed version of the intel analysis
-    // We'll gather the same data but without printing
-    
     const result = {
         room: room.name,
         owner: room.controller && room.controller.owner ? room.controller.owner.username : 'Unowned',
@@ -607,6 +604,10 @@ function runIntelSilent(room) {
     return result;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// PLAYER ANALYSIS
+// ═══════════════════════════════════════════════════════════════════
+
 /**
  * Start player analysis
  */
@@ -616,14 +617,12 @@ function startPlayerAnalysis(playerName) {
         return;
     }
     
-    // Check if already running
     if (Memory.playerAnalysis && Memory.playerAnalysis.active) {
         console.log('[PlayerAnalysis] ERROR: Analysis already in progress for ' + Memory.playerAnalysis.targetPlayer);
         console.log('[PlayerAnalysis] Use playerCancel() to cancel the current analysis.');
         return;
     }
     
-    // Get observers
     const observerMap = getMyObservers();
     const observerRooms = Object.keys(observerMap);
     
@@ -635,10 +634,8 @@ function startPlayerAnalysis(playerName) {
     console.log('[PlayerAnalysis] Starting analysis of player: ' + playerName);
     console.log('[PlayerAnalysis] Found ' + observerRooms.length + ' observer(s)');
     
-    // Get all rooms in observer range
     const allRooms = getRoomsInObserverRange();
     
-    // Initialize state
     Memory.playerAnalysis = {
         active: true,
         phase: 'scanning',
@@ -646,14 +643,12 @@ function startPlayerAnalysis(playerName) {
         startTick: Game.time,
         observerRooms: observerRooms,
         
-        // Phase 1: Wide scan to find player rooms
         scanQueue: allRooms.slice(),
         scannedCount: 0,
         totalScanRooms: allRooms.length,
         foundRooms: [],
         lastObservedRoom: null,
         
-        // Phase 2: Intel gathering
         intelQueue: [],
         intelResults: [],
         intelCount: 0,
@@ -708,7 +703,7 @@ function getAnalysisStatus() {
 }
 
 /**
- * Run function - call every tick from main loop
+ * Main run function - call every tick from main loop
  */
 function run() {
     // Auto-clear expired analysis data
@@ -716,23 +711,25 @@ function run() {
         delete Memory.lastPlayerAnalysis;
     }
     
-    if (!Memory.playerAnalysis || !Memory.playerAnalysis.active) return;
-    
-    const state = Memory.playerAnalysis;
-    const observerMap = getMyObservers();
-    
-    if (state.phase === 'scanning') {
-        runScanPhase(state, observerMap);
-    } else if (state.phase === 'intel') {
-        runIntelPhase(state, observerMap);
+    if (Memory.playerAnalysis && Memory.playerAnalysis.active) {
+        const state = Memory.playerAnalysis;
+        const observerMap = getMyObservers();
+        
+        if (state.phase === 'scanning') {
+            runScanPhase(state, observerMap);
+        } else if (state.phase === 'intel') {
+            runIntelPhase(state, observerMap);
+        }
     }
+    
+    // Lightweight scan tick (playerScan)
+    runScanTick();
 }
 
 /**
  * Phase 1: Scan for player rooms
  */
 function runScanPhase(state, observerMap) {
-    // Process room observed last tick
     if (state.lastObservedRoom) {
         const room = Game.rooms[state.lastObservedRoom];
         if (room) {
@@ -748,7 +745,6 @@ function runScanPhase(state, observerMap) {
         state.lastObservedRoom = null;
     }
     
-    // Check if scan complete
     if (state.scanQueue.length === 0) {
         console.log('[PlayerAnalysis] Phase 1 complete. Found ' + state.foundRooms.length + ' room(s).');
         
@@ -758,7 +754,6 @@ function runScanPhase(state, observerMap) {
             return;
         }
         
-        // Move to intel phase
         state.phase = 'intel';
         state.intelQueue = state.foundRooms.slice();
         state.totalIntelRooms = state.foundRooms.length;
@@ -766,7 +761,6 @@ function runScanPhase(state, observerMap) {
         return;
     }
     
-    // Get next room to scan
     const nextRoom = state.scanQueue.shift();
     const observer = findObserverForRoom(nextRoom, observerMap);
     
@@ -781,7 +775,6 @@ function runScanPhase(state, observerMap) {
         state.scannedCount++;
     }
     
-    // Progress update
     if (state.scannedCount > 0 && state.scannedCount % 100 === 0) {
         const progress = ((state.scannedCount / state.totalScanRooms) * 100).toFixed(1);
         console.log('[PlayerAnalysis] Scan progress: ' + state.scannedCount + '/' + state.totalScanRooms + ' (' + progress + '%) - Found ' + state.foundRooms.length + ' room(s)');
@@ -792,7 +785,6 @@ function runScanPhase(state, observerMap) {
  * Phase 2: Gather intel on found rooms
  */
 function runIntelPhase(state, observerMap) {
-    // Process room observed last tick
     if (state.lastObservedRoom) {
         const room = Game.rooms[state.lastObservedRoom];
         if (room) {
@@ -803,14 +795,12 @@ function runIntelPhase(state, observerMap) {
         state.lastObservedRoom = null;
     }
     
-    // Check if intel complete
     if (state.intelQueue.length === 0) {
         console.log('[PlayerAnalysis] Phase 2 complete. Intel gathered on ' + state.intelResults.length + ' room(s).');
         completeAnalysis(state);
         return;
     }
     
-    // Get next room for intel
     const nextRoom = state.intelQueue.shift();
     const observer = findObserverForRoom(nextRoom, observerMap);
     
@@ -834,18 +824,14 @@ function completeAnalysis(state) {
     const results = state.intelResults;
     const playerName = state.targetPlayer;
     
-    // Calculate nuke capabilities
     const myNukers = getMyNukerRooms();
     const myRooms = getMyRooms();
     
-    // Enemy rooms that can nuke my rooms
     const enemyNukeThreats = [];
-    // My rooms that can nuke enemy rooms
     const myNukeTargets = [];
     
     for (const intel of results) {
         if (intel.structures.nuker) {
-            // Check which of my rooms this enemy nuker can hit
             const threatenedRooms = myRooms.filter(r => canNuke(intel.room, r));
             if (threatenedRooms.length > 0) {
                 enemyNukeThreats.push({
@@ -857,7 +843,6 @@ function completeAnalysis(state) {
             }
         }
         
-        // Check which of my nukers can hit this enemy room
         for (const myNuker of myNukers) {
             if (canNuke(myNuker.room, intel.room)) {
                 const existing = myNukeTargets.find(t => t.myRoom === myNuker.room);
@@ -874,32 +859,27 @@ function completeAnalysis(state) {
         }
     }
     
-    // Classify rooms
-    const weakRooms = results.filter(r => r.scores.overall < SCORE_THRESHOLDS.weak);
-    const strongRooms = results.filter(r => r.scores.overall >= SCORE_THRESHOLDS.strong);
+    const weakRooms    = results.filter(r => r.scores.overall < SCORE_THRESHOLDS.weak);
+    const strongRooms  = results.filter(r => r.scores.overall >= SCORE_THRESHOLDS.strong);
     const averageRooms = results.filter(r => r.scores.overall >= SCORE_THRESHOLDS.weak && r.scores.overall < SCORE_THRESHOLDS.strong);
     
-    // Calculate aggregates
-    const avgOverall = results.length > 0 ? results.reduce((sum, r) => sum + r.scores.overall, 0) / results.length : 0;
-    const avgEconomic = results.length > 0 ? results.reduce((sum, r) => sum + r.scores.economic, 0) / results.length : 0;
-    const avgMilitary = results.length > 0 ? results.reduce((sum, r) => sum + r.scores.military, 0) / results.length : 0;
+    const avgOverall     = results.length > 0 ? results.reduce((sum, r) => sum + r.scores.overall, 0)     / results.length : 0;
+    const avgEconomic    = results.length > 0 ? results.reduce((sum, r) => sum + r.scores.economic, 0)    / results.length : 0;
+    const avgMilitary    = results.length > 0 ? results.reduce((sum, r) => sum + r.scores.military, 0)    / results.length : 0;
     const avgDualPurpose = results.length > 0 ? results.reduce((sum, r) => sum + r.scores.dualPurpose, 0) / results.length : 0;
     
-    // Total resources
-    const totalStorageEnergy = results.reduce((sum, r) => sum + r.resources.storageEnergy, 0);
+    const totalStorageEnergy  = results.reduce((sum, r) => sum + r.resources.storageEnergy, 0);
     const totalTerminalEnergy = results.reduce((sum, r) => sum + r.resources.terminalEnergy, 0);
-    const totalPower = results.reduce((sum, r) => sum + r.resources.power, 0);
-    const totalCombatBoosts = results.reduce((sum, r) => sum + r.resources.combatBoosts, 0);
+    const totalPower          = results.reduce((sum, r) => sum + r.resources.power, 0);
+    const totalCombatBoosts   = results.reduce((sum, r) => sum + r.resources.combatBoosts, 0);
     
-    // Structure counts
-    const totalSpawns = results.reduce((sum, r) => sum + r.structures.spawns, 0);
-    const totalTowers = results.reduce((sum, r) => sum + r.structures.towers, 0);
-    const totalLabs = results.reduce((sum, r) => sum + r.structures.labs, 0);
-    const roomsWithNuker = results.filter(r => r.structures.nuker).length;
-    const roomsWithFactory = results.filter(r => r.structures.factory).length;
+    const totalSpawns        = results.reduce((sum, r) => sum + r.structures.spawns, 0);
+    const totalTowers        = results.reduce((sum, r) => sum + r.structures.towers, 0);
+    const totalLabs          = results.reduce((sum, r) => sum + r.structures.labs, 0);
+    const roomsWithNuker     = results.filter(r => r.structures.nuker).length;
+    const roomsWithFactory   = results.filter(r => r.structures.factory).length;
     const roomsWithPowerSpawn = results.filter(r => r.structures.powerSpawn).length;
     
-    // Print report
     printPlayerReport({
         playerName,
         elapsed,
@@ -926,7 +906,6 @@ function completeAnalysis(state) {
         myNukers
     });
     
-    // Send notification
     let notifyMsg = `[PlayerAnalysis] ${playerName} analysis complete.\n`;
     notifyMsg += `Rooms: ${results.length} (${strongRooms.length} strong, ${averageRooms.length} average, ${weakRooms.length} weak)\n`;
     notifyMsg += `Avg Score: ${avgOverall.toFixed(1)}/100\n`;
@@ -935,7 +914,6 @@ function completeAnalysis(state) {
     }
     Game.notify(notifyMsg, 0);
     
-    // Clean up
     delete Memory.playerAnalysis;
 }
 
@@ -950,12 +928,10 @@ function printPlayerReport(data) {
     lines.push('PLAYER ANALYSIS: ' + data.playerName + ' | Rooms: ' + data.results.length + ' | Analysis Time: ' + data.elapsed + ' ticks');
     lines.push(div);
     
-    // === SCORE SUMMARY ===
     lines.push('');
     lines.push('📊 AVERAGE SCORES:');
     lines.push('   Overall: ' + data.avgOverall.toFixed(1) + '/100 | Economic: ' + data.avgEconomic.toFixed(1) + '/100 | Military: ' + data.avgMilitary.toFixed(1) + '/100 | Infrastructure: ' + data.avgDualPurpose.toFixed(1) + '/100');
     
-    // === ROOM CLASSIFICATIONS ===
     lines.push('');
     lines.push('🏠 ROOM CLASSIFICATIONS:');
     
@@ -963,30 +939,25 @@ function printPlayerReport(data) {
         const strongList = data.strongRooms.map(r => r.room + '(' + r.scores.overall.toFixed(0) + ')').join(', ');
         lines.push('   🟢 STRONG (' + data.strongRooms.length + '): ' + strongList);
     }
-    
     if (data.averageRooms.length > 0) {
         const avgList = data.averageRooms.map(r => r.room + '(' + r.scores.overall.toFixed(0) + ')').join(', ');
         lines.push('   🟡 AVERAGE (' + data.averageRooms.length + '): ' + avgList);
     }
-    
     if (data.weakRooms.length > 0) {
         const weakList = data.weakRooms.map(r => r.room + '(' + r.scores.overall.toFixed(0) + ')').join(', ');
         lines.push('   🔴 WEAK (' + data.weakRooms.length + '): ' + weakList);
     }
     
-    // === INFRASTRUCTURE TOTALS ===
     lines.push('');
     lines.push('🏗️ INFRASTRUCTURE TOTALS:');
     lines.push('   Spawns: ' + data.totalSpawns + ' | Towers: ' + data.totalTowers + ' | Labs: ' + data.totalLabs);
     lines.push('   Nukers: ' + data.roomsWithNuker + ' | Factories: ' + data.roomsWithFactory + ' | Power Spawns: ' + data.roomsWithPowerSpawn);
     
-    // === RESOURCE TOTALS ===
     lines.push('');
     lines.push('💰 RESOURCE TOTALS:');
     lines.push('   Storage Energy: ' + formatNumber(data.totalStorageEnergy) + ' | Terminal Energy: ' + formatNumber(data.totalTerminalEnergy));
     lines.push('   Power: ' + formatNumber(data.totalPower) + ' | Combat Boosts: ' + formatNumber(data.totalCombatBoosts));
     
-    // === NUCLEAR THREAT ANALYSIS ===
     lines.push('');
     lines.push('☢️ NUCLEAR ANALYSIS:');
     
@@ -1011,39 +982,35 @@ function printPlayerReport(data) {
         lines.push('   ✗ None of your nukers can reach ' + data.playerName + '\'s rooms');
     }
     
-    // === PER-ROOM DETAILS ===
     lines.push('');
     lines.push('📋 PER-ROOM DETAILS:');
     lines.push('   Room         | RCL | Overall | Eco  | Mil  | Infra | Towers | Nuker    | Storage E  | Def Avg');
     lines.push('   ' + '-'.repeat(95));
     
-    // Sort by overall score descending
     const sortedResults = data.results.slice().sort((a, b) => b.scores.overall - a.scores.overall);
     
     for (const r of sortedResults) {
-        const roomPad = r.room.padEnd(12);
-        const rclPad = String(r.rcl).padStart(3);
+        const roomPad    = r.room.padEnd(12);
+        const rclPad     = String(r.rcl).padStart(3);
         const overallPad = r.scores.overall.toFixed(1).padStart(7);
-        const ecoPad = r.scores.economic.toFixed(1).padStart(5);
-        const milPad = r.scores.military.toFixed(1).padStart(5);
-        const dualPad = r.scores.dualPurpose.toFixed(1).padStart(5);
-        const towerPad = (r.structures.towers + '/6').padStart(6);
-        let nukerStatus = 'None';
+        const ecoPad     = r.scores.economic.toFixed(1).padStart(5);
+        const milPad     = r.scores.military.toFixed(1).padStart(5);
+        const dualPad    = r.scores.dualPurpose.toFixed(1).padStart(5);
+        const towerPad   = (r.structures.towers + '/6').padStart(6);
+        let nukerStatus  = 'None';
         if (r.structures.nuker) {
             nukerStatus = r.structures.nukerReady ? 'READY' : (r.structures.nukerCharging ? 'Charging' : 'Empty');
         }
-        const nukerPad = nukerStatus.padStart(8);
+        const nukerPad   = nukerStatus.padStart(8);
         const storagePad = formatNumber(r.resources.storageEnergy).padStart(10);
-        const defPad = formatNumber(r.defense.avgDefenseHits).padStart(9);
+        const defPad     = formatNumber(r.defense.avgDefenseHits).padStart(9);
         
         lines.push('   ' + roomPad + ' | ' + rclPad + ' | ' + overallPad + ' | ' + ecoPad + ' | ' + milPad + ' | ' + dualPad + ' | ' + towerPad + ' | ' + nukerPad + ' | ' + storagePad + ' | ' + defPad);
     }
     
-    // === VULNERABILITY ANALYSIS ===
     lines.push('');
     lines.push('🎯 ATTACK RECOMMENDATIONS:');
     
-    // Find most vulnerable rooms
     const vulnerableTargets = sortedResults
         .filter(r => r.scores.military < 50)
         .sort((a, b) => a.scores.military - b.scores.military)
@@ -1057,14 +1024,12 @@ function printPlayerReport(data) {
             if (r.defense.avgDefenseHits < 1000000) issues.push('weak walls');
             if (r.defense.weakRamparts > 0) issues.push('weak ramparts');
             if (r.resources.storageEnergy < 100000) issues.push('low energy');
-            
             lines.push('      ' + r.room + ' (Mil: ' + r.scores.military.toFixed(1) + ') - ' + (issues.length > 0 ? issues.join(', ') : 'general weakness'));
         }
     } else {
         lines.push('   No obviously vulnerable rooms found.');
     }
     
-    // Find nuke-ready targets
     const nukeableWeak = data.myNukeTargets
         .filter(t => t.ready)
         .map(t => ({
@@ -1089,71 +1054,337 @@ function printPlayerReport(data) {
     lines.push('Analysis stored in Memory.lastPlayerAnalysis (expires in 10,000 ticks)');
     lines.push(div);
     
-    // Store for reference (expires after 10k ticks)
     Memory.lastPlayerAnalysis = {
         player: data.playerName,
         tick: Game.time,
         expiresTick: Game.time + 10000,
         roomCount: data.results.length,
         
-        // Score averages
-        avgOverall: data.avgOverall,
-        avgEconomic: data.avgEconomic,
-        avgMilitary: data.avgMilitary,
+        avgOverall:     data.avgOverall,
+        avgEconomic:    data.avgEconomic,
+        avgMilitary:    data.avgMilitary,
         avgDualPurpose: data.avgDualPurpose,
         
-        // Room classifications
-        weakRooms: data.weakRooms.map(r => r.room),
+        weakRooms:    data.weakRooms.map(r => r.room),
         averageRooms: data.averageRooms.map(r => r.room),
-        strongRooms: data.strongRooms.map(r => r.room),
+        strongRooms:  data.strongRooms.map(r => r.room),
         
-        // Infrastructure totals
-        totalSpawns: data.totalSpawns,
-        totalTowers: data.totalTowers,
-        totalLabs: data.totalLabs,
-        roomsWithNuker: data.roomsWithNuker,
-        roomsWithFactory: data.roomsWithFactory,
+        totalSpawns:         data.totalSpawns,
+        totalTowers:         data.totalTowers,
+        totalLabs:           data.totalLabs,
+        roomsWithNuker:      data.roomsWithNuker,
+        roomsWithFactory:    data.roomsWithFactory,
         roomsWithPowerSpawn: data.roomsWithPowerSpawn,
         
-        // Resource totals
-        totalStorageEnergy: data.totalStorageEnergy,
+        totalStorageEnergy:  data.totalStorageEnergy,
         totalTerminalEnergy: data.totalTerminalEnergy,
-        totalPower: data.totalPower,
-        totalCombatBoosts: data.totalCombatBoosts,
+        totalPower:          data.totalPower,
+        totalCombatBoosts:   data.totalCombatBoosts,
         
-        // Per-room details (sorted by score)
         rooms: sortedResults.map(r => ({
-            room: r.room,
-            rcl: r.rcl,
-            scores: r.scores,
-            towers: r.structures.towers,
-            nuker: r.structures.nuker,
-            nukerReady: r.structures.nukerReady,
-            nukerCharging: r.structures.nukerCharging,
-            storageEnergy: r.resources.storageEnergy,
+            room:           r.room,
+            rcl:            r.rcl,
+            scores:         r.scores,
+            towers:         r.structures.towers,
+            nuker:          r.structures.nuker,
+            nukerReady:     r.structures.nukerReady,
+            nukerCharging:  r.structures.nukerCharging,
+            storageEnergy:  r.resources.storageEnergy,
             avgDefenseHits: r.defense.avgDefenseHits,
-            weakRamparts: r.defense.weakRamparts
+            weakRamparts:   r.defense.weakRamparts
         })),
         
-        // Nuclear analysis
         nukeThreats: data.enemyNukeThreats,
-        myStrikes: data.myNukeTargets
+        myStrikes:   data.myNukeTargets
     };
     
-    // Print as single log
     console.log(lines.join('\n'));
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// PLAYER SCAN — lightweight creep census
+// ═══════════════════════════════════════════════════════════════════
+
 /**
- * Format number helper
+ * Classify a single creep by body composition.
+ *
+ * Priority order (mutually exclusive):
+ *   1. Military  — any ATTACK, RANGED_ATTACK, or HEAL parts
+ *   2. Claimer   — any CLAIM parts
+ *   3. Worker    — >25% WORK parts
+ *   4. Scout     — 100% MOVE parts (single-move scouts)
+ *   5. Supplier  — <10% WORK parts (logistics haulers)
+ *   6. Other     — 10–25% WORK, hybrid builds
  */
-function formatNumber(num) {
-    if (num === undefined || num === null) return '0';
-    if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
-    if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
-    if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
-    return String(num);
+function categorizeCreep(creep) {
+    const body  = creep.body;
+    const total = body.length;
+
+    if (body.some(p => p.type === ATTACK || p.type === RANGED_ATTACK || p.type === HEAL)) {
+        return 'military';
+    }
+    if (body.some(p => p.type === CLAIM)) {
+        return 'claimer';
+    }
+
+    const workParts = body.filter(p => p.type === WORK).length;
+    const workPct   = workParts / total;
+
+    if (workPct > 0.25) return 'worker';
+    if (body.every(p => p.type === MOVE)) return 'scout';
+    if (workPct < 0.10) return 'supplier';
+    return 'other';
 }
+
+/**
+ * Start a lightweight player scan.
+ * @param {string} playerName
+ * @param {string} scanType  - currently only 'CREEPCOUNT'
+ */
+function startPlayerScan(playerName, scanType) {
+    if (!playerName || typeof playerName !== 'string') {
+        console.log('[PlayerScan] Usage: playerScan("PlayerName", "CREEPCOUNT")');
+        return;
+    }
+
+    scanType = (scanType || 'CREEPCOUNT').toUpperCase();
+
+    if (!SCAN_TYPES.includes(scanType)) {
+        console.log('[PlayerScan] Unknown scan type "' + scanType + '". Available: ' + SCAN_TYPES.join(', '));
+        return;
+    }
+
+    if (Memory.playerScan && Memory.playerScan.active) {
+        console.log('[PlayerScan] Scan already in progress for ' + Memory.playerScan.targetPlayer + '. Use playerScanCancel() to stop it.');
+        return;
+    }
+
+    const observerMap   = getMyObservers();
+    const observerRooms = Object.keys(observerMap);
+
+    if (observerRooms.length === 0) {
+        console.log('[PlayerScan] No observers found.');
+        return;
+    }
+
+    const allRooms = getRoomsInObserverRange();
+
+    console.log('[PlayerScan] Starting ' + scanType + ' scan for: ' + playerName);
+    console.log('[PlayerScan] Scanning ' + allRooms.length + ' rooms across ' + observerRooms.length + ' observer(s)...');
+
+    Memory.playerScan = {
+        active:           true,
+        type:             scanType,
+        targetPlayer:     playerName,
+        startTick:        Game.time,
+        scanQueue:        allRooms.slice(),
+        scannedCount:     0,
+        totalScanRooms:   allRooms.length,
+        lastObservedRoom: null,
+
+        creepCounts: {
+            military: 0,
+            claimer:  0,
+            worker:   0,
+            supplier: 0,
+            scout:    0,
+            other:    0,
+            total:    0
+        },
+        roomBreakdown: {}
+    };
+}
+
+/**
+ * Per-tick handler for playerScan — called from run() every tick.
+ */
+function runScanTick() {
+    if (!Memory.playerScan || !Memory.playerScan.active) return;
+
+    const state      = Memory.playerScan;
+    const observerMap = getMyObservers();
+
+    // Process the room that was observed last tick
+    if (state.lastObservedRoom) {
+        const room = Game.rooms[state.lastObservedRoom];
+
+        if (room && room.controller && room.controller.owner &&
+            room.controller.owner.username === state.targetPlayer) {
+
+            if (state.type === 'CREEPCOUNT') {
+                const hostiles = room.find(FIND_HOSTILE_CREEPS);
+                const roomCounts = {
+                    military: 0,
+                    claimer:  0,
+                    worker:   0,
+                    supplier: 0,
+                    scout:    0,
+                    other:    0,
+                    total:    hostiles.length
+                };
+
+                for (const creep of hostiles) {
+                    const cat = categorizeCreep(creep);
+                    roomCounts[cat]++;
+                    state.creepCounts[cat]++;
+                    state.creepCounts.total++;
+                }
+
+                state.roomBreakdown[state.lastObservedRoom] = roomCounts;
+            }
+        }
+
+        state.scannedCount++;
+        state.lastObservedRoom = null;
+    }
+
+    // Scan complete?
+    if (state.scanQueue.length === 0) {
+        completeScanReport(state);
+        return;
+    }
+
+    // Observe next room
+    const nextRoom = state.scanQueue.shift();
+    const observer  = findObserverForRoom(nextRoom, observerMap);
+
+    if (observer && observer.observeRoom(nextRoom) === OK) {
+        state.lastObservedRoom = nextRoom;
+    } else {
+        state.scannedCount++;
+    }
+
+    // Progress update every 200 rooms
+    if (state.scannedCount > 0 && state.scannedCount % 200 === 0) {
+        const pct = ((state.scannedCount / state.totalScanRooms) * 100).toFixed(1);
+        console.log('[PlayerScan] ' + state.scannedCount + '/' + state.totalScanRooms + ' (' + pct + '%)');
+    }
+}
+
+/**
+ * Print creep count results and clean up.
+ */
+function completeScanReport(state) {
+    const elapsed   = Game.time - state.startTick;
+    const roomCount = Object.keys(state.roomBreakdown).length;
+    const c         = state.creepCounts;
+
+    if (state.type === 'CREEPCOUNT') {
+        const div   = '════════════════════════════════════════════════════════════';
+        const lines = [];
+
+        lines.push(div);
+        lines.push('CREEP COUNT: ' + state.targetPlayer + '  |  Rooms found: ' + roomCount + '  |  Elapsed: ' + elapsed + ' ticks');
+        lines.push(div);
+        lines.push('');
+        lines.push('  Total creeps:  ' + c.total);
+        lines.push('');
+
+        const cats = [
+            { key: 'military', label: 'Military ', desc: '≥1 ATTACK / RANGED_ATTACK / HEAL' },
+            { key: 'worker',   label: 'Worker   ', desc: '>25% WORK parts'                  },
+            { key: 'supplier', label: 'Supplier ', desc: '<10% WORK parts, logistics'        },
+            { key: 'claimer',  label: 'Claimer  ', desc: 'has CLAIM parts'                   },
+            { key: 'scout',    label: 'Scout    ', desc: 'only MOVE parts'                   },
+            { key: 'other',    label: 'Other    ', desc: '10-25% WORK, hybrid builds'        },
+        ];
+
+        for (const cat of cats) {
+            const count = c[cat.key];
+            if (count === 0) continue;
+            const pct = c.total > 0 ? ((count / c.total) * 100).toFixed(1) : '0.0';
+            const bar = '█'.repeat(Math.round(count / Math.max(c.total, 1) * 20));
+            lines.push('  ' + cat.label + '  ' + String(count).padStart(4) + '  (' + pct.padStart(5) + '%)  ' + bar);
+        }
+
+        // Per-room table (only when multiple rooms were found)
+        if (roomCount > 1) {
+            lines.push('');
+            lines.push('  Per room:');
+            lines.push('  Room         | Total | Mil | Work | Sup | Claim | Scout | Other');
+            lines.push('  ' + '-'.repeat(64));
+
+            const sorted = Object.entries(state.roomBreakdown)
+                .sort((a, b) => b[1].total - a[1].total);
+
+            for (const [room, rc] of sorted) {
+                lines.push(
+                    '  ' + room.padEnd(12) +
+                    ' | ' + String(rc.total   ).padStart(5) +
+                    ' | ' + String(rc.military ).padStart(3) +
+                    ' | ' + String(rc.worker   ).padStart(4) +
+                    ' | ' + String(rc.supplier ).padStart(3) +
+                    ' | ' + String(rc.claimer  ).padStart(5) +
+                    ' | ' + String(rc.scout    ).padStart(5) +
+                    ' | ' + String(rc.other    ).padStart(5)
+                );
+            }
+        }
+
+        lines.push('');
+        lines.push(div);
+        console.log(lines.join('\n'));
+
+        let notifyMsg = `[PlayerScan] ${state.targetPlayer} creep count complete.\n`;
+        notifyMsg += `Total: ${c.total} | Military: ${c.military} | Workers: ${c.worker} | Suppliers: ${c.supplier}`;
+        if (c.claimer > 0) notifyMsg += ` | Claimers: ${c.claimer}`;
+        if (c.scout   > 0) notifyMsg += ` | Scouts: ${c.scout}`;
+        if (c.other   > 0) notifyMsg += ` | Other: ${c.other}`;
+        Game.notify(notifyMsg, 0);
+    }
+
+    delete Memory.playerScan;
+}
+
+/**
+ * Cancel active creep scan
+ */
+function cancelPlayerScan() {
+    if (Memory.playerScan && Memory.playerScan.active) {
+        console.log('[PlayerScan] Scan cancelled.');
+        delete Memory.playerScan;
+    } else {
+        console.log('[PlayerScan] No active scan.');
+    }
+}
+
+/**
+ * Get status of active creep scan
+ */
+function getPlayerScanStatus() {
+    if (!Memory.playerScan || !Memory.playerScan.active) {
+        console.log('[PlayerScan] No active scan.');
+        return null;
+    }
+
+    const state     = Memory.playerScan;
+    const elapsed   = Game.time - state.startTick;
+    const pct       = ((state.scannedCount / state.totalScanRooms) * 100).toFixed(1);
+    const roomCount = Object.keys(state.roomBreakdown).length;
+
+    console.log('[PlayerScan] Status:');
+    console.log('  Target:      ' + state.targetPlayer);
+    console.log('  Type:        ' + state.type);
+    console.log('  Progress:    ' + state.scannedCount + '/' + state.totalScanRooms + ' (' + pct + '%)');
+    console.log('  Rooms found: ' + roomCount);
+    if (state.type === 'CREEPCOUNT' && state.creepCounts.total > 0) {
+        const c = state.creepCounts;
+        console.log('  Creeps so far: ' + c.total +
+            ' | Mil: '   + c.military +
+            ' | Work: '  + c.worker   +
+            ' | Sup: '   + c.supplier +
+            ' | Claim: ' + c.claimer  +
+            ' | Scout: ' + c.scout    +
+            ' | Other: ' + c.other);
+    }
+    console.log('  Elapsed:     ' + elapsed + ' ticks');
+
+    return state;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LAST ANALYSIS REPORT
+// ═══════════════════════════════════════════════════════════════════
 
 /**
  * Quick lookup of last analysis - prints full report
@@ -1166,16 +1397,13 @@ function getLastAnalysis() {
     
     const data = Memory.lastPlayerAnalysis;
     
-    // Check if expired
     if (data.expiresTick <= Game.time) {
         console.log('[PlayerAnalysis] Previous analysis has expired. Clearing...');
         delete Memory.lastPlayerAnalysis;
         return null;
     }
     
-    // Reprint the full report
     reprintReport(data);
-    
     return data;
 }
 
@@ -1186,36 +1414,32 @@ function reprintReport(data) {
     const div = '════════════════════════════════════════════════════════════════════════════════════════════════════';
     const lines = [];
     
-    const ticksAgo = Game.time - data.tick;
+    const ticksAgo       = Game.time - data.tick;
     const ticksRemaining = data.expiresTick - Game.time;
     
     lines.push(div);
     lines.push('PLAYER ANALYSIS: ' + data.player + ' | Rooms: ' + data.roomCount + ' | Analyzed ' + ticksAgo + ' ticks ago (expires in ' + ticksRemaining + ')');
     lines.push(div);
     
-    // Handle backward compatibility with old data format
-    const avgOverall = data.avgOverall !== undefined ? data.avgOverall : (data.avgScore || 0);
-    const avgEconomic = data.avgEconomic !== undefined ? data.avgEconomic : 0;
-    const avgMilitary = data.avgMilitary !== undefined ? data.avgMilitary : 0;
+    const avgOverall     = data.avgOverall     !== undefined ? data.avgOverall     : (data.avgScore || 0);
+    const avgEconomic    = data.avgEconomic    !== undefined ? data.avgEconomic    : 0;
+    const avgMilitary    = data.avgMilitary    !== undefined ? data.avgMilitary    : 0;
     const avgDualPurpose = data.avgDualPurpose !== undefined ? data.avgDualPurpose : 0;
     
-    // === SCORE SUMMARY ===
     lines.push('');
     lines.push('📊 AVERAGE SCORES:');
     if (avgEconomic === 0 && avgMilitary === 0 && avgDualPurpose === 0) {
-        // Old format - only have overall
         lines.push('   Overall: ' + avgOverall.toFixed(1) + '/100 (detailed scores not available - run analysis again for full data)');
     } else {
         lines.push('   Overall: ' + avgOverall.toFixed(1) + '/100 | Economic: ' + avgEconomic.toFixed(1) + '/100 | Military: ' + avgMilitary.toFixed(1) + '/100 | Infrastructure: ' + avgDualPurpose.toFixed(1) + '/100');
     }
     
-    // === ROOM CLASSIFICATIONS ===
     lines.push('');
     lines.push('🏠 ROOM CLASSIFICATIONS:');
     
-    const strongRooms = data.strongRooms || [];
+    const strongRooms  = data.strongRooms  || [];
     const averageRooms = data.averageRooms || [];
-    const weakRooms = data.weakRooms || [];
+    const weakRooms    = data.weakRooms    || [];
     
     if (strongRooms.length > 0) {
         const strongList = strongRooms.map(r => {
@@ -1224,7 +1448,6 @@ function reprintReport(data) {
         }).join(', ');
         lines.push('   🟢 STRONG (' + strongRooms.length + '): ' + strongList);
     }
-    
     if (averageRooms.length > 0) {
         const avgList = averageRooms.map(r => {
             const roomData = data.rooms.find(rd => rd.room === r);
@@ -1232,7 +1455,6 @@ function reprintReport(data) {
         }).join(', ');
         lines.push('   🟡 AVERAGE (' + averageRooms.length + '): ' + avgList);
     }
-    
     if (weakRooms.length > 0) {
         const weakList = weakRooms.map(r => {
             const roomData = data.rooms.find(rd => rd.room === r);
@@ -1240,13 +1462,10 @@ function reprintReport(data) {
         }).join(', ');
         lines.push('   🔴 WEAK (' + weakRooms.length + '): ' + weakList);
     }
-    
-    // If no classifications, just list rooms
     if (strongRooms.length === 0 && averageRooms.length === 0 && weakRooms.length === 0 && data.rooms) {
         lines.push('   Rooms: ' + data.rooms.map(r => r.room).join(', '));
     }
     
-    // === INFRASTRUCTURE TOTALS ===
     if (data.totalSpawns !== undefined) {
         lines.push('');
         lines.push('🏗️ INFRASTRUCTURE TOTALS:');
@@ -1254,7 +1473,6 @@ function reprintReport(data) {
         lines.push('   Nukers: ' + (data.roomsWithNuker || 0) + ' | Factories: ' + (data.roomsWithFactory || 0) + ' | Power Spawns: ' + (data.roomsWithPowerSpawn || 0));
     }
     
-    // === RESOURCE TOTALS ===
     if (data.totalStorageEnergy !== undefined) {
         lines.push('');
         lines.push('💰 RESOURCE TOTALS:');
@@ -1262,7 +1480,6 @@ function reprintReport(data) {
         lines.push('   Power: ' + formatNumber(data.totalPower) + ' | Combat Boosts: ' + formatNumber(data.totalCombatBoosts));
     }
     
-    // === NUCLEAR THREAT ANALYSIS ===
     lines.push('');
     lines.push('☢️ NUCLEAR ANALYSIS:');
     
@@ -1287,7 +1504,6 @@ function reprintReport(data) {
         lines.push('   ✗ None of your nukers can reach ' + data.player + '\'s rooms');
     }
     
-    // === PER-ROOM DETAILS ===
     if (data.rooms && data.rooms.length > 0 && data.rooms[0].scores) {
         lines.push('');
         lines.push('📋 PER-ROOM DETAILS:');
@@ -1295,29 +1511,27 @@ function reprintReport(data) {
         lines.push('   ' + '-'.repeat(95));
         
         for (const r of data.rooms) {
-            const roomPad = r.room.padEnd(12);
-            const rclPad = String(r.rcl).padStart(3);
+            const roomPad    = r.room.padEnd(12);
+            const rclPad     = String(r.rcl).padStart(3);
             const overallPad = (r.scores ? r.scores.overall.toFixed(1) : '?').toString().padStart(7);
-            const ecoPad = (r.scores ? r.scores.economic.toFixed(1) : '?').toString().padStart(5);
-            const milPad = (r.scores ? r.scores.military.toFixed(1) : '?').toString().padStart(5);
-            const dualPad = (r.scores ? r.scores.dualPurpose.toFixed(1) : '?').toString().padStart(5);
-            const towerPad = ((r.towers !== undefined ? r.towers : '?') + '/6').padStart(6);
-            let nukerStatus = 'None';
+            const ecoPad     = (r.scores ? r.scores.economic.toFixed(1) : '?').toString().padStart(5);
+            const milPad     = (r.scores ? r.scores.military.toFixed(1) : '?').toString().padStart(5);
+            const dualPad    = (r.scores ? r.scores.dualPurpose.toFixed(1) : '?').toString().padStart(5);
+            const towerPad   = ((r.towers !== undefined ? r.towers : '?') + '/6').padStart(6);
+            let nukerStatus  = 'None';
             if (r.nuker) {
                 nukerStatus = r.nukerReady ? 'READY' : (r.nukerCharging ? 'Charging' : 'Empty');
             }
-            const nukerPad = nukerStatus.padStart(8);
+            const nukerPad   = nukerStatus.padStart(8);
             const storagePad = formatNumber(r.storageEnergy !== undefined ? r.storageEnergy : 0).padStart(10);
-            const defPad = formatNumber(r.avgDefenseHits !== undefined ? r.avgDefenseHits : 0).padStart(9);
+            const defPad     = formatNumber(r.avgDefenseHits !== undefined ? r.avgDefenseHits : 0).padStart(9);
             
             lines.push('   ' + roomPad + ' | ' + rclPad + ' | ' + overallPad + ' | ' + ecoPad + ' | ' + milPad + ' | ' + dualPad + ' | ' + towerPad + ' | ' + nukerPad + ' | ' + storagePad + ' | ' + defPad);
         }
         
-        // === VULNERABILITY ANALYSIS ===
         lines.push('');
         lines.push('🎯 ATTACK RECOMMENDATIONS:');
         
-        // Find most vulnerable rooms
         const vulnerableTargets = data.rooms
             .filter(r => r.scores && r.scores.military < 50)
             .sort((a, b) => a.scores.military - b.scores.military)
@@ -1331,14 +1545,12 @@ function reprintReport(data) {
                 if (r.avgDefenseHits !== undefined && r.avgDefenseHits < 1000000) issues.push('weak walls');
                 if (r.weakRamparts !== undefined && r.weakRamparts > 0) issues.push('weak ramparts');
                 if (r.storageEnergy !== undefined && r.storageEnergy < 100000) issues.push('low energy');
-                
                 lines.push('      ' + r.room + ' (Mil: ' + r.scores.military.toFixed(1) + ') - ' + (issues.length > 0 ? issues.join(', ') : 'general weakness'));
             }
         } else {
             lines.push('   No obviously vulnerable rooms found.');
         }
         
-        // Find nuke-ready targets
         if (data.myStrikes) {
             const nukeableWeak = data.myStrikes
                 .filter(t => t.ready)
@@ -1360,7 +1572,6 @@ function reprintReport(data) {
             }
         }
     } else {
-        // Old format - just list rooms
         lines.push('');
         lines.push('📋 ROOMS (limited data - run analysis again for full details):');
         if (data.rooms) {
@@ -1373,21 +1584,42 @@ function reprintReport(data) {
     lines.push('');
     lines.push(div);
     
-    // Print as single log
     console.log(lines.join('\n'));
 }
 
-// Module exports
+// ═══════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Format number helper
+ */
+function formatNumber(num) {
+    if (num === undefined || num === null) return '0';
+    if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
+    if (num >= 1000000)    return (num / 1000000).toFixed(1)    + 'M';
+    if (num >= 1000)       return (num / 1000).toFixed(1)       + 'k';
+    return String(num);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MODULE EXPORTS & GLOBAL COMMANDS
+// ═══════════════════════════════════════════════════════════════════
+
 module.exports = {
-    start: startPlayerAnalysis,
-    run: run,
-    cancel: cancelPlayerAnalysis,
-    status: getAnalysisStatus,
-    last: getLastAnalysis
+    start:      startPlayerAnalysis,
+    run:        run,
+    cancel:     cancelPlayerAnalysis,
+    status:     getAnalysisStatus,
+    last:       getLastAnalysis,
+    scan:       startPlayerScan,
+    scanStatus: getPlayerScanStatus
 };
 
-// Global console commands
-global.player = startPlayerAnalysis;
-global.playerCancel = cancelPlayerAnalysis;
-global.playerStatus = getAnalysisStatus;
-global.playerLast = getLastAnalysis;
+global.player           = startPlayerAnalysis;
+global.playerCancel     = cancelPlayerAnalysis;
+global.playerStatus     = getAnalysisStatus;
+global.playerLast       = getLastAnalysis;
+global.playerScan       = startPlayerScan;
+global.playerScanCancel = cancelPlayerScan;
+global.playerScanStatus = getPlayerScanStatus;

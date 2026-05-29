@@ -1,1659 +1,1535 @@
 // roleSupplier.js
-// Purpose: Supplier role using cached room view from getRoomState.js to reduce CPU.
-// OPTIMIZATIONS APPLIED:
-// - "True Idle": Sleeps efficiently ONLY if room is truly empty (no avoids active).
-// - Native Search: Uses findClosestByRange (C++) instead of Array.sort (JS).
-// - Labeled breaks/continues: For clean nested loop exits without flag variables.
-// - Lookup tables: Pre-computed type checks at module load (O(1) vs switch).
-// - Assignment caching: Per-tick cache of supplier assignments.
-// - Distance pre-computation: Avoid getRangeTo in sort comparators.
-// - Object.keys(): Faster than for...in for store iteration.
-// - Global priority order: Cached once per tick instead of per-room memory.
+// Unified single-state-machine supplier with per-room task scanner.
 
 const SUPPLIER_ENABLED = true;
-const SUPPLIER_DEBUG = false;
-const SUPPLIER_IDLE_TICKS = 16;
-const LINK_FILL_THRESHOLD = 200;
-const LINK_DRAIN_THRESHOLD = 600;
-const DONOR_DRAIN_THRESHOLD = 200;
-const POWER_SPAWN_FILL_THRESHOLD = 1000;
-const ASSIGNMENT_TTL = 75;
-const NO_PATH_DELIVER_TTL = 6;
-const AVOID_PAIR_TTL = 5;
+const SUPPLIER_DEBUG   = false;
 
-const getRoomState = require("getRoomState");
+// Tuning
+const IDLE_SLEEP_TICKS           = 16;
+const IDLE_SHORT_SLEEP           = 2;
+const LINK_FILL_THRESHOLD        = 100;
+const LINK_DRAIN_THRESHOLD       = 600;
+const DONOR_DRAIN_THRESHOLD      = 200;
+const POWER_SPAWN_FILL_THRESHOLD = 1000;
+const ASSIGNMENT_TTL             = 75;
+const NO_PATH_TTL                = 6;
+const AVOID_PAIR_TTL             = 5;
+const EXT_ROUTE_SKIP_LIMIT       = 8;
+const EXT_ROUTE_RECOMPUTE_TICKS  = 200;
+const TERMINAL_TARGET            = 20000;
+const TERMINAL_MIN               = 19500;
+const TERMINAL_MAX               = 20500;
+
+const getRoomState    = require("getRoomState");
 const terminalManager = require("terminalManager");
 
-// --- PRE-COMPUTED LOOKUP TABLES (runs once at module load) ---
-const WITHDRAW_TYPES = {
-    "container_empty": true,
-    "container_drain": true,
-    "materials_drain_energy": true,
-    "materials_empty": true,
-    "link_drain": true,
-    "link_fill": true,
-    "terminal_balance": true
-};
-
-const CONTAINER_TYPES = {
-    "container_empty": true,
-    "container_drain": true,
-    "materials_drain_energy": true,
-    "materials_empty": true
-};
-
+// ─── PRIORITIES ────────────────────────────────────────────────────────────────
+// Lower number = higher priority.  Extensions are back in the table.
 const TASK_PRIORITY = {
-    "spawn": 10,
-    "extension": 10,
-    "tower": 30,
-    "power_spawn_fill": 37,
-    "link_drain": 29,
-    "link_fill": 36,
-    "container_empty": 40,
-    "materials_drain_energy": 45,
-    "container_drain": 50,
-    "materials_empty": 55,
-    "terminal_balance": 60,
-    "idle": 100
+    spawn:                20,
+    extension:            10,
+    tower:                30,
+    link_drain:           19,
+    link_fill:            36,
+    power_spawn_fill:     37,
+    container_empty:      40,
+    materials_drain_energy: 45,
+    container_drain:      50,
+    //materials_empty:      55,
+    terminal_balance:     60,
 };
 
-const ALL_TASKS = [
-    "spawn", "extension", "tower", "power_spawn_fill",
-    "link_drain", "link_fill", "container_empty",
-    "materials_drain_energy", "container_drain", "materials_empty",
-    "terminal_balance", "idle"
-];
-
-// --- HELPER FUNCTIONS ---
-function isWithdrawType(type) {
-    return type ? WITHDRAW_TYPES[type] === true : false;
+// ─── UTILITY ───────────────────────────────────────────────────────────────────
+function cheb(a, b) {
+    var dx = a.x - b.x; if (dx < 0) dx = -dx;
+    var dy = a.y - b.y; if (dy < 0) dy = -dy;
+    return dx > dy ? dx : dy;
 }
 
-function doTransfer(creep, target, resourceType, amount) {
-    return amount != null ? creep.transfer(target, resourceType, amount) : creep.transfer(target, resourceType);
-}
+function sup_say(creep, msg) { if (SUPPLIER_DEBUG) creep.say(msg); }
 
-function doWithdraw(creep, target, resourceType, amount) {
-    return amount != null ? creep.withdraw(target, resourceType, amount) : creep.withdraw(target, resourceType);
-}
-
-function getCreepEnergyCapacity(creep) {
-    var cap = creep.store.getCapacity(RESOURCE_ENERGY);
-    if (cap == null) cap = creep.store.getCapacity();
-    if (cap == null) cap = creep.store.getFreeCapacity() + creep.store.getUsedCapacity();
-    return cap || 0;
-}
-
-// --- AVOID-PAIR HELPERS ---
-function pruneAvoidPairs(creep) {
-    if (!creep.memory.avoidPairs) return;
-    var arr = creep.memory.avoidPairs;
-    var kept = [];
-    for (var i = 0; i < arr.length; i++) {
-        if (Game.time <= arr[i].until) kept.push(arr[i]);
+// ─── HEAP ──────────────────────────────────────────────────────────────────────
+function getHeap(name) {
+    if (!global._supHeap) global._supHeap = {};
+    if (!global._supHeap[name]) {
+        global._supHeap[name] = {
+            stuckCount: 0, lastPos: null, lastTriedMoveTick: 0,
+            rerouteUntil: 0, noPathCount: 0, fetchSourceId: null,
+            avoidPairs: [],
+            lastCompletedTick: 0, lastCompletedType: null,
+            lastCompletedTaskId: null, lastCompletedTargetId: null,
+            consecutiveIdlePicks: 0,
+            extRoute: null, extRouteTick: 0,
+        };
     }
-    creep.memory.avoidPairs = kept;
+    return global._supHeap[name];
 }
 
-function addAvoidPair(creep, assignment, ttl) {
-    if (!assignment || !assignment.type || !assignment.taskId) return;
-    if (!creep.memory.avoidPairs) creep.memory.avoidPairs = [];
-    creep.memory.avoidPairs.push({
-        type: assignment.type,
-        taskId: assignment.taskId,
-        transferTargetId: assignment.transferTargetId || assignment.taskId,
-        until: Game.time + (ttl || 1)
-    });
+function pruneHeap() {
+    if (!global._supHeap || global._supHeapTick === Game.time) return;
+    global._supHeapTick = Game.time;
+    var names = Object.keys(global._supHeap);
+    for (var i = 0; i < names.length; i++) {
+        if (!Game.creeps[names[i]]) delete global._supHeap[names[i]];
+    }
+    // Also prune the extension waypoint cache for rooms we can't see
+    if (global._extWpMapCache) {
+        for (var roomName in global._extWpMapCache) {
+            if (!Game.rooms[roomName]) delete global._extWpMapCache[roomName];
+        }
+    }
 }
 
-function isPairAvoided(creep, type, taskId, transferTargetId) {
-    var arr = creep.memory.avoidPairs;
-    if (!arr || !arr.length) return false;
-    var tt = transferTargetId || taskId;
-    for (var i = 0; i < arr.length; i++) {
-        var it = arr[i];
+// ─── AVOID PAIRS (heap) ───────────────────────────────────────────────────────
+function pruneAvoids(h) {
+    var a = h.avoidPairs, kept = [];
+    for (var i = 0; i < a.length; i++) {
+        if (Game.time <= a[i].until) kept.push(a[i]);
+    }
+    h.avoidPairs = kept;
+}
+
+function addAvoid(h, type, taskId, targetId) {
+    h.avoidPairs.push({ type: type, taskId: taskId, targetId: targetId || taskId, until: Game.time + AVOID_PAIR_TTL - 1 });
+}
+
+function isAvoided(h, type, taskId, targetId) {
+    var a = h.avoidPairs, tt = targetId || taskId;
+    for (var i = 0; i < a.length; i++) {
+        var it = a[i];
         if (Game.time > it.until) continue;
-        if (it.type !== type) continue;
-        if (it.taskId !== taskId) continue;
-        var itt = it.transferTargetId || it.taskId;
-        if (itt !== tt) continue;
-        return true;
+        if (it.type === type && it.taskId === taskId && (it.targetId || it.taskId) === tt) return true;
     }
     return false;
 }
 
-function matchesAvoid(avoid, type, taskId, transferTargetId) {
-    if (!avoid) return false;
-    if (avoid.type !== type) return false;
-    var at = avoid.transferTargetId || avoid.taskId;
-    var tt = transferTargetId || taskId;
-    return avoid.taskId === taskId && at === tt;
+function hasActiveAvoids(h) {
+    var a = h.avoidPairs;
+    for (var i = 0; i < a.length; i++) {
+        if (Game.time <= a[i].until) return true;
+    }
+    return false;
 }
 
-// --- ASSIGNMENT MANAGEMENT ---
-function clearAssignment(creep, opts) {
-    opts = opts || {};
-    var a = creep.memory.assignment;
-
-    if ((opts.justCompleted || opts.avoid) && a && a.type && a.taskId) {
-        creep.memory.lastCompletedTick = Game.time;
-        creep.memory.lastCompletedType = a.type;
-        creep.memory.lastCompletedTaskId = a.taskId;
-        creep.memory.lastCompletedTargetId = a.transferTargetId || a.taskId;
-        addAvoidPair(creep, a, AVOID_PAIR_TTL);
-    }
-
-    creep.memory.assignment = null;
-    delete creep.memory.noPathDeliver;
-    delete creep.memory.nextCheckTick;
-    delete creep.memory.extOpportunistic;
-    delete creep.memory.sleepUntil;
-
-    if (SUPPLIER_DEBUG && opts && opts.reason) {
-        console.log("[SUP] " + creep.name + " clearAssignment (" + opts.reason + ") t=" + Game.time);
-    }
+// ─── PACKED ASSIGNMENT ─────────────────────────────────────────────────────────
+function packAssignment(a) {
+    if (!a) return null;
+    return a.type + '|' + a.taskId + '|' + (a.targetId || '') + '|' +
+           (a.amount || 0) + '|' + (a.assignedTick || 0) + '|' +
+           (a.extra || '');
 }
 
-// --- MOVEMENT ---
-function smartMove(creep, target, extraOpts) {
-    if (creep.fatigue > 0) return ERR_TIRED;
-    if (creep.memory.lastTriedMoveTick === Game.time) return ERR_BUSY;
-
-    var targetPos = target.pos || target;
-    var dist = creep.pos.getRangeTo(targetPos);
-    var maxOps = Math.min(2000, Math.max(200, dist * 50));
-    var inReroute = Game.time < (creep.memory.rerouteUntil || 0);
-
-    var moveOpts = {
-        reusePath: inReroute ? 0 : Math.min(10, Math.max(3, Math.floor(dist / 2))),
-        maxOps: maxOps,
-        heuristicWeight: 1.2
+function unpackAssignment(raw) {
+    if (!raw) return null;
+    var p = raw.split('|');
+    return {
+        type: p[0], taskId: p[1], targetId: p[2] || null,
+        amount: +p[3] || 0, assignedTick: +p[4] || 0,
+        extra: p[5] || ''
     };
-    if (extraOpts) {
-        for (var k in extraOpts) moveOpts[k] = extraOpts[k];
+}
+
+// Per-tick cache so we only unpack once
+function getAssignment(creep) {
+    var h = getHeap(creep.name);
+    if (h._aTick === Game.time) return h._aCache;
+    h._aCache = unpackAssignment(creep.memory.a);
+    h._aTick = Game.time;
+    return h._aCache;
+}
+
+function setAssignment(creep, a) {
+    var h = getHeap(creep.name);
+    creep.memory.a = packAssignment(a);
+    h._aCache = a;
+    h._aTick = Game.time;
+    // Bust the claim cache so other creeps see this
+    if (global._taskClaimCache) delete global._taskClaimCache[creep.room.name];
+}
+
+function clearAssignment(creep, reason, shouldAvoid) {
+    var a = getAssignment(creep);
+    var h = getHeap(creep.name);
+    if (shouldAvoid && a && a.type) {
+        addAvoid(h, a.type, a.taskId, a.targetId);
+        h.lastCompletedTick = Game.time;
+        h.lastCompletedType = a.type;
+        h.lastCompletedTaskId = a.taskId;
+        h.lastCompletedTargetId = a.targetId;
     }
+    setAssignment(creep, null);
+    creep.memory.s = "idle";
+    h.noPathCount = 0;
+    h.fetchSourceId = null;
+    delete creep.memory.sl;
+    delete creep.memory._move;
+    if (SUPPLIER_DEBUG) console.log("[SUP] " + creep.name + " clear: " + reason);
+}
 
-    creep.memory.lastTriedMoveTick = Game.time;
-    var res = creep.moveTo(targetPos, moveOpts);
+// ─── MOVEMENT ──────────────────────────────────────────────────────────────────
+function smartMove(creep, target, extraOpts) {
+    var h = getHeap(creep.name);
+    if (creep.fatigue > 0) return ERR_TIRED;
+    if (h.lastTriedMoveTick === Game.time) return ERR_BUSY;
 
+    var pos = target.pos || target;
+    var dist = cheb(creep.pos, pos);
+    var inReroute = Game.time < h.rerouteUntil;
+    var opts = {
+        reusePath: inReroute ? 0 : Math.min(10, Math.max(3, dist >> 1)),
+        maxOps: Math.min(2000, Math.max(200, dist * 50)),
+        heuristicWeight: 1.2,
+        range: 1
+    };
+    if (extraOpts) { for (var k in extraOpts) opts[k] = extraOpts[k]; }
+
+    h.lastTriedMoveTick = Game.time;
+    var res = creep.moveTo(pos, opts);
     if (res === ERR_NO_PATH && !inReroute) {
-        creep.memory.rerouteUntil = Game.time + 3;
-        if (creep.memory._move) delete creep.memory._move;
+        h.rerouteUntil = Game.time + 3;
+        delete creep.memory._move;
     }
     return res;
 }
 
-// --- ROOM STATE HELPERS ---
-function ensureGetRoomStateInit() {
+// ─── ROOM VIEW (cached per tick, lazy validation) ──────────────────────────────
+function ensureRoomStateInit() {
     if (getRoomState && typeof getRoomState.init === "function") {
-        if (global.__supplierLastRoomStateInitTick !== Game.time) {
+        if (global._rsInitTick !== Game.time) {
             getRoomState.init();
-            global.__supplierLastRoomStateInitTick = Game.time;
+            global._rsInitTick = Game.time;
         }
     }
 }
 
 function getRoomView(room) {
-    ensureGetRoomStateInit();
+    if (global._rvTick !== Game.time) { global._rvTick = Game.time; global._rvCache = {}; }
+    if (global._rvCache[room.name]) return global._rvCache[room.name];
+
+    ensureRoomStateInit();
     var base = getRoomState.get(room.name);
     if (!base) return null;
 
-    var structuresByType = base.structuresByType || {};
-    return {
-        roomName: room.name,
-        controller: room.controller,
-        storage: room.storage,
-        terminal: room.terminal,
-        containers: structuresByType[STRUCTURE_CONTAINER] || [],
-        spawns: (structuresByType[STRUCTURE_SPAWN] || []).filter(function(s) { return s.my; }),
-        extractors: (structuresByType[STRUCTURE_EXTRACTOR] || []).filter(function(e) { return e.my; }),
-        sources: base.sources || [],
-        towers: (structuresByType[STRUCTURE_TOWER] || []).filter(function(t) { return t.my; }),
-        links: (structuresByType[STRUCTURE_LINK] || []).filter(function(l) { return l.my; }),
-        extensions: (structuresByType[STRUCTURE_EXTENSION] || []).filter(function(e) { return e.my; }),
-        powerSpawns: (structuresByType[STRUCTURE_POWER_SPAWN] || []).filter(function(s) { return s.my; }),
-        nukers: (structuresByType[STRUCTURE_NUKER] || []).filter(function(n) { return n.my; }),
-        suppliers: (base.myCreeps || []).filter(function(c) { return c.memory && c.memory.role === "supplier"; })
+    var sbt = base.structuresByType || {};
+
+    function resolve(type, filter) {
+        var arr = sbt[type] || [];
+        if (!filter) return arr;
+        var out = [];
+        for (var i = 0; i < arr.length; i++) {
+            if (filter(arr[i])) out.push(arr[i]);
+        }
+        return out;
+    }
+
+    var view = {
+        roomName:     room.name,
+        controller:   room.controller,
+        storage:      room.storage,
+        terminal:     room.terminal,
+        containers:   resolve(STRUCTURE_CONTAINER),
+        spawns:       resolve(STRUCTURE_SPAWN,       function(s) { return s.my; }),
+        extractors:   resolve(STRUCTURE_EXTRACTOR,   function(e) { return e.my; }),
+        sources:      base.sources || [],
+        towers:       resolve(STRUCTURE_TOWER,        function(t) { return t.my; }),
+        links:        resolve(STRUCTURE_LINK,         function(l) { return l.my; }),
+        extensions:   resolve(STRUCTURE_EXTENSION,    function(e) { return e.my; }),
+        powerSpawns:  resolve(STRUCTURE_POWER_SPAWN,  function(s) { return s.my; }),
+        nukers:       resolve(STRUCTURE_NUKER,        function(n) { return n.my; }),
+        suppliers:    (base.myCreeps || []).filter(function(c) { return c.memory && c.memory.role === "supplier"; }),
+        towerFillers: (base.myCreeps || []).filter(function(c) { return c.memory && c.memory.role === "towerFiller"; }),
     };
+
+    global._rvCache[room.name] = view;
+    return view;
 }
 
-// --- CONTAINER LABELING ---
+// ─── CONTAINER LABELING ────────────────────────────────────────────────────────
 function ensureContainerLabels(room, view) {
     if (!view) return;
     var mem = room.memory;
     if (!mem.containerLabels) mem.containerLabels = {};
 
-    var ids = view.containers.map(function(c) { return c.id; }).sort().join(',');
-    if (mem.containerLabelIds !== ids || Game.time % 1000 === 0) {
-        var labels = {};
-        for (var i = 0; i < view.containers.length; i++) {
-            var c = view.containers[i];
-            if (c.pos.findInRange(view.extractors, 1).length > 0) {
-                labels[c.id] = "materials";
-            } else if (view.controller && c.pos.getRangeTo(view.controller.pos) <= 2) {
-                labels[c.id] = "recipient";
-            } else if (c.pos.findInRange(view.sources, 4).length > 0) {
-                labels[c.id] = "donor";
-            } else {
-                labels[c.id] = "recipient";
+    var cKey = view.containers.map(function(c) { return c.id; }).sort().join(',') + ':' +
+               view.links.map(function(l) { return l.id; }).sort().join(',');
+
+    if (mem._clKey === cKey && Game.time % 1000 !== 0) return;
+
+    var labels = {}, blacklist = {};
+    var srcLinks = {};
+    for (var si = 0; si < view.sources.length; si++) {
+        for (var li = 0; li < view.links.length; li++) {
+            if (cheb(view.links[li].pos, view.sources[si].pos) <= 2) {
+                srcLinks[view.sources[si].id] = true; break;
             }
         }
-        mem.containerLabels = labels;
-        mem.containerLabelIds = ids;
     }
-}
-
-function getContainerBuckets(room, view) {
-    ensureContainerLabels(room, view);
-    var labels = room.memory.containerLabels || {};
-    var donors = [], recipients = [], materials = [];
 
     for (var i = 0; i < view.containers.length; i++) {
         var c = view.containers[i];
-        var label = labels[c.id];
-        if (label === "donor") donors.push(c);
-        else if (label === "materials") materials.push(c);
-        else recipients.push(c);
-    }
-    return { donors: donors, recipients: recipients, materials: materials };
-}
-
-// --- PRIORITY ORDER (Global cache instead of per-room memory) ---
-function getPriorityOrder(room) {
-    // Check for per-room custom priorities first
-    var customMapping = room.memory.supplierPriorities;
-    
-    // If no custom mapping, use global cache
-    if (!customMapping || Object.keys(customMapping).length === 0) {
-        if (global.__supplierPriorityOrder && 
-            global.__supplierPriorityOrderTick === Game.time) {
-            return global.__supplierPriorityOrder;
-        }
-        
-        var list = ALL_TASKS.slice();
-        list.sort(function(a, b) {
-            return TASK_PRIORITY[a] - TASK_PRIORITY[b];
-        });
-        
-        global.__supplierPriorityOrder = list;
-        global.__supplierPriorityOrderTick = Game.time;
-        return list;
-    }
-    
-    // Room has custom priorities - compute for this room (rare case)
-    var list = ALL_TASKS.slice();
-    list.sort(function(a, b) {
-        var pa = customMapping[a] != null ? customMapping[a] : TASK_PRIORITY[a];
-        var pb = customMapping[b] != null ? customMapping[b] : TASK_PRIORITY[b];
-        return pa - pb;
-    });
-    return list;
-}
-
-// --- CACHED SUPPLIER ASSIGNMENT LOOKUP (per-tick) ---
-function getSupplierAssignmentCache(view) {
-    if (global.__supplierAssignmentCacheTick !== Game.time) {
-        global.__supplierAssignmentCacheTick = Game.time;
-        global.__supplierAssignmentCache = {};
-    }
-
-    var cacheKey = view.roomName;
-    if (!global.__supplierAssignmentCache[cacheKey]) {
-        var assignments = {};
-        for (var i = 0; i < view.suppliers.length; i++) {
-            var s = view.suppliers[i];
-            var a = s.memory && s.memory.assignment;
-            if (a && a.type && a.taskId) {
-                // Nested structure: type -> taskId -> transferTargetId -> creepName
-                if (!assignments[a.type]) assignments[a.type] = {};
-                if (!assignments[a.type][a.taskId]) assignments[a.type][a.taskId] = {};
-                assignments[a.type][a.taskId][a.transferTargetId || '_'] = s.name;
+        if (c.pos.findInRange(view.extractors, 1).length > 0) {
+            labels[c.id] = "materials";
+        } else if (view.controller && cheb(c.pos, view.controller.pos) <= 2) {
+            labels[c.id] = "recipient";
+        } else if (c.pos.findInRange(view.sources, 4).length > 0) {
+            labels[c.id] = "donor";
+            for (var s2 = 0; s2 < view.sources.length; s2++) {
+                if (cheb(c.pos, view.sources[s2].pos) <= 2 && srcLinks[view.sources[s2].id]) {
+                    blacklist[c.id] = true; break;
+                }
             }
+        } else {
+            labels[c.id] = "recipient";
         }
-        global.__supplierAssignmentCache[cacheKey] = assignments;
     }
-    return global.__supplierAssignmentCache[cacheKey];
+
+    mem.containerLabels = labels;
+    mem.linkServedBlacklist = blacklist;
+    mem._clKey = cKey;
 }
 
-function isTakenByOtherSupplier(view, creep, type, taskId, transferTargetId) {
-    var cache = getSupplierAssignmentCache(view);
-    var typeCache = cache[type];
-    if (!typeCache) return false;
-    var taskCache = typeCache[taskId];
-    if (!taskCache) return false;
-    var owner = taskCache[transferTargetId || '_'];
+function getLabel(room, id) { return (room.memory.containerLabels || {})[id]; }
+function isLinkServed(room, id) { return (room.memory.linkServedBlacklist || {})[id] === true; }
+
+// ─── CLAIM CACHE ───────────────────────────────────────────────────────────────
+// Lets us check "is another supplier already on this task?" in O(1).
+function getClaimCache(view) {
+    if (global._taskClaimTick !== Game.time) {
+        global._taskClaimTick = Game.time;
+        global._taskClaimCache = {};
+    }
+    if (global._taskClaimCache[view.roomName]) return global._taskClaimCache[view.roomName];
+
+    var claims = {};  // "type|taskId|targetId" → creepName
+    for (var i = 0; i < view.suppliers.length; i++) {
+        var s = view.suppliers[i];
+        var a = getAssignment(s);
+        if (a && a.type) {
+            claims[a.type + '|' + a.taskId + '|' + (a.targetId || '')] = s.name;
+        }
+    }
+    global._taskClaimCache[view.roomName] = claims;
+    return claims;
+}
+
+function isClaimed(view, creep, type, taskId, targetId) {
+    var c = getClaimCache(view);
+    var owner = c[type + '|' + taskId + '|' + (targetId || '')];
     return owner && owner !== creep.name;
 }
 
-// --- UTILITY ---
-function pickBestByNeedThenDistance(structs, getNeedFn, creep) {
-    var best = null, bestNeed = -1, bestDist = Infinity;
-    for (var i = 0; i < structs.length; i++) {
-        var s = structs[i];
-        var need = getNeedFn(s);
-        if (need <= 0) continue;
-        var dist = creep.pos.getRangeTo(s.pos);
-        if (need > bestNeed || (need === bestNeed && dist < bestDist)) {
-            best = s;
-            bestNeed = need;
-            bestDist = dist;
-        }
-    }
-    return { target: best, need: bestNeed };
+// ─── ENERGY CAPACITY HELPER ────────────────────────────────────────────────────
+function getEnergyCapacity(creep) {
+    return creep.store.getCapacity(RESOURCE_ENERGY) ||
+           creep.store.getCapacity() ||
+           (creep.store.getFreeCapacity() + creep.store.getUsedCapacity()) || 0;
 }
 
-// --- CACHED EXTENSION LIST ---
-function getCachedExtensionList(view) {
-    if (global.__supplierExtensionCacheTick !== Game.time) {
-        global.__supplierExtensionCacheTick = Game.time;
-        global.__supplierExtensionCache = {};
-    }
+// ─── EXTENSION WAYPOINT CACHE (room level, recomputed when empties change) ─────
+function getExtWpMap(room, emptyExts) {
+    var roomName = room.name;
+    if (!global._extWpMapCache) global._extWpMapCache = {};
+    if (!global._extWpMapCache[roomName]) global._extWpMapCache[roomName] = {};
 
-    var cacheKey = view.roomName;
-    if (!global.__supplierExtensionCache[cacheKey]) {
-        var list = view.extensions || [];
-        var validExtensions = [];
-        for (var i = 0; i < list.length; i++) {
-            var ext = list[i];
-            if (!ext.my) continue;
-            var freeCapacity = ext.store.getFreeCapacity(RESOURCE_ENERGY);
-            if (freeCapacity <= 0) continue;
-            validExtensions.push({ id: ext.id, pos: ext.pos, freeCapacity: freeCapacity });
-        }
-        global.__supplierExtensionCache[cacheKey] = validExtensions;
-    }
-    return global.__supplierExtensionCache[cacheKey];
-}
+    // Build a stable key from sorted ids
+    var key = emptyExts.map(e => e.id).sort().join(',');
+    if (global._extWpMapCache[roomName].key === key) return global._extWpMapCache[roomName].map;
 
-// --- TASK FINDERS ---
-function findSpawnFill(view, creep, avoid) {
-    var candidates = [];
-    for (var i = 0; i < view.spawns.length; i++) {
-        var s = view.spawns[i];
-        if (!s.my) continue;
-        if (s.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) continue;
-        if (matchesAvoid(avoid, "spawn", s.id, s.id)) continue;
-        candidates.push(s);
-    }
-    if (candidates.length === 0) return null;
+    var map = {};
+    var candidates = {};
+    var terrain = room.getTerrain();
 
-    var pick = pickBestByNeedThenDistance(candidates, function(s) {
-        return s.store.getFreeCapacity(RESOURCE_ENERGY);
-    }, creep);
+    for (var i = 0; i < emptyExts.length; i++) {
+        var ext = emptyExts[i];
+        for (var dx = -1; dx <= 1; dx++) {
+            for (var dy = -1; dy <= 1; dy++) {
+                if (dx === 0 && dy === 0) continue;
+                var x = ext.pos.x + dx, y = ext.pos.y + dy;
+                if (x < 0 || x > 49 || y < 0 || y > 49) continue;
+                if (terrain.get(x, y) === TERRAIN_MASK_WALL) continue;
 
-    if (!pick.target) return null;
-    return { type: "spawn", taskId: pick.target.id, amount: pick.need };
-}
+                // Lightweight passability: reject tiles with any non‑road, non‑container structure
+                var structs = room.lookForAt(LOOK_STRUCTURES, x, y);
+                var blocked = false;
+                for (var si = 0; si < structs.length; si++) {
+                    var st = structs[si].structureType;
+                    if (st !== STRUCTURE_ROAD && st !== STRUCTURE_CONTAINER) {
+                        blocked = true; break;
+                    }
+                }
+                if (blocked) continue;
 
-function findExtensionFill(view, creep, avoid) {
-    var cachedList = getCachedExtensionList(view);
-    if (cachedList.length === 0) return null;
-
-    var candidates = [];
-    for (var i = 0; i < cachedList.length; i++) {
-        var extData = cachedList[i];
-        if (matchesAvoid(avoid, "extension", extData.id, extData.id)) continue;
-        if (isTakenByOtherSupplier(view, creep, "extension", extData.id, extData.id)) continue;
-
-        var obj = Game.getObjectById(extData.id);
-        if (obj && obj.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-            candidates.push(obj);
-        }
-    }
-    if (candidates.length === 0) return null;
-
-    // CPU WIN: Native search (C++) is much faster than JS sort
-    var best = creep.pos.findClosestByRange(candidates);
-    if (!best) return null;
-
-    return {
-        type: "extension",
-        taskId: best.id,
-        amount: best.store.getFreeCapacity(RESOURCE_ENERGY)
-    };
-}
-
-function findTowerFill(view, creep, avoid) {
-    var candidates = [];
-    for (var i = 0; i < view.towers.length; i++) {
-        var t = view.towers[i];
-        if (!t.my) continue;
-        var free = t.store.getFreeCapacity(RESOURCE_ENERGY);
-        var ratio = (t.store[RESOURCE_ENERGY] || 0) / t.store.getCapacity(RESOURCE_ENERGY);
-        if (free <= 0 || ratio >= 0.75) continue;
-        if (matchesAvoid(avoid, "tower", t.id, t.id)) continue;
-        candidates.push(t);
-    }
-    if (candidates.length === 0) return null;
-
-    var pick = pickBestByNeedThenDistance(candidates, function(t) {
-        return t.store.getFreeCapacity(RESOURCE_ENERGY);
-    }, creep);
-
-    if (!pick.target) return null;
-    return { type: "tower", taskId: pick.target.id, amount: pick.need };
-}
-
-function findPowerSpawnFill(view, creep, avoid) {
-    var candidates = [];
-    for (var i = 0; i < view.powerSpawns.length; i++) {
-        var ps = view.powerSpawns[i];
-        var used = ps.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        if (used <= POWER_SPAWN_FILL_THRESHOLD) {
-            if (matchesAvoid(avoid, "power_spawn_fill", ps.id, ps.id)) continue;
-            candidates.push(ps);
-        }
-    }
-    if (candidates.length === 0) return null;
-
-    var pick = pickBestByNeedThenDistance(candidates, function(ps) {
-        return ps.store.getFreeCapacity(RESOURCE_ENERGY);
-    }, creep);
-
-    if (!pick.target) return null;
-    return { type: "power_spawn_fill", taskId: pick.target.id, amount: pick.need };
-}
-
-// OPTIMIZED: Uses labeled continue to skip source-adjacent links cleanly
-function findLinkFill(view, creep, avoid) {
-    if (!view.storage) return null;
-    var storage = view.storage;
-    var storageEnergy = storage.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-    if (storageEnergy < 500) return null;
-
-    var list = view.links;
-
-    // LABELED LOOP: Clean exit when link is near a source
-    linkLoop: for (var i = 0; i < list.length; i++) {
-        var link = list[i];
-        if (!link.my) continue;
-        if (!link.pos.inRangeTo(storage.pos, 2)) continue;
-        if (view.controller && link.pos.getRangeTo(view.controller.pos) <= 2) continue;
-
-        // Check if link is near any source - use labeled continue for clean exit
-        for (var s = 0; s < view.sources.length; s++) {
-            if (view.sources[s].pos.getRangeTo(link.pos) <= 2) {
-                continue linkLoop; // Skip directly to next link
-            }
-        }
-
-        var linkEnergy = link.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        if (linkEnergy < LINK_FILL_THRESHOLD) {
-            if (matchesAvoid(avoid, "link_fill", storage.id, link.id)) continue;
-
-            var maxFillAmount = Math.min(
-                LINK_DRAIN_THRESHOLD - linkEnergy,
-                storageEnergy,
-                link.store.getFreeCapacity(RESOURCE_ENERGY)
-            );
-
-            if (maxFillAmount > 100) {
-                return {
-                    type: "link_fill",
-                    taskId: storage.id,
-                    transferTargetId: link.id,
-                    amount: maxFillAmount
-                };
+                var tileKey = x + ',' + y;
+                if (!candidates[tileKey]) candidates[tileKey] = [];
+                candidates[tileKey].push(ext.id);
             }
         }
     }
-    return null;
-}
 
-// OPTIMIZED: Uses labeled continue for source-adjacent link check
-function findLinkDrain(view, creep, avoid) {
-    if (!view.storage) return null;
-    var storage = view.storage;
-    var storageFree = storage.store.getFreeCapacity(RESOURCE_ENERGY);
-    if (storageFree <= 0) return null;
+    if (Object.keys(candidates).length === 0) {
+        // Fallback: every extension becomes its own waypoint
+        for (var j = 0; j < emptyExts.length; j++) {
+            var id = emptyExts[j].id;
+            map[id] = { x: emptyExts[j].pos.x, y: emptyExts[j].pos.y };
+        }
+    } else {
+        // Greedy set cover: pick the tile that serves the most uncovered extensions
+        var uncovered = emptyExts.map(e => e.id);
+        while (uncovered.length > 0) {
+            var bestKey = null, bestCount = 0;
+            for (var cKey in candidates) {
+                var covered = [];
+                var ids = candidates[cKey];
+                for (var k = 0; k < ids.length; k++) {
+                    if (uncovered.indexOf(ids[k]) !== -1) covered.push(ids[k]);
+                }
+                if (covered.length > bestCount || (covered.length === bestCount && bestKey === null)) {
+                    bestCount = covered.length;
+                    bestKey = cKey;
+                }
+            }
+            if (!bestKey) break;
 
-    var list = view.links;
-
-    // LABELED LOOP: Clean exit when link is near a source
-    linkLoop: for (var i = 0; i < list.length; i++) {
-        var link = list[i];
-        if (!link.my) continue;
-        if (!link.pos.inRangeTo(storage.pos, 2)) continue;
-        if (view.controller && link.pos.getRangeTo(view.controller.pos) <= 2) continue;
-
-        // Check source proximity with labeled continue
-        for (var s = 0; s < view.sources.length; s++) {
-            if (view.sources[s].pos.getRangeTo(link.pos) <= 2) {
-                continue linkLoop;
+            var parts = bestKey.split(',');
+            var wp = { x: +parts[0], y: +parts[1] };
+            var served = candidates[bestKey].filter(function(id) { return uncovered.indexOf(id) !== -1; });
+            for (var s = 0; s < served.length; s++) {
+                map[served[s]] = wp;
+                var idx = uncovered.indexOf(served[s]);
+                if (idx !== -1) uncovered.splice(idx, 1);
             }
         }
+        // Any leftover (shouldn't happen) → own position
+        for (var u = 0; u < uncovered.length; u++) {
+            var fallExt = Game.getObjectById(uncovered[u]);
+            if (fallExt) map[uncovered[u]] = { x: fallExt.pos.x, y: fallExt.pos.y };
+        }
+    }
 
-        var linkEnergy = link.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        if (linkEnergy > LINK_DRAIN_THRESHOLD) {
-            if (matchesAvoid(avoid, "link_drain", link.id, storage.id)) continue;
-            var amount = Math.min(linkEnergy - LINK_FILL_THRESHOLD, storageFree);
-            if (amount > 0) {
-                return {
-                    type: "link_drain",
-                    taskId: link.id,
-                    transferTargetId: storage.id,
-                    amount: amount
-                };
+    global._extWpMapCache[roomName] = { key: key, map: map };
+    return map;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  TASK SCANNER — runs ONCE per room per tick, returns sorted task list
+// ════════════════════════════════════════════════════════════════════════════════
+// Each task: { type, taskId, targetId, amount, priority, extra? }
+// "extra" carries type-specific metadata (minDrainEnergy, minCapacity, etc.)
+
+function scanRoomTasks(room, view) {
+    if (global._scanTick !== Game.time) { global._scanTick = Game.time; global._scanCache = {}; }
+    if (global._scanCache[room.name]) return global._scanCache[room.name];
+
+    ensureContainerLabels(room, view);
+    var tasks = [];
+
+    function emit(t) { if (t) tasks.push(t); }
+
+    var rcl8 = view.controller && view.controller.level >= 8;
+
+    // ── SPAWNS ──────────────────────────────────────────────────────────────
+    for (var si = 0; si < view.spawns.length; si++) {
+        var sp = view.spawns[si];
+        var spFree = sp.store.getFreeCapacity(RESOURCE_ENERGY);
+        if (spFree <= 0) continue;
+        if (rcl8 && (sp.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0) continue;
+        var nearSrc = false;
+        for (var s2 = 0; s2 < view.sources.length; s2++) {
+            if (cheb(sp.pos, view.sources[s2].pos) <= 2) { nearSrc = true; break; }
+        }
+        if (nearSrc) continue;
+        tasks.push({ type: "spawn", taskId: sp.id, targetId: sp.id,
+                      amount: spFree, priority: TASK_PRIORITY.spawn });
+    }
+
+    // ── EXTENSIONS (single task — route handles ordering) ───────────────────
+    var emptyExtCount = 0, totalExtNeed = 0;
+    var emptyExts = [];
+    for (var ei = 0; ei < view.extensions.length; ei++) {
+        var ext = view.extensions[ei];
+        var free = ext.store.getFreeCapacity(RESOURCE_ENERGY) || 0;
+        if (free <= 0) continue;
+        if (rcl8 && (ext.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0) continue;
+        emptyExtCount++;
+        totalExtNeed += free;
+        emptyExts.push(ext);
+    }
+    if (emptyExtCount > 0) {
+        if (!view._extWpMap) view._extWpMap = getExtWpMap(room, emptyExts);
+        view._emptyExts = emptyExts;
+        tasks.push({ type: "extension", taskId: "ext_" + room.name, targetId: null,
+                      amount: totalExtNeed, priority: TASK_PRIORITY.extension });
+    }
+
+    // ── TOWERS ──────────────────────────────────────────────────────────────
+    if (view.towerFillers.length === 0) {
+        for (var ti = 0; ti < view.towers.length; ti++) {
+            var tw = view.towers[ti];
+            var twFree = tw.store.getFreeCapacity(RESOURCE_ENERGY);
+            var twRatio = (tw.store[RESOURCE_ENERGY] || 0) / tw.store.getCapacity(RESOURCE_ENERGY);
+            if (twFree <= 0 || twRatio >= 0.75) continue;
+            tasks.push({ type: "tower", taskId: tw.id, targetId: tw.id,
+                          amount: twFree, priority: TASK_PRIORITY.tower });
+        }
+    }
+
+    // ── LINKS (fill / drain — only storage-adjacent hub link) ───────────────
+    if (view.storage) {
+        var stor = view.storage;
+        var storE = stor.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+
+        linkScan: for (var li = 0; li < view.links.length; li++) {
+            var lnk = view.links[li];
+            if (cheb(lnk.pos, stor.pos) > 2) continue;
+            if (view.controller && cheb(lnk.pos, view.controller.pos) <= 2) continue;
+            for (var ls = 0; ls < view.sources.length; ls++) {
+                if (cheb(view.sources[ls].pos, lnk.pos) <= 2) continue linkScan;
+            }
+
+            var lnkE = lnk.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+
+            if (lnkE > LINK_DRAIN_THRESHOLD && stor.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                var drainAmt = Math.min(lnkE - LINK_FILL_THRESHOLD, stor.store.getFreeCapacity(RESOURCE_ENERGY));
+                if (drainAmt > 0) {
+                    tasks.push({ type: "link_drain", taskId: lnk.id, targetId: stor.id,
+                                  amount: drainAmt, priority: TASK_PRIORITY.link_drain });
+                }
+            }
+
+            if (lnkE < LINK_FILL_THRESHOLD && storE >= 500) {
+                var fillAmt = Math.min(LINK_DRAIN_THRESHOLD - lnkE, storE,
+                                        lnk.store.getFreeCapacity(RESOURCE_ENERGY));
+                if (fillAmt > 100) {
+                    tasks.push({ type: "link_fill", taskId: stor.id, targetId: lnk.id,
+                                  amount: fillAmt, priority: TASK_PRIORITY.link_fill });
+                }
             }
         }
     }
-    return null;
-}
 
-function findMaterialsDrainEnergy(room, view, creep, avoid) {
-    var buckets = getContainerBuckets(room, view);
-    var mats = buckets.materials;
-    if (!mats || mats.length === 0) return null;
+    // ── POWER SPAWNS ────────────────────────────────────────────────────────
+    for (var pi = 0; pi < view.powerSpawns.length; pi++) {
+        var ps = view.powerSpawns[pi];
+        if ((ps.store.getUsedCapacity(RESOURCE_ENERGY) || 0) <= POWER_SPAWN_FILL_THRESHOLD) {
+            tasks.push({ type: "power_spawn_fill", taskId: ps.id, targetId: ps.id,
+                          amount: ps.store.getFreeCapacity(RESOURCE_ENERGY),
+                          priority: TASK_PRIORITY.power_spawn_fill });
+        }
+    }
 
-    var best = null;
-    var most = 0;
-    for (var i = 0; i < mats.length; i++) {
-        var c = mats[i];
-        var e = c.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        if (e <= 0) continue;
+    // ── CONTAINERS ──────────────────────────────────────────────────────────
+    var labels = room.memory.containerLabels || {};
+    var donors = [], materials = [];
+    for (var ci = 0; ci < view.containers.length; ci++) {
+        var cn = view.containers[ci], lb = labels[cn.id];
+        if (lb === "donor") donors.push(cn);
+        else if (lb === "materials") materials.push(cn);
+    }
 
-        var drainTarget = null;
+    for (var di = 0; di < donors.length; di++) {
+        var don = donors[di];
+        var donE = don.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+        if (donE < DONOR_DRAIN_THRESHOLD) continue;
+        if (isLinkServed(room, don.id)) continue;
+
+        var drainTgt = null;
         if (view.storage && view.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-            drainTarget = view.storage;
+            drainTgt = view.storage;
         } else {
-            for (var ti = 0; ti < view.towers.length; ti++) {
-                var t = view.towers[ti];
-                if (t.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                    drainTarget = t;
-                    break;
-                }
+            for (var cj = 0; cj < view.containers.length; cj++) {
+                var tgt = view.containers[cj];
+                if (tgt.id === don.id) continue;
+                var tgtL = labels[tgt.id];
+                if (tgtL === "donor" || tgtL === "materials") continue;
+                if (tgt.store.getFreeCapacity(RESOURCE_ENERGY) > 0) { drainTgt = tgt; break; }
             }
         }
-        if (!drainTarget) break;
+        if (!drainTgt) continue;
 
-        if (matchesAvoid(avoid, "materials_drain_energy", c.id, drainTarget.id)) continue;
-        if (e > most) {
-            most = e;
-            best = { cont: c, tgt: drainTarget };
+        tasks.push({ type: "container_drain", taskId: don.id, targetId: drainTgt.id,
+                      amount: Math.min(donE, drainTgt.store.getFreeCapacity(RESOURCE_ENERGY)),
+                      priority: TASK_PRIORITY.container_drain,
+                      extra: "mde=" + DONOR_DRAIN_THRESHOLD });
+    }
+
+    if (view.storage && view.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+        for (var ce = 0; ce < view.containers.length; ce++) {
+            var co = view.containers[ce], coL = labels[co.id];
+            if (coL === "materials") continue;
+            if (coL === "donor") {
+                if ((co.store.getUsedCapacity(RESOURCE_ENERGY) || 0) >= DONOR_DRAIN_THRESHOLD) continue;
+                if (isLinkServed(room, co.id)) continue;
+            }
+            if (isLinkServed(room, co.id)) continue;
+            var coE = co.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+            if (coE < 50) continue;
+            tasks.push({ type: "container_empty", taskId: co.id, targetId: view.storage.id,
+                          amount: coE, priority: TASK_PRIORITY.container_empty });
         }
     }
-    if (!best) return null;
-    return {
-        type: "materials_drain_energy",
-        taskId: best.cont.id,
-        transferTargetId: best.tgt.id,
-        amount: most
-    };
-}
 
-// OPTIMIZED: Uses labeled continue and Object.keys for store iteration
-function findMaterialsEmpty(room, view, creep, avoid) {
-    var buckets = getContainerBuckets(room, view);
-    var mats = buckets.materials;
-    if (!mats || mats.length === 0) return null;
-
-    // LABELED LOOP for clean multi-level continue
-    matLoop: for (var i = 0; i < mats.length; i++) {
-        var mc = mats[i];
-        var totalUsed = mc.store.getUsedCapacity() || 0;
-        var energyUsed = mc.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        var totalMinerals = totalUsed - energyUsed;
-        if (totalMinerals < 1000) continue;
-
-        var target = null;
-        // Object.keys is faster than for...in
-        var storeKeys = Object.keys(mc.store);
-
-        // Check storage first
-        if (view.storage) {
-            for (var ki = 0; ki < storeKeys.length; ki++) {
-                var r = storeKeys[ki];
-                if (r !== RESOURCE_ENERGY && (mc.store[r] || 0) > 0 && view.storage.store.getFreeCapacity(r) > 0) {
-                    target = view.storage;
-                    break;
-                }
+    for (var mi = 0; mi < materials.length; mi++) {
+        var mc = materials[mi];
+        var mcE = mc.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+        if (mcE <= 0) continue;
+        var mTgt = null;
+        if (view.storage && view.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) mTgt = view.storage;
+        else {
+            for (var mti = 0; mti < view.towers.length; mti++) {
+                if (view.towers[mti].store.getFreeCapacity(RESOURCE_ENERGY) > 0) { mTgt = view.towers[mti]; break; }
             }
         }
+        if (!mTgt) break;
+        tasks.push({ type: "materials_drain_energy", taskId: mc.id, targetId: mTgt.id,
+                      amount: mcE, priority: TASK_PRIORITY.materials_drain_energy });
+    }
 
-        // Check terminal if no storage target
-        if (!target && view.terminal) {
-            for (var ki2 = 0; ki2 < storeKeys.length; ki2++) {
-                var r2 = storeKeys[ki2];
-                if (r2 !== RESOURCE_ENERGY && (mc.store[r2] || 0) > 0 && view.terminal.store.getFreeCapacity(r2) > 0) {
-                    target = view.terminal;
-                    break;
-                }
+    // ── TERMINAL BALANCE ────────────────────────────────────────────────────
+    if (view.storage && view.terminal) {
+        var tE = view.terminal.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+        var roomBusy = terminalManager && typeof terminalManager.isRoomBusyWithTransfer === "function"
+                       && terminalManager.isRoomBusyWithTransfer(view.roomName);
+
+        if (tE > TERMINAL_MAX && !roomBusy && view.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            tasks.push({ type: "terminal_balance", taskId: view.terminal.id, targetId: view.storage.id,
+                          amount: Math.min(tE - TERMINAL_TARGET, view.storage.store.getFreeCapacity(RESOURCE_ENERGY)),
+                          priority: TASK_PRIORITY.terminal_balance });
+        }
+        if (tE < TERMINAL_MIN && view.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+            var tbAmt = Math.min(TERMINAL_TARGET - tE,
+                                  view.storage.store.getUsedCapacity(RESOURCE_ENERGY),
+                                  view.terminal.store.getFreeCapacity(RESOURCE_ENERGY));
+            if (tbAmt > 0) {
+                tasks.push({ type: "terminal_balance", taskId: view.storage.id, targetId: view.terminal.id,
+                              amount: tbAmt, priority: TASK_PRIORITY.terminal_balance });
             }
         }
-
-        if (!target) continue matLoop;
-        if (matchesAvoid(avoid, "materials_empty", mc.id, target.id)) continue matLoop;
-
-        return {
-            type: "materials_empty",
-            taskId: mc.id,
-            transferTargetId: target.id,
-            amount: totalMinerals,
-            minCapacityRequired: Math.ceil(totalMinerals * 0.5)
-        };
-    }
-    return null;
-}
-
-// OPTIMIZED: Pre-compute distances before sorting to avoid repeated getRangeTo in comparator
-function findContainerDrain(room, view, creep, avoid) {
-    var buckets = getContainerBuckets(room, view);
-    var donors = buckets.donors || [];
-    if (donors.length === 0) return null;
-
-    var creepCapacity = getCreepEnergyCapacity(creep);
-
-    // Pre-compute energy and distance for each donor (avoids O(n log n) getRangeTo calls)
-    var donorData = [];
-    for (var i = 0; i < donors.length; i++) {
-        var d = donors[i];
-        donorData.push({
-            container: d,
-            energy: d.store.getUsedCapacity(RESOURCE_ENERGY) || 0,
-            dist: creep.pos.getRangeTo(d.pos)
-        });
     }
 
-    // Sort using pre-computed values
-    donorData.sort(function(a, b) {
-        if (a.energy !== b.energy) return b.energy - a.energy;
-        return a.dist - b.dist;
+    // ── SORT BY PRIORITY ────────────────────────────────────────────────────
+    var custom = room.memory.supplierPriorities;
+    tasks.sort(function(a, b) {
+        var pa = (custom && custom[a.type] != null) ? custom[a.type] : a.priority;
+        var pb = (custom && custom[b.type] != null) ? custom[b.type] : b.priority;
+        return pa - pb;
     });
 
-    var labels = room.memory.containerLabels || {};
+    global._scanCache[room.name] = tasks;
+    return tasks;
+}
 
-    for (var di = 0; di < donorData.length; di++) {
-        var data = donorData[di];
-        var d = data.container;
-        var e = data.energy;
+// ════════════════════════════════════════════════════════════════════════════════
+//  TASK PICKER — pick highest-priority unclaimed task for this creep
+// ════════════════════════════════════════════════════════════════════════════════
 
-        var minRequired = Math.max(DONOR_DRAIN_THRESHOLD, creepCapacity || 0);
-        if (e < minRequired) continue;
+function pickTask(creep, view, h) {
+    var tasks = scanRoomTasks(creep.room, view);
+    var energyUsed = creep.store.getUsedCapacity(RESOURCE_ENERGY);
 
-        var targets = [];
-        if (view.storage && view.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-            targets.push({
-                target: view.storage,
-                priority: 1,
-                free: view.storage.store.getFreeCapacity(RESOURCE_ENERGY)
-            });
-        }
+    for (var i = 0; i < tasks.length; i++) {
+        var t = tasks[i];
+        if (isClaimed(view, creep, t.type, t.taskId, t.targetId)) continue;
+        if (isAvoided(h, t.type, t.taskId, t.targetId)) continue;
 
-        for (var j = 0; j < view.containers.length; j++) {
-            var tgt = view.containers[j];
-            if (tgt.id === d.id) continue;
-            var label = labels[tgt.id];
-            if (label === "materials" || label === "donor") continue;
-            var free = tgt.store.getFreeCapacity(RESOURCE_ENERGY);
-            if (free > 0) {
-                targets.push({ target: tgt, priority: 2, free: free });
+        // Assign it
+        var a = {
+            type: t.type, taskId: t.taskId, targetId: t.targetId,
+            amount: t.amount, assignedTick: Game.time, extra: t.extra || ''
+        };
+        setAssignment(creep, a);
+        h.consecutiveIdlePicks = 0;
+
+        // Determine initial state
+        if (t.type === "extension") {
+            // Build route immediately, decide fetch vs deliver based on energy
+            h.extRoute = buildExtensionRoute(creep, view);
+            h.extRouteTick = Game.time;
+            creep.memory.s = energyUsed > 0 ? "delivering" : "fetching";
+        } else if (t.type === "materials_empty" && energyUsed > 0) {
+            // Need to dump energy before fetching minerals
+            creep.memory.s = "delivering";
+            a.extra = (a.extra ? a.extra + "," : "") + "dump_energy";
+            setAssignment(creep, a);
+        } else if (isWithdrawTask(t.type)) {
+            // Withdraw-type: if already carrying enough for a delivery task, deliver
+            if (shouldDeliverImmediately(t.type, energyUsed)) {
+                creep.memory.s = "delivering";
+            } else {
+                creep.memory.s = "fetching";
             }
-        }
-
-        targets.sort(function(a, b) {
-            if (a.priority !== b.priority) return a.priority - b.priority;
-            return b.free - a.free;
-        });
-
-        for (var k = 0; k < targets.length; k++) {
-            var t = targets[k].target;
-            if (matchesAvoid(avoid, "container_drain", d.id, t.id)) continue;
-
-            return {
-                type: "container_drain",
-                taskId: d.id,
-                transferTargetId: t.id,
-                amount: Math.min(e, t.store.getFreeCapacity(RESOURCE_ENERGY)),
-                minDrainEnergy: creepCapacity
-            };
-        }
-    }
-    return null;
-}
-
-function findContainerEmpty(room, view, creep, avoid) {
-    if (!view.storage) return null;
-    var storage = view.storage;
-    if (storage.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) return null;
-
-    var labels = room.memory.containerLabels || {};
-    var candidates = [];
-
-    for (var i = 0; i < view.containers.length; i++) {
-        var c = view.containers[i];
-        var l = labels[c.id];
-        if (l === "materials") continue;
-        if (l === "donor" && (c.store.getUsedCapacity(RESOURCE_ENERGY) || 0) >= DONOR_DRAIN_THRESHOLD) continue;
-
-        var e = c.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        if (e <= 0) continue;
-        if (matchesAvoid(avoid, "container_empty", c.id, storage.id)) continue;
-
-        candidates.push(c);
-    }
-    if (candidates.length === 0) return null;
-
-    // CPU WIN: Native search is faster
-    var best = creep.pos.findClosestByRange(candidates);
-    if (!best) return null;
-
-    return {
-        type: "container_empty",
-        taskId: best.id,
-        transferTargetId: storage.id,
-        amount: best.store.getUsedCapacity(RESOURCE_ENERGY)
-    };
-}
-
-function findTerminalBalance(view, creep, avoid) {
-    if (!view.storage || !view.terminal) return null;
-
-    var term = view.terminal;
-    var stor = view.storage;
-    var TARGET = 20000;
-    var MIN = 19500;
-    var MAX = 20500;
-
-    var termEnergy = term.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-
-    var roomBusy = false;
-    if (terminalManager && typeof terminalManager.isRoomBusyWithTransfer === "function") {
-        roomBusy = terminalManager.isRoomBusyWithTransfer(view.roomName);
-    }
-    if (roomBusy && termEnergy > MAX) return null;
-
-    if (termEnergy > MAX && stor.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-        if (matchesAvoid(avoid, "terminal_balance", term.id, stor.id)) return null;
-        var amountOut = Math.min(termEnergy - TARGET, stor.store.getFreeCapacity(RESOURCE_ENERGY));
-        if (amountOut > 0) {
-            return {
-                type: "terminal_balance",
-                taskId: term.id,
-                transferTargetId: stor.id,
-                amount: amountOut
-            };
-        }
-    }
-
-    if (termEnergy < MIN && stor.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-        if (matchesAvoid(avoid, "terminal_balance", stor.id, term.id)) return null;
-        var amountIn = Math.min(
-            TARGET - termEnergy,
-            stor.store.getUsedCapacity(RESOURCE_ENERGY),
-            term.store.getFreeCapacity(RESOURCE_ENERGY)
-        );
-        if (amountIn > 0) {
-            return {
-                type: "terminal_balance",
-                taskId: stor.id,
-                transferTargetId: term.id,
-                amount: amountIn
-            };
-        }
-    }
-    return null;
-}
-
-function findIdle() {
-    return { type: "idle", taskId: "idle_sleep", amount: 0 };
-}
-
-function findTaskForType(room, view, creep, type, avoid, labelsComputed) {
-    // Lazy container label computation
-    if (CONTAINER_TYPES[type] && !labelsComputed.done) {
-        ensureContainerLabels(room, view);
-        labelsComputed.done = true;
-    }
-
-    var task = null;
-    if (type === "idle") task = findIdle();
-    else if (type === "spawn") task = findSpawnFill(view, creep, avoid);
-    else if (type === "extension") task = findExtensionFill(view, creep, avoid);
-    else if (type === "tower") task = findTowerFill(view, creep, avoid);
-    else if (type === "power_spawn_fill") task = findPowerSpawnFill(view, creep, avoid);
-    else if (type === "link_fill") task = findLinkFill(view, creep, avoid);
-    else if (type === "link_drain") task = findLinkDrain(view, creep, avoid);
-    else if (type === "materials_drain_energy") task = findMaterialsDrainEnergy(room, view, creep, avoid);
-    else if (type === "materials_empty") task = findMaterialsEmpty(room, view, creep, avoid);
-    else if (type === "container_drain") task = findContainerDrain(room, view, creep, avoid);
-    else if (type === "container_empty") task = findContainerEmpty(room, view, creep, avoid);
-    else if (type === "terminal_balance") task = findTerminalBalance(view, creep, avoid);
-
-    if (!task || type === "idle") return task;
-
-    if (isTakenByOtherSupplier(view, creep, task.type, task.taskId, task.transferTargetId)) return null;
-    if (isPairAvoided(creep, task.type, task.taskId, task.transferTargetId)) return null;
-
-    return task;
-}
-
-// --- VALIDATION ---
-function validateAssignment(creep, view, a) {
-    if (!a || !a.type || !a.taskId) return false;
-    if (a.type === "idle") return true;
-
-    var srcObj = Game.getObjectById(a.taskId);
-    var dstObj = a.transferTargetId ? Game.getObjectById(a.transferTargetId) : srcObj;
-
-    if (!srcObj) return false;
-    if (a.transferTargetId && !dstObj) return false;
-
-    var withdrawKind = isWithdrawType(a.type);
-
-    if (!withdrawKind) {
-        if (!dstObj || !dstObj.store || typeof dstObj.store.getFreeCapacity !== "function") return false;
-        if (a.type !== "materials_empty" && a.type !== "fallback_dump") {
-            if (dstObj.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) return false;
-        }
-        if ((a.type === "spawn" || a.type === "extension" || a.type === "tower" || a.type === "power_spawn_fill") && !dstObj.my) {
-            return false;
-        }
-        if (a.type === "fallback_dump" && dstObj.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) return false;
-    }
-
-    if (withdrawKind) {
-        if (a.type === "materials_empty") {
-            var totalUsedME = srcObj.store.getUsedCapacity() || 0;
-            var energyUsedME = srcObj.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-            if (totalUsedME - energyUsedME < 1000) return false;
-        } else if (a.type === "link_drain") {
-            var linkEnergy = srcObj.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-            if (linkEnergy <= LINK_FILL_THRESHOLD) return false;
-            if (!dstObj || dstObj.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) return false;
-        } else if (a.type === "link_fill") {
-            if (!dstObj || !dstObj.my) return false;
-            var cap = dstObj.store.getCapacity(RESOURCE_ENERGY);
-            var e2 = dstObj.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-            var maxFillNow = Math.max(0, Math.min(LINK_DRAIN_THRESHOLD, cap) - e2);
-            if (maxFillNow <= 0) return false;
-            if ((srcObj.store.getUsedCapacity(RESOURCE_ENERGY) || 0) < 100) return false;
-        } else if (a.type === "terminal_balance") {
-            if (!view.storage || !view.terminal) return false;
-            var termEnergy = view.terminal.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-            if (a.taskId === view.terminal.id) {
-                if (!(termEnergy > 20500 && view.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0)) return false;
-            } else if (a.taskId === view.storage.id) {
-                if (!(termEnergy < 19500 && view.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0)) return false;
-            } else return false;
-        } else if (a.type === "container_drain") {
-            var availableDrain = srcObj.store && srcObj.store.getUsedCapacity
-                ? (srcObj.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-            if (availableDrain <= 0) return false;
-            if (a.minDrainEnergy != null && availableDrain < a.minDrainEnergy) return false;
         } else {
-            var available = srcObj.store && srcObj.store.getUsedCapacity
-                ? (srcObj.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-            if (available <= 0) return false;
+            // Transfer-type: need energy first
+            creep.memory.s = energyUsed > 0 ? "delivering" : "fetching";
         }
+
+        sup_say(creep, creep.memory.s === "fetching" ? "🔄" : "🚚");
+        return true;
     }
-    return true;
+
+    // Nothing to do — idle
+    h.consecutiveIdlePicks = (h.consecutiveIdlePicks || 0) + 1;
+    creep.memory.s = "idle";
+    delete creep.memory._move;
+
+    if (!hasActiveAvoids(h) && h.consecutiveIdlePicks >= 3) {
+        creep.memory.sl = Game.time + IDLE_SLEEP_TICKS;
+    } else {
+        creep.memory.sl = Game.time + IDLE_SHORT_SLEEP;
+    }
+    sup_say(creep, "💤");
+    return false;
 }
 
-function isTaskComplete(view, a) {
-    if (!a || !a.type || !a.taskId) return true;
-    if (a.type === "idle") return false;
+var WITHDRAW_TASKS = {
+    container_empty: true, container_drain: true, materials_drain_energy: true,
+    materials_empty: true, link_drain: true, link_fill: true,
+    terminal_balance: true
+};
+
+function isWithdrawTask(type) { return WITHDRAW_TASKS[type] === true; }
+
+function shouldDeliverImmediately(type, energyUsed) {
+    if (type === "link_fill" && energyUsed > 0) return true;
+    if (type === "terminal_balance" && energyUsed > 0) return true;
+    return false;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  EXTENSION ROUTE (greedy nearest-neighbor, with waypoint-aware positions)
+// ════════════════════════════════════════════════════════════════════════════════
+
+function buildExtensionRoute(creep, view) {
+    var emptyExts = view._emptyExts;
+
+    // FIX: Populate _emptyExts if missing (occurs when no supplier called scanRoomTasks this tick)
+    if (!emptyExts) {
+        emptyExts = [];
+        var rcl8 = view.controller && view.controller.level >= 8;
+        for (var ei = 0; ei < view.extensions.length; ei++) {
+            var ext = view.extensions[ei];
+            var free = ext.store.getFreeCapacity(RESOURCE_ENERGY) || 0;
+            if (free <= 0) continue;
+            if (rcl8 && (ext.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0) continue;
+            emptyExts.push(ext);
+        }
+        view._emptyExts = emptyExts;
+        if (emptyExts.length > 0 && !view._extWpMap) {
+            view._extWpMap = getExtWpMap(creep.room, emptyExts);
+        }
+    }
+
+    if (emptyExts.length === 0) return [];
+
+    var wpMap = view._extWpMap;
+    var extMap = {};
+    for (var i = 0; i < emptyExts.length; i++) {
+        var ext = emptyExts[i];
+        extMap[ext.id] = {
+            pos: (wpMap && wpMap[ext.id]) ? wpMap[ext.id] : ext.pos,
+            cap: ext.store.getCapacity(RESOURCE_ENERGY) || 200
+        };
+    }
+
+    // Greedy nearest-neighbor tour using waypoint positions
+    var remaining = emptyExts.map(function(e) { return e.id; });
+    var rawRoute = [];
+    var cur = creep.pos;
+    while (remaining.length > 0) {
+        var bestIdx = 0, bestDist = cheb(cur, extMap[remaining[0]].pos);
+        for (var j = 1; j < remaining.length; j++) {
+            var d = cheb(cur, extMap[remaining[j]].pos);
+            if (d < bestDist) { bestDist = d; bestIdx = j; }
+        }
+        var pickedId = remaining.splice(bestIdx, 1)[0];
+        rawRoute.push(pickedId);
+        cur = extMap[pickedId].pos;
+    }
+
+    if (!view.storage) return rawRoute;
+
+    // Insert REFUEL sentinels where the creep would run out of energy
+    var storagePos = view.storage.pos;
+    var fullCap    = getEnergyCapacity(creep);
+
+    if (fullCap <= 0) return rawRoute;
+
+    var energy     = creep.store.getUsedCapacity(RESOURCE_ENERGY);
+    var result     = [];
+    var segStart   = 0;
+    var segOrigin  = creep.pos;
+    var ri         = 0;
+
+    var refuelCount = 0;
+    var maxRefuels  = rawRoute.length + 1;
+
+    while (ri < rawRoute.length) {
+        var id = rawRoute[ri];
+        var ed = extMap[id];
+        if (!ed) { ri++; continue; }
+
+        if (energy >= ed.cap) {
+            result.push(id);
+            energy -= ed.cap;
+            ri++;
+            continue;
+        }
+
+        refuelCount++;
+        if (refuelCount > maxRefuels) {
+            while (ri < rawRoute.length) { result.push(rawRoute[ri]); ri++; }
+            break;
+        }
+
+        // Find cheapest insertion point for the REFUEL sentinel
+        var lastPos = result.length > segStart
+            ? extMap[result[result.length - 1]].pos : segOrigin;
+        var bestOverhead = cheb(lastPos, storagePos) + cheb(storagePos, ed.pos) - cheb(lastPos, ed.pos);
+        var bestJ = result.length;
+
+        var jStart = (segOrigin === storagePos) ? segStart + 1 : segStart;
+        for (var j = jStart; j < result.length; j++) {
+            var pPos = (j === segStart) ? segOrigin : extMap[result[j - 1]].pos;
+            var nPos = extMap[result[j]].pos;
+            var overhead = cheb(pPos, storagePos) + cheb(storagePos, nPos) - cheb(pPos, nPos);
+            if (overhead < bestOverhead) { bestOverhead = overhead; bestJ = j; }
+        }
+
+        result.splice(bestJ, 0, "REFUEL");
+        segStart  = bestJ + 1;
+        segOrigin = storagePos;
+        energy    = fullCap;
+        for (var k = segStart; k < result.length; k++) {
+            if (result[k] !== "REFUEL" && extMap[result[k]]) energy -= extMap[result[k]].cap;
+        }
+    }
+
+    return result;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  VALIDATION — is the current assignment still worth doing?
+// ════════════════════════════════════════════════════════════════════════════════
+
+function isAssignmentDone(creep, view, a, h) {
+    if (!a || !a.type) return true;
 
     var src = Game.getObjectById(a.taskId);
-    var dst = a.transferTargetId ? Game.getObjectById(a.transferTargetId) : src;
+    var dst = a.targetId ? Game.getObjectById(a.targetId) : src;
+
+    // Extension: done when route is empty and no empties remain
+    if (a.type === "extension") {
+        var route = h.extRoute;
+        if (route && route.length > 0) return false;
+        // Check if any extension still needs energy
+        var rcl8 = view.controller && view.controller.level >= 8;
+        for (var ei = 0; ei < view.extensions.length; ei++) {
+            var ext = view.extensions[ei];
+            if ((ext.store.getFreeCapacity(RESOURCE_ENERGY) || 0) <= 0) continue;
+            // At RCL 8, partially-filled extensions don't count
+            if (rcl8 && (ext.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0) continue;
+            return false;
+        }
+        return true;
+    }
 
     if (!src) return true;
 
-    if (a.type === "tower") {
-        if (!dst || !dst.store) return true;
-        var towerCapacity = dst.store.getCapacity(RESOURCE_ENERGY) || 0;
-        if (towerCapacity === 0) return true;
-        var towerEnergy = dst.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        return towerEnergy >= towerCapacity * 0.9;
-    }
-
-    if (a.type === "spawn" || a.type === "extension" || a.type === "power_spawn_fill" || a.type === "fallback_dump") {
+    if (a.type === "spawn" || a.type === "power_spawn_fill") {
         return !dst || !dst.store || dst.store.getFreeCapacity(RESOURCE_ENERGY) <= 0;
     }
-
+    if (a.type === "tower") {
+        return !dst || !dst.store ||
+               (dst.store.getUsedCapacity(RESOURCE_ENERGY) || 0) >= dst.store.getCapacity(RESOURCE_ENERGY) * 0.9;
+    }
     if (a.type === "link_fill") {
         if (!dst || !dst.store) return true;
-        var cap = dst.store.getCapacity(RESOURCE_ENERGY);
-        var e = dst.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        return Math.max(0, Math.min(LINK_DRAIN_THRESHOLD, cap) - e) <= 0;
+        return Math.max(0, Math.min(LINK_DRAIN_THRESHOLD, dst.store.getCapacity(RESOURCE_ENERGY))
+               - (dst.store.getUsedCapacity(RESOURCE_ENERGY) || 0)) <= 0;
     }
-
     if (a.type === "link_drain") {
         return !src.store || (src.store.getUsedCapacity(RESOURCE_ENERGY) || 0) <= LINK_FILL_THRESHOLD;
     }
-
     if (a.type === "container_drain" || a.type === "container_empty" || a.type === "materials_drain_energy") {
-        if (!dst || !dst.store) return true;
-        var srcE = src.store && src.store.getUsedCapacity ? (src.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-        if (a.type === "container_drain" && a.minDrainEnergy != null && srcE < a.minDrainEnergy) return true;
-        return srcE <= 0 || dst.store.getFreeCapacity(RESOURCE_ENERGY) <= 0;
+        var srcE = src.store ? (src.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
+        if (a.type === "container_drain" && a.extra) {
+            var mde = parseExtra(a.extra, "mde");
+            if (mde && srcE < +mde) return true;
+        }
+        return srcE <= 0 || !dst || !dst.store || dst.store.getFreeCapacity(RESOURCE_ENERGY) <= 0;
     }
-
     if (a.type === "materials_empty") {
         if (!src.store) return true;
-        var totalUsedMEc = src.store.getUsedCapacity() || 0;
-        var energyUsedMEc = src.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        return totalUsedMEc - energyUsedMEc < 1000;
+        return (src.store.getUsedCapacity() || 0) - (src.store.getUsedCapacity(RESOURCE_ENERGY) || 0) < 1000;
     }
-
     if (a.type === "terminal_balance") {
         if (!view.storage || !view.terminal) return true;
-        var teBal = view.terminal.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        if (a.taskId === view.terminal.id) return teBal < 20500;
-        if (a.taskId === view.storage.id) return teBal > 19500;
+        var tE = view.terminal.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+        if (a.taskId === view.terminal.id) return tE < TERMINAL_MAX;
+        if (a.taskId === view.storage.id) return tE > TERMINAL_MIN;
         return true;
     }
 
     return false;
 }
 
-// --- STEP ASIDE ---
-function tryStepAside(creep) {
-    var terrain = creep.room.getTerrain();
-    var dirs = [TOP, TOP_RIGHT, RIGHT, BOTTOM_RIGHT, BOTTOM, BOTTOM_LEFT, LEFT, TOP_LEFT];
-
-    // Shuffle directions
-    for (var i = dirs.length - 1; i > 0; i--) {
-        var j = (Math.random() * (i + 1)) | 0;
-        var tmp = dirs[i];
-        dirs[i] = dirs[j];
-        dirs[j] = tmp;
+function parseExtra(extra, key) {
+    if (!extra) return null;
+    var parts = extra.split(",");
+    for (var i = 0; i < parts.length; i++) {
+        var kv = parts[i].split("=");
+        if (kv[0] === key) return kv[1];
     }
+    return null;
+}
 
-    var dx = [0, 1, 1, 1, 0, -1, -1, -1];
-    var dy = [-1, -1, 0, 1, 1, 1, 0, -1];
-
-    for (var di = 0; di < dirs.length; di++) {
-        var dir = dirs[di];
-        var idx = dir - 1;
-        var x = creep.pos.x + dx[idx];
-        var y = creep.pos.y + dy[idx];
-
-        if (x <= 0 || x >= 49 || y <= 0 || y >= 49) continue;
-        if (terrain.get(x, y) === TERRAIN_MASK_WALL) continue;
-        if (creep.room.lookForAt(LOOK_CREEPS, x, y).length > 0) continue;
-
-        var structsHere = creep.room.lookForAt(LOOK_STRUCTURES, x, y);
-        var hasBlocker = false;
-        for (var si = 0; si < structsHere.length; si++) {
-            var s = structsHere[si];
-            if (s.structureType !== STRUCTURE_ROAD && s.structureType !== STRUCTURE_CONTAINER) {
-                hasBlocker = true;
-                break;
-            }
-        }
-        if (hasBlocker) continue;
-
-        creep.memory.lastTriedMoveTick = Game.time;
-        creep.move(dir);
-        return true;
+function hasNonEnergyCarry(creep) {
+    var keys = Object.keys(creep.store);
+    for (var i = 0; i < keys.length; i++) {
+        if (keys[i] !== RESOURCE_ENERGY && creep.store[keys[i]] > 0) return true;
     }
     return false;
 }
 
-function findFallbackDumpTarget(view, creep) {
-    if (view.storage && view.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) return view.storage;
-    if (view.terminal && view.terminal.store.getFreeCapacity(RESOURCE_ENERGY) > 0) return view.terminal;
+// ════════════════════════════════════════════════════════════════════════════════
+//  STATE MACHINE EXECUTORS
+// ════════════════════════════════════════════════════════════════════════════════
 
-    var containersWithSpace = [];
-    for (var i = 0; i < view.containers.length; i++) {
-        var c = view.containers[i];
-        if (c.store.getFreeCapacity(RESOURCE_ENERGY) > 0) containersWithSpace.push(c);
-    }
-    return containersWithSpace.length > 0 ? creep.pos.findClosestByRange(containersWithSpace) : null;
-}
-
-function shouldStartDelivering(view, picked, storeCache) {
-    if (!picked || !storeCache || (storeCache.energyUsed || 0) <= 0) return false;
-    if (picked.type === "link_fill") return true;
-    if (picked.type === "terminal_balance" && view.storage && picked.taskId === view.storage.id) return true;
-    return false;
-}
-
-// --- ASSIGNMENT PICKER ---
-function attemptPickAssignment(creep, view, storeCache) {
-    if (creep.memory.assignment) return true;
-
-    if (!storeCache) {
-        storeCache = {
-            freeCapacity: creep.store.getFreeCapacity(),
-            usedCapacity: creep.store.getUsedCapacity(),
-            energyUsed: creep.store.getUsedCapacity(RESOURCE_ENERGY)
-        };
+// ── FETCH STATE ─────────────────────────────────────────────────────────────
+function executeFetch(creep, a, view, h) {
+    if (creep.store.getFreeCapacity() === 0) {
+        creep.memory.s = "delivering";
+        return;
     }
 
-    var typeOrder = getPriorityOrder(creep.room);
-
-    var avoid = null;
-    if (creep.memory.lastCompletedTick === Game.time && creep.memory.lastCompletedType && creep.memory.lastCompletedTaskId) {
-        avoid = {
-            type: creep.memory.lastCompletedType,
-            taskId: creep.memory.lastCompletedTaskId,
-            transferTargetId: creep.memory.lastCompletedTargetId
-        };
-    }
-
-    var picked = null;
-    var labelsComputed = { done: false };
-
-    // Take FIRST valid task in strict priority order
-    for (var oi = 0; oi < typeOrder.length; oi++) {
-        var tType = typeOrder[oi];
-        var avoidForType = (avoid && avoid.type === tType) ? avoid : null;
-        var candidate = findTaskForType(creep.room, view, creep, tType, avoidForType, labelsComputed);
-        if (candidate) {
-            picked = candidate;
-            break;
+    // --- Extension: fetch = go to storage ---
+    if (a.type === "extension") {
+        var stor = view.storage;
+        if (!stor || (stor.store.getUsedCapacity(RESOURCE_ENERGY) || 0) === 0) {
+            clearAssignment(creep, "ext: storage empty", true);
+            return;
         }
-    }
-
-    // Fallback dump logic
-    if (!picked || picked.type === "idle") {
-        if (storeCache.energyUsed > 0) {
-            var dumpTarget = findFallbackDumpTarget(view, creep);
-            if (dumpTarget) {
-                var avoidFallback = false;
-                if (dumpTarget.id === (view.storage && view.storage.id)) {
-                    if (creep.memory.lastCompletedType &&
-                        (creep.memory.lastCompletedType === "link_drain" ||
-                         creep.memory.lastCompletedType === "container_empty" ||
-                         creep.memory.lastCompletedType === "materials_drain_energy")) {
-                        avoidFallback = true;
-                    }
-                    if ((view.storage.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 5000) {
-                        avoidFallback = true;
-                    }
-                }
-
-                if (!avoidFallback) {
-                    creep.memory.assignment = {
-                        taskId: dumpTarget.id,
-                        type: "fallback_dump",
-                        transferTargetId: dumpTarget.id,
-                        amount: storeCache.energyUsed,
-                        assignedTick: Game.time
-                    };
-                    creep.memory.state = "delivering";
-                    creep.say("📦 dump");
-                    return true;
-                }
-            }
-        }
-    }
-
-    // Assign picked task
-    if (picked) {
-        creep.memory.assignment = {
-            taskId: picked.taskId,
-            type: picked.type,
-            transferTargetId: picked.transferTargetId,
-            amount: picked.amount,
-            assignedTick: Game.time
-        };
-        if (picked.minDrainEnergy != null) creep.memory.assignment.minDrainEnergy = picked.minDrainEnergy;
-        if (picked.minCapacityRequired != null) creep.memory.assignment.minCapacityRequired = picked.minCapacityRequired;
-        if (creep.memory.nextCheckTick) delete creep.memory.nextCheckTick;
-
-        // Handle idle
-        if (picked.type === "idle") {
-            creep.memory.state = "idle";
-            var hasActiveAvoids = false;
-            if (creep.memory.avoidPairs) {
-                for (var aInd = 0; aInd < creep.memory.avoidPairs.length; aInd++) {
-                    if (Game.time <= creep.memory.avoidPairs[aInd].until) {
-                        hasActiveAvoids = true;
+        if (creep.pos.isNearTo(stor)) {
+            delete creep.memory._move;
+            creep.withdraw(stor, RESOURCE_ENERGY);
+            creep.memory.s = "delivering";
+            // Move toward first route extension after refill
+            var route = h.extRoute;
+            if (route && route.length > 0) {
+                for (var pi = 0; pi < route.length; pi++) {
+                    if (route[pi] === "REFUEL") break;
+                    var peek = Game.getObjectById(route[pi]);
+                    if (peek && cheb(creep.pos, peek.pos) > 1) {
+                        smartMove(creep, peek);
                         break;
                     }
                 }
             }
-            if (!hasActiveAvoids) {
-                creep.memory.sleepUntil = Game.time + SUPPLIER_IDLE_TICKS;
-                creep.say("💤");
-            } else {
-                creep.say("⏳");
-            }
-            return false;
-        }
-
-        // Set state based on task type
-        if (picked.type === "materials_empty" && storeCache.energyUsed > 0) {
-            creep.memory.state = "delivering_energy";
-            creep.say("⚡ drop energy");
         } else {
-            var withdrawTask = isWithdrawType(picked.type);
-            if (withdrawTask) {
-                if (shouldStartDelivering(view, picked, storeCache)) {
-                    creep.memory.state = "delivering";
-                    creep.say("🚚 deliver");
-                } else {
-                    creep.memory.state = "fetching";
-                    creep.say("🔄 fetch");
+            smartMove(creep, stor);
+        }
+        return;
+    }
+
+    // --- Materials empty: fetch minerals, not energy ---
+    if (a.type === "materials_empty") {
+        var matSrc = Game.getObjectById(a.taskId);
+        if (!matSrc) { clearAssignment(creep, "mat src gone", true); return; }
+        var resType = null;
+        var sk = Object.keys(matSrc.store);
+        for (var i = 0; i < sk.length; i++) {
+            if (sk[i] !== RESOURCE_ENERGY && matSrc.store[sk[i]] > 0) { resType = sk[i]; break; }
+        }
+        if (!resType) { clearAssignment(creep, "mat no minerals", true); return; }
+
+        if (cheb(creep.pos, matSrc.pos) > 1) { smartMove(creep, matSrc); return; }
+        delete creep.memory._move;
+        var wr = creep.withdraw(matSrc, resType);
+        if (wr === OK || wr === ERR_FULL) creep.memory.s = "delivering";
+        else if (wr !== ERR_NOT_IN_RANGE) clearAssignment(creep, "mat withdraw err " + wr, true);
+        return;
+    }
+
+    // --- Standard fetch: determine source ---
+    var source = null;
+
+    if (isWithdrawTask(a.type)) {
+        // Withdraw tasks: source IS the taskId
+        source = Game.getObjectById(a.taskId);
+        if (!source || (source.store.getUsedCapacity(RESOURCE_ENERGY) || 0) <= 0) {
+            clearAssignment(creep, "fetch src empty", true);
+            return;
+        }
+    } else {
+        // Transfer tasks: find energy source
+        source = findEnergySource(creep, view, h);
+        if (!source) { clearAssignment(creep, "no energy source", true); return; }
+        h.fetchSourceId = source.id;
+    }
+
+    // Compute withdraw amount
+    var amt = null;
+    var available = source.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+    var free = creep.store.getFreeCapacity();
+
+    if (a.type === "link_drain") {
+        var maxDrain = Math.max(0, available - LINK_FILL_THRESHOLD);
+        if (maxDrain <= 0) { clearAssignment(creep, "link drained enough", true); return; }
+        amt = Math.min(a.amount || maxDrain, maxDrain, free);
+    } else if (a.type === "link_fill") {
+        var lnk = Game.getObjectById(a.targetId);
+        if (!lnk) { clearAssignment(creep, "link gone", true); return; }
+        var maxFill = Math.max(0, Math.min(LINK_DRAIN_THRESHOLD, lnk.store.getCapacity(RESOURCE_ENERGY))
+                      - (lnk.store.getUsedCapacity(RESOURCE_ENERGY) || 0));
+        if (maxFill <= 0) { clearAssignment(creep, "link full", true); return; }
+        amt = Math.min(a.amount || available, available, free, maxFill);
+    } else if (a.type === "terminal_balance") {
+        amt = Math.min(a.amount || available, available, free);
+    } else {
+        amt = Math.min(available, free);
+    }
+
+    if (cheb(creep.pos, source.pos) > 1) { smartMove(creep, source); return; }
+    delete creep.memory._move;
+
+    var wRes = amt != null ? creep.withdraw(source, RESOURCE_ENERGY, amt) : creep.withdraw(source, RESOURCE_ENERGY);
+    if (wRes === OK || wRes === ERR_FULL) {
+        creep.memory.s = "delivering";
+    } else if (wRes === ERR_NOT_ENOUGH_RESOURCES) {
+        clearAssignment(creep, "not enough res", true);
+    } else if (wRes !== ERR_NOT_IN_RANGE) {
+        clearAssignment(creep, "withdraw err " + wRes, true);
+    }
+}
+
+function findEnergySource(creep, view, h) {
+    // Try cached source first
+    if (h.fetchSourceId) {
+        var cached = Game.getObjectById(h.fetchSourceId);
+        if (cached && cached.store && (cached.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0 &&
+            !(cached.structureType === STRUCTURE_CONTAINER && isLinkServed(creep.room, cached.id))) {
+            return cached;
+        }
+        h.fetchSourceId = null;
+    }
+
+    // Storage first
+    if (view.storage && view.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 500) return view.storage;
+
+    // Containers with energy
+    var containers = [];
+    for (var i = 0; i < view.containers.length; i++) {
+        var c = view.containers[i];
+        var e = c.store.getUsedCapacity(RESOURCE_ENERGY);
+        if (e <= 0) continue;
+        if (view.controller && cheb(c.pos, view.controller.pos) <= 2) continue;
+        if (isLinkServed(creep.room, c.id)) continue;
+        containers.push(c);
+    }
+    if (containers.length > 0) {
+        var freeE = creep.store.getFreeCapacity(RESOURCE_ENERGY);
+        var canFill = [];
+        for (var j = 0; j < containers.length; j++) {
+            if (containers[j].store.getUsedCapacity(RESOURCE_ENERGY) >= freeE) canFill.push(containers[j]);
+        }
+        return canFill.length > 0 ? creep.pos.findClosestByRange(canFill) : creep.pos.findClosestByRange(containers);
+    }
+
+    // Terminal
+    if (view.terminal && view.terminal.store.getUsedCapacity(RESOURCE_ENERGY) > 0) return view.terminal;
+
+    return null;
+}
+
+// ── DELIVER STATE ───────────────────────────────────────────────────────────
+function executeDeliver(creep, a, view, h) {
+    if (creep.store.getUsedCapacity() === 0) {
+        // Nothing to deliver — back to fetch or done
+        if (a.type === "extension") {
+            // Route may have more — refuel needed
+            if (h.extRoute && h.extRoute.length > 0) {
+                creep.memory.s = "fetching";
+                if (view.storage && cheb(creep.pos, view.storage.pos) > 1) {
+                    smartMove(creep, view.storage);
+                }
+                return;
+            }
+            // Check for new empties (spawn may have fired mid-route)
+            h.extRoute = buildExtensionRoute(creep, view);
+            h.extRouteTick = Game.time;
+            if (h.extRoute.length > 0) {
+                creep.memory.s = "fetching";
+                if (view.storage && cheb(creep.pos, view.storage.pos) > 1) {
+                    smartMove(creep, view.storage);
+                }
+                return;
+            }
+            clearAssignment(creep, "ext all full", true);
+            return;
+        }
+        // For any task that still has work to do, go fetch instead of
+        // abandoning — covers towers, spawns, power-spawns, link-fill,
+        // container-drain, etc. when the creep arrives empty due to a
+        // same-tick re-pick or other edge case.
+        if (!isAssignmentDone(creep, view, a, h)) {
+            creep.memory.s = "fetching";
+            return;
+        }
+        clearAssignment(creep, "nothing to deliver", true);
+        return;
+    }
+
+    // --- Materials empty: dump energy first ---
+    if (a.type === "materials_empty" && a.extra && a.extra.indexOf("dump_energy") >= 0) {
+        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+            // Energy dumped, strip flag and switch to fetch minerals
+            a.extra = a.extra.replace(/,?dump_energy/, "");
+            setAssignment(creep, a);
+            creep.memory.s = "fetching";
+            return;
+        }
+        var dumpTgt = view.storage || view.terminal;
+        if (!dumpTgt || dumpTgt.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) {
+            clearAssignment(creep, "no dump target", true); return;
+        }
+        if (cheb(creep.pos, dumpTgt.pos) > 1) { smartMove(creep, dumpTgt); return; }
+        delete creep.memory._move;
+        creep.transfer(dumpTgt, RESOURCE_ENERGY);
+        return;
+    }
+
+    // --- Extension route delivery ---
+    if (a.type === "extension") {
+        executeExtensionDeliver(creep, a, view, h);
+        return;
+    }
+
+    // --- Determine target and resource type ---
+    var target = Game.getObjectById(a.targetId || a.taskId);
+    if (!target) { clearAssignment(creep, "target gone", true); return; }
+
+    var resType = RESOURCE_ENERGY;
+    if (a.type === "materials_empty") {
+        var found = false;
+        var ck = Object.keys(creep.store);
+        for (var i = 0; i < ck.length; i++) {
+            if (ck[i] !== RESOURCE_ENERGY && creep.store[ck[i]] > 0) { resType = ck[i]; found = true; break; }
+        }
+        if (!found) {
+            if (!isAssignmentDone(creep, view, a, h)) { creep.memory.s = "fetching"; return; }
+            clearAssignment(creep, "materials done", true); return;
+        }
+    }
+
+    // Check target capacity
+    if (target.store && target.store.getFreeCapacity && target.store.getFreeCapacity(resType) <= 0) {
+        // Try alternate target for mineral types
+        if (a.type === "materials_empty") {
+            var alt = null;
+            if (view.storage && view.storage.id !== target.id && view.storage.store.getFreeCapacity(resType) > 0) alt = view.storage;
+            else if (view.terminal && view.terminal.id !== target.id && view.terminal.store.getFreeCapacity(resType) > 0) alt = view.terminal;
+            if (alt) { a.targetId = alt.id; setAssignment(creep, a); return; }
+        }
+        clearAssignment(creep, "target full", true);
+        return;
+    }
+
+    // Move + transfer
+    if (cheb(creep.pos, target.pos) > 1) {
+        var mv = smartMove(creep, target);
+        if (mv === ERR_NO_PATH && Game.time >= h.rerouteUntil) {
+            h.noPathCount = (h.noPathCount || 0) + 1;
+            if (h.noPathCount >= NO_PATH_TTL) clearAssignment(creep, "no path", true);
+        } else { h.noPathCount = 0; }
+        return;
+    }
+    delete creep.memory._move;
+
+    // Compute transfer amount for link_fill
+    var amt = null;
+    if (a.type === "link_fill") {
+        var lCap = target.store.getCapacity(RESOURCE_ENERGY);
+        var lE = target.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+        var maxFill = Math.max(0, Math.min(LINK_DRAIN_THRESHOLD, lCap) - lE);
+        if (maxFill <= 0) { clearAssignment(creep, "link filled", true); return; }
+        amt = Math.min(a.amount || creep.store.getUsedCapacity(RESOURCE_ENERGY), maxFill,
+                       creep.store.getUsedCapacity(RESOURCE_ENERGY));
+    }
+
+    var res = amt != null ? creep.transfer(target, resType, amt) : creep.transfer(target, resType);
+
+    if (res === OK || res === ERR_FULL) {
+        if (isAssignmentDone(creep, view, a, h)) {
+            clearAssignment(creep, "task complete", true);
+        } else if (creep.store.getUsedCapacity() === 0 ||
+                   (a.type === "materials_empty" || a.type === "terminal_balance")) {
+            creep.memory.s = "fetching";
+        }
+    } else if (res !== ERR_NOT_IN_RANGE) {
+        clearAssignment(creep, "transfer err " + res, true);
+    }
+}
+
+// ── EXTENSION DELIVERY (route following with move+fill pipelining) ──────────
+function executeExtensionDeliver(creep, a, view, h) {
+    var route = h.extRoute;
+    if (!route || route.length === 0) {
+        route = buildExtensionRoute(creep, view);
+        h.extRoute = route;
+        h.extRouteTick = Game.time;
+        if (route.length === 0) {
+            clearAssignment(creep, "ext all full", true);
+            return;
+        }
+        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+            creep.memory.s = "fetching";
+            return;
+        }
+    }
+
+    // Stale route guard
+    if (h.extRouteTick && Game.time - h.extRouteTick > EXT_ROUTE_RECOMPUTE_TICKS) {
+        route = buildExtensionRoute(creep, view);
+        h.extRoute = route;
+        h.extRouteTick = Game.time;
+        if (route.length === 0) { clearAssignment(creep, "ext stale recompute empty", true); return; }
+        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) { creep.memory.s = "fetching"; return; }
+    }
+
+    // Advance past full/dead extensions (at RCL 8, also skip partially-filled)
+    var rcl8 = view.controller && view.controller.level >= 8;
+    var skipped = 0;
+    while (route.length > 0 && route[0] !== "REFUEL") {
+        var head = Game.getObjectById(route[0]);
+        if (head && head.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            if (!rcl8 || (head.store.getUsedCapacity(RESOURCE_ENERGY) || 0) === 0) break;
+        }
+        route.shift();
+        skipped++;
+        if (skipped >= EXT_ROUTE_SKIP_LIMIT) {
+            route = buildExtensionRoute(creep, view);
+            h.extRoute = route;
+            h.extRouteTick = Game.time;
+            return;
+        }
+    }
+
+    if (route.length === 0) {
+        route = buildExtensionRoute(creep, view);
+        h.extRoute = route;
+        h.extRouteTick = Game.time;
+        if (route.length === 0) { clearAssignment(creep, "ext done", true); return; }
+        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) { creep.memory.s = "fetching"; return; }
+        return;
+    }
+
+    // REFUEL sentinel → switch to fetch
+    if (route[0] === "REFUEL") {
+        route.shift(); // consume sentinel
+        creep.memory.s = "fetching";
+        if (view.storage && cheb(creep.pos, view.storage.pos) > 1) {
+            smartMove(creep, view.storage);
+        }
+        return;
+    }
+
+    // Fill the head extension
+    var target = Game.getObjectById(route[0]);
+    if (!target) { route.shift(); return; }
+
+    // Use the waypoint position for this extension if available
+    var wpMap = view._extWpMap;
+    var targetPos = (wpMap && wpMap[target.id]) ? wpMap[target.id] : target.pos;
+
+    if (cheb(creep.pos, targetPos) > 1) {
+        tryOpportunisticFill(creep, route, view);
+        smartMove(creep, targetPos);
+        return;
+    }
+    delete creep.memory._move;
+
+    var energyHave = creep.store.getUsedCapacity(RESOURCE_ENERGY);
+    var energyNeed = target.store.getFreeCapacity(RESOURCE_ENERGY) || 0;
+    if (energyHave < energyNeed) {
+        route.unshift("REFUEL");  // re-insert so we return here after refuel
+        creep.memory.s = "fetching";
+        if (view.storage && cheb(creep.pos, view.storage.pos) > 1) {
+            smartMove(creep, view.storage);
+        }
+        return;
+    }
+
+    var res = creep.transfer(target, RESOURCE_ENERGY);
+    if (res === OK || res === ERR_FULL) {
+        route.shift();
+
+        var energyAfter = creep.store.getUsedCapacity(RESOURCE_ENERGY) - energyNeed;
+        // Move only if the immediate next extension is out of reach
+        var shouldMove = false;
+        var moveTarget = null;
+        if (route.length > 0) {
+            if (route[0] === "REFUEL") {
+                if (view.storage && cheb(creep.pos, view.storage.pos) > 1) {
+                    shouldMove = true;
+                    moveTarget = view.storage;
                 }
             } else {
-                creep.memory.state = storeCache.energyUsed === 0 ? "fetching" : "delivering";
-                creep.say(creep.memory.state === "fetching" ? "🔄 fetch" : "🚚 deliver");
+                var nextExt = Game.getObjectById(route[0]);
+                if (nextExt) {
+                    var nextWp = (wpMap && wpMap[nextExt.id]) ? wpMap[nextExt.id] : nextExt.pos;
+                    if (cheb(creep.pos, nextWp) > 1) {
+                        shouldMove = true;
+                        moveTarget = nextWp;
+                    }
+                }
             }
         }
+        if (shouldMove && moveTarget) {
+            smartMove(creep, moveTarget);
+        }
+    }
+}
+
+// ── OPPORTUNISTIC FILL: while walking toward route head, fill any adjacent
+//    route extension we happen to pass by.
+//    Note: RCL8 guard is intentionally absent here. The scanner prevents
+//    dispatching a supplier specifically for partial extensions at RCL8, but
+//    if the creep is already adjacent while en route, filling them is free. ──
+function tryOpportunisticFill(creep, route, view) {
+    if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) return false;
+
+    for (var i = 1; i < route.length; i++) {
+        if (route[i] === "REFUEL") break; // don't look past refuel boundaries
+        var ext = Game.getObjectById(route[i]);
+        if (!ext) continue;
+        if (cheb(creep.pos, ext.pos) > 1) continue;
+        if ((ext.store.getFreeCapacity(RESOURCE_ENERGY) || 0) <= 0) continue;
+
+        // Adjacent and needs energy — fill it now
+        var res = creep.transfer(ext, RESOURCE_ENERGY);
+        if (res === OK || res === ERR_FULL) {
+            route.splice(i, 1); // remove from route since we just filled it
+            return true;
+        }
+        break; // only one transfer intent per tick
+    }
+    return false;
+}
+
+// ─── FALLBACK DUMP ──────────────────────────────────────────────────────────
+function tryFallbackDump(creep, view) {
+    var energyUsed = creep.store.getUsedCapacity(RESOURCE_ENERGY);
+    if (energyUsed === 0) return false;
+
+    var target = null;
+    if (view.storage && view.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+        // FIX: Use getFreeCapacity so storage is selected when it has room available,
+        // not when it's nearly empty (original buggy logic inverted the intent)
+        if ((view.storage.store.getFreeCapacity(RESOURCE_ENERGY) || 0) > 5000) target = view.storage;
+    }
+    if (!target && view.terminal && view.terminal.store.getFreeCapacity(RESOURCE_ENERGY) > 0) target = view.terminal;
+    if (!target) {
+        for (var i = 0; i < view.containers.length; i++) {
+            if (view.containers[i].store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+                target = view.containers[i]; break;
+            }
+        }
+    }
+    if (!target) return false;
+
+    // Set a dump assignment
+    setAssignment(creep, {
+        type: "fallback_dump", taskId: target.id, targetId: target.id,
+        amount: energyUsed, assignedTick: Game.time, extra: ''
+    });
+    creep.memory.s = "delivering";
+    sup_say(creep, "📦");
+    return true;
+}
+
+// ─── STEP ASIDE ─────────────────────────────────────────────────────────────
+function tryStepAside(creep, h) {
+    var terrain = creep.room.getTerrain();
+    var dirs = [TOP, TOP_RIGHT, RIGHT, BOTTOM_RIGHT, BOTTOM, BOTTOM_LEFT, LEFT, TOP_LEFT];
+    // Shuffle
+    for (var i = dirs.length - 1; i > 0; i--) {
+        var j = (Math.random() * (i + 1)) | 0;
+        var tmp = dirs[i]; dirs[i] = dirs[j]; dirs[j] = tmp;
+    }
+    var dx = [0, 1, 1, 1, 0, -1, -1, -1];
+    var dy = [-1, -1, 0, 1, 1, 1, 0, -1];
+
+    for (var di = 0; di < dirs.length; di++) {
+        var idx = dirs[di] - 1;
+        var x = creep.pos.x + dx[idx], y = creep.pos.y + dy[idx];
+        if (x <= 0 || x >= 49 || y <= 0 || y >= 49) continue;
+        if (terrain.get(x, y) === TERRAIN_MASK_WALL) continue;
+        if (creep.room.lookForAt(LOOK_CREEPS, x, y).length > 0) continue;
+        var structs = creep.room.lookForAt(LOOK_STRUCTURES, x, y);
+        var blocked = false;
+        for (var si = 0; si < structs.length; si++) {
+            if (structs[si].structureType !== STRUCTURE_ROAD && structs[si].structureType !== STRUCTURE_CONTAINER) {
+                blocked = true; break;
+            }
+        }
+        if (blocked) continue;
+        h.lastTriedMoveTick = Game.time;
+        creep.move(dirs[di]);
         return true;
     }
     return false;
 }
 
-// ============================================
-// MAIN RUN FUNCTION
-// ============================================
-const roleSupplier = {
+// ════════════════════════════════════════════════════════════════════════════════
+//  MAIN RUN
+// ════════════════════════════════════════════════════════════════════════════════
+
+var roleSupplier = {
     run: function(creep) {
-        if (!SUPPLIER_ENABLED) {
-            if (Game.time % 5 === 0) creep.say("Disabled");
-            return;
+        if (!SUPPLIER_ENABLED) return;
+        pruneHeap();
+        var h = getHeap(creep.name);
+
+        // ── IDLE SLEEP GATE ────────────────────────────────────────────────
+        if (creep.memory.s === "idle" && creep.memory.sl && Game.time < creep.memory.sl) {
+            return;  // Sleeping — zero CPU
         }
 
-        // --- IDLE SLEEP GATE (CPU SAVER) ---
-        if (creep.memory.assignment && creep.memory.assignment.type === "idle") {
-            if (creep.memory.sleepUntil && Game.time < creep.memory.sleepUntil) {
-                return; // Near 0 CPU cost
-            }
-            creep.memory.assignment = null;
-            delete creep.memory.sleepUntil;
-        }
-
-        // --- SUICIDE LOGIC IF LOW TTL ---
+        // ── LOW TTL → DUMP AND DIE ────────────────────────────────────────
         if (creep.ticksToLive < 100) {
-            creep.say("☠️ retiring");
             if (creep.store.getUsedCapacity() > 0) {
-                var storeKeys = Object.keys(creep.store);
-                var carryType = storeKeys.length > 0 ? storeKeys[0] : RESOURCE_ENERGY;
-                var dumpTarget = creep.room.storage || creep.room.terminal;
-                if (dumpTarget) {
-                    if (doTransfer(creep, dumpTarget, carryType) === ERR_NOT_IN_RANGE) {
-                        smartMove(creep, dumpTarget);
-                    }
-                } else {
-                    creep.drop(carryType);
-                }
+                var dumpKey = Object.keys(creep.store)[0] || RESOURCE_ENERGY;
+                var dumpTgt = creep.room.storage || creep.room.terminal;
+                if (dumpTgt) {
+                    if (creep.transfer(dumpTgt, dumpKey) === ERR_NOT_IN_RANGE) smartMove(creep, dumpTgt);
+                } else { creep.drop(dumpKey); }
                 return;
             }
             creep.suicide();
             return;
         }
 
-        pruneAvoidPairs(creep);
-        if (!creep.memory.state) creep.memory.state = "idle";
+        pruneAvoids(h);
+        if (!creep.memory.s) creep.memory.s = "idle";
 
-        // --- ANTI-STUCK LOGIC ---
-        if (creep.memory.lastPos) {
-            if (creep.fatigue === 0) {
-                var moved = creep.pos.x !== creep.memory.lastPos.x ||
-                            creep.pos.y !== creep.memory.lastPos.y ||
-                            creep.room.name !== creep.memory.lastPos.roomName;
-                var triedMoveLastTick = creep.memory.lastTriedMoveTick === (Game.time - 1);
-                if (!moved && triedMoveLastTick) {
-                    creep.memory.stuckCount = (creep.memory.stuckCount || 0) + 1;
-                } else if (moved) {
-                    creep.memory.stuckCount = 0;
-                }
+        // ── ROOM CONTAINMENT ───────────────────────────────────────────────
+        var home = creep.memory.assignedRoom || creep.memory.homeRoom;
+        if (home && creep.room.name !== home) {
+            delete creep.memory._move;
+            var exit = creep.room.findExitTo(home);
+            if (exit > 0) {
+                var ePos = creep.pos.findClosestByRange(exit);
+                if (ePos) { h.lastTriedMoveTick = Game.time; creep.moveTo(ePos, { reusePath: 5, maxOps: 500 }); }
             }
-        } else {
-            creep.memory.stuckCount = 0;
-        }
-        creep.memory.lastPos = { x: creep.pos.x, y: creep.pos.y, roomName: creep.room.name };
-
-        if ((creep.memory.stuckCount || 0) >= 2) {
-            var shouldStepAside = true;
-            var a0 = creep.memory.assignment;
-
-            if (a0) {
-                if (creep.memory.state === "delivering") {
-                    var t0 = Game.getObjectById(a0.transferTargetId || a0.taskId);
-                    if (t0 && creep.pos.getRangeTo(t0.pos) <= 1) shouldStepAside = false;
-                } else if (creep.memory.state === "fetching") {
-                    if (isWithdrawType(a0.type)) {
-                        var s0 = Game.getObjectById(a0.taskId);
-                        if (s0 && creep.pos.getRangeTo(s0.pos) <= 1) shouldStepAside = false;
-                    }
-                    if (shouldStepAside && creep.store.getFreeCapacity() > 0) {
-                        var nearby = creep.pos.findInRange(FIND_STRUCTURES, 1, {
-                            filter: function(s) {
-                                return s.store && (s.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0;
-                            }
-                        });
-                        if (nearby && nearby.length > 0) shouldStepAside = false;
-                    }
-                } else if (creep.memory.state === "delivering_energy") {
-                    if (creep.room.storage && creep.pos.getRangeTo(creep.room.storage.pos) <= 1) {
-                        shouldStepAside = false;
-                    }
-                }
-            }
-
-            if (shouldStepAside) {
-                if (!tryStepAside(creep)) {
-                    creep.memory.lastTriedMoveTick = Game.time;
-                    return;
-                }
-                creep.memory.rerouteUntil = Math.max(Game.time + 5, creep.memory.rerouteUntil || 0);
-                if (creep.memory._move) delete creep.memory._move;
-                creep.say("🔄 reroute");
-            }
-            creep.memory.stuckCount = 0;
+            return;
         }
 
-        if (creep.memory.rerouteUntil && Game.time >= creep.memory.rerouteUntil) {
-            delete creep.memory.rerouteUntil;
+        // ── ANTI-STUCK ─────────────────────────────────────────────────────
+        if (h.lastPos && creep.fatigue === 0) {
+            var moved = creep.pos.x !== h.lastPos.x || creep.pos.y !== h.lastPos.y || creep.room.name !== h.lastPos.rn;
+            if (!moved && h.lastTriedMoveTick === Game.time - 1) h.stuckCount++;
+            else if (moved) h.stuckCount = 0;
+        } else { h.stuckCount = 0; }
+        h.lastPos = { x: creep.pos.x, y: creep.pos.y, rn: creep.room.name };
+
+        if (h.stuckCount >= 2) {
+            // Only step aside if not adjacent to our target
+            var shouldStep = true;
+            var curA = getAssignment(creep);
+            if (curA) {
+                var stuckTarget = (creep.memory.s === "delivering")
+                    ? Game.getObjectById(curA.targetId || curA.taskId)
+                    : (isWithdrawTask(curA.type) ? Game.getObjectById(curA.taskId) : null);
+                if (stuckTarget && cheb(creep.pos, stuckTarget.pos) <= 1) shouldStep = false;
+            }
+            if (shouldStep) {
+                tryStepAside(creep, h);
+                h.rerouteUntil = Math.max(Game.time + 5, h.rerouteUntil || 0);
+                delete creep.memory._move;
+            }
+            h.stuckCount = 0;
         }
+        if (h.rerouteUntil && Game.time >= h.rerouteUntil) h.rerouteUntil = 0;
 
-        // Cache store values
-        var storeCache = {
-            freeCapacity: creep.store.getFreeCapacity(),
-            usedCapacity: creep.store.getUsedCapacity(),
-            energyUsed: creep.store.getUsedCapacity(RESOURCE_ENERGY)
-        };
-
+        // ── BUILD VIEW ─────────────────────────────────────────────────────
         var view = getRoomView(creep.room);
-        if (!view) {
-            creep.say("no view");
-            return;
-        }
+        if (!view) return;
 
-        // --- PRIORITY MINERALS DROP-OFF ---
+        // ── PRIORITY: DEPOSIT NON-ENERGY MINERALS ──────────────────────────
+        // If carrying minerals and NOT on a mineral pickup task, deposit immediately.
         var mineralType = null;
-        var creepStoreKeys = Object.keys(creep.store);
-        for (var csi = 0; csi < creepStoreKeys.length; csi++) {
-            var resourceType = creepStoreKeys[csi];
-            if (resourceType !== RESOURCE_ENERGY && creep.store[resourceType] > 0) {
-                mineralType = resourceType;
-                break;
-            }
+        var sKeys = Object.keys(creep.store);
+        for (var ki = 0; ki < sKeys.length; ki++) {
+            if (sKeys[ki] !== RESOURCE_ENERGY && creep.store[sKeys[ki]] > 0) { mineralType = sKeys[ki]; break; }
         }
-
         if (mineralType) {
-            var depositTarget = null;
-            if (view.storage && view.storage.store.getFreeCapacity(mineralType) > 0) {
-                depositTarget = view.storage;
-            } else if (view.terminal && view.terminal.store.getFreeCapacity(mineralType) > 0) {
-                depositTarget = view.terminal;
-            }
-
-            if (depositTarget) {
-                creep.say("💎 deposit");
-                if (creep.pos.getRangeTo(depositTarget) > 1) {
-                    smartMove(creep, depositTarget);
+            var curAM = getAssignment(creep);
+            if (!curAM || curAM.type !== "materials_empty") {
+                var depTgt = null;
+                if (view.storage && view.storage.store.getFreeCapacity(mineralType) > 0) depTgt = view.storage;
+                else if (view.terminal && view.terminal.store.getFreeCapacity(mineralType) > 0) depTgt = view.terminal;
+                if (depTgt) {
+                    if (cheb(creep.pos, depTgt.pos) > 1) { smartMove(creep, depTgt); return; }
+                    delete creep.memory._move;
+                    creep.transfer(depTgt, mineralType);
                     return;
                 }
-                doTransfer(creep, depositTarget, mineralType, null);
-                return;
+                return; // Can't deposit — wait
             }
-            creep.say("⚠️ full!");
-            return;
         }
 
-        // --- OPPORTUNISTIC ADJACENT EXTENSION FILL ---
-        if (creep.memory.assignment &&
-            creep.memory.assignment.type === "extension" &&
-            creep.memory.state === "delivering" &&
-            creep.memory.extOpportunistic) {
+        // ── VALIDATE / PICK ASSIGNMENT ─────────────────────────────────────
+        var a = getAssignment(creep);
 
-            if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-                var nearbyExtensions = creep.pos.findInRange(FIND_STRUCTURES, 1, {
-                    filter: function(s) {
-                        return s && s.my && s.structureType === STRUCTURE_EXTENSION &&
-                               s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
+        // TTL check
+        if (a && a.assignedTick && Game.time - a.assignedTick > ASSIGNMENT_TTL) {
+            clearAssignment(creep, "TTL", true);
+            a = null;
+        }
+
+        // Completion check (skip on tick assigned — just validated by scanner)
+        if (a && a.assignedTick !== Game.time && isAssignmentDone(creep, view, a, h)) {
+            clearAssignment(creep, "done", true);
+            a = null;
+        }
+
+        // Pick new task if idle
+        if (!a || creep.memory.s === "idle") {
+            // Try fallback dump first if carrying energy with nothing to do
+            if (a && creep.memory.s === "idle" && creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                if (tryFallbackDump(creep, view)) return;
+            }
+            delete creep.memory.sl;
+            if (!pickTask(creep, view, h)) return; // idle, sleeping
+            a = getAssignment(creep);
+            if (!a) return;
+        }
+
+        // ── EXECUTE STATE ──────────────────────────────────────────────────
+        if (creep.memory.s === "fetching") {
+            executeFetch(creep, a, view, h);
+        } else if (creep.memory.s === "delivering") {
+            executeDeliver(creep, a, view, h);
+        } else {
+            // Unknown state — reset
+            creep.memory.s = creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0 ? "delivering" : "fetching";
+        }
+
+        // ── SAME-TICK RE-PICK: if the task just completed, the transfer intent
+        //    is spent but the move intent is still free. Pick a new task and
+        //    start executing it so we don't waste the move. ──────────────────
+        if (creep.memory.s === "idle" && !getAssignment(creep)) {
+            if (pickTask(creep, view, h)) {
+                a = getAssignment(creep);
+                if (a) {
+                    if (creep.memory.s === "fetching") {
+                        executeFetch(creep, a, view, h);
+                    } else if (creep.memory.s === "delivering") {
+                        executeDeliver(creep, a, view, h);
                     }
-                });
-                if (nearbyExtensions && nearbyExtensions.length > 0) {
-                    doTransfer(creep, nearbyExtensions[0], RESOURCE_ENERGY, null);
-                    return;
                 }
-            }
-            delete creep.memory.extOpportunistic;
-        }
-
-        // --- COMPLETION + TTL GUARDS ---
-        if (creep.memory.assignment) {
-            var aChk = creep.memory.assignment;
-            if (aChk.assignedTick && Game.time - aChk.assignedTick > ASSIGNMENT_TTL) {
-                clearAssignment(creep, { reason: "TTL expired", avoid: true });
-            } else if (isTaskComplete(view, aChk)) {
-                clearAssignment(creep, { justCompleted: true, reason: "pre-action complete" });
-            }
-        }
-
-        // --- VALIDATE EXISTING ASSIGNMENT ---
-        if (creep.memory.assignment) {
-            if (!validateAssignment(creep, view, creep.memory.assignment)) {
-                clearAssignment(creep, { reason: "validation failed", avoid: true });
-            }
-        }
-
-        // Pick assignment
-        attemptPickAssignment(creep, view, storeCache);
-
-        // --- EXECUTE ACTION ---
-        if (creep.memory.assignment && creep.memory.assignment.type !== "idle") {
-            var inReroute = Game.time < (creep.memory.rerouteUntil || 0);
-
-            // Cache assignment objects once
-            var execAssignment = creep.memory.assignment;
-            var execSrcObj = Game.getObjectById(execAssignment.taskId);
-            var execDstObj = execAssignment.transferTargetId
-                ? Game.getObjectById(execAssignment.transferTargetId)
-                : execSrcObj;
-
-            switch (creep.memory.state) {
-                case "delivering_energy":
-                    executeDeliveringEnergy(creep, view, execAssignment, inReroute);
-                    break;
-
-                case "fetching":
-                    executeFetching(creep, view, execAssignment, execSrcObj, execDstObj);
-                    break;
-
-                case "delivering":
-                    executeDelivering(creep, view, execAssignment, execDstObj, inReroute);
-                    break;
-
-                case "idle":
-                    clearAssignment(creep, { reason: "unexpected idle state" });
-                    break;
-
-                default:
-                    creep.memory.state = creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0 ? "fetching" : "delivering";
-                    break;
             }
         }
     }
 };
-
-// --- STATE EXECUTION FUNCTIONS ---
-function executeDeliveringEnergy(creep, view, execA, inReroute) {
-    if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-        if (execA.type === "materials_empty") {
-            creep.memory.state = "fetching";
-        } else {
-            clearAssignment(creep, { justCompleted: true, reason: "energy dropped" });
-        }
-        return;
-    }
-
-    var targetDE = null;
-    if (view.storage && view.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-        targetDE = view.storage;
-    } else if (view.terminal && view.terminal.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-        targetDE = view.terminal;
-    }
-
-    creep.say("⚡ drop energy");
-    if (!targetDE) {
-        clearAssignment(creep, { reason: "no capacity to drop energy", avoid: execA.type === "materials_empty" });
-        return;
-    }
-
-    if (creep.pos.getRangeTo(targetDE) > 1) {
-        var mv = smartMove(creep, targetDE);
-        if (mv === ERR_NO_PATH && !inReroute) {
-            creep.memory.noPathDeliver = (creep.memory.noPathDeliver || 0) + 1;
-            if (creep.memory.noPathDeliver >= NO_PATH_DELIVER_TTL) {
-                clearAssignment(creep, { reason: "no path delivering_energy", avoid: true });
-            }
-        } else {
-            creep.memory.noPathDeliver = 0;
-        }
-        return;
-    }
-
-    var resDE = doTransfer(creep, targetDE, RESOURCE_ENERGY, null);
-    if (resDE === OK || resDE === ERR_FULL) {
-        if (execA.type === "materials_empty") {
-            creep.memory.state = "fetching";
-            creep.say("🔄 fetch");
-        } else {
-            clearAssignment(creep, { justCompleted: true, reason: "drop energy OK/FULL" });
-        }
-    } else if (resDE !== ERR_NOT_IN_RANGE) {
-        clearAssignment(creep, { reason: "drop energy transfer error " + resDE, avoid: true });
-    }
-}
-
-function executeFetching(creep, view, execA, execSrcObj, execDstObj) {
-    if (execA.type === "container_drain" && creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-        creep.memory.state = "delivering";
-        creep.say("⚡ dump");
-        return;
-    }
-
-    if (creep.store.getFreeCapacity() === 0) {
-        creep.memory.state = "delivering";
-        return;
-    }
-
-    creep.say("🔄 fetch");
-    var source = null;
-
-    if (execA.type === "link_fill") {
-        source = execSrcObj;
-        if (source && (source.store.getUsedCapacity(RESOURCE_ENERGY) || 0) < 100) {
-            clearAssignment(creep, { reason: "link_fill: storage low on energy", avoid: true });
-            return;
-        }
-    } else if (isWithdrawType(execA.type)) {
-        source = execSrcObj;
-    } else {
-        // Find energy source
-        if (view.storage && view.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 1000) {
-            source = view.storage;
-        } else {
-            var energyContainers = [];
-            for (var ci = 0; ci < view.containers.length; ci++) {
-                var c = view.containers[ci];
-                var e = c.store.getUsedCapacity(RESOURCE_ENERGY);
-                if (e <= 0) continue;
-                if (view.controller && c.pos.getRangeTo(view.controller.pos) <= 2) continue;
-                energyContainers.push(c);
-            }
-
-            if (energyContainers.length > 0) {
-                var freeE = creep.store.getFreeCapacity(RESOURCE_ENERGY);
-                var canFill = [];
-                for (var fi = 0; fi < energyContainers.length; fi++) {
-                    if (energyContainers[fi].store.getUsedCapacity(RESOURCE_ENERGY) >= freeE) {
-                        canFill.push(energyContainers[fi]);
-                    }
-                }
-                source = canFill.length > 0 ? creep.pos.findClosestByRange(canFill) : creep.pos.findClosestByRange(energyContainers);
-            }
-
-            if (!source && view.terminal && view.terminal.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-                source = view.terminal;
-            }
-
-            if (!source && view.nukers && view.nukers.length > 0) {
-                var termE = view.terminal ? (view.terminal.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-                var storE = view.storage ? (view.storage.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-                if (termE === 0 && storE <= 1000) {
-                    var nukerCands = [];
-                    for (var ni = 0; ni < view.nukers.length; ni++) {
-                        if (view.nukers[ni].store && (view.nukers[ni].store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0) {
-                            nukerCands.push(view.nukers[ni]);
-                        }
-                    }
-                    if (nukerCands.length > 0) source = creep.pos.findClosestByRange(nukerCands);
-                }
-            }
-        }
-    }
-
-    if (!source) {
-        clearAssignment(creep, { reason: "no source", avoid: true });
-        return;
-    }
-
-    var resType = RESOURCE_ENERGY;
-    var amt = null;
-
-    if (execA.type === "materials_empty") {
-        var picked = false;
-        var srcKeys = Object.keys(source.store);
-        for (var ski = 0; ski < srcKeys.length; ski++) {
-            if (srcKeys[ski] !== RESOURCE_ENERGY && source.store[srcKeys[ski]] > 0) {
-                resType = srcKeys[ski];
-                picked = true;
-                break;
-            }
-        }
-        if (!picked) {
-            clearAssignment(creep, { reason: "materials_empty no minerals", avoid: true });
-            return;
-        }
-    }
-
-    var available = source.store && source.store.getUsedCapacity ? (source.store.getUsedCapacity(resType) || 0) : 0;
-    if (available <= 0) {
-        clearAssignment(creep, { reason: "fetch source empty", avoid: true });
-        return;
-    }
-
-    var freeCap = creep.store.getFreeCapacity();
-
-    if (execA.type === "link_drain") {
-        var maxDrainNow = Math.max(0, available - LINK_FILL_THRESHOLD);
-        if (maxDrainNow <= 0) {
-            clearAssignment(creep, { justCompleted: true, reason: "link_drain already below threshold" });
-            return;
-        }
-        amt = Math.min(execA.amount != null ? execA.amount : maxDrainNow, maxDrainNow, freeCap);
-    } else if (execA.type === "link_fill") {
-        var linkEnergyNow = execDstObj ? (execDstObj.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-        var linkCapNow = execDstObj ? execDstObj.store.getCapacity(RESOURCE_ENERGY) : 0;
-        var maxFillNow = Math.max(0, Math.min(LINK_DRAIN_THRESHOLD, linkCapNow) - linkEnergyNow);
-        if (maxFillNow <= 0) {
-            clearAssignment(creep, { justCompleted: true, reason: "link already filled at fetch" });
-            return;
-        }
-        amt = Math.min(execA.amount != null ? execA.amount : available, available, freeCap, maxFillNow);
-        if (amt <= 0) {
-            clearAssignment(creep, { justCompleted: true, reason: "link_fill no amount to fetch" });
-            return;
-        }
-    } else if (execA.type === "terminal_balance") {
-        amt = Math.min(execA.amount != null ? execA.amount : available, available, freeCap);
-    } else {
-        amt = Math.min(available, freeCap);
-    }
-
-    if (creep.pos.getRangeTo(source) > 1) {
-        smartMove(creep, source);
-        return;
-    }
-
-    var withdrawResult = doWithdraw(creep, source, resType, amt);
-    if (withdrawResult === OK || withdrawResult === ERR_FULL) {
-        creep.memory.state = "delivering";
-    } else if (withdrawResult === ERR_NOT_ENOUGH_RESOURCES) {
-        clearAssignment(creep, { reason: "withdraw not enough", avoid: true });
-    } else if (withdrawResult !== ERR_NOT_IN_RANGE) {
-        clearAssignment(creep, { reason: "withdraw error " + withdrawResult, avoid: true });
-    }
-}
-
-function executeDelivering(creep, view, execA, execDstObj, inReroute) {
-    if (creep.store.getUsedCapacity() === 0) {
-        clearAssignment(creep, { reason: "nothing to deliver" });
-        return;
-    }
-
-    var target = execDstObj;
-    creep.say("🚚 deliver");
-
-    if (!target) {
-        clearAssignment(creep, { reason: "missing delivery target", avoid: true });
-        return;
-    }
-
-    var resTypeD = RESOURCE_ENERGY;
-    if (execA.type === "materials_empty") {
-        var foundRes = false;
-        var cKeys = Object.keys(creep.store);
-        for (var ck = 0; ck < cKeys.length; ck++) {
-            if (cKeys[ck] !== RESOURCE_ENERGY && creep.store[cKeys[ck]] > 0) {
-                resTypeD = cKeys[ck];
-                foundRes = true;
-                break;
-            }
-        }
-        if (!foundRes) {
-            if (isTaskComplete(view, execA)) {
-                clearAssignment(creep, { justCompleted: true, reason: "materials below threshold (no cargo)" });
-            } else {
-                creep.memory.state = "fetching";
-                creep.say("🔄 fetch");
-            }
-            return;
-        }
-    }
-
-    if (target.store && target.store.getFreeCapacity && target.store.getFreeCapacity(resTypeD) <= 0) {
-        if (execA.type === "materials_empty") {
-            var alt = null;
-            if (view.storage && view.storage.id !== target.id && view.storage.store.getFreeCapacity(resTypeD) > 0) {
-                alt = view.storage;
-            } else if (view.terminal && view.terminal.id !== target.id && view.terminal.store.getFreeCapacity(resTypeD) > 0) {
-                alt = view.terminal;
-            }
-            if (alt) {
-                creep.memory.assignment.transferTargetId = alt.id;
-            } else {
-                clearAssignment(creep, { reason: "no capacity for minerals", avoid: true });
-            }
-        } else {
-            clearAssignment(creep, { justCompleted: true, reason: "target full" });
-        }
-        return;
-    }
-
-    if (creep.pos.getRangeTo(target) > 1) {
-        var mv = smartMove(creep, target);
-        if (mv === ERR_NO_PATH && !inReroute) {
-            creep.memory.noPathDeliver = (creep.memory.noPathDeliver || 0) + 1;
-            if (creep.memory.noPathDeliver >= NO_PATH_DELIVER_TTL) {
-                clearAssignment(creep, { reason: "no path delivering", avoid: true });
-            }
-        } else {
-            creep.memory.noPathDeliver = 0;
-        }
-        return;
-    }
-
-    var amtD = null;
-    if (execA.type === "link_fill") {
-        var linkCapD = target.store.getCapacity(RESOURCE_ENERGY);
-        var linkEnergyD = target.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-        var maxFillNowD = Math.max(0, Math.min(LINK_DRAIN_THRESHOLD, linkCapD) - linkEnergyD);
-        if (maxFillNowD <= 0) {
-            clearAssignment(creep, { justCompleted: true, reason: "link filled at delivery" });
-            return;
-        }
-        amtD = Math.min(
-            execA.amount != null ? execA.amount : creep.store.getUsedCapacity(RESOURCE_ENERGY),
-            maxFillNowD,
-            creep.store.getUsedCapacity(RESOURCE_ENERGY)
-        );
-    }
-
-    var resTx = doTransfer(creep, target, resTypeD, amtD);
-    if (resTx === OK || resTx === ERR_FULL) {
-        if (execA.type === "extension") {
-            creep.memory.extOpportunistic = true;
-            return;
-        }
-        if (isTaskComplete(view, execA) || execA.type === "fallback_dump") {
-            clearAssignment(creep, { justCompleted: true, reason: "transfer complete" });
-        } else if (execA.type === "materials_empty" || execA.type === "terminal_balance" || creep.store.getUsedCapacity() === 0) {
-            creep.memory.state = "fetching";
-            creep.say("🔄 fetch");
-        }
-    } else if (resTx !== ERR_NOT_IN_RANGE) {
-        clearAssignment(creep, { reason: "transfer error " + resTx, avoid: true });
-    }
-}
 
 module.exports = roleSupplier;

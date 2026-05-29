@@ -1,201 +1,236 @@
 // roleRepairBot.js
-// Behavior:
-// 1) Energy: withdraw from storage if available; otherwise from a container; otherwise idle
-// 2) Repairs priority:
-//    2A) First damaged containers (first found)
-//    2B) If none, damaged roads (first found)
-//    2C) If none, other damaged structures (exclude walls & ramparts)
-//    2D) If none, walls or ramparts under 1,000,000 hits (pick the lowest hits)
-// Notes:
-// - Uses getRoomState for data access (no room.find calls here)
-// - No optional chaining used
-// - Caches current repair target in memory to reduce re-scanning CPU cost
-// - Creep.repair works up to range 3; move within range if needed【1】
-// - Structures expose hits/hitsMax which we use to decide damage【3】
+// Spawned when 3+ roads are below 50% health in a room, OR when any container
+// is below CONTAINER_TRIGGER_HITS (200k).
+// On first tick: computes a greedy nearest-neighbor route through up to 25
+// damaged roads and containers and stores the ordered ID list in memory.
+// Works through the queue in order, repairs each structure to its done threshold
+// (ROAD_DONE_THRESHOLD for roads, CONTAINER_DONE_HITS for containers),
+// then advances. When the queue is empty, attempts to rebuild before giving up.
+// On confirmed empty rebuild: deposits remaining energy into storage (if any)
+// and suicides, writing a cooldown to Memory so the spawn manager doesn't
+// immediately re-trigger.
+// Rampart repair is disabled — handled by a dedicated role.
 
 const getRoomState = require('getRoomState');
 
-const WALL_RAMPART_THRESHOLD = 1000000;
-const RESCAN_COOLDOWN = 5; // ticks to wait before re-scanning when no target
-const MOVE_OPTS_CLOSE = { reusePath: 10, range: 1 };
-const MOVE_OPTS_REPAIR = { reusePath: 10, range: 3 };
+const ROAD_DONE_THRESHOLD    = 0.99;    // consider a road done at 99% — avoids chasing last few hits
+const CONTAINER_TRIGGER_HITS = 200000;  // include a container in the queue below this
+const CONTAINER_DONE_HITS    = 244000;  // consider a container done once it reaches this
+const MAX_ROADS               = 25;
+const SPAWN_COOLDOWN          = 50;     // ticks to wait after suicide before spawning a replacement
+const MOVE_OPTS_CLOSE         = { reusePath: 15, range: 1};
+const MOVE_OPTS_REPAIR        = { reusePath: 15, range: 3};
 
-function isDamaged(structure) {
-  if (!structure) return false;
-  if (typeof structure.hits !== 'number') return false;
-  if (typeof structure.hitsMax !== 'number') return structure.hits > 0 && structure.hits < WALL_RAMPART_THRESHOLD; // fallback
-  return structure.hits < structure.hitsMax;
-}
 
-function getEnergy(creep, rs) {
-  // Prefer storage
-  var storage = rs ? rs.storage : null;
-  if (storage && storage.store) {
-    var se = storage.store[RESOURCE_ENERGY] || 0;
-    if (se > 0) {
-      var w = creep.withdraw(storage, RESOURCE_ENERGY);
-      if (w === ERR_NOT_IN_RANGE) creep.moveTo(storage, MOVE_OPTS_CLOSE);
-      return true;
-    }
+// ─── Route planning ───────────────────────────────────────────────────────────
+
+/**
+ * Greedy nearest-neighbor tour through all damaged roads and containers,
+ * starting from the creep's current position.
+ * Returns an ordered array of structure IDs (≤ MAX_ROADS).
+ * Runs once on spawn — O(N²) getRangeTo calls are acceptable at N ≤ 25.
+ */
+function buildRepairQueue(creep, rs) {
+  if (!rs || !rs.structuresByType) return [];
+
+  var roads      = rs.structuresByType[STRUCTURE_ROAD]      || [];
+  var containers = rs.structuresByType[STRUCTURE_CONTAINER] || [];
+  var damaged = [];
+
+  for (var i = 0; i < roads.length; i++) {
+    var road = roads[i];
+    if (!road || typeof road.hits !== 'number' || typeof road.hitsMax !== 'number') continue;
+    if (road.hitsMax === 0) continue;
+    if (road.hits < road.hitsMax * ROAD_DONE_THRESHOLD) damaged.push(road);
   }
 
-  // Otherwise the fullest container
-  var bestContainer = null;
+  for (var ci = 0; ci < containers.length; ci++) {
+    var cont = containers[ci];
+    if (!cont || typeof cont.hits !== 'number') continue;
+    if (cont.hits < CONTAINER_TRIGGER_HITS) damaged.push(cont);
+  }
+
+  if (damaged.length === 0) return [];
+
+  var remaining = damaged.slice();
+  var route     = [];
+  var cur       = creep.pos; // updated to each picked structure's pos as we build the tour
+
+  while (route.length < MAX_ROADS && remaining.length > 0) {
+    var bestIdx  = 0;
+    var bestDist = cur.getRangeTo(remaining[0].pos);
+
+    for (var j = 1; j < remaining.length; j++) {
+      var d = cur.getRangeTo(remaining[j].pos);
+      if (d < bestDist) { bestDist = d; bestIdx = j; }
+    }
+
+    var picked = remaining.splice(bestIdx, 1)[0];
+    route.push(picked.id);
+    cur = picked.pos;
+  }
+
+  return route; // plain string IDs — safe to store in Memory
+}
+
+// ─── Energy helpers ───────────────────────────────────────────────────────────
+
+function getEnergy(creep, rs) {
+  var storage = rs ? rs.storage : null;
+  if (storage && storage.store && (storage.store[RESOURCE_ENERGY] || 0) > 0) {
+    if (creep.pos.isNearTo(storage)) {
+      creep.withdraw(storage, RESOURCE_ENERGY);
+    } else {
+      creep.moveTo(storage, MOVE_OPTS_CLOSE);
+    }
+    return true;
+  }
+
+  var containers = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_CONTAINER]) || [];
+  var best = null;
   var bestAmt = 0;
-  var containers = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_CONTAINER]) ? rs.structuresByType[STRUCTURE_CONTAINER] : [];
+
   for (var i = 0; i < containers.length; i++) {
     var c = containers[i];
     if (!c || !c.store) continue;
     var amt = c.store[RESOURCE_ENERGY] || 0;
-    if (amt > bestAmt) {
-      bestAmt = amt;
-      bestContainer = c;
-    }
+    if (amt > bestAmt) { bestAmt = amt; best = c; }
   }
-  if (bestContainer && bestAmt > 0) {
-    var res = creep.withdraw(bestContainer, RESOURCE_ENERGY);
-    if (res === ERR_NOT_IN_RANGE) creep.moveTo(bestContainer, MOVE_OPTS_CLOSE);
+
+  if (best) {
+    if (creep.pos.isNearTo(best)) {
+      creep.withdraw(best, RESOURCE_ENERGY);
+    } else {
+      creep.moveTo(best, MOVE_OPTS_CLOSE);
+    }
     return true;
   }
 
-  // Nothing to withdraw -> idle
   return false;
 }
 
-function pickRepairTarget(creep, rs) {
-  if (!rs || !rs.structuresByType) return null;
+// ─── End-of-life ──────────────────────────────────────────────────────────────
 
-  // 2A: damaged containers (first found)
-  var containers = rs.structuresByType[STRUCTURE_CONTAINER] || [];
-  for (var i = 0; i < containers.length; i++) {
-    var cont = containers[i];
-    if (isDamaged(cont)) return cont;
-  }
-
-  // 2B: damaged roads (first found)
-  var roads = rs.structuresByType[STRUCTURE_ROAD] || [];
-  for (var r = 0; r < roads.length; r++) {
-    var road = roads[r];
-    if (isDamaged(road)) return road;
-  }
-
-  // 2C: damaged "other" structures excluding walls/ramparts/containers/roads
-  // iterate by type to avoid big room.find calls
-  var sbt = rs.structuresByType;
-  for (var t in sbt) {
-    if (!sbt.hasOwnProperty(t)) continue;
-    if (t === STRUCTURE_WALL || t === STRUCTURE_RAMPART || t === STRUCTURE_ROAD || t === STRUCTURE_CONTAINER) continue;
-    var list = sbt[t];
-    for (var j = 0; j < list.length; j++) {
-      var s = list[j];
-      if (isDamaged(s)) return s;
-    }
-  }
-
-  // 2D: walls/ramparts under threshold - pick lowest hits
-  var lowest = null;
-  var walls = sbt[STRUCTURE_WALL] || [];
-  for (var w = 0; w < walls.length; w++) {
-    var wall = walls[w];
-    if (!wall) continue;
-    var hitsNum = typeof wall.hits === 'number' ? wall.hits : null;
-    if (hitsNum !== null && hitsNum < WALL_RAMPART_THRESHOLD) {
-      if (!lowest || hitsNum < lowest.hits) lowest = wall;
-    }
-  }
-  var ramps = sbt[STRUCTURE_RAMPART] || [];
-  for (var p = 0; p < ramps.length; p++) {
-    var ramp = ramps[p];
-    if (!ramp) continue;
-    var rh = typeof ramp.hits === 'number' ? ramp.hits : null;
-    if (rh !== null && rh < WALL_RAMPART_THRESHOLD) {
-      if (!lowest || rh < lowest.hits) lowest = ramp;
-    }
-  }
-
-  return lowest || null;
-}
-
-function ensureTarget(creep, rs) {
-  // If we have a target, validate it
-  if (creep.memory.repairTargetId) {
-    var t = Game.getObjectById(creep.memory.repairTargetId);
-    if (!t) {
-      creep.memory.repairTargetId = null;
-    } else {
-      // If it’s fully repaired, or (for wall/rampart) above threshold when we’re in 2D mode
-      var tType = t.structureType;
-      var fully = !isDamaged(t);
-      var overBarrierThresh = (tType === STRUCTURE_WALL || tType === STRUCTURE_RAMPART) &&
-                              typeof t.hits === 'number' && t.hits >= WALL_RAMPART_THRESHOLD;
-
-      if (fully || overBarrierThresh) {
-        creep.memory.repairTargetId = null;
+/**
+ * Deposits any remaining energy into storage, then suicides.
+ * Writes a spawn cooldown to Memory before dying so the spawn manager doesn't
+ * immediately re-trigger on the same tick.
+ * If no storage or no energy to deposit, suicides immediately.
+ * Uses a one-tick deferred suicide so the transfer isn't wasted.
+ */
+function depositAndSuicide(creep, rs) {
+  if (creep.store[RESOURCE_ENERGY] > 0) {
+    var storage = rs ? rs.storage : null;
+    if (storage) {
+      if (creep.pos.isNearTo(storage)) {
+        creep.transfer(storage, RESOURCE_ENERGY);
+        creep.memory.pendingSuicide = true; // suicide next tick after transfer lands
+      } else {
+        creep.moveTo(storage, MOVE_OPTS_CLOSE);
       }
+      return;
     }
   }
-
-  // If no target, throttle scans
-  if (!creep.memory.repairTargetId) {
-    if (!creep.memory.nextScan || Game.time >= creep.memory.nextScan) {
-      var pick = pickRepairTarget(creep, rs);
-      creep.memory.repairTargetId = pick ? pick.id : null;
-      creep.memory.nextScan = Game.time + RESCAN_COOLDOWN;
-    }
-  }
-
-  return creep.memory.repairTargetId ? Game.getObjectById(creep.memory.repairTargetId) : null;
+  // Write cooldown before dying so spawn manager sees it this tick.
+  Memory['repairBotCooldown_' + creep.room.name] = Game.time + SPAWN_COOLDOWN;
+  creep.suicide();
 }
 
-function park(creep, rs) {
-  // Idle near storage if present, else near controller center-ish
-  var storage = rs ? rs.storage : null;
-  if (storage) {
-    creep.moveTo(storage, { reusePath: 20, range: 3 });
-  } else if (rs && rs.controller) {
-    creep.moveTo(rs.controller, { reusePath: 20, range: 3 });
-  }
-}
-
-function work(creep, rs) {
-  // Maintain working state
-  if (creep.memory.working !== true && creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
-    creep.memory.working = true;
-  }
-  if (creep.memory.working === true && creep.store[RESOURCE_ENERGY] === 0) {
-    creep.memory.working = false;
-    creep.memory.repairTargetId = null; // drop target to seek energy
-  }
-
-  if (!creep.memory.working) {
-    var acted = getEnergy(creep, rs); // withdraw storage -> container
-    if (!acted) park(creep, rs);
-    return;
-  }
-
-  // Working: find/keep a target and repair
-  var target = ensureTarget(creep, rs);
-  if (!target) {
-    park(creep, rs);
-    return;
-  }
-
-  var res = creep.repair(target);
-  if (res === ERR_NOT_IN_RANGE) {
-    creep.moveTo(target, MOVE_OPTS_REPAIR);
-  } else if (res === ERR_INVALID_TARGET || res === ERR_NO_BODYPART) {
-    // Fail-fast: invalid or cannot repair -> clear and rescan soon
-    creep.memory.repairTargetId = null;
-    creep.memory.nextScan = Game.time + 1;
-  }
-}
+// ─── Main loop ────────────────────────────────────────────────────────────────
 
 function run(creep) {
+  // CPU throttle — pause road repair when average CPU is too high
+  if (Memory.cpuStats && Memory.cpuStats.average > 19) {
+    creep.say('💤');
+    return;
+  }
+
   var roomName = creep.room && creep.room.name ? creep.room.name : null;
   if (!roomName) return;
 
   var rs = getRoomState.get(roomName);
-  work(creep, rs);
+  if (!rs) return;
+
+  // ── Edge guard ───────────────────────────────────────────────────────────
+  // If the creep is on a room exit tile, push it inward immediately.
+  // Uses reusePath:0 so it always gets a fresh inward path.
+  var p = creep.pos;
+  if (p.x === 0 || p.x === 49 || p.y === 0 || p.y === 49) {
+    creep.moveTo(25, 25, { reusePath: 0, ignoreCreeps: true });
+    return;
+  }
+
+  // Deferred suicide — transfer was issued last tick, now safe to die.
+  if (creep.memory.pendingSuicide) {
+    Memory['repairBotCooldown_' + roomName] = Game.time + SPAWN_COOLDOWN;
+    creep.suicide();
+    return;
+  }
+
+  // ── Build queue exactly once, on first tick ──────────────────────────────
+  if (!creep.memory.repairQueue) {
+    creep.memory.repairQueue = buildRepairQueue(creep, rs);
+    if (creep.memory.repairQueue.length === 0) {
+      depositAndSuicide(creep, rs);
+      return;
+    }
+    console.log('[RepairBot] ' + creep.name + ' queued ' +
+      creep.memory.repairQueue.length + ' structures in ' + roomName);
+  }
+
+  // ── Queue exhausted → try to rebuild before giving up ────────────────────
+  if (creep.memory.repairQueue.length === 0) {
+    var rebuilt = buildRepairQueue(creep, rs);
+    if (rebuilt.length > 0) {
+      creep.memory.repairQueue = rebuilt;
+      console.log('[RepairBot] ' + creep.name + ' rebuilt queue with ' +
+        rebuilt.length + ' structures in ' + roomName);
+      return; // pick up work next tick
+    }
+    // Nothing left to do — deposit and die.
+    depositAndSuicide(creep, rs);
+    return;
+  }
+
+  // ── Energy state toggle ──────────────────────────────────────────────────
+  if (!creep.memory.working && creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
+    creep.memory.working = true;
+  }
+  if (creep.memory.working && creep.store[RESOURCE_ENERGY] === 0) {
+    creep.memory.working = false;
+  }
+
+  // ── Refuel ───────────────────────────────────────────────────────────────
+  if (!creep.memory.working) {
+    getEnergy(creep, rs);
+    return;
+  }
+
+  // ── Repair current head of queue ─────────────────────────────────────────
+  var targetId = creep.memory.repairQueue[0];
+  var target   = Game.getObjectById(targetId);
+
+  // Determine the done threshold for this structure type.
+  var doneHits = (target && target.structureType === STRUCTURE_CONTAINER)
+    ? CONTAINER_DONE_HITS
+    : (target ? target.hitsMax * ROAD_DONE_THRESHOLD : 0);
+
+  // Advance if target is gone or sufficiently repaired.
+  if (!target || target.hits >= doneHits) {
+    creep.memory.repairQueue.shift();
+    return; // pick next target next tick
+  }
+
+  if (creep.pos.inRangeTo(target, 3)) {
+    var res = creep.repair(target);
+    if (res === ERR_NOT_ENOUGH_ENERGY) {
+      creep.memory.working = false; // flip immediately so next tick refuels
+    } else if (res === ERR_INVALID_TARGET || res === ERR_NO_BODYPART) {
+      creep.memory.repairQueue.shift();
+    }
+  } else {
+    creep.moveTo(target, MOVE_OPTS_REPAIR);
+  }
 }
 
 module.exports = { run: run };

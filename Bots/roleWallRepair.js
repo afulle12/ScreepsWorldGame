@@ -1,557 +1,591 @@
 // roleWallRepair.js
 //
-// Wall repairer that works off a per-room order in Memory.wallRepairOrders[roomName].
-// - Repairs STRUCTURE_WALL up to `threshold`
-// - Uses Storage (or containers), else harvests
-// - Skips unreachable wall segments and removes them from the order
-// - Avoids standing on room edges (x/y = 0 or 49)
-// - One creep per active order; respawn handled by main's spawn manager
-// orderWallRepair('W1N1', 500000)
-// wallRepairStatus('W1N1')
-// cancelWallRepair('W1N1')
+// Wall & rampart repairer driven by Memory.wallRepairOrders[roomName].
+//
+// Repairs walls/ramparts in 1M-hit increments. All walls are brought to the
+// next million above the current floor before advancing to the next tier,
+// keeping defences balanced rather than maxing individual walls.
+//
+// ── Console Commands ──────────────────────────────────────────────────────────
+//
+// orderWallRepair(roomName, threshold, count?, interiorIncluded?)
+//   Creates or replaces a wall/rampart repair order for a room.
+//   Ex: orderWallRepair('W1N1', 10000000)
+//   Ex: orderWallRepair('W1N1', 10000000, 3, true)
+//
+// wallRepairStatus(roomName?)
+//   Shows queue size, active creep count, current step, and % near threshold.
+//   Omit roomName to show all rooms.
+//   Ex: wallRepairStatus('W1N1')
+//   Ex: wallRepairStatus()
+//
+// wallRepairOverview()
+//   Summary of all active orders: walls near target across every room.
+//   Ex: wallRepairOverview()
+//
+// cancelWallRepair(roomName)
+//   Cancels the repair order for a room and clears its transient queue.
+//   Ex: cancelWallRepair('W1N1')
+//
+// ─────────────────────────────────────────────────────────────────────────────
 
 const ROLE_NAME = 'wallRepair';
 
 // Centralized room vision provider
 const getRoomStateCentral = require('getRoomState');
 
-// -----------------------------------------------------------------------------
-// Renewal settings
-// -----------------------------------------------------------------------------
-var RENEW_TRIGGER_TTL = 100; // If below this and carrying no energy, attempt renew
-var RENEW_TARGET_TTL = 200;  // Renew until at least this TTL, then resume work
+// Step size for incremental repair tiers
+const STEP_SIZE = 1000000; // 1M
 
-// -----------------------------------------------------------------------------
-// Edge-avoid CostMatrix cache (refresh every 25 ticks)
-// -----------------------------------------------------------------------------
-var CACHE_REFRESH_TICKS = 25;
-if (!global._edgeAvoidCache) {
-  global._edgeAvoidCache = {};
+// How many ticks before a skipped (unreachable) wall is retried
+const SKIP_RETRY_TICKS = 20;
+
+// ── Module-level transient state (never serialised to Memory) ─────────────────
+var _transient = {};
+
+function getTransient(roomName) {
+  if (!_transient[roomName]) {
+    _transient[roomName] = { queue: [], skipped: {}, needsRebuild: false };
+  }
+  return _transient[roomName];
 }
 
-function getEdgeAvoidCacheEntry(roomName) {
-  var entry = global._edgeAvoidCache[roomName];
-  if (!entry) {
-    entry = { builtAt: 0, matrix: null };
-    global._edgeAvoidCache[roomName] = entry;
+// ─────────────────────────────────────────────────────────────────────────────
+var REPAIR_TYPES = [STRUCTURE_WALL, STRUCTURE_RAMPART];
+var PERIMETER_RANGE = 3;
+
+function isPerimeter(pos) {
+  return pos.x <= PERIMETER_RANGE || pos.x >= 49 - PERIMETER_RANGE ||
+         pos.y <= PERIMETER_RANGE || pos.y >= 49 - PERIMETER_RANGE;
+}
+
+// Uses stepThreshold so creeps only repair to the current tier, not the final target.
+function shouldRepair(struct, order) {
+  if (!struct || struct.hits >= order.stepThreshold) return false;
+  if (struct.structureType === STRUCTURE_RAMPART && !struct.my) return false;
+  if (!order.interiorIncluded && !isPerimeter(struct.pos)) return false;
+  return true;
+}
+
+// ── Step threshold calculation ────────────────────────────────────────────────
+// Returns the next full million above the lowest wall in the provided array,
+// always rounding up (so exactly 1M → 2M), capped at the final threshold.
+function computeStepThreshold(walls, threshold) {
+  var minHits = Infinity;
+  for (var i = 0; i < walls.length; i++) {
+    if (walls[i].hits < minHits) minHits = walls[i].hits;
   }
-  return entry;
+  if (!isFinite(minHits)) return threshold;
+  var step = (Math.floor(minHits / STEP_SIZE) + 1) * STEP_SIZE;
+  return Math.min(step, threshold);
+}
+
+// ── Candidate gathering ───────────────────────────────────────────────────────
+// Returns all wall/rampart structures below the final threshold that pass the
+// interior and ownership filters. Does NOT filter by stepThreshold — that is
+// done separately when building the queue.
+function gatherCandidates(roomName, order) {
+  var base = getRoomStateCentral && typeof getRoomStateCentral.get === 'function'
+    ? getRoomStateCentral.get(roomName) : null;
+  if (!base || !base.structuresByType) return [];
+
+  var candidates = [];
+  for (var tp = 0; tp < REPAIR_TYPES.length; tp++) {
+    var arr = base.structuresByType[REPAIR_TYPES[tp]];
+    if (!arr) continue;
+    for (var i = 0; i < arr.length; i++) {
+      var s = arr[i];
+      if (!s) continue;
+      if (s.structureType === STRUCTURE_RAMPART && !s.my) continue;
+      if (!order.interiorIncluded && !isPerimeter(s.pos)) continue;
+      if (s.hits < order.threshold) candidates.push(s);
+    }
+  }
+  return candidates;
+}
+
+// ── Queue rebuild ─────────────────────────────────────────────────────────────
+// Called at the start of the tick after needsRebuild is set. Advances
+// stepThreshold to the next tier and repopulates the queue. Marks the order
+// complete if no candidates remain below the final threshold.
+function rebuildQueue(roomName, order) {
+  var t = getTransient(roomName);
+  t.needsRebuild = false;
+  t.skipped = {};
+
+  if (!Game.rooms[roomName]) return;
+
+  var candidates = gatherCandidates(roomName, order);
+
+  if (candidates.length === 0) {
+    order.completedAt = Game.time;
+    order.active = false;
+    return;
+  }
+
+  order.stepThreshold = computeStepThreshold(candidates, order.threshold);
+
+  // Sort ascending so the lowest walls are first in the queue.
+  candidates.sort(function(a, b) { return a.hits - b.hits; });
+
+  t.queue = [];
+  for (var i = 0; i < candidates.length; i++) {
+    if (candidates[i].hits < order.stepThreshold) t.queue.push(candidates[i].id);
+  }
+}
+
+// ── Edge-avoid CostMatrix cache ───────────────────────────────────────────────
+var CACHE_REFRESH_TICKS = 25;
+if (!global._edgeAvoidCache) global._edgeAvoidCache = {};
+
+function getEdgeAvoidCacheEntry(roomName) {
+  if (!global._edgeAvoidCache[roomName]) {
+    global._edgeAvoidCache[roomName] = { builtAt: 0, matrix: null };
+  }
+  return global._edgeAvoidCache[roomName];
 }
 
 function buildEdgeAvoidMatrixFor(room) {
   var matrix = new PathFinder.CostMatrix();
+  for (var x = 0; x < 50; x++) { matrix.set(x, 0, 255); matrix.set(x, 49, 255); }
+  for (var y = 0; y < 50; y++) { matrix.set(0, y, 255); matrix.set(49, y, 255); }
+  if (!room) return matrix;
 
-  // Block room edges
-  var x;
-  var y;
-  for (x = 0; x < 50; x++) {
-    matrix.set(x, 0, 255);
-    matrix.set(x, 49, 255);
-  }
-  for (y = 0; y < 50; y++) {
-    matrix.set(0, y, 255);
-    matrix.set(49, y, 255);
-  }
-
-  // If no vision, return edge-only matrix
-  if (!room) {
-    return matrix;
-  }
-
-  // Single pass over structures via centralized vision
-  var base = null;
-  var structsByType = null;
   var structs = [];
   if (getRoomStateCentral && typeof getRoomStateCentral.get === 'function') {
-    base = getRoomStateCentral.get(room.name);
+    var base = getRoomStateCentral.get(room.name);
     if (base && base.structuresByType) {
-      structsByType = base.structuresByType;
-      for (var t in structsByType) {
-        var arr = structsByType[t];
+      for (var t in base.structuresByType) {
+        var arr = base.structuresByType[t];
         if (arr && arr.length) {
-          for (var i = 0; i < arr.length; i++) {
-            structs.push(arr[i]);
-          }
+          for (var i = 0; i < arr.length; i++) structs.push(arr[i]);
         }
       }
     }
   }
-
   for (var i2 = 0; i2 < structs.length; i2++) {
     var s = structs[i2];
-
     if (s.structureType === STRUCTURE_ROAD) {
-      // Prefer roads slightly
       matrix.set(s.pos.x, s.pos.y, 1);
     } else if (s.structureType === STRUCTURE_RAMPART) {
-      // Only block hostile, non-public ramparts
-      if (!s.my && !s.isPublic) {
-        matrix.set(s.pos.x, s.pos.y, 255);
-      }
+      // Enemy/non-public ramparts are impassable; own and public ramparts are
+      // walkable — do NOT set a cost so the terrain default applies.
+      if (!s.my && !s.isPublic) matrix.set(s.pos.x, s.pos.y, 255);
+    } else if (s.structureType === STRUCTURE_WALL) {
+      // Walls are repair targets, not navigation obstacles. Leave the tile at
+      // its terrain cost so PathFinder can route adjacent to them.
     } else if (s.structureType !== STRUCTURE_CONTAINER) {
-      // Block non-walkables (leave containers walkable)
       matrix.set(s.pos.x, s.pos.y, 255);
     }
   }
-
   return matrix;
 }
 
 function getEdgeAvoidMatrix(roomName) {
   var entry = getEdgeAvoidCacheEntry(roomName);
   if (!entry.matrix || Game.time - entry.builtAt >= CACHE_REFRESH_TICKS) {
-    var room = Game.rooms[roomName];
-    entry.matrix = buildEdgeAvoidMatrixFor(room);
+    entry.matrix = buildEdgeAvoidMatrixFor(Game.rooms[roomName]);
     entry.builtAt = Game.time;
   }
   return entry.matrix;
 }
 
-// Assigned-room helper (pins the creep to one room)
-function getAssignedRoom(creep) {
-  if (!creep.memory.taskRoom) {
-    creep.memory.taskRoom = creep.room.name;
-  }
-  return creep.memory.taskRoom;
+// ── Stuck detection ───────────────────────────────────────────────────────────
+var STUCK_THRESHOLD = 5;
+function updateStuckCounter(creep) {
+  if (!creep.memory._stk) creep.memory._stk = { x: creep.pos.x, y: creep.pos.y, r: creep.pos.roomName, n: 0 };
+  var s = creep.memory._stk;
+  if (s.x === creep.pos.x && s.y === creep.pos.y && s.r === creep.pos.roomName) s.n++;
+  else { s.x = creep.pos.x; s.y = creep.pos.y; s.r = creep.pos.roomName; s.n = 0; }
+  return s.n >= STUCK_THRESHOLD;
+}
+function consumeStuck(creep) {
+  var stuck = updateStuckCounter(creep);
+  if (stuck) creep.memory._stk.n = 0;
+  return stuck;
 }
 
-// Move options that avoid room edges for pathfinding
 function edgeAvoidMoveOpts(creep, lockRoomName) {
   var roomName = lockRoomName || creep.room.name;
+  var stuck = consumeStuck(creep);
   return {
-    reusePath: 15,
+    reusePath: stuck ? 1 : 15,
+    ignoreCreeps: !stuck,
     maxRooms: 1,
-    plainCost: 2,
-    swampCost: 10,
-    roomCallback: function(rn) {
-      if (rn !== roomName) {
-        return false;
-      }
-      return getEdgeAvoidMatrix(roomName);
-    }
+    plainCost: 20,
+    swampCost: 40,
+    roomCallback: function(rn) { return rn === roomName ? getEdgeAvoidMatrix(roomName) : false; }
   };
 }
 
-// Cost callback for findClosestByPath (API shape: (roomName, costMatrix))
 function edgeAvoidCostCallback(lockRoomName) {
   return function(rn, matrix) {
-    if (rn !== lockRoomName) {
-      return;
-    }
+    if (rn !== lockRoomName) return;
     var cached = getEdgeAvoidMatrix(lockRoomName);
-    var x;
-    var y;
-    var val;
-    for (x = 0; x < 50; x++) {
-      for (y = 0; y < 50; y++) {
-        val = cached.get(x, y);
-        if (val) {
-          matrix.set(x, y, val);
-        }
+    for (var x = 0; x < 50; x++) {
+      for (var y = 0; y < 50; y++) {
+        var val = cached.get(x, y);
+        if (val) matrix.set(x, y, val);
       }
     }
   };
 }
 
 function stayOffEdges(creep) {
-  // Nudge inside the room if standing on edge
-  if (creep.pos.x === 0) {
-    creep.move(RIGHT);
-  } else if (creep.pos.x === 49) {
-    creep.move(LEFT);
-  }
-
-  if (creep.pos.y === 0) {
-    creep.move(BOTTOM);
-  } else if (creep.pos.y === 49) {
-    creep.move(TOP);
-  }
+  if (creep.pos.x === 0) creep.move(RIGHT);
+  else if (creep.pos.x === 49) creep.move(LEFT);
+  if (creep.pos.y === 0) creep.move(BOTTOM);
+  else if (creep.pos.y === 49) creep.move(TOP);
 }
 
-// Ensure order object is sane
-function getOrder(roomName) {
-  if (!Memory.wallRepairOrders) {
-    Memory.wallRepairOrders = {};
-  }
-  var order = Memory.wallRepairOrders[roomName];
-  if (order) {
-    return order;
-  }
-  return null;
+function getAssignedRoom(creep) {
+  if (!creep.memory.taskRoom) creep.memory.taskRoom = creep.room.name;
+  return creep.memory.taskRoom;
 }
 
+// ── No-path wait ─────────────────────────────────────────────────────────────
+var WAIT_TICKS = 5;
+function startWait(creep) { creep.say('⏳'); creep.memory._waitUntil = Game.time + WAIT_TICKS; }
+function isWaiting(creep) {
+  if (creep.memory._waitUntil && Game.time < creep.memory._waitUntil) return true;
+  delete creep.memory._waitUntil;
+  return false;
+}
+
+// ── Target selection ──────────────────────────────────────────────────────────
 function selectNextTarget(creep, order) {
-  // Drop targets already above threshold or missing
-  while (order.queue && order.queue.length > 0) {
-    var id = order.queue[0];
+  var roomName = getAssignedRoom(creep);
+  var t = getTransient(roomName);
+
+  var claimed = {};
+  for (var n in Game.creeps) {
+    var other = Game.creeps[n];
+    if (other.name !== creep.name && other.memory.role === ROLE_NAME && other.memory.targetId) {
+      claimed[other.memory.targetId] = true;
+    }
+  }
+
+  for (var qi = 0; qi < t.queue.length; qi++) {
+    var id = t.queue[qi];
     var wall = Game.getObjectById(id);
-    if (!wall || wall.hits >= order.threshold) {
-      order.queue.shift();
-      continue;
-    }
 
-    // Check reachability (within range 3) while avoiding edges
-    var res = PathFinder.search(
-      creep.pos,
-      { pos: wall.pos, range: 3 },
-      { maxRooms: 1, roomCallback: edgeAvoidMoveOpts(creep).roomCallback }
-    );
+    // Wall is gone or already repaired to this tier — remove permanently.
+    if (!wall || !shouldRepair(wall, order)) { t.queue.splice(qi, 1); qi--; continue; }
 
+    if (claimed[id]) continue;
+
+    // Skip walls that recently failed a reachability check; retry after
+    // SKIP_RETRY_TICKS to recover from transient pathfinding failures without
+    // permanently orphaning reachable walls.
+    if (t.skipped[id] && Game.time - t.skipped[id] < SKIP_RETRY_TICKS) continue;
+
+    var moveOpts = edgeAvoidMoveOpts(creep);
+    var res = PathFinder.search(creep.pos, { pos: wall.pos, range: 3 },
+      { maxRooms: 1, roomCallback: moveOpts.roomCallback });
     if (res.incomplete) {
-      // Mark skipped and pop it from the queue
-      if (!order.skipped) {
-        order.skipped = {};
+      var res2 = PathFinder.search(creep.pos, { pos: wall.pos, range: 5 },
+        { maxRooms: 1, roomCallback: moveOpts.roomCallback });
+      if (res2.incomplete) {
+        // Mark as temporarily skipped but keep in queue for retry.
+        t.skipped[id] = Game.time;
+        continue;
       }
-      order.skipped[id] = Game.time;
-      order.queue.shift();
-      continue;
     }
 
-    // Assign target
+    // Clear any stale skip record now that we have a path.
+    delete t.skipped[id];
     creep.memory.targetId = id;
     return wall;
   }
-
-  // No valid target
   creep.memory.targetId = null;
   return null;
 }
 
+// ── Energy refill ─────────────────────────────────────────────────────────────
 function refill(creep) {
-  // If we ever ended up outside our assigned room, do not refill here. Go home.
   var assignedRoom = getAssignedRoom(creep);
-  if (creep.room.name !== assignedRoom) {
-    return;
-  }
+  if (creep.room.name !== assignedRoom) return;
 
-  // Prefer Storage, then containers, else harvest
   var room = creep.room;
-  if (room.storage && room.storage.store && room.storage.store[RESOURCE_ENERGY] > 0) {
+  if (room.storage && room.storage.store[RESOURCE_ENERGY] > 0) {
     if (creep.pos.getRangeTo(room.storage) > 1) {
-      creep.moveTo(room.storage, edgeAvoidMoveOpts(creep, assignedRoom));
-    } else {
-      creep.withdraw(room.storage, RESOURCE_ENERGY);
-    }
+      var r = creep.moveTo(room.storage, edgeAvoidMoveOpts(creep, assignedRoom));
+      if (r === ERR_NO_PATH) startWait(creep);
+    } else creep.withdraw(room.storage, RESOURCE_ENERGY);
     return;
   }
 
-  // Centralized: containers with energy
-  var base = null;
-  var containers = [];
+  var base = null, containers = [];
   if (getRoomStateCentral && typeof getRoomStateCentral.get === 'function') {
     base = getRoomStateCentral.get(assignedRoom);
     if (base && base.structuresByType && base.structuresByType[STRUCTURE_CONTAINER]) {
-      var arr = base.structuresByType[STRUCTURE_CONTAINER];
-      for (var i = 0; i < arr.length; i++) {
-        var s = arr[i];
-        if (s && s.store && s.store[RESOURCE_ENERGY] > 0) {
-          containers.push(s);
-        }
+      for (var i = 0; i < base.structuresByType[STRUCTURE_CONTAINER].length; i++) {
+        var s = base.structuresByType[STRUCTURE_CONTAINER][i];
+        if (s && s.store && s.store[RESOURCE_ENERGY] > 0) containers.push(s);
       }
     }
   }
-
-  var container = null;
   if (containers.length > 0) {
-    container = creep.pos.findClosestByRange(containers);
-  }
-
-  if (container) {
+    var container = creep.pos.findClosestByRange(containers);
     if (creep.pos.getRangeTo(container) > 1) {
-      creep.moveTo(container, edgeAvoidMoveOpts(creep, assignedRoom));
-    } else {
-      creep.withdraw(container, RESOURCE_ENERGY);
-    }
+      var r2 = creep.moveTo(container, edgeAvoidMoveOpts(creep, assignedRoom));
+      if (r2 === ERR_NO_PATH) startWait(creep);
+    } else creep.withdraw(container, RESOURCE_ENERGY);
     return;
   }
 
-  // Harvest as a fallback using centralized sources (active only)
-  var activeSources = [];
-  if (base && base.sources && base.sources.length > 0) {
-    for (var j = 0; j < base.sources.length; j++) {
-      var srcObj = base.sources[j];
-      if (srcObj && srcObj.energy > 0) {
-        activeSources.push(srcObj);
-      }
-    }
-  }
-
+  var activeSources = base && base.sources ? base.sources.filter(function(s) { return s && s.energy > 0; }) : [];
   if (activeSources.length > 0) {
-    var src = creep.pos.findClosestByPath(activeSources, {
-      maxRooms: 1,
-      costCallback: edgeAvoidCostCallback(assignedRoom)
-    });
+    var src = creep.pos.findClosestByPath(activeSources, { maxRooms: 1, costCallback: edgeAvoidCostCallback(assignedRoom) });
     if (src) {
       if (creep.harvest(src) === ERR_NOT_IN_RANGE) {
-        creep.moveTo(src, edgeAvoidMoveOpts(creep, assignedRoom));
+        var r3 = creep.moveTo(src, edgeAvoidMoveOpts(creep, assignedRoom));
+        if (r3 === ERR_NO_PATH) startWait(creep);
       }
-    }
-  }
+    } else startWait(creep);
+  } else startWait(creep);
 }
 
-function tryFinishOrderIfDone(order, room) {
-  // Lightweight check first
-  if (order.queue && order.queue.length > 0) {
-    return false;
-  }
-
-  // Double-check room for any walls below threshold (centralized)
-  var base = null;
-  var walls = [];
-  if (getRoomStateCentral && typeof getRoomStateCentral.get === 'function') {
-    base = getRoomStateCentral.get(room.name);
-    if (base && base.structuresByType && base.structuresByType[STRUCTURE_WALL]) {
-      var arr = base.structuresByType[STRUCTURE_WALL];
-      for (var i = 0; i < arr.length; i++) {
-        var w = arr[i];
-        if (w && w.hits < order.threshold) {
-          walls.push(w);
-        }
-      }
-    }
-  }
-
-  if (walls.length === 0) {
-    order.completedAt = Game.time;
-    order.active = false;
-    return true;
-  }
-
-  // Rebuild queue if needed (this helps if queue was emptied by towers or others)
-  // Sort by range to origin
-  var origin = Game.getObjectById(order.originId);
-  var originPos;
-  if (origin) {
-    originPos = origin.pos;
-  } else {
-    originPos = new RoomPosition(25, 25, room.name);
-  }
-
-  walls.sort(function(a, b) {
-    var da = originPos.getRangeTo(a.pos);
-    var db = originPos.getRangeTo(b.pos);
-    return da - db;
-  });
-  order.queue = walls.map(function(w2) { return w2.id; });
-  return false;
-}
-
-// -----------------------------------------------------------------------------
-// Renewal helpers
-// -----------------------------------------------------------------------------
-function getLiveOwnedSpawnsInRoom(roomName) {
-  var base = null;
-  var live = [];
-  if (getRoomStateCentral && typeof getRoomStateCentral.get === 'function') {
-    base = getRoomStateCentral.get(roomName);
-  }
-  var arrS = base && base.structuresByType ? base.structuresByType[STRUCTURE_SPAWN] : null;
-  if (arrS && arrS.length > 0) {
-    for (var i = 0; i < arrS.length; i++) {
-      var s = Game.getObjectById(arrS[i].id); // Live object needed for actions/pos【1】
-      if (s && s.my) {
-        live.push(s);
-      }
-    }
-  }
-  return live;
-}
-
-function handleRenew(creep) {
-  var assignedRoom = getAssignedRoom(creep);
-
-  // Start renewing if below trigger and empty, or continue if already renewing
-  var wantsRenew = (typeof creep.ticksToLive === 'number' &&
-                    creep.ticksToLive < RENEW_TRIGGER_TTL &&
-                    creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) || creep.memory.renewing;
-
-  if (!wantsRenew) {
-    return false; // not handling this tick
-  }
-
-  // Pick/validate renew target
-  var spawn = null;
-  if (creep.memory.renewSpawnId) {
-    spawn = Game.getObjectById(creep.memory.renewSpawnId);
-  }
-  if (!spawn) {
-    var spawns = getLiveOwnedSpawnsInRoom(assignedRoom);
-    if (spawns.length === 0) {
-      // No spawn available; abort renew and let normal logic proceed
-      creep.memory.renewing = false;
-      delete creep.memory.renewSpawnId;
-      return false;
-    }
-    spawn = creep.pos.findClosestByRange(spawns);
-    if (spawn) {
-      creep.memory.renewing = true;
-      creep.memory.renewSpawnId = spawn.id;
-    } else {
-      creep.memory.renewing = false;
-      delete creep.memory.renewSpawnId;
-      return false;
-    }
-  }
-
-  // If we already have enough TTL, stop renewing and resume work
-  if (typeof creep.ticksToLive === 'number' && creep.ticksToLive >= RENEW_TARGET_TTL) {
-    creep.memory.renewing = false;
-    delete creep.memory.renewSpawnId;
-    return false;
-  }
-
-  // Move to spawn and attempt renewal (renew is performed by the spawn)【2】
-  if (!creep.pos.isNearTo(spawn)) {
-    var moveOpts = edgeAvoidMoveOpts(creep, assignedRoom);
-    moveOpts.range = 1;
-    creep.moveTo(spawn, moveOpts);
-    return true; // handled this tick
-  }
-
-  var rc = spawn.renewCreep(creep); // Renewing removes all boosts【2】
-  if (rc === OK) {
-    // Keep renewing until target TTL
-    return true;
-  }
-
-  // If couldn't renew (busy, not enough energy, etc.), wait and try again
-  // Alternatively, you can abort on certain codes if desired.
-  return true;
-}
-
-// -----------------------------------------------------------------------------
-// Main work loop
-// -----------------------------------------------------------------------------
+// ── Main work loop ────────────────────────────────────────────────────────────
 function work(creep) {
-  var assignedRoom = getAssignedRoom(creep);
+  if (Memory.cpuStats && Memory.cpuStats.average > 25) { creep.say('💤'); return; }
+  if (isWaiting(creep)) return;
 
-  // If out of assigned room, return immediately and do nothing else
+  var assignedRoom = getAssignedRoom(creep);
   if (creep.room.name !== assignedRoom) {
     stayOffEdges(creep);
-    var dest = new RoomPosition(25, 25, assignedRoom);
-    // Allow crossing one border to get back
-    creep.moveTo(dest, { reusePath: 10, maxRooms: 2 });
+    creep.moveTo(new RoomPosition(25, 25, assignedRoom), { reusePath: 10, maxRooms: 2, plainCost: 20, swampCost: 40,
+      roomCallback: function(rn) { return getEdgeAvoidMatrix(rn); } });
     return;
   }
-
-  // Hard block standing on edges
   stayOffEdges(creep);
-
-  // If low TTL and empty, renew first before doing anything else
-  if (handleRenew(creep)) {
-    return;
-  }
 
   var order = getOrder(assignedRoom);
   if (!order || order.active === false) {
-    // Idle near storage or center (in assigned room only)
     var waitSpot = creep.room.storage ? creep.room.storage.pos : new RoomPosition(25, 25, assignedRoom);
-    if (!creep.pos.inRangeTo(waitSpot, 3)) {
-      creep.moveTo(waitSpot, edgeAvoidMoveOpts(creep, assignedRoom));
+    if (!creep.pos.inRangeTo(waitSpot, 3)) creep.moveTo(waitSpot, edgeAvoidMoveOpts(creep, assignedRoom));
+    return;
+  }
+
+  // ── Pending rebuild from previous tick's queue drain ─────────────────────
+  var t = getTransient(assignedRoom);
+  if (t.needsRebuild) {
+    rebuildQueue(assignedRoom, order);
+    // rebuildQueue may have marked the order inactive if all walls are done.
+    if (!order.active) {
+      var waitSpot2 = creep.room.storage ? creep.room.storage.pos : new RoomPosition(25, 25, assignedRoom);
+      if (!creep.pos.inRangeTo(waitSpot2, 3)) creep.moveTo(waitSpot2, edgeAvoidMoveOpts(creep, assignedRoom));
+      return;
     }
-    return;
   }
 
-  // Energy state
-  if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-    creep.memory.working = false;
-  } else if (creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0) {
-    creep.memory.working = true;
-  }
+  if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) creep.memory.working = false;
+  else creep.memory.working = true;
 
-  if (!creep.memory.working) {
-    refill(creep);
-    return;
-  }
+  if (!creep.memory.working) { refill(creep); return; }
 
-  // Make sure order still needs work
-  if (tryFinishOrderIfDone(order, creep.room)) {
-    // Optional: recycle self when done (only in assigned room)
-    var base = null;
+  // ── Queue drain detection ─────────────────────────────────────────────────
+  // If the queue is empty here, flag for rebuild next tick and idle near spawn.
+  if (t.queue.length === 0) {
+    t.needsRebuild = true;
     var spawnsHere = [];
-    if (getRoomStateCentral && typeof getRoomStateCentral.get === 'function') {
-      base = getRoomStateCentral.get(assignedRoom);
-      if (base && base.structuresByType && base.structuresByType[STRUCTURE_SPAWN]) {
-        var arrS = base.structuresByType[STRUCTURE_SPAWN];
-        for (var i = 0; i < arrS.length; i++) {
-          var sp = arrS[i];
-          if (sp && sp.my) {
-            spawnsHere.push(sp);
-          }
-        }
+    var base = getRoomStateCentral && typeof getRoomStateCentral.get === 'function' ? getRoomStateCentral.get(assignedRoom) : null;
+    if (base && base.structuresByType && base.structuresByType[STRUCTURE_SPAWN]) {
+      for (var i = 0; i < base.structuresByType[STRUCTURE_SPAWN].length; i++) {
+        var sp = base.structuresByType[STRUCTURE_SPAWN][i];
+        if (sp && sp.my) spawnsHere.push(sp);
       }
     }
-
-    if (spawnsHere && spawnsHere.length > 0) {
+    if (spawnsHere.length > 0) {
       var spawn = creep.pos.findClosestByRange(spawnsHere);
-      if (spawn) {
-        creep.moveTo(spawn, edgeAvoidMoveOpts(creep, assignedRoom));
-      }
+      if (spawn) creep.moveTo(spawn, edgeAvoidMoveOpts(creep, assignedRoom));
     }
     return;
   }
 
-  // Ensure we have a valid target
   var target = null;
   if (creep.memory.targetId) {
     target = Game.getObjectById(creep.memory.targetId);
-    if (!target || target.hits >= order.threshold) {
-      // Clear and pick next
-      creep.memory.targetId = null;
-      target = selectNextTarget(creep, order);
-    }
-  } else {
-    target = selectNextTarget(creep, order);
-  }
+    if (!target || !shouldRepair(target, order)) { creep.memory.targetId = null; target = selectNextTarget(creep, order); }
+  } else target = selectNextTarget(creep, order);
 
-  if (!target) {
-    // No current target; re-check completion soon
-    if (Game.time % 25 === 0) {
-      tryFinishOrderIfDone(order, creep.room);
+  if (!target) return;
+
+  if (creep.pos.inRangeTo(target.pos, 3)) creep.repair(target);
+  if (!creep.pos.inRangeTo(target.pos, 3)) {
+    if (creep.fatigue === 0) {
+      var moveOpts = edgeAvoidMoveOpts(creep, assignedRoom);
+      moveOpts.range = 3;
+      var mr = creep.moveTo(target, moveOpts);
+      if (mr === ERR_NO_PATH) startWait(creep);
     }
     return;
   }
 
-  // Move within repair range and repair
-  var inRange = creep.pos.inRangeTo(target.pos, 3);
-  if (!inRange) {
-    var moveOpts = edgeAvoidMoveOpts(creep, assignedRoom);
-    moveOpts.range = 3;
-    creep.moveTo(target, moveOpts);
-    return;
-  }
-
-  var res = creep.repair(target);
-  if (res === ERR_NOT_IN_RANGE) {
-    var moveOpts2 = edgeAvoidMoveOpts(creep, assignedRoom);
-    moveOpts2.range = 3;
-    creep.moveTo(target, moveOpts2);
-  } else if (res === OK) {
-    // If we topped it off this tick, clear target next tick
-    if (target.hits >= order.threshold) {
-      creep.memory.targetId = null;
-      // Remove from head if still there
-      if (order.queue && order.queue.length > 0 && order.queue[0] === target.id) {
-        order.queue.shift();
-      }
-    }
-  } else {
-    // If we cannot repair, skip this one
+  // Wall has reached this tier's step threshold — release and let queue drain
+  // naturally. When the last wall in the queue is released, needsRebuild fires
+  // and the next tick advances to the next tier.
+  if (target.hits >= order.stepThreshold) {
     creep.memory.targetId = null;
-    if (!order.skipped) {
-      order.skipped = {};
-    }
-    order.skipped[target.id] = Game.time;
-    // Also remove from queue if at head
-    if (order.queue && order.queue.length > 0 && order.queue[0] === target.id) {
-      order.queue.shift();
-    }
+    var idx = t.queue.indexOf(target.id);
+    if (idx !== -1) t.queue.splice(idx, 1);
   }
 }
 
-module.exports = {
-  role: ROLE_NAME,
-  run: function(creep) {
-    work(creep);
+// ── Console commands ──────────────────────────────────────────────────────────
+function getOrder(roomName) {
+  if (!Memory.wallRepairOrders) Memory.wallRepairOrders = {};
+  return Memory.wallRepairOrders[roomName] || null;
+}
+
+global.orderWallRepair = function(roomName, threshold, count, interiorIncluded) {
+  if (!roomName || !threshold) return 'Usage: orderWallRepair(roomName, threshold, count?, interiorIncluded?)';
+  count = Math.max(1, Math.floor(count || 1));
+  interiorIncluded = !!interiorIncluded;
+
+  if (!Memory.wallRepairOrders) Memory.wallRepairOrders = {};
+  var room = Game.rooms[roomName];
+  var originId = room && room.storage ? room.storage.id : null;
+  var prevSerial = (Memory.wallRepairOrders[roomName] && Memory.wallRepairOrders[roomName]._serial) || 0;
+
+  // Gather candidates to determine starting step threshold.
+  var tempOrder = { threshold: threshold, interiorIncluded: interiorIncluded };
+  var candidates = room ? gatherCandidates(roomName, tempOrder) : [];
+  var initialStep = candidates.length > 0
+    ? computeStepThreshold(candidates, threshold)
+    : Math.min(STEP_SIZE, threshold);
+
+  Memory.wallRepairOrders[roomName] = {
+    active: true,
+    threshold: threshold,
+    stepThreshold: initialStep,
+    count: count,
+    interiorIncluded: interiorIncluded,
+    originId: originId,
+    createdAt: Game.time,
+    completedAt: null,
+    _manual: true,
+    _serial: prevSerial
+  };
+
+  var order = Memory.wallRepairOrders[roomName];
+  var t = getTransient(roomName);
+  t.queue = [];
+  t.skipped = {};
+  t.needsRebuild = false;
+
+  // Populate initial queue: only walls below the first step threshold.
+  for (var i = 0; i < candidates.length; i++) {
+    if (candidates[i].hits < order.stepThreshold) t.queue.push(candidates[i].id);
   }
+
+  return 'Wall/rampart repair ordered for ' + roomName +
+    ' — threshold:' + threshold +
+    ', step:' + initialStep +
+    ', creeps:' + count +
+    ', interior:' + interiorIncluded +
+    ', queued:' + t.queue.length + ' [manual]';
 };
+
+global.wallRepairStatus = function(roomName) {
+  if (!Memory.wallRepairOrders) return 'No wall repair orders exist.';
+
+  var rooms = roomName ? [roomName] : Object.keys(Memory.wallRepairOrders);
+  var lines = [];
+  var totalWalls = 0, totalNearTarget = 0;
+
+  for (var ri = 0; ri < rooms.length; ri++) {
+    var rn = rooms[ri];
+    var order = Memory.wallRepairOrders[rn];
+    if (!order) continue;
+
+    var alive = 0;
+    for (var n in Game.creeps) {
+      var c = Game.creeps[n];
+      if (c.memory.role === ROLE_NAME && c.memory.taskRoom === rn) alive++;
+    }
+
+    var wallCount = 0, nearTargetCount = 0;
+    var room = Game.rooms[rn];
+    if (room) {
+      var structs = room.find(FIND_STRUCTURES, {
+        filter: function(s) {
+          return s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART;
+        }
+      });
+      for (var i = 0; i < structs.length; i++) {
+        var s = structs[i];
+        if (!order.interiorIncluded && !isPerimeter(s.pos)) continue;
+        wallCount++;
+        if (s.hits >= order.threshold - 500000) nearTargetCount++;
+      }
+    }
+
+    totalWalls += wallCount;
+    totalNearTarget += nearTargetCount;
+
+    var t = getTransient(rn);
+    var pct = wallCount > 0 ? Math.round((nearTargetCount / wallCount) * 100) : 0;
+    var status = order.active ? 'ON' : 'OFF';
+    var stepM = order.stepThreshold ? Math.round(order.stepThreshold / 1000000) + 'M' : '?';
+    lines.push(rn + ' [' + status + '] step:' + stepM + ' ' + alive + '/c ' + t.queue.length + '/q ' + pct + '%');
+  }
+
+  var overallPct = totalWalls > 0 ? Math.round((totalNearTarget / totalWalls) * 100) : 0;
+  lines.unshift('Overall: ' + totalNearTarget + '/' + totalWalls + ' (' + overallPct + '%) within .5M');
+  return lines.join('\n');
+};
+
+global.wallRepairOverview = function() {
+  if (!Memory.wallRepairOrders) return 'No wall repair orders exist.';
+  var roomNames = Object.keys(Memory.wallRepairOrders);
+  if (roomNames.length === 0) return 'No wall repair orders exist.';
+
+  var totalWalls = 0, totalNearTarget = 0, roomSummaries = [];
+
+  for (var rn in Memory.wallRepairOrders) {
+    var order = Memory.wallRepairOrders[rn];
+    if (!order || !order.active) continue;
+
+    var nearTargetCount = 0, wallCount = 0;
+    var room = Game.rooms[rn];
+    if (!room) { roomSummaries.push(rn + ': [no vision]'); continue; }
+
+    var structs = room.find(FIND_STRUCTURES, {
+      filter: function(s) { return s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART; }
+    });
+
+    for (var i = 0; i < structs.length; i++) {
+      var s = structs[i];
+      if (!order.interiorIncluded && !isPerimeter(s.pos)) continue;
+      wallCount++;
+      if (s.hits >= order.threshold - 500000) nearTargetCount++;
+    }
+
+    totalWalls += wallCount;
+    totalNearTarget += nearTargetCount;
+    var pct = wallCount > 0 ? Math.round((nearTargetCount / wallCount) * 100) : 0;
+    var stepM = order.stepThreshold ? Math.round(order.stepThreshold / 1000000) + 'M' : '?';
+    roomSummaries.push(rn + ': ' + nearTargetCount + '/' + wallCount +
+      ' (' + pct + '%) within .5M of ' + order.threshold +
+      ' [step: ' + stepM + ']');
+  }
+
+  var overallPct = totalWalls > 0 ? Math.round((totalNearTarget / totalWalls) * 100) : 0;
+  var lines = [
+    '=== Wall Repair Overview ===',
+    'Overall: ' + totalNearTarget + '/' + totalWalls + ' (' + overallPct + '%) within .5M of target',
+    '',
+    roomSummaries.join('\n')
+  ];
+  return lines.join('\n');
+};
+
+global.cancelWallRepair = function(roomName) {
+  if (!Memory.wallRepairOrders || !Memory.wallRepairOrders[roomName]) return 'No order for ' + roomName;
+  delete Memory.wallRepairOrders[roomName];
+  delete _transient[roomName];
+  return 'Wall repair order cancelled for ' + roomName;
+};
+// ── Exports ───────────────────────────────────────────────────────────────────
+module.exports = { role: ROLE_NAME, run: function(creep) { work(creep); } };

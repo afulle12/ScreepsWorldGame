@@ -2,32 +2,49 @@
  * Opportunistic Market Buy Module
  * 
  * Sets up requests to buy resources from the market when prices are favorable.
+ * Supports both terminal-based resources and account-level resources (pixel, cpuUnlock, accessKey).
  * 
  * Usage:
- * 1. Call opportunisticBuy.setup('ROOM#', RESOURCE, AMOUNT, MAXPRICE) from console
+ * 1. Call opportunisticBuy.setup('ROOM', RESOURCE, AMOUNT, MAXPRICE) from console
+ *    - For account resources (PIXEL, CPU_UNLOCK, ACCESS_KEY), the room name is used only as
+ *      a key; no terminal is needed. You can use any string (e.g. your main room name).
  * 2. Call opportunisticBuy.process() in your main loop (every tick is fine)
  * 3. Call opportunisticBuy.listActiveRequests() to view current orders
  * 4. Call opportunisticBuy.cancelRequest('ROOM#', RESOURCE) to delete a request
  * 
  * Behavior:
- * - Attempts at most one market deal per terminal at a time.
+ * - Attempts at most one market deal per terminal at a time (terminal resources).
  * - Among requests for the same terminal in the same tick, prefers the one created earlier.
  * - Attempts every tick by default (configurable via `checkInterval` on each request).
  * - Caches the last successful order to reduce scanning and speed follow-up purchases.
  * - Chooses the cheapest feasible order. Among equally cheap, prefers the one allowing
  *   the largest buy amount this tick (often closest, saving energy).
- * - Validates transfers by comparing terminal resource counts before and after a deal; 
+ * - Validates terminal transfers by comparing terminal resource counts before and after a deal; 
  *   progress is updated only after the terminal reflects the transfer.
  * - Pending confirmations time out after 20 ticks; timed-out deals are not counted,
  *   the cached order is invalidated, and the module immediately retries new deals.
  * - Orders from our own rooms are always accepted regardless of maxPrice, since credits
  *   cycle back to us (only transfer energy is the real cost).
+ * - Account-level resources (pixel, cpuUnlock, accessKey) bypass all terminal logic:
+ *   no energy cost, no capacity checks, no room name in deal(), immediate confirmation.
  * 
  * @module opportunisticBuy
  */
 
 // Confirmation timeout in ticks for pending market deals
 var CONFIRMATION_TIMEOUT_TICKS = 20;
+
+// Account-level resources that go to your account, not a terminal
+var ACCOUNT_RESOURCES = { pixel: true, cpuUnlock: true, accessKey: true };
+
+/**
+ * Check if a resource type is an account-level resource (no terminal needed).
+ * @param {string} resourceType
+ * @returns {boolean}
+ */
+function isAccountResource(resourceType) {
+    return !!ACCOUNT_RESOURCES[resourceType];
+}
 
 // Initialize memory structure on first run
 if (!Memory.opportunisticBuy) {
@@ -54,7 +71,8 @@ function getMyRooms() {
 /**
  * Sets up an opportunistic buy request.
  * 
- * @param {string} roomName - The room name where the terminal is located
+ * @param {string} roomName - The room name where the terminal is located.
+ *   For account-level resources (pixel, cpuUnlock, accessKey), this is only used as a key.
  * @param {string} resourceType - RESOURCE_* constant for the resource to buy
  * @param {number} amount - Target amount to purchase
  * @param {number} maxPrice - Maximum price per unit willing to pay
@@ -83,7 +101,8 @@ function setup(roomName, resourceType, amount, maxPrice) {
         pending: null // { pre: number, expected: number, tick: number, orderId, orderRoom, price, energyCost }
     };
 
-    var message = 'Buy request for ' + amount + ' ' + resourceType + ' in ' + roomName + ' created (max ' + maxPrice + ' credits/unit)';
+    var acctTag = isAccountResource(resourceType) ? ' [ACCOUNT RESOURCE]' : '';
+    var message = 'Buy request for ' + amount + ' ' + resourceType + ' in ' + roomName + ' created (max ' + maxPrice + ' credits/unit)' + acctTag;
     console.log('[OpportunisticBuy] ' + message);
     return message;
 }
@@ -127,6 +146,7 @@ function setCheckInterval(roomName, resourceType, ticks) {
  */
 function capByEnergy(desired, fromRoom, toRoom, energyAvail) {
     if (energyAvail <= 0 || desired <= 0) return 0;
+    if (!toRoom) return 0; // guard against undefined room names
     var low = 0;
     var high = desired;
     while (low < high) {
@@ -142,10 +162,136 @@ function capByEnergy(desired, fromRoom, toRoom, energyAvail) {
 }
 
 /**
+ * Process a single account-level resource request (pixel, cpuUnlock, accessKey).
+ * No terminal, energy, or capacity checks needed. deal() is called without a room name.
+ * On OK, progress is counted immediately (no pending confirmation needed).
+ *
+ * @param {string} key_i - The request key in Memory
+ * @param {Object} request - The request object
+ * @param {Object} requests - Reference to Memory.opportunisticBuy.requests
+ * @param {Object} myRooms - Map of owned room names
+ */
+function processAccountResource(key_i, request, requests, myRooms) {
+    // Check interval
+    var interval = request.checkInterval || 1;
+    if (Game.time - request.lastCheck < interval) return;
+    request.lastCheck = Game.time;
+
+    /**
+     * Attempt a deal for an account-level resource.
+     * No energy cost, no room name passed to deal().
+     * Progress is counted immediately on OK.
+     *
+     * @param {Object} order - Market order to attempt
+     * @returns {boolean} true if an attempt was made (success or consumed error), false if not feasible
+     */
+    function attemptAccountDeal(order) {
+        var isOwnRoom = !!(order.roomName && myRooms[order.roomName]);
+        var creditsLeft = Game.market.credits;
+        var maxAffordable = order.price > 0 ? Math.floor(creditsLeft / order.price) : 0;
+        if (maxAffordable <= 0 && !isOwnRoom) {
+            console.log('[OpportunisticBuy] Insufficient credits to buy ' + request.resourceType +
+                ' at ' + order.price + ' (balance: ' + Game.market.credits.toFixed(3) + ')');
+            return true; // consume attempt
+        }
+
+        var candidate = order.amount;
+        if (candidate > request.remaining) candidate = request.remaining;
+        if (!isOwnRoom && candidate > maxAffordable) candidate = maxAffordable;
+        if (candidate <= 0) return false;
+
+        // Account-level resources: no room name in deal()
+        var result = Game.market.deal(order.id, candidate);
+        if (result === OK) {
+            var creditsCost = candidate * order.price;
+            request.fulfilled = (request.fulfilled || 0) + candidate;
+            request.remaining -= candidate;
+
+            // Cache this order for next attempts
+            request.cachedOrderId = order.id;
+            request.cachedOrderRoomName = order.roomName;
+
+            var ownTag = isOwnRoom ? ' [OWN ROOM]' : '';
+            console.log('[OpportunisticBuy] Bought ' + candidate + ' ' + request.resourceType +
+                ' (account resource) from ' + (order.roomName || 'market') + ownTag +
+                ' @ ' + order.price + ' (credits: ' + creditsCost.toFixed(3) + '). Progress: ' +
+                request.fulfilled + '/' + request.totalAmount);
+            return true;
+        } else {
+            var errorMessage = 'Unknown error: ' + result;
+            if (result === ERR_NOT_ENOUGH_RESOURCES) {
+                errorMessage = 'Insufficient credits or order resources';
+            } else if (result === ERR_INVALID_ARGS) {
+                errorMessage = 'Invalid arguments';
+            } else if (result === ERR_NOT_FOUND) {
+                errorMessage = 'Order no longer available';
+            }
+            console.log('[OpportunisticBuy] Error buying account resource from order ' +
+                order.id + ' (' + (order.roomName || 'unknown') + '): ' + errorMessage);
+
+            // Drop cache if the order failed
+            request.cachedOrderId = null;
+            request.cachedOrderRoomName = null;
+            return true; // consume attempt
+        }
+    }
+
+    var attempted = false;
+
+    // 1) Try cached order first (fast path)
+    if (request.cachedOrderId) {
+        var cached = Game.market.getOrderById(request.cachedOrderId);
+        var cachedIsOwn = !!(cached && cached.roomName && myRooms[cached.roomName]);
+        if (cached &&
+            cached.resourceType === request.resourceType &&
+            (cached.price <= request.maxPrice || cachedIsOwn) &&
+            cached.amount > 0) {
+            attempted = attemptAccountDeal(cached);
+        } else {
+            // Invalidate cache if not usable
+            request.cachedOrderId = null;
+            request.cachedOrderRoomName = null;
+        }
+    }
+
+    // 2) If no attempt yet, scan orders for the best feasible one
+    if (!attempted) {
+        var orders = Game.market.getAllOrders({
+            type: ORDER_SELL,
+            resourceType: request.resourceType
+        }).filter(function(order) {
+            // Account resource orders may not have a roomName — that's OK
+            // Accept orders from our own rooms regardless of price
+            if (order.roomName && myRooms[order.roomName]) return order.amount > 0;
+            return order.price <= request.maxPrice && order.amount > 0;
+        }).sort(function(a, b) {
+            // Prefer own-room orders first (effective price = 0), then cheapest
+            var aOwn = (a.roomName && myRooms[a.roomName]) ? 1 : 0;
+            var bOwn = (b.roomName && myRooms[b.roomName]) ? 1 : 0;
+            if (aOwn !== bOwn) return bOwn - aOwn; // own rooms first
+            return a.price - b.price; // then cheapest
+        });
+
+        // Try each order in priority order until one succeeds
+        for (var ai = 0; ai < orders.length && !attempted; ai++) {
+            attempted = attemptAccountDeal(orders[ai]);
+        }
+    }
+
+    // Clean up if fully fulfilled
+    if (request.remaining <= 0) {
+        delete requests[key_i];
+        console.log('[OpportunisticBuy] Completed buy request for ' + request.resourceType +
+            ' (' + request.totalAmount + ' total)');
+    }
+}
+
+/**
  * Processes all active opportunistic buy requests.
  * Should be called periodically in your main loop.
  * 
- * - Confirms pending deals by comparing terminal before/after counts.
+ * - Handles account-level resources (pixel, cpuUnlock, accessKey) without terminal logic.
+ * - Confirms pending terminal deals by comparing terminal before/after counts.
  * - Executes at most one deal per terminal per tick.
  * - Among requests for the same terminal, the earlier created is processed first.
  * - Orders from our own rooms are accepted regardless of maxPrice (credits cycle back).
@@ -183,6 +329,14 @@ function process() {
         // Skip completed
         if (request.remaining <= 0) continue;
 
+        // ======= ACCOUNT-LEVEL RESOURCE PATH =======
+        // No terminal, no energy, no capacity — just credits and deal() without room name.
+        if (isAccountResource(request.resourceType)) {
+            processAccountResource(key_i, request, requests, myRooms);
+            continue;
+        }
+
+        // ======= TERMINAL RESOURCE PATH (existing logic) =======
         var roomName = request.roomName;
         var room = Game.rooms[roomName];
         var terminal = room && room.terminal;
@@ -340,6 +494,7 @@ function process() {
             var cached = Game.market.getOrderById(request.cachedOrderId);
             var cachedIsOwn = !!(cached && cached.roomName && myRooms[cached.roomName]);
             if (cached &&
+                cached.roomName &&
                 cached.resourceType === request.resourceType &&
                 (cached.price <= request.maxPrice || cachedIsOwn) &&
                 cached.amount > 0) {
@@ -357,9 +512,11 @@ function process() {
                 type: ORDER_SELL,
                 resourceType: request.resourceType
             }).filter(function(order) {
+                // Skip orders with no roomName (NPC/system orders that can't be used with deal())
+                if (!order.roomName) return false;
                 // Accept orders from our own rooms regardless of price,
                 // since credits cycle back to us (only transfer energy is the real cost)
-                if (order.roomName && myRooms[order.roomName]) return order.amount > 0;
+                if (myRooms[order.roomName]) return order.amount > 0;
                 return order.price <= request.maxPrice && order.amount > 0;
             }).sort(function(a, b) {
                 // Prefer own-room orders first (effective price = 0), then cheapest
@@ -476,11 +633,12 @@ function listActiveRequests() {
     for (var key in requests) {
         var req = requests[key];
         var fulfilled = req.fulfilled || 0;
+        var acctTag = isAccountResource(req.resourceType) ? ' [ACCOUNT]' : '';
         var pendingStr = req.pending && typeof req.pending.expected === 'number'
             ? ' (pending ' + req.pending.expected + ' awaiting confirmation)'
             : '';
         output += '- ' + req.roomName + ': ' + (req.remaining) + '/' + req.totalAmount + ' ' + req.resourceType +
-                  ' (fulfilled ' + fulfilled + ')' + ' (max ' + req.maxPrice + ' credits)' + pendingStr + '\n';
+                  acctTag + ' (fulfilled ' + fulfilled + ')' + ' (max ' + req.maxPrice + ' credits)' + pendingStr + '\n';
     }
 
     console.log('[OpportunisticBuy] ' + output);

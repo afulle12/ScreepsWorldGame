@@ -7,25 +7,26 @@
 // - If a second recipient exists, transfer 100,000 ENERGY from the second-highest donor to the second-lowest recipient.
 // - Skips any room currently busy with a terminal transfer (as source or destination).
 // - Sends an email notification via Game.notify after each successful transfer.
+// - If a room's storage energy exceeds 825,000 and no opportunistic sell order exists for it,
+//   creates an opportunistic sell order to sell the excess down to 825,000.
 // Notes:
 // - No optional chaining used (Screeps-compatible).
 // - All transfers are initiated exclusively via terminalManager.transferStuff(fromRoom, toRoom, 'energy', amount).
 // - Tick interval is controlled from main; this file has no internal gating.
 
 const terminalManager = require('terminalManager');
+const opportunisticSell = require('opportunisticSell');
 
 const LOW_STORAGE_THRESHOLD = 300000;
 const HIGH_STORAGE_THRESHOLD = 400000;
 const TRANSFER_AMOUNT = 15000;
+const SELL_THRESHOLD = 825000;
 
 function isSuccess(result) {
-  // Accept common "success" indicators; we can tighten this if your terminalManager differs.
-  // Screeps OK is 0; some wrappers return OK or true.
   return result === OK || result === 0 || result === true || result === 'OK' || result === 'queued';
 }
 
 function notifyTransfer(fromRoom, toRoom, amount) {
-  // Group identical messages for 60 minutes to reduce noise; each message includes tick so grouping rarely triggers.
   Game.notify(
     '[RoomBalance] Transfer started: ' + fromRoom + ' -> ' + toRoom +
     ' x ' + amount + ' ENERGY at tick ' + Game.time,
@@ -57,7 +58,25 @@ const roomBalance = {
 
     if (roomsData.length === 0) return;
 
-    // Determine recipients (low rooms) and donors (rich rooms)
+    // ---- Opportunistic sell for rooms above 825k ----
+    var sellRequests = (Memory.opportunisticSell && Memory.opportunisticSell.requests)
+      ? Memory.opportunisticSell.requests
+      : {};
+
+    for (var si = 0; si < roomsData.length; si++) {
+      var rd = roomsData[si];
+      if (rd.energy > SELL_THRESHOLD && rd.hasTerminal) {
+        var sellKey = rd.name + '_energy';
+        if (!sellRequests[sellKey]) {
+          var sellAmount = rd.energy - SELL_THRESHOLD;
+          opportunisticSell.setup(rd.name, RESOURCE_ENERGY, sellAmount, true);
+          console.log('[RoomBalance] Created opportunistic sell for ' + rd.name +
+            ': ' + sellAmount + ' energy (storage at ' + rd.energy + ')');
+        }
+      }
+    }
+
+    // ---- Normal balancing logic ----
     var recipients = roomsData.filter(function(r) {
       return r.energy < LOW_STORAGE_THRESHOLD &&
              r.hasTerminal;
@@ -70,13 +89,9 @@ const roomBalance = {
 
     if (recipients.length === 0 || donors.length === 0) return;
 
-    // Sort donors by storage energy descending (highest first)
     donors.sort(function(a, b) { return b.energy - a.energy; });
-
-    // Sort recipients by storage energy ascending (lowest first)
     recipients.sort(function(a, b) { return a.energy - b.energy; });
 
-    // Avoid rooms that are currently busy with transfers
     function isBusy(rn) {
       return terminalManager.isRoomBusyWithTransfer(rn);
     }
@@ -91,7 +106,6 @@ const roomBalance = {
       var to1 = recipients[0].name;
       var from1 = donors[0].name;
       if (from1 !== to1 && !isBusy(to1) && !isBusy(from1)) {
-        // EXACT signature match: transferStuff('DONORROOM', 'RECEIVINGROOM', 'energy', 100000)
         var res1 = terminalManager.transferStuff(from1, to1, 'energy', TRANSFER_AMOUNT);
         console.log('[RoomBalance] ' + from1 + ' -> ' + to1 + ' x ' + TRANSFER_AMOUNT + ' ENERGY | ' + res1);
         if (isSuccess(res1)) {

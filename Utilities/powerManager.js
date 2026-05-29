@@ -13,9 +13,18 @@
 //
 // stopPowerUpgrade(roomName)
 //   Disables power processing mode for the specified room.
-//   - Sets powerMode to false in room memory
+//   - Sets Memory.power[roomName] to false / deletes it
 //   - Does NOT cancel any active market orders (do that manually if needed)
 //   Example: stopPowerUpgrade('W1N1')
+//
+// powerStatus()
+//   Lists all rooms that currently have power processing enabled.
+//   - Shows stored Power (Terminal + Storage + PowerSpawn) per room
+//   - Shows current GPL progress
+//   Example: powerStatus()
+//
+// Enable:  Memory.power['W1N1'] = 1;
+// Disable: delete Memory.power['W1N1'];
 //
 // ============================================================================
 
@@ -36,17 +45,17 @@ function getMarketPriceAvg(resource) {
     let sumPV = 0;
     let sumV = 0;
 
-    if (last && typeof last.avgPrice === 'number') { 
-        sumPV += last.avgPrice * last.volume; 
-        sumV += last.volume; 
+    if (last && typeof last.avgPrice === 'number') {
+        sumPV += last.avgPrice * last.volume;
+        sumV += last.volume;
     }
-    if (prev && typeof prev.avgPrice === 'number') { 
-        sumPV += prev.avgPrice * prev.volume; 
-        sumV += prev.volume; 
+    if (prev && typeof prev.avgPrice === 'number') {
+        sumPV += prev.avgPrice * prev.volume;
+        sumV += prev.volume;
     }
 
     if (sumV === 0) return last ? last.avgPrice : 0;
-    
+
     return sumPV / sumV;
 }
 
@@ -57,20 +66,22 @@ function getMarketPriceAvg(resource) {
 global.startPowerUpgrade = function(roomName) {
     if (!Game.rooms[roomName]) return "❌ Room " + roomName + " not visible.";
     const room = Game.rooms[roomName];
-    
+
     // --- 1. Detect Amount Needed ---
     // Calculate how much is left to reach the next GPL level
     const totalForLevel = Game.gpl.progressTotal;
     const currentProgress = Game.gpl.progress;
     const remainingForLevel = totalForLevel - currentProgress;
-    
+
     // Calculate what we already have in this room
     let stored = 0;
     if (room.terminal) stored += room.terminal.store[RESOURCE_POWER] || 0;
-    if (room.storage) stored += room.storage.store[RESOURCE_POWER] || 0;
-    
+    if (room.storage)  stored += room.storage.store[RESOURCE_POWER] || 0;
+
     // Check PowerSpawn for existing resource
-    const powerSpawns = room.find(FIND_MY_STRUCTURES, { filter: s => s.structureType === STRUCTURE_POWER_SPAWN });
+    const powerSpawns = room.find(FIND_MY_STRUCTURES, {
+        filter: s => s.structureType === STRUCTURE_POWER_SPAWN
+    });
     if (powerSpawns.length > 0) {
         stored += powerSpawns[0].store[RESOURCE_POWER] || 0;
     }
@@ -79,8 +90,8 @@ global.startPowerUpgrade = function(roomName) {
     const amountToBuy = Math.max(0, remainingForLevel - stored);
 
     // --- 2. Activate Processing Mode ---
-    if (!Memory.rooms[roomName]) Memory.rooms[roomName] = {};
-    Memory.rooms[roomName].powerMode = true;
+    if (!Memory.power) Memory.power = {};
+    Memory.power[roomName] = 1;
 
     if (amountToBuy === 0) {
         return `✅ PROCESSING ENABLED: No purchase needed.\n` +
@@ -91,14 +102,14 @@ global.startPowerUpgrade = function(roomName) {
     let avgPrice = getMarketPriceAvg(RESOURCE_POWER);
     if (avgPrice <= 0) {
         // Fallback if API returns no history (rare for Power)
-        avgPrice = 100; 
+        avgPrice = 100;
         console.log("⚠️ No market history for POWER, defaulting to 100cr.");
     }
-    
+
     // --- 4. Place Order ---
     // We use the exact 48h weighted average as the max price
     opportunisticBuy.setup(roomName, RESOURCE_POWER, amountToBuy, avgPrice);
-    
+
     return `🚀 UPGRADE STARTED in ${roomName}\n` +
            `   - Goal: Level ${Game.gpl.level + 1} (${currentProgress}/${totalForLevel})\n` +
            `   - Buying: ${amountToBuy} Power\n` +
@@ -106,25 +117,67 @@ global.startPowerUpgrade = function(roomName) {
 };
 
 global.stopPowerUpgrade = function(roomName) {
-    if (Memory.rooms[roomName]) {
-        Memory.rooms[roomName].powerMode = false;
-    }
+    if (Memory.power) delete Memory.power[roomName];
     return "🛑 STOPPED: Power processing disabled for " + roomName;
+};
+
+/**
+ * Console Command: Show all rooms with power processing enabled
+ * Usage: powerStatus();
+ */
+global.powerStatus = function() {
+    const lines = [];
+    const activeRooms = [];
+
+    lines.push(`⚡ GPL ${Game.gpl.level} — Progress: ${Game.gpl.progress}/${Game.gpl.progressTotal}`);
+    lines.push('');
+
+    if (!Memory.power) Memory.power = {};
+
+    for (const roomName in Memory.power) {
+        if (!Memory.power[roomName]) continue;
+        activeRooms.push(roomName);
+
+        const room = Game.rooms[roomName];
+        if (!room) {
+            lines.push(`  ${roomName}  ⚠️ (not visible)`);
+            continue;
+        }
+
+        // Tally stored power across structures
+        let terminal = 0, storage = 0, pSpawn = 0;
+        if (room.terminal) terminal = room.terminal.store[RESOURCE_POWER] || 0;
+        if (room.storage)  storage  = room.storage.store[RESOURCE_POWER] || 0;
+
+        const powerSpawns = room.find(FIND_MY_STRUCTURES, {
+            filter: s => s.structureType === STRUCTURE_POWER_SPAWN
+        });
+        if (powerSpawns.length > 0) pSpawn = powerSpawns[0].store[RESOURCE_POWER] || 0;
+
+        const total = terminal + storage + pSpawn;
+        lines.push(`  ${roomName}  🔋 ${total} Power  (T:${terminal} S:${storage} PS:${pSpawn})`);
+    }
+
+    if (activeRooms.length === 0) {
+        lines.push('  No rooms have powerMode enabled.');
+    }
+
+    return lines.join('\n');
 };
 
 module.exports = {
     run: function(roomName) {
         var room = Game.rooms[roomName];
         if (!room) return;
-        
+
         // Only run if Power Mode is enabled in memory
-        if (!Memory.rooms[roomName] || !Memory.rooms[roomName].powerMode) return;
+        if (!Memory.power || !Memory.power[roomName]) return;
 
         // --- 1. Find Power Spawn ---
         var powerSpawns = room.find(FIND_MY_STRUCTURES, {
             filter: function(s) { return s.structureType === STRUCTURE_POWER_SPAWN; }
         });
-        
+
         if (powerSpawns.length === 0) return;
         var powerSpawn = powerSpawns[0];
 
@@ -153,7 +206,7 @@ module.exports = {
         // Write to memory so spawnManager can read it
         if (!Memory.spawnRequests) Memory.spawnRequests = {};
         if (!Memory.spawnRequests[roomName]) Memory.spawnRequests[roomName] = {};
-        
+
         Memory.spawnRequests[roomName].needPowerBot = needsPowerBot;
 
         // --- 4. Alert for New Power Creeps (global, one-time) ---
@@ -163,8 +216,9 @@ module.exports = {
 
         if (Game.gpl.level > assignedPowerCreeps && Game.gpl.level > Memory._lastGplAlertLevel) {
             Memory._lastGplAlertLevel = Game.gpl.level;
-            console.log("!!! POWER LEVEL UPGRADE DETECTED — GPL " + Game.gpl.level + " !!!");
-            console.log("You have " + assignedPowerCreeps + " Power Creep(s). Use Game.powerCreeps['Name'].create(...) to initialize a new one.");
+            var msg = "GPL " + Game.gpl.level + " reached! You have " + assignedPowerCreeps + " Power Creep(s). Use Game.powerCreeps['Name'].create(...) to initialize a new one.";
+            console.log("!!! POWER LEVEL UPGRADE DETECTED — " + msg);
+            Game.notify(msg);
         }
     }
 };

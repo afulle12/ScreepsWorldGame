@@ -91,18 +91,6 @@
 //
 //   // Driven from the power creep loop inside runCreeps() — no standalone call needed.
 //
-// ============================================================================
-// DESIGN
-// ============================================================================
-//
-//   - Each power has a self-contained handler in POWER_HANDLERS
-//   - Creeps only attempt powers they actually have leveled
-//   - Adding new powers = adding a new handler entry, nothing else changes
-//   - Multiple creeps in different rooms with different power sets is supported
-//   - Priority loop: Renew → Emergency Ops → Ops Banking → Intel Observe → Powers in config order → Idle
-//
-// ============================================================================
-
 // --- Power Handler Registry ---
 // Each handler defines:
 //   getTarget(creep, room)  -> Game object to use the power on, or null for self-cast
@@ -116,7 +104,8 @@ const POWER_HANDLERS = {};
 // ---------------------------------------------------------------------------
 // PWR_GENERATE_OPS (1) - Self-cast, generates ops resource
 // Generates ops as long as carry is not completely full.
-// The deposit-to-storage logic keeps space available so generation never stalls.
+// The deposit-to-storage/terminal logic keeps space available so generation
+// never stalls. Fired unconditionally before all other powers in Layer 1.
 // ---------------------------------------------------------------------------
 POWER_HANDLERS[PWR_GENERATE_OPS] = {
     label: 'GenerateOps',
@@ -134,38 +123,49 @@ POWER_HANDLERS[PWR_GENERATE_OPS] = {
 // ---------------------------------------------------------------------------
 // PWR_OPERATE_FACTORY (22) - Targets factory, sets its level
 // Only activates when there is an active factory order in the room whose
-// recipe requires a factory level (e.g. Composite, Crystal, Liquid).
+// recipe requires a factory level (e.g. Composite, Crystal, Liquid, Concentrate).
+// Uses getRecipe() which falls back to COMMODITIES, so ALL leveled products
+// are detected — not just the ones in the hardcoded RECIPES table.
 // ---------------------------------------------------------------------------
 POWER_HANDLERS[PWR_OPERATE_FACTORY] = {
     label: 'OperateFactory',
     range: 3,
     opsCost: 100,
+
     getTarget: function(creep, room) {
+        // Determine what level the active order needs
+        var neededLevel = 0;
+        var orders = Memory.factoryOrders || [];
+        var getRecipe = require('factoryManager').getRecipe;
+        for (var i = 0; i < orders.length; i++) {
+            var o = orders[i];
+            if (o.room !== room.name || o.status !== 'active') continue;
+            var recipe = getRecipe(o.product);
+            if (recipe && recipe.level) { neededLevel = recipe.level; break; }
+        }
+        if (!neededLevel) return null; // no leveled order — don't operate
+
         var factories = room.find(FIND_MY_STRUCTURES, {
             filter: function(s) {
                 if (s.structureType !== STRUCTURE_FACTORY) return false;
+
                 if (s.effects && s.effects.length) {
                     for (var i = 0; i < s.effects.length; i++) {
-                        if (s.effects[i].effect === PWR_OPERATE_FACTORY) return false;
+                        if (s.effects[i].effect === PWR_OPERATE_FACTORY) {
+                            // Effect is live — re-target only if the level is wrong
+                            return s.effects[i].level !== neededLevel;
+                        }
                     }
                 }
-                return true;
+
+                return true; // no active effect — needs operating
             }
         });
         return factories[0] || null;
     },
-    shouldUse: function(creep, room) {
-        var orders = Memory.factoryOrders || [];
-        var RECIPES = require('factoryManager').RECIPES;
-        for (var i = 0; i < orders.length; i++) {
-            var o = orders[i];
-            if (o.room !== room.name) continue;
-            if (o.status !== 'active') continue;
-            var recipe = RECIPES[o.product];
-            if (recipe && recipe.level) return true;
-        }
-        return false;
-    }
+
+    // getTarget is the sole gatekeeper; shouldUse is a passthrough
+    shouldUse: function() { return true; }
 };
 
 // ---------------------------------------------------------------------------
@@ -211,6 +211,7 @@ POWER_HANDLERS[PWR_OPERATE_SPAWN] = {
 
 // ---------------------------------------------------------------------------
 // PWR_OPERATE_TERMINAL (23) - Reduces transaction cost by 50%
+// Only activates when the terminal is on cooldown (a send just occurred).
 // ---------------------------------------------------------------------------
 POWER_HANDLERS[PWR_OPERATE_TERMINAL] = {
     label: 'OperateTerminal',
@@ -229,7 +230,7 @@ POWER_HANDLERS[PWR_OPERATE_TERMINAL] = {
     shouldUse: function(creep, room) {
         var terminal = room.terminal;
         if (!terminal) return false;
-        return terminal.store.getUsedCapacity() > 0;
+        return terminal.cooldown > 0;
     }
 };
 
@@ -252,6 +253,33 @@ POWER_HANDLERS[PWR_REGEN_SOURCE] = {
             }
         });
         return sources[0] || null;
+    },
+    shouldUse: function() { return true; }
+};
+
+// ---------------------------------------------------------------------------
+// PWR_REGEN_MINERAL (17) - Boosts mineral yield (like PWR_REGEN_SOURCE for energy)
+// Only targets minerals that are actively minable — skips depleted ones that
+// are waiting on their natural regeneration timer.
+// ---------------------------------------------------------------------------
+POWER_HANDLERS[PWR_REGEN_MINERAL] = {
+    label: 'RegenMineral',
+    range: 3,
+    opsCost: 0,
+    getTarget: function(creep, room) {
+        var minerals = room.find(FIND_MINERALS, {
+            filter: function(s) {
+                if (s.mineralAmount === 0) return false;
+                if (s.ticksToRegeneration > 0) return false;
+                if (s.effects && s.effects.length) {
+                    for (var i = 0; i < s.effects.length; i++) {
+                        if (s.effects[i].effect === PWR_REGEN_MINERAL) return false;
+                    }
+                }
+                return true;
+            }
+        });
+        return minerals[0] || null;
     },
     shouldUse: function() { return true; }
 };
@@ -346,14 +374,11 @@ POWER_HANDLERS[PWR_OPERATE_OBSERVER] = {
 // Tuning Constants
 // ============================================================================
 var RENEW_TTL = 500;
-var OPS_EMERGENCY = 10;
 
-// --- Ops Banking Thresholds ---
-// When carry reaches this level, deposit excess ops into room storage.
-// When carry is low, withdraw ops back from storage to stay operational.
-var OPS_DEPOSIT_THRESHOLD = 695;   // deposit when ops >= this
-var OPS_DEPOSIT_AMOUNT = 100;      // how many ops to deposit per trip
-var OPS_WITHDRAW_THRESHOLD = 100;  // withdraw when ops fall below this
+// --- Ops Banking Thresholds (percentage-based, scales with any carry capacity) ---
+var OPS_DEPOSIT_PCT = 0.85;       // deposit when ops >= 85% of capacity
+var OPS_WITHDRAW_PCT = 0.15;      // withdraw when ops < 15% of capacity
+var OPS_BANK_AMOUNT_PCT = 0.15;   // amount per banking trip (% of capacity, min 10)
 
 // ============================================================================
 // Console Commands — Creation & Upgrades
@@ -422,13 +447,18 @@ global.setupOperator = function(creepName, roomName, powers) {
     if (!Memory.operators) Memory.operators = {};
 
     if (!powers || !powers.length) {
+        // Priority order: regen powers first (frequent, free), then extension,
+        // then factory (long-duration effect — serviced promptly after regen
+        // completes, and its getTarget() returns null while the effect is
+        // active so it never wins a commit it doesn't need), then the rest.
         powers = [
             PWR_GENERATE_OPS,
-            PWR_OPERATE_FACTORY,
+            PWR_REGEN_SOURCE,
+            PWR_REGEN_MINERAL,
             PWR_OPERATE_EXTENSION,
+            PWR_OPERATE_FACTORY,
             PWR_OPERATE_SPAWN,
             PWR_OPERATE_TERMINAL,
-            PWR_REGEN_SOURCE,
             PWR_OPERATE_STORAGE,
             PWR_OPERATE_LAB,
             PWR_OPERATE_CONTROLLER
@@ -534,6 +564,7 @@ global.listPowers = function() {
     lines.push('  PWR_OPERATE_SPAWN (' + PWR_OPERATE_SPAWN + ')       - +30% spawn speed (100 ops)');
     lines.push('  PWR_OPERATE_TERMINAL (' + PWR_OPERATE_TERMINAL + ')    - -50% transaction cost (100 ops)');
     lines.push('  PWR_REGEN_SOURCE (' + PWR_REGEN_SOURCE + ')        - +50% source energy (free)');
+    lines.push('  PWR_REGEN_MINERAL (' + PWR_REGEN_MINERAL + ')       - Regen mineral deposit (free)');
     lines.push('  PWR_OPERATE_STORAGE (' + PWR_OPERATE_STORAGE + ')     - +500k storage cap (100 ops)');
     lines.push('  PWR_OPERATE_LAB (' + PWR_OPERATE_LAB + ')         - +2 reaction/tick (10 ops)');
     lines.push('  PWR_OPERATE_CONTROLLER (' + PWR_OPERATE_CONTROLLER + ')  - +8 upgrade/tick (200 ops)');
@@ -566,6 +597,15 @@ module.exports = {
         }
     },
 
+    // ====================================================================
+    // Main tick entry point — two-layer architecture
+    //
+    //   Layer 1 (Power):    Fire all ready, in-range powers. Free action —
+    //                       usePower does NOT consume the movement slot.
+    //   Layer 2 (Movement): Mutually exclusive — first match wins.
+    //                       Renew → Banking → Intel → Move-commit → Idle
+    // ====================================================================
+
     runCreep: function(pc, config) {
         var room = Game.rooms[config.homeRoom];
         if (!room) {
@@ -578,7 +618,7 @@ module.exports = {
             return;
         }
 
-        // --- PRIORITY 0: Enable power in room (one-time per room) ---
+        // --- PRE-CHECK: Enable power in room (one-time, needs exclusive movement) ---
         if (room.controller && !room.controller.isPowerEnabled) {
             var result = pc.enableRoom(room.controller);
             if (result === ERR_NOT_IN_RANGE) {
@@ -591,24 +631,215 @@ module.exports = {
             }
         }
 
-        // --- PRIORITY 1: Renew if TTL is low ---
+        // =============================================================
+        // LAYER 1: Fire all ready powers that are in range (free action)
+        // Self-cast powers (PWR_GENERATE_OPS) always fire here.
+        // This runs unconditionally — movement tasks can never starve it.
+        // =============================================================
+        this.fireAllReadyPowers(pc, room, config);
+
+        // =============================================================
+        // LAYER 2: Movement — mutually exclusive, first match wins
+        // =============================================================
+
+        // 2a: Renew if TTL is low
         if (pc.ticksToLive < RENEW_TTL) {
             if (this.doRenew(pc, room)) return;
         }
 
-        // --- PRIORITY 2: Emergency ops generation ---
-        var ops = pc.store[RESOURCE_OPS] || 0;
-        if (ops <= OPS_EMERGENCY && pc.powers[PWR_GENERATE_OPS]) {
-            if (this.tryPower(pc, room, PWR_GENERATE_OPS)) return;
-        }
-
-        // --- PRIORITY 2.5: Ops banking (deposit / withdraw) ---
+        // 2b: Ops banking (deposit overflow / withdraw when depleted)
         if (this.handleOpsBanking(pc, room)) return;
 
-        // --- PRIORITY 3: On-demand intel observation (PWR_OPERATE_OBSERVER) ---
+        // 2c: On-demand intel observation
         if (this.handleIntelObserve(pc, room)) return;
 
-        // --- PRIORITY 4: Run configured powers in order ---
+        // 2d: Move-commit to nearest out-of-range power target
+        if (this.handleMoveCommit(pc, room, config)) return;
+
+        // 2e: Nothing to do — idle near power spawn
+        this.idleNearSpawn(pc, room);
+    },
+
+    // ====================================================================
+    // Layer 1: Fire all ready, in-range powers
+    //
+    // PWR_GENERATE_OPS is always fired first, unconditionally, before the
+    // priority loop. This guarantees ops generation is never skipped or
+    // starved regardless of config order or other power states.
+    //
+    // Operate Terminal is checked next (outside the config list) because
+    // it is time-sensitive: the terminal cooldown window is short.
+    //
+    // All other configured powers are then iterated in priority order.
+    // ====================================================================
+
+    fireAllReadyPowers: function(pc, room, config) {
+
+        // Always generate ops first — self-cast, free, never skipped
+        if (pc.powers && pc.powers[PWR_GENERATE_OPS] &&
+            pc.powers[PWR_GENERATE_OPS].cooldown === 0) {
+            this.tryPowerInRange(pc, room, PWR_GENERATE_OPS);
+        }
+
+        // High-priority: Operate Terminal (time-sensitive, terminal cooldown window)
+        if (pc.powers && pc.powers[PWR_OPERATE_TERMINAL] && pc.powers[PWR_OPERATE_TERMINAL].cooldown === 0) {
+            var ops = pc.store[RESOURCE_OPS] || 0;
+            if (ops >= POWER_HANDLERS[PWR_OPERATE_TERMINAL].opsCost) {
+                this.tryPowerInRange(pc, room, PWR_OPERATE_TERMINAL);
+            }
+        }
+
+        // Walk the configured power list in priority order.
+        // Skip PWR_GENERATE_OPS — already fired unconditionally above.
+        var powers = config.powers || [];
+        for (var i = 0; i < powers.length; i++) {
+            var powerId = powers[i];
+
+            // Already fired above
+            if (powerId === PWR_GENERATE_OPS) continue;
+
+            if (!pc.powers || !pc.powers[powerId]) continue;
+            if (pc.powers[powerId].cooldown > 0) continue;
+
+            var handler = POWER_HANDLERS[powerId];
+            if (!handler) continue;
+
+            var ops = pc.store[RESOURCE_OPS] || 0;
+            if (handler.opsCost > 0 && ops < handler.opsCost) continue;
+
+            this.tryPowerInRange(pc, room, powerId);
+        }
+    },
+
+    // ====================================================================
+    // Layer 2d: Move-commit system
+    //
+    // Maintains a persistent movement lock so the creep walks to one target
+    // without being redirected each tick. Layer 1 fires in-range powers
+    // along the way.
+    //
+    // Each tick:
+    //   1. If a commit exists, validate it (target still needs the power,
+    //      cooldown still 0, can still afford ops).
+    //   2. If valid and in range — hold position so Layer 1 fires the power.
+    //      Clear after 3 ticks if unfired (safety valve).
+    //   3. If valid and out of range — keep walking.
+    //   4. If invalid — clear lock and fall through to find a new target.
+    //   5. If no commit, scan for the highest-priority out-of-range target.
+    //
+    // No mid-walk preemption is used. Any form of preemption causes
+    // oscillation when multiple targets are simultaneously valid (e.g.
+    // source and factory both needing service at different locations).
+    // Priority is resolved entirely by the config list order at the moment
+    // a new commit is chosen — keep high-value frequent powers near the top.
+    // ====================================================================
+
+    handleMoveCommit: function(pc, room, config) {
+        var ops = pc.store[RESOURCE_OPS] || 0;
+        var mem = pc.memory || {};
+        if (!mem._moveCommit) mem._moveCommit = null;
+
+        // --- Validate existing commit ---
+        if (mem._moveCommit) {
+            var commit = mem._moveCommit;
+            var cTarget = Game.getObjectById(commit.targetId);
+            var cHandler = POWER_HANDLERS[commit.powerId];
+            var stillValid = cTarget && cHandler
+                && pc.powers[commit.powerId]
+                && pc.powers[commit.powerId].cooldown === 0
+                && (cHandler.opsCost === 0 || ops >= cHandler.opsCost)
+                && cHandler.shouldUse(pc, room, cTarget);
+
+            // Confirm the target still needs the power
+            if (stillValid && cHandler.range > 0) {
+                var freshTarget = cHandler.getTarget(pc, room);
+                if (!freshTarget || freshTarget.id !== cTarget.id) {
+                    stillValid = false;
+                }
+            }
+
+            if (stillValid) {
+                if (pc.pos.getRangeTo(cTarget) <= cHandler.range) {
+                    // In range — hold position so Layer 1 can fire the power.
+                    // When it fires, cooldown > 0 → stillValid fails next tick
+                    // → commit clears naturally via the else branch below.
+                    // Safety: if the power hasn't fired after 3 ticks in range,
+                    // clear the commit to avoid getting permanently stuck.
+                    if (!commit.inRangeSince) commit.inRangeSince = Game.time;
+                    if (Game.time - commit.inRangeSince > 3) {
+                        mem._moveCommit = null;
+                        return false;
+                    }
+                    return true;
+                } else {
+                    commit.inRangeSince = null;
+                    pc.moveTo(cTarget, { reusePath: 5 });
+                    return true;
+                }
+            } else {
+                mem._moveCommit = null;
+            }
+        }
+
+        // --- Find a new target and lock onto it ---
+        var moveResult = this.findMoveTarget(pc, room, config, ops);
+        if (moveResult) {
+            mem._moveCommit = {
+                targetId: moveResult.target.id,
+                powerId: moveResult.powerId
+            };
+            pc.moveTo(moveResult.target, { reusePath: 5 });
+            return true;
+        }
+
+        return false;
+    },
+
+    /**
+     * Try to use a power ONLY if the creep is already in range.
+     * Does not issue any movement. Returns true if the power fired.
+     */
+    tryPowerInRange: function(pc, room, powerId) {
+        var handler = POWER_HANDLERS[powerId];
+        if (!handler) return false;
+
+        // Self-cast (range 0) — always in range
+        if (handler.range === 0) {
+            if (!handler.shouldUse(pc, room, null)) return false;
+            return pc.usePower(powerId) === OK;
+        }
+
+        var target = handler.getTarget(pc, room);
+        if (!target) return false;
+        if (!handler.shouldUse(pc, room, target)) return false;
+        if (pc.pos.getRangeTo(target) > handler.range) return false;
+
+        var result = pc.usePower(powerId, target);
+        if (result !== OK) {
+            console.log('[Operator] ' + handler.label + ' failed on ' + target + ' → code ' + result);
+        }
+        return result === OK;
+    },
+
+    /**
+     * Scan configured powers for the highest-priority one that has a valid
+     * target out of range. Returns {target, powerId} or null.
+     */
+    findMoveTarget: function(pc, room, config, ops) {
+        // Check Operate Terminal first (high priority when active)
+        if (pc.powers && pc.powers[PWR_OPERATE_TERMINAL] && pc.powers[PWR_OPERATE_TERMINAL].cooldown === 0) {
+            var termHandler = POWER_HANDLERS[PWR_OPERATE_TERMINAL];
+            if (ops >= termHandler.opsCost) {
+                var termTarget = termHandler.getTarget(pc, room);
+                if (termTarget && termHandler.shouldUse(pc, room, termTarget)) {
+                    if (pc.pos.getRangeTo(termTarget) > termHandler.range) {
+                        return { target: termTarget, powerId: PWR_OPERATE_TERMINAL };
+                    }
+                }
+            }
+        }
+
+        // Check configured powers in priority order
         var powers = config.powers || [];
         for (var i = 0; i < powers.length; i++) {
             var powerId = powers[i];
@@ -618,63 +849,87 @@ module.exports = {
             if (!POWER_HANDLERS[powerId]) continue;
 
             var handler = POWER_HANDLERS[powerId];
+            if (handler.range === 0) continue; // self-cast, no movement needed
             if (handler.opsCost > 0 && ops < handler.opsCost) continue;
 
-            if (this.tryPower(pc, room, powerId)) return;
+            var target = handler.getTarget(pc, room);
+            if (!target) continue;
+            if (!handler.shouldUse(pc, room, target)) continue;
+            if (pc.pos.getRangeTo(target) > handler.range) {
+                return { target: target, powerId: powerId };
+            }
         }
 
-        // --- IDLE: Move near power spawn for quick renew access ---
-        this.idleNearSpawn(pc, room);
+        return null;
     },
 
-    // ========================================================================
+    // ====================================================================
     // Ops Banking — deposit excess ops to storage, withdraw when depleted
-    // ========================================================================
+    //
+    // Checks storage first for both deposit and withdraw. Falls back to
+    // terminal if storage is absent or has no ops to offer.
+    //
+    // Thresholds are percentage-based so they scale with any carry capacity
+    // (100 for a base Operator, potentially more with upgrades).
+    //
+    //   cap=100: deposit at 85 ops, withdraw below 15, bank 15 per trip
+    //   cap=700: deposit at 595 ops, withdraw below 105, bank 105 per trip
+    // ====================================================================
 
-    /**
-     * Manages ops overflow and depletion via room storage.
-     *
-     * - When carry ops >= OPS_DEPOSIT_THRESHOLD (695), deposit OPS_DEPOSIT_AMOUNT
-     *   (100) into storage so generation can continue.
-     * - When carry ops < OPS_WITHDRAW_THRESHOLD (100) and storage has ops,
-     *   withdraw up to OPS_DEPOSIT_AMOUNT to stay operational.
-     *
-     * Returns true if the creep was given an action this tick.
-     */
     handleOpsBanking: function(pc, room) {
         var storage = room.storage;
-        if (!storage) return false;
+        var terminal = room.terminal;
+        if (!storage && !terminal) return false;
 
         var ops = pc.store[RESOURCE_OPS] || 0;
+        var cap = pc.store.getCapacity(RESOURCE_OPS) || 100;
+        var depositAt   = Math.floor(cap * OPS_DEPOSIT_PCT);
+        var withdrawAt  = Math.floor(cap * OPS_WITHDRAW_PCT);
+        var bankAmount  = Math.max(10, Math.floor(cap * OPS_BANK_AMOUNT_PCT));
 
-        // ── Deposit: offload ops when near carry capacity ──
-        if (ops >= OPS_DEPOSIT_THRESHOLD) {
-            var depositAmount = Math.min(OPS_DEPOSIT_AMOUNT, ops);
-            var result = pc.transfer(storage, RESOURCE_OPS, depositAmount);
-            if (result === OK) {
-                return true;
-            } else if (result === ERR_NOT_IN_RANGE) {
-                pc.moveTo(storage, { reusePath: 5 });
+        // ── Deposit: prefer storage, fall back to terminal ──
+        // Skip deposit if actively committed to walking toward a power target —
+        // banking would yank the creep back to storage every few ticks, preventing
+        // it from ever reaching distant targets like minerals or sources.
+        var mem = pc.memory || {};
+        if (ops >= depositAt && !mem._moveCommit) {
+            var depositTarget = storage ? storage : terminal;
+            var depositAmount = Math.min(bankAmount, ops);
+            var result = pc.transfer(depositTarget, RESOURCE_OPS, depositAmount);
+            if (result === OK) return true;
+            if (result === ERR_NOT_IN_RANGE) {
+                pc.moveTo(depositTarget, { reusePath: 5 });
                 return true;
             }
             return false;
         }
 
-        // ── Withdraw: pull ops back from storage when running low ──
-        if (ops < OPS_WITHDRAW_THRESHOLD) {
-            var storageOps = storage.store[RESOURCE_OPS] || 0;
-            if (storageOps === 0) return false;
+        // ── Withdraw: check storage first, then terminal ──
+        if (ops < withdrawAt) {
+            var storageOps  = storage  ? (storage.store[RESOURCE_OPS]  || 0) : 0;
+            var terminalOps = terminal ? (terminal.store[RESOURCE_OPS] || 0) : 0;
 
-            var cap = pc.store.getCapacity(RESOURCE_OPS) || 700;
-            var space = cap - ops;
-            var withdrawAmount = Math.min(OPS_DEPOSIT_AMOUNT, storageOps, space);
+            var withdrawSource = null;
+            var availableOps   = 0;
+            if (storageOps > 0) {
+                withdrawSource = storage;
+                availableOps   = storageOps;
+            } else if (terminalOps > 0) {
+                withdrawSource = terminal;
+                availableOps   = terminalOps;
+            }
+
+            if (!withdrawSource) return false;
+
+            var space          = cap - ops;
+            var targetOps      = Math.floor(cap * 0.50);
+            var withdrawAmount = Math.min(targetOps - ops, availableOps, space);
             if (withdrawAmount <= 0) return false;
 
-            var result = pc.withdraw(storage, RESOURCE_OPS, withdrawAmount);
-            if (result === OK) {
-                return true;
-            } else if (result === ERR_NOT_IN_RANGE) {
-                pc.moveTo(storage, { reusePath: 5 });
+            var result = pc.withdraw(withdrawSource, RESOURCE_OPS, withdrawAmount);
+            if (result === OK) return true;
+            if (result === ERR_NOT_IN_RANGE) {
+                pc.moveTo(withdrawSource, { reusePath: 5 });
                 return true;
             }
             return false;
@@ -682,6 +937,10 @@ module.exports = {
 
         return false;
     },
+
+    // ====================================================================
+    // Intel Observation (on-demand, not part of the power cycle)
+    // ====================================================================
 
     handleIntelObserve: function(pc, room) {
         if (!Memory.intelPowerObserve) return false;
@@ -785,10 +1044,7 @@ module.exports = {
 
         var ops = pc.store[RESOURCE_OPS] || 0;
         if (handler.opsCost > 0 && ops < handler.opsCost) {
-            if (pc.powers[PWR_GENERATE_OPS] && pc.powers[PWR_GENERATE_OPS].cooldown === 0) {
-                pc.usePower(PWR_GENERATE_OPS);
-                return true;
-            }
+            // Layer 1 already fired generation if possible — just wait for next tick
             return false;
         }
 
@@ -842,6 +1098,11 @@ module.exports = {
         return null;
     },
 
+    /**
+     * Legacy helper — attempts a power with movement fallback.
+     * No longer called from the main loop (Layer 1 handles in-range,
+     * Layer 2 handles movement separately), but kept as a utility.
+     */
     tryPower: function(pc, room, powerId) {
         var handler = POWER_HANDLERS[powerId];
         if (!handler) return false;

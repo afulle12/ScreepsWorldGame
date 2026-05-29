@@ -4,87 +4,23 @@
 // =============================================================================
 //
 // Usage:
-//   orderTowerDrain('E1S1', 'E2S1', 2)       // Order 2 drainers from E1S1 to drain E2S1
-//   orderTowerDrain('E1S1', 'E2S1', 2, 'N')  // Order 2 drainers, attack from North edge
-//   cancelTowerDrainOrder('E1S1', 'E2S1')    // Cancel the operation
-//   getTowerDrainStatus()                     // View all operations status
-//
-// In main.js:
-//   require('roleTowerDrain').run();
-//
+//   orderTowerDrain('E1S1', 'E2S1', 2)            // Order 2 drainers from E1S1 to drain E2S1
+//   orderTowerDrain('E1S1', 'E2S1', 2, 'N')       // Order 2 drainers, attack from North edge
+//   orderTowerDrain('E1S1', 'E2S1', 2, 'N', 'long') // Long-range body (9T/1A/25M/15H)
+//   cancelTowerDrainOrder('E1S1', 'E2S1')          // Cancel the operation
+//   getTowerDrainStatus()                           // View all operations status
+//   testTowerDrain('E1S1', 'E2S1', 2, 'N')         // Dry run: plan route without spawning
+//   testTowerDrain('E1S1', 'E2S1', 2, 'N', 'long') // Dry run with long-range body
+//   testPlayerRoutes('PlayerName', 'E2N46')         // Batch test all routes to a player's rooms
+//   testPlayerRoutesSetTargets(['W1N46'])            // Set target rooms manually
+//   testPlayerRoutesStatus()                        // Check batch test progress
+//   testPlayerRoutesCancel()                        // Cancel batch test
 // =============================================================================
 // 4-POSITION BOUNCE MECHANIC:
 // =============================================================================
 // Each lane uses 4 specific positions - 2 in the safe room, 2 in the target room.
 // The creep bounces between these positions to drain towers while staying alive.
 //
-// Example: Attacking E4N51 from the NORTH (safe room = E4N52, entry edge = N)
-// Lane coordinate: x = 15
-//
-//   SAFE ROOM (E4N52)                    TARGET ROOM (E4N51)
-//   +---------------------------+        +---------------------------+
-//   |                           |        |                           |
-//   |                           |        |  [4] attackRestPos        |
-//   |                           |        |      (15, 1) - DRAIN HERE |
-//   |                           |        |      Takes tower damage   |
-//   |                           |        |                           |
-//   |                           |        |  [3] attackEdgePos        |
-//   |  [1] healRestPos          |   y=49 |      (15, 0) - transit    |
-//   |      (15, 48) - HEAL HERE |========|========================== | y=0
-//   |      Safe from towers     |  EDGE  |                           |
-//   |                           |        |                           |
-//   |  [2] healEdgePos          |        |                           |
-//   |      (15, 49) - transit   |        |                           |
-//   +---------------------------+        +---------------------------+
-//
-// Creep Behavior:
-//   1. Travel to drainPos [4] - sit here taking tower fire
-//   2. When damaged, retreat to healPos [1] - self-heal safely
-//   3. When fully healed, return to drainPos [4]
-//   4. Repeat until towers are drained of energy
-//
-// The 4 positions per lane:
-//   - healRestPos  [1]: Safe room, 1 tile from edge - creep heals here
-//   - healEdgePos  [2]: Safe room, on the edge - transit tile
-//   - attackEdgePos[3]: Target room, on the edge - transit tile  
-//   - attackRestPos[4]: Target room, 1 tile from edge - creep drains here
-//
-// For convenience:
-//   - drainPos = attackRestPos (where creep sits to take damage)
-//   - healPos  = healRestPos   (where creep sits to heal)
-//
-// =============================================================================
-// Planning Flow:
-// 1. orderTowerDrain() creates operation with status 'scanning'
-// 2. Build route from home -> target, identify safe room (room before target)
-//    - If preferredEdge specified, route through the adjacent room in that direction
-// 3. For each room in route (skip owned rooms):
-//    - Use observer to scan
-//    - Route rooms: Check passability (can walk from entry to exit edge)
-//    - Safe room: Analyze edge facing target for walkable heal positions
-//    - Target room: Analyze entry edge for walkable drain positions
-// 4. Once all scans complete:
-//    - Verify entire route is passable
-//    - Find tiles walkable on BOTH safe and target sides
-//    - Compute lane positions with 1-tile gaps
-// 5. Status -> 'ready', spawning begins
-// 6. Creeps spawn with pre-assigned lanes, route, and positions
-// =============================================================================
-// CROSS-SECTOR ROUTING:
-// =============================================================================
-// When origin and target are in different 10x10 sectors, we need to route
-// through highway rooms (rooms where X or Y coordinate ends in 0).
-//
-// Algorithm:
-// 1. Detect if same sector using areInSameSector()
-// 2. If same sector: use normal direct routing
-// 3. If different sector:
-//    a. BFS from safe room to find up to 16 paths to highway rooms
-//    b. Scan each room in all paths with observer
-//    c. Filter out routes containing hostile rooms
-//    d. Pick route with shortest total path (origin -> highway -> safe room)
-// =============================================================================
-
 // ========== CONSTANTS ==========
 
 var OBSERVER_RANGE = 10;
@@ -475,10 +411,68 @@ function checkRoomPassability(room, fromRoomName, toRoomName) {
             startPos = new RoomPosition(25, 25, room.name);
         }
     } else {
+        // No entry direction (home room) — find a walkable start position.
         startPos = new RoomPosition(25, 25, room.name);
+        if (room.controller && room.controller.my) {
+            var myCreeps = room.find(FIND_MY_CREEPS);
+            if (myCreeps.length > 0) {
+                startPos = myCreeps[0].pos;
+                console.log('[TowerDrain] checkRoomPassability: ' + room.name + ' using creep pos ' + startPos);
+            } else {
+                console.log('[TowerDrain] checkRoomPassability: ' + room.name + ' has 0 creeps, searching for walkable tile...');
+                var earlyMatrix = buildCostMatrix(room);
+                var terrain = room.getTerrain();
+                var allSpawns = room.find(FIND_MY_SPAWNS);
+                var foundStart = false;
+                
+                // Try near spawns first
+                for (var si = 0; si < allSpawns.length && !foundStart; si++) {
+                    var sp = allSpawns[si].pos;
+                    var offsets = [[0,-1],[0,1],[-1,0],[1,0],[-1,-1],[1,-1],[-1,1],[1,1]];
+                    for (var oi = 0; oi < offsets.length; oi++) {
+                        var tx = sp.x + offsets[oi][0];
+                        var ty = sp.y + offsets[oi][1];
+                        if (tx >= 1 && tx <= 48 && ty >= 1 && ty <= 48) {
+                            var tCost = earlyMatrix.get(tx, ty);
+                            var tTerrain = terrain.get(tx, ty);
+                            if (tTerrain !== TERRAIN_MASK_WALL && tCost < 255) {
+                                startPos = new RoomPosition(tx, ty, room.name);
+                                foundStart = true;
+                                console.log('[TowerDrain] checkRoomPassability: found tile near spawn at (' + tx + ',' + ty + ') cost=' + tCost);
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Last resort: scan all tiles
+                if (!foundStart) {
+                    console.log('[TowerDrain] checkRoomPassability: no tile near spawns, full scan...');
+                    var walkableCount = 0;
+                    for (var sx = 1; sx <= 48 && !foundStart; sx++) {
+                        for (var sy = 1; sy <= 48 && !foundStart; sy++) {
+                            if (terrain.get(sx, sy) !== TERRAIN_MASK_WALL && earlyMatrix.get(sx, sy) < 255) {
+                                startPos = new RoomPosition(sx, sy, room.name);
+                                foundStart = true;
+                                console.log('[TowerDrain] checkRoomPassability: full scan found (' + sx + ',' + sy + ')');
+                            }
+                            if (terrain.get(sx, sy) !== TERRAIN_MASK_WALL) walkableCount++;
+                        }
+                    }
+                    if (!foundStart) {
+                        console.log('[TowerDrain] checkRoomPassability: NO walkable tile found! walkableTerrain=' + walkableCount + ' (all have cost 255)');
+                    }
+                }
+            }
+        }
     }
     
     var matrix = buildCostMatrix(room);
+    
+    // Log start position for owned rooms
+    if (room.controller && room.controller.my && !fromRoomName) {
+        console.log('[TowerDrain] checkRoomPassability: ' + room.name + ' startPos=(' + startPos.x + ',' + startPos.y + ') matrixCost=' + matrix.get(startPos.x, startPos.y));
+    }
     
     var exitDirs = [FIND_EXIT_TOP, FIND_EXIT_BOTTOM, FIND_EXIT_LEFT, FIND_EXIT_RIGHT];
     var exitNames = ['N', 'S', 'W', 'E'];
@@ -497,13 +491,17 @@ function checkRoomPassability(room, fromRoomName, toRoomName) {
         }
         
         var result = PathFinder.search(startPos, goals, {
-            roomCallback: function(rn) {
-                if (rn !== room.name) return false;
+            roomCallback: function() {
                 return matrix;
             },
             maxRooms: 1,
             maxOps: 5000
         });
+        
+        // Log for owned rooms
+        if (room.controller && room.controller.my && !fromRoomName) {
+            console.log('[TowerDrain] checkRoomPassability: ' + room.name + ' exit ' + exitNames[i] + ': ' + exitTiles.length + ' tiles, ' + (result.incomplete ? 'BLOCKED' : 'OK') + ' (ops=' + result.ops + ')');
+        }
         
         if (!result.incomplete) {
             availableExits.push(exitNames[i]);
@@ -836,6 +834,48 @@ function computeLanes(op) {
     
     console.log('[TowerDrain] ' + bothWalkable.length + ' tiles walkable on both sides');
     
+    // Filter out tiles where the drain position (attackRestPos) is on swamp.
+    // Creeps on swamp move at half speed and can't retreat fast enough to survive tower fire.
+    var targetTerrain = Game.map.getRoomTerrain(targetRoom);
+    var safeTerrain = Game.map.getRoomTerrain(safeRoom);
+    var noSwampWalkable = [];
+    for (var sw = 0; sw < bothWalkable.length; sw++) {
+        var sc = bothWalkable[sw];
+        var attackRestX, attackRestY, healRestX, healRestY;
+        
+        if (edge === 'N') {
+            attackRestX = sc; attackRestY = 1;
+            healRestX = sc;   healRestY = 48;
+        } else if (edge === 'S') {
+            attackRestX = sc; attackRestY = 48;
+            healRestX = sc;   healRestY = 1;
+        } else if (edge === 'E') {
+            attackRestX = 48; attackRestY = sc;
+            healRestX = 1;    healRestY = sc;
+        } else { // W
+            attackRestX = 1;  attackRestY = sc;
+            healRestX = 48;   healRestY = sc;
+        }
+        
+        if (targetTerrain.get(attackRestX, attackRestY) === TERRAIN_MASK_SWAMP) {
+            continue;
+        }
+        if (safeTerrain.get(healRestX, healRestY) === TERRAIN_MASK_SWAMP) {
+            continue;
+        }
+        noSwampWalkable.push(sc);
+    }
+    
+    if (noSwampWalkable.length < bothWalkable.length) {
+        console.log('[TowerDrain] Filtered ' + (bothWalkable.length - noSwampWalkable.length) + ' swamp positions (attack or heal)');
+    }
+    
+    if (noSwampWalkable.length > 0) {
+        bothWalkable = noSwampWalkable;
+    } else {
+        console.log('[TowerDrain] WARNING: ALL drain/heal positions are on swamp - no safe lanes available');
+    }
+    
     if (bothWalkable.length === 0) {
         console.log('[TowerDrain] ERROR: No tiles walkable on both sides of edge ' + edge);
         return false;
@@ -910,7 +950,8 @@ function computeLanes(op) {
 
 // ========== OPERATION MANAGEMENT ==========
 
-function orderTowerDrain(homeRoom, targetRoom, count, preferredEdge) {
+function orderTowerDrain(homeRoom, targetRoom, count, preferredEdge, range) {
+    var options = { longRange: range === 'long' };
     initMemory();
     
     if (preferredEdge) {
@@ -955,8 +996,8 @@ function orderTowerDrain(homeRoom, targetRoom, count, preferredEdge) {
     if (Memory.towerDrainOps.operations[opKey]) {
         var existingOp = Memory.towerDrainOps.operations[opKey];
         
-        if (existingOp.status === 'failed') {
-            console.log('[TowerDrain] Clearing failed operation ' + opKey + ' (reason: ' + (existingOp.failReason || 'unknown') + ')');
+        if (existingOp.status === 'failed' || existingOp.status === 'dryrun_complete') {
+            console.log('[TowerDrain] Clearing ' + existingOp.status + ' operation ' + opKey + (existingOp.failReason ? ' (reason: ' + existingOp.failReason + ')' : ''));
             delete Memory.towerDrainOps.operations[opKey];
         } else {
             console.log('[TowerDrain] Operation ' + opKey + ' already exists (status: ' + existingOp.status + ')');
@@ -977,15 +1018,17 @@ function orderTowerDrain(homeRoom, targetRoom, count, preferredEdge) {
     var sameSector = areInSameSector(homeRoom, targetRoom);
     console.log('[TowerDrain] Origin sector: ' + getSectorName(homeRoom) + ', Target sector: ' + getSectorName(targetRoom));
     console.log('[TowerDrain] Same sector: ' + sameSector);
+    console.log('[TowerDrain] Body type: ' + (options.longRange ? 'long-range (9T/1A/25M/15H, 5170e)' : 'standard'));
     
     if (sameSector) {
-        return orderTowerDrainSameSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey);
+        return orderTowerDrainSameSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey, options);
     } else {
-        return orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey);
+        return orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey, options);
     }
 }
 
-function orderTowerDrainSameSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey) {
+function orderTowerDrainSameSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey, options) {
+    if (!options) options = {};
     var routeResult;
     if (requiredSafeRoom) {
         var routeToSafe = Game.map.findRoute(homeRoom, requiredSafeRoom, {
@@ -997,7 +1040,7 @@ function orderTowerDrainSameSector(homeRoom, targetRoom, count, preferredEdge, r
         if (!routeToSafe || routeToSafe === ERR_NO_PATH) {
             console.log('[TowerDrain] Cannot find route from ' + homeRoom + ' to required safe room ' + requiredSafeRoom);
             console.log('[TowerDrain] Falling back to cross-sector routing...');
-            return orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey);
+            return orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey, options);
         }
         
         var exitToTarget = Game.map.findExit(requiredSafeRoom, targetRoom);
@@ -1019,7 +1062,7 @@ function orderTowerDrainSameSector(homeRoom, targetRoom, count, preferredEdge, r
     if (!routeResult || routeResult === ERR_NO_PATH || routeResult.length === 0) {
         console.log('[TowerDrain] Cannot find direct route from ' + homeRoom + ' to ' + targetRoom);
         console.log('[TowerDrain] Falling back to cross-sector routing...');
-        return orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey);
+        return orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey, options);
     }
     
     var route = [homeRoom];
@@ -1053,6 +1096,8 @@ function orderTowerDrainSameSector(homeRoom, targetRoom, count, preferredEdge, r
         preferredEdge: preferredEdge || null,
         lanes: {},
         observerRoom: observerInfo.roomName,
+        dryRun: !!options.dryRun,
+        longRange: !!options.longRange,
         crossSector: false,
         scanData: {
             roomsToScan: roomsToScan,
@@ -1069,13 +1114,17 @@ function orderTowerDrainSameSector(homeRoom, targetRoom, count, preferredEdge, r
     if (preferredEdge) {
         console.log('[TowerDrain] Entry edge (forced): ' + preferredEdge);
     }
+    if (options.longRange) {
+        console.log('[TowerDrain] Long-range body: 9T/1A/25M/15H (5170e)');
+    }
     console.log('[TowerDrain] Observer in: ' + observerInfo.roomName + ' (distance ' + observerInfo.distance + ')');
     console.log('[TowerDrain] Rooms to scan: ' + roomsToScan.join(', '));
     
     return OK;
 }
 
-function orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey) {
+function orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, requiredSafeRoom, observerInfo, opKey, options) {
+    if (!options) options = {};
     var safeRoom;
     if (requiredSafeRoom) {
         safeRoom = requiredSafeRoom;
@@ -1128,6 +1177,8 @@ function orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, 
         preferredEdge: preferredEdge || null,
         lanes: {},
         observerRoom: observerInfo.roomName,
+        dryRun: !!options.dryRun,
+        longRange: !!options.longRange,
         crossSector: true,
         scanData: {
             roomsToScan: roomsToScan,
@@ -1148,6 +1199,9 @@ function orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, 
     console.log('[TowerDrain] Entry edge: ' + (preferredEdge || 'TBD'));
     console.log('[TowerDrain] Candidate paths: ' + candidatePaths.length);
     console.log('[TowerDrain] Total rooms to scan: ' + roomsToScan.length);
+    if (options.longRange) {
+        console.log('[TowerDrain] Long-range body: 9T/1A/25M/15H (5170e)');
+    }
     
     return OK;
 }
@@ -1194,6 +1248,7 @@ function getTowerDrainStatus() {
         console.log('Operation: ' + opKey);
         console.log('  Status: ' + op.status);
         console.log('  Cross-Sector: ' + (op.crossSector ? 'YES' : 'NO'));
+        console.log('  Body: ' + (op.longRange ? 'long-range (9T/1A/25M/15H)' : 'standard'));
         console.log('  Route: ' + (op.route ? op.route.join(' -> ') : 'N/A'));
         console.log('  Safe Room: ' + op.safeRoom);
         console.log('  Entry Edge: ' + (op.entryEdge || 'TBD') + (op.preferredEdge ? ' (forced)' : ''));
@@ -1317,12 +1372,22 @@ function runScanner() {
         
         var observerInfo = findObserverForRoom(nextRoom);
         if (!observerInfo) {
-            console.log('[TowerDrain] No observer can reach ' + nextRoom + ' - marking blocked');
-            op.scanData.scannedRooms[nextRoom] = { blocked: true, reason: 'no_observer' };
-            op.scanData.routePassability[nextRoom] = false;
-            
-            if (op.crossSector) {
-                invalidatePathsContainingRoom(op, nextRoom);
+            if (isHighwayRoom(nextRoom)) {
+                // Highway rooms have no controller and rarely have obstacles — assume passable
+                console.log('[TowerDrain] No observer can reach ' + nextRoom + ' - assuming passable (highway room)');
+                op.scanData.scannedRooms[nextRoom] = { 
+                    tick: Game.time, safe: true, reason: 'highway_no_observer',
+                    blockedExits: [], passable: true
+                };
+                op.scanData.routePassability[nextRoom] = true;
+            } else {
+                console.log('[TowerDrain] No observer can reach ' + nextRoom + ' - marking blocked');
+                op.scanData.scannedRooms[nextRoom] = { blocked: true, reason: 'no_observer' };
+                op.scanData.routePassability[nextRoom] = false;
+                
+                if (op.crossSector) {
+                    invalidatePathsContainingRoom(op, nextRoom);
+                }
             }
             continue;
         }
@@ -1426,6 +1491,98 @@ function invalidatePathsWithBlockedExit(op, roomName, blockedExits) {
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Through-passability check: verifies you can actually path from one edge
+// to another through the room interior. Edge tile counts alone don't
+// guarantee passability — e.g. both edges may have walkable tiles but
+// a wall of ramparts runs across the middle.
+// ═══════════════════════════════════════════════════════════════════════════
+function checkTransitPassability(room, edgeData, blockedExits) {
+    var edges = ['N', 'S', 'E', 'W'];
+    var passableTransits = {};
+    
+    if (!room || !edgeData) return passableTransits;
+    
+    var matrix = buildCostMatrix(room);
+    
+    for (var ei = 0; ei < edges.length; ei++) {
+        for (var ej = 0; ej < edges.length; ej++) {
+            if (ei === ej) continue;
+            var fromEdge = edges[ei];
+            var toEdge = edges[ej];
+            
+            if (blockedExits.indexOf(fromEdge) !== -1 || blockedExits.indexOf(toEdge) !== -1) {
+                passableTransits[fromEdge + '->' + toEdge] = false;
+                continue;
+            }
+            
+            var fromTiles = edgeData[fromEdge].walkableTiles;
+            var toTiles = edgeData[toEdge].walkableTiles;
+            
+            if (fromTiles.length === 0 || toTiles.length === 0) {
+                passableTransits[fromEdge + '->' + toEdge] = false;
+                continue;
+            }
+            
+            // Pick up to 5 representative start tiles spread across the entry edge.
+            // A single middle tile can be behind ramparts even when other tiles
+            // on the same edge can path through fine (e.g. ally room with partial walls).
+            var testIndices = [0];
+            if (fromTiles.length > 1) testIndices.push(fromTiles.length - 1);
+            if (fromTiles.length > 2) testIndices.push(Math.floor(fromTiles.length / 2));
+            if (fromTiles.length > 4) testIndices.push(Math.floor(fromTiles.length / 4));
+            if (fromTiles.length > 4) testIndices.push(Math.floor(fromTiles.length * 3 / 4));
+            
+            var exitDir;
+            if (toEdge === 'N') exitDir = FIND_EXIT_TOP;
+            else if (toEdge === 'S') exitDir = FIND_EXIT_BOTTOM;
+            else if (toEdge === 'E') exitDir = FIND_EXIT_RIGHT;
+            else exitDir = FIND_EXIT_LEFT;
+            
+            var exitTiles = room.find(exitDir);
+            if (exitTiles.length === 0) {
+                passableTransits[fromEdge + '->' + toEdge] = false;
+                continue;
+            }
+            
+            var goals = [];
+            for (var g = 0; g < exitTiles.length; g++) {
+                goals.push({ pos: exitTiles[g], range: 0 });
+            }
+            
+            var rn = room.name;
+            var transitFound = false;
+            
+            for (var ti = 0; ti < testIndices.length; ti++) {
+                var startCoord = fromTiles[testIndices[ti]];
+                var startPos;
+                if (fromEdge === 'N') startPos = new RoomPosition(startCoord, 0, rn);
+                else if (fromEdge === 'S') startPos = new RoomPosition(startCoord, 49, rn);
+                else if (fromEdge === 'E') startPos = new RoomPosition(49, startCoord, rn);
+                else startPos = new RoomPosition(0, startCoord, rn);
+                
+                var result = PathFinder.search(startPos, goals, {
+                    roomCallback: function() {
+                        return matrix;
+                    },
+                    maxRooms: 1,
+                    maxOps: 3000
+                });
+                
+                if (!result.incomplete) {
+                    transitFound = true;
+                    break;
+                }
+            }
+            
+            passableTransits[fromEdge + '->' + toEdge] = transitFound;
+        }
+    }
+    
+    return passableTransits;
+}
+
 function processCrossSectorScanResult(op, roomName, room, opKey) {
     var scanData = op.scanData;
     
@@ -1495,6 +1652,42 @@ function processCrossSectorScanResult(op, roomName, room, opKey) {
         invalidatePathsWithBlockedExit(op, roomName, blockedExits);
     }
     
+    // Check through-passability (can we path from each entry edge to each exit edge?)
+    var passableTransits = checkTransitPassability(room, edgeData, blockedExits);
+    scanData.scannedRooms[roomName].passableTransits = passableTransits;
+    
+    // Log any blocked transits not already caught by edge analysis
+    for (var tk in passableTransits) {
+        if (passableTransits[tk] === false) {
+            var parts = tk.split('->');
+            if (blockedExits.indexOf(parts[0]) === -1 && blockedExits.indexOf(parts[1]) === -1) {
+                console.log('[TowerDrain] Room ' + roomName + ' transit ' + tk + ' is BLOCKED (interior walls/ramparts)');
+            }
+        }
+    }
+    
+    // Invalidate BFS candidate paths that use blocked transits
+    if (op.scanData.candidatePaths) {
+        for (var ci = op.scanData.candidatePaths.length - 1; ci >= 0; ci--) {
+            var cpath = op.scanData.candidatePaths[ci];
+            for (var cj = 0; cj < cpath.length; cj++) {
+                var cnode = cpath[cj];
+                if (typeof cnode === 'object' && cnode.room === roomName) {
+                    if (cnode.entryDir && cnode.exitDir) {
+                        var tKey = cnode.entryDir + '->' + cnode.exitDir;
+                        if (passableTransits[tKey] === false) {
+                            if (!op.scanData.invalidatedPaths) op.scanData.invalidatedPaths = [];
+                            op.scanData.invalidatedPaths.push(cpath);
+                            op.scanData.candidatePaths.splice(ci, 1);
+                            console.log('[TowerDrain] Invalidated path through ' + roomName + ' (transit ' + tKey + ' blocked)');
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
     scanData.routePassability[roomName] = true;
 }
 
@@ -1537,6 +1730,16 @@ function finalizeCrossSectorOperation(op, opKey) {
                     break;
                 }
             }
+            
+            // Also check through-passability from scan data
+            if (typeof node === 'object' && roomInfo.passableTransits && node.entryDir && node.exitDir) {
+                var tKey = node.entryDir + '->' + node.exitDir;
+                if (roomInfo.passableTransits[tKey] === false) {
+                    console.log('[TowerDrain] Path invalid: ' + roomName + ' transit ' + tKey + ' blocked');
+                    pathValid = false;
+                    break;
+                }
+            }
         }
         
         if (pathValid) {
@@ -1555,99 +1758,514 @@ function finalizeCrossSectorOperation(op, opKey) {
         return;
     }
     
-    var bestRoute = selectBestCrossSectorRoute(op.homeRoom, validPaths);
+    // Try each candidate route; skip routes whose routeToHighway segment is blocked
+    var triedHighways = {};
+    if (!scanData._avoidRooms) scanData._avoidRooms = {};
+    if (!scanData._highwayRetries) scanData._highwayRetries = {};
     
-    if (!bestRoute) {
-        console.log('[TowerDrain] FAILED: Could not select best route');
-        op.status = 'failed';
-        op.failReason = 'no_valid_route';
-        return;
-    }
-    
-    console.log('[TowerDrain] Selected route via highway ' + bestRoute.highwayEntry + ' (total length: ' + bestRoute.totalLength + ')');
-    
-    var routeToHighway = Game.map.findRoute(op.homeRoom, bestRoute.highwayEntry, {
-        routeCallback: function(roomName) {
-            return getRoomRouteCost(roomName, null);
+    while (validPaths.length > 0) {
+        var bestRoute = selectBestCrossSectorRoute(op.homeRoom, validPaths);
+        
+        if (!bestRoute) {
+            break;
         }
-    });
-    
-    if (!routeToHighway || routeToHighway === ERR_NO_PATH) {
-        console.log('[TowerDrain] FAILED: Cannot build route to highway ' + bestRoute.highwayEntry);
-        op.status = 'failed';
-        op.failReason = 'no_route_to_highway';
-        return;
-    }
-    
-    var fullRoute = [op.homeRoom];
-    
-    for (var r = 0; r < routeToHighway.length; r++) {
-        fullRoute.push(routeToHighway[r].room);
-    }
-    
-    var bfsRooms = [];
-    for (var b = 0; b < bestRoute.path.length; b++) {
-        bfsRooms.push(getPathNodeRoom(bestRoute.path[b]));
-    }
-    bfsRooms.reverse();
-    
-    for (var br = 1; br < bfsRooms.length; br++) {
-        if (fullRoute.indexOf(bfsRooms[br]) === -1) {
-            fullRoute.push(bfsRooms[br]);
+        
+        if (triedHighways[bestRoute.highwayEntry]) {
+            validPaths = validPaths.filter(function(p) {
+                var last = p[p.length - 1];
+                return getPathNodeRoom(last) !== bestRoute.highwayEntry;
+            });
+            continue;
+        }
+        triedHighways[bestRoute.highwayEntry] = true;
+        
+        if (!scanData._highwayRetries[bestRoute.highwayEntry]) scanData._highwayRetries[bestRoute.highwayEntry] = 0;
+        
+        console.log('[TowerDrain] Selected route via highway ' + bestRoute.highwayEntry + ' (total length: ' + bestRoute.totalLength + ')');
+        
+        // Build the route from home -> highway (respecting avoid list)
+        var routeToHighway = Game.map.findRoute(op.homeRoom, bestRoute.highwayEntry, {
+            routeCallback: function(roomName) {
+                if (scanData._avoidRooms[roomName]) return Infinity;
+                return getRoomRouteCost(roomName, null);
+            }
+        });
+        
+        if (!routeToHighway || routeToHighway === ERR_NO_PATH) {
+            console.log('[TowerDrain] Cannot build route to highway ' + bestRoute.highwayEntry + ', trying next');
+            validPaths = validPaths.filter(function(p) {
+                var last = p[p.length - 1];
+                return getPathNodeRoom(last) !== bestRoute.highwayEntry;
+            });
+            continue;
+        }
+        
+        // Build the full route
+        var fullRoute = [op.homeRoom];
+        
+        for (var r = 0; r < routeToHighway.length; r++) {
+            fullRoute.push(routeToHighway[r].room);
+        }
+        
+        var bfsRooms = [];
+        for (var b = 0; b < bestRoute.path.length; b++) {
+            bfsRooms.push(getPathNodeRoom(bestRoute.path[b]));
+        }
+        bfsRooms.reverse();
+        
+        for (var br = 1; br < bfsRooms.length; br++) {
+            if (fullRoute.indexOf(bfsRooms[br]) === -1) {
+                fullRoute.push(bfsRooms[br]);
+            }
+        }
+        
+        if (fullRoute.indexOf(op.targetRoom) === -1) {
+            fullRoute.push(op.targetRoom);
+        }
+        
+        // ══════════════════════════════════════════════════════════════
+        // Inner verification loop: verify the route, try detours if
+        // a room has partial passability, re-verify after each detour.
+        // ══════════════════════════════════════════════════════════════
+        var routeVerified = false;
+        var giveUpOnHighway = false;
+        var MAX_VERIFY_ATTEMPTS = 6;
+        
+        for (var verifyAttempt = 0; verifyAttempt < MAX_VERIFY_ATTEMPTS; verifyAttempt++) {
+            
+            // ── Check for unscanned rooms ──
+            var unscannedRouteRooms = [];
+            for (var ur = 1; ur < fullRoute.length; ur++) {
+                var urRoom = fullRoute[ur];
+                if (urRoom === op.targetRoom && scanData.scannedRooms[urRoom]) continue;
+                if (isMyRoom(urRoom)) continue;
+                if (!scanData.scannedRooms[urRoom]) {
+                    unscannedRouteRooms.push(urRoom);
+                }
+            }
+            
+            if (unscannedRouteRooms.length > 0) {
+                console.log('[TowerDrain] Full route has ' + unscannedRouteRooms.length +
+                            ' unscanned room(s): ' + unscannedRouteRooms.join(', '));
+                console.log('[TowerDrain] Adding to scan queue for passability verification');
+                
+                for (var ua = 0; ua < unscannedRouteRooms.length; ua++) {
+                    if (scanData.roomsToScan.indexOf(unscannedRouteRooms[ua]) === -1) {
+                        scanData.roomsToScan.push(unscannedRouteRooms[ua]);
+                    }
+                }
+                
+                op.route = fullRoute;
+                op.routeBack = fullRoute.slice().reverse();
+                if (!scanData._selectedHighway) scanData._selectedHighway = bestRoute.highwayEntry;
+                return; // stay in scanning state
+            }
+            
+            // ── Verify passability of every room in the route (except target) ──
+            var routeBlocked = false;
+            var blockedAtRoom = null;
+            var blockedReason = '';
+            
+            // Check home room can exit toward first step
+            if (fullRoute.length >= 2) {
+                var homeObj = Game.rooms[fullRoute[0]];
+                if (homeObj) {
+                    var homeEdges = analyzeRoomEdges(homeObj);
+                    if (homeEdges) {
+                        var homeNextRoom = fullRoute[1];
+                        var homeExitDir = getDirectionBetweenRooms(fullRoute[0], homeNextRoom);
+                        
+                        if (homeExitDir && homeEdges[homeExitDir] && homeEdges[homeExitDir].totalWalkable === 0) {
+                            var homeAvailExits = [];
+                            var edgeDirs = ['N', 'S', 'E', 'W'];
+                            for (var he = 0; he < edgeDirs.length; he++) {
+                                if (homeEdges[edgeDirs[he]] && homeEdges[edgeDirs[he]].totalWalkable > 0) {
+                                    homeAvailExits.push(edgeDirs[he]);
+                                }
+                            }
+                            console.log('[TowerDrain] Home room ' + fullRoute[0] + ' exit ' + homeExitDir + ' blocked (0 walkable edge tiles). Available: ' + homeAvailExits.join(', '));
+                            routeBlocked = true;
+                            blockedAtRoom = fullRoute[0];
+                            blockedReason = 'home_exit_blocked';
+                            if (!scanData._homeAvailExits) scanData._homeAvailExits = homeAvailExits;
+                        }
+                    }
+                }
+            }
+            
+            for (var vr = 1; !routeBlocked && vr < fullRoute.length; vr++) {
+                var vrRoom = fullRoute[vr];
+                if (vrRoom === op.targetRoom) continue;
+                
+                if (isMyRoom(vrRoom)) {
+                    var myRoomObj = Game.rooms[vrRoom];
+                    if (myRoomObj) {
+                        var vrPrevOwn = fullRoute[vr - 1];
+                        var vrNextOwn = vr < fullRoute.length - 1 ? fullRoute[vr + 1] : null;
+                        var ownEdges = analyzeRoomEdges(myRoomObj);
+                        if (ownEdges) {
+                            var ownEntryDir = getDirectionBetweenRooms(vrPrevOwn, vrRoom);
+                            var ownEntryEdge = ownEntryDir ? getOppositeEdge(ownEntryDir) : null;
+                            var ownExitDir = vrNextOwn ? getDirectionBetweenRooms(vrRoom, vrNextOwn) : null;
+                            
+                            if (ownEntryEdge && ownEdges[ownEntryEdge] && ownEdges[ownEntryEdge].totalWalkable === 0) {
+                                console.log('[TowerDrain] Own room ' + vrRoom + ' entry from ' + ownEntryEdge + ' blocked');
+                                routeBlocked = true;
+                                blockedAtRoom = vrRoom;
+                                blockedReason = 'own_room_blocked';
+                                break;
+                            }
+                            if (ownExitDir && ownEdges[ownExitDir] && ownEdges[ownExitDir].totalWalkable === 0) {
+                                console.log('[TowerDrain] Own room ' + vrRoom + ' exit toward ' + ownExitDir + ' blocked');
+                                routeBlocked = true;
+                                blockedAtRoom = vrRoom;
+                                blockedReason = 'own_room_blocked';
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                
+                var vrInfo = scanData.scannedRooms[vrRoom];
+                if (!vrInfo) continue;
+                
+                if (vrInfo.safe === false) {
+                    console.log('[TowerDrain] Route room ' + vrRoom + ' is hostile (' + vrInfo.reason + ')');
+                    routeBlocked = true;
+                    blockedAtRoom = vrRoom;
+                    blockedReason = 'hostile';
+                    break;
+                }
+                
+                if (vrInfo.blockedExits && vrInfo.blockedExits.length > 0) {
+                    var vrPrev = fullRoute[vr - 1];
+                    var vrNext = vr < fullRoute.length - 1 ? fullRoute[vr + 1] : null;
+                    
+                    var dirFromPrev = getDirectionBetweenRooms(vrPrev, vrRoom);
+                    var vrEntryEdge = dirFromPrev ? getOppositeEdge(dirFromPrev) : null;
+                    var vrExitEdge = vrNext ? getDirectionBetweenRooms(vrRoom, vrNext) : null;
+                    
+                    if (vrEntryEdge && vrInfo.blockedExits.indexOf(vrEntryEdge) !== -1) {
+                        console.log('[TowerDrain] Route room ' + vrRoom +
+                                    ': entry from ' + vrEntryEdge + ' is blocked');
+                        routeBlocked = true;
+                        blockedAtRoom = vrRoom;
+                        blockedReason = 'entry_blocked_' + vrEntryEdge;
+                        break;
+                    }
+                    if (vrExitEdge && vrInfo.blockedExits.indexOf(vrExitEdge) !== -1) {
+                        console.log('[TowerDrain] Route room ' + vrRoom +
+                                    ': exit toward ' + vrExitEdge + ' is blocked');
+                        routeBlocked = true;
+                        blockedAtRoom = vrRoom;
+                        blockedReason = 'exit_blocked_' + vrExitEdge;
+                        break;
+                    }
+                }
+                
+                if (vrInfo.passableTransits) {
+                    var vrPrev2 = fullRoute[vr - 1];
+                    var vrNext2 = vr < fullRoute.length - 1 ? fullRoute[vr + 1] : null;
+                    var dirIn = getDirectionBetweenRooms(vrPrev2, vrRoom);
+                    var entryE = dirIn ? getOppositeEdge(dirIn) : null;
+                    var exitE = vrNext2 ? getDirectionBetweenRooms(vrRoom, vrNext2) : null;
+                    
+                    if (entryE && exitE) {
+                        var transitKey = entryE + '->' + exitE;
+                        if (vrInfo.passableTransits[transitKey] === false) {
+                            console.log('[TowerDrain] Route room ' + vrRoom +
+                                        ': transit ' + transitKey + ' blocked (interior walls/ramparts)');
+                            routeBlocked = true;
+                            blockedAtRoom = vrRoom;
+                            blockedReason = 'transit_blocked_' + transitKey;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (!routeBlocked) {
+                routeVerified = true;
+                break;
+            }
+            
+            console.log('[TowerDrain] Route blocked at ' + blockedAtRoom + ' (' + blockedReason + ')');
+            
+            scanData._highwayRetries[bestRoute.highwayEntry]++;
+            if (scanData._highwayRetries[bestRoute.highwayEntry] > 5) {
+                console.log('[TowerDrain] Max retries (5) for highway ' + bestRoute.highwayEntry);
+                giveUpOnHighway = true;
+                break;
+            }
+            
+            // ── DETOUR: Try an alternate exit from the blocked room ──
+            var detourFound = false;
+            
+            if (blockedReason === 'home_exit_blocked' || blockedReason === 'own_room_blocked') {
+                var ownedRoom = Game.rooms[blockedAtRoom];
+                if (ownedRoom) {
+                    var ownedBlockedIdx = fullRoute.indexOf(blockedAtRoom);
+                    
+                    var ownedExits = [];
+                    if (blockedReason === 'home_exit_blocked' && scanData._homeAvailExits) {
+                        ownedExits = scanData._homeAvailExits.slice();
+                    } else {
+                        var ownedEdges = analyzeRoomEdges(ownedRoom);
+                        if (ownedEdges) {
+                            var dirs = ['N', 'S', 'E', 'W'];
+                            for (var di = 0; di < dirs.length; di++) {
+                                if (ownedEdges[dirs[di]] && ownedEdges[dirs[di]].totalWalkable > 0) {
+                                    ownedExits.push(dirs[di]);
+                                }
+                            }
+                        }
+                    }
+                    
+                    var ownedPrevRoom = ownedBlockedIdx > 0 ? fullRoute[ownedBlockedIdx - 1] : null;
+                    if (ownedPrevRoom) {
+                        var ownedEntryDir = getDirectionBetweenRooms(ownedPrevRoom, blockedAtRoom);
+                        var ownedEntryEdge = ownedEntryDir ? getOppositeEdge(ownedEntryDir) : null;
+                        if (ownedEntryEdge) {
+                            ownedExits = ownedExits.filter(function(e) { return e !== ownedEntryEdge; });
+                        }
+                    }
+                    
+                    var ownedNextRoom = ownedBlockedIdx < fullRoute.length - 1 ? fullRoute[ownedBlockedIdx + 1] : null;
+                    if (ownedNextRoom) {
+                        var blockedDir = getDirectionBetweenRooms(blockedAtRoom, ownedNextRoom);
+                        if (blockedDir) {
+                            ownedExits = ownedExits.filter(function(e) { return e !== blockedDir; });
+                        }
+                    }
+                    
+                    console.log('[TowerDrain] Owned room ' + blockedAtRoom + ' available detour exits: ' + ownedExits.join(', '));
+                    
+                    var bfsStartOwned = getPathNodeRoom(bestRoute.path[bestRoute.path.length - 1]);
+                    
+                    for (var oe = 0; oe < ownedExits.length; oe++) {
+                        var ownedExitDir = ownedExits[oe];
+                        var ownedExitRoom = getAdjacentRoom(blockedAtRoom, ownedExitDir);
+                        if (!ownedExitRoom || scanData._avoidRooms[ownedExitRoom]) continue;
+                        
+                        console.log('[TowerDrain] Trying exit ' + ownedExitDir + ' -> ' + ownedExitRoom);
+                        
+                        var ownedDetourRoute = Game.map.findRoute(ownedExitRoom, bfsStartOwned, {
+                            routeCallback: function(roomName) {
+                                if (scanData._avoidRooms[roomName]) return Infinity;
+                                return getRoomRouteCost(roomName, null);
+                            }
+                        });
+                        
+                        if (!ownedDetourRoute || ownedDetourRoute === ERR_NO_PATH || ownedDetourRoute.length === 0) {
+                            console.log('[TowerDrain] No path from ' + ownedExitRoom + ' to ' + bfsStartOwned);
+                            continue;
+                        }
+                        
+                        var ownedNewRoute = fullRoute.slice(0, ownedBlockedIdx + 1);
+                        ownedNewRoute.push(ownedExitRoom);
+                        for (var odr = 0; odr < ownedDetourRoute.length; odr++) {
+                            var odrRoom = ownedDetourRoute[odr].room;
+                            if (odrRoom !== ownedExitRoom && ownedNewRoute.indexOf(odrRoom) === -1) {
+                                ownedNewRoute.push(odrRoom);
+                            }
+                        }
+                        for (var obf = 0; obf < bfsRooms.length; obf++) {
+                            if (ownedNewRoute.indexOf(bfsRooms[obf]) === -1) {
+                                ownedNewRoute.push(bfsRooms[obf]);
+                            }
+                        }
+                        if (ownedNewRoute.indexOf(op.targetRoom) === -1) {
+                            ownedNewRoute.push(op.targetRoom);
+                        }
+                        
+                        console.log('[TowerDrain] Detour route: ' + ownedNewRoute.join(' -> '));
+                        fullRoute = ownedNewRoute;
+                        detourFound = true;
+                        break;
+                    }
+                }
+            }
+            
+            var vrInfoDetour = scanData.scannedRooms[blockedAtRoom];
+            
+            if (!detourFound && vrInfoDetour && vrInfoDetour.passableTransits && blockedReason.indexOf('transit_blocked_') === 0) {
+                var blockedIdx = fullRoute.indexOf(blockedAtRoom);
+                var prevInRoute = blockedIdx > 0 ? fullRoute[blockedIdx - 1] : null;
+                var dDirFromPrev = prevInRoute ? getDirectionBetweenRooms(prevInRoute, blockedAtRoom) : null;
+                var dEntryEdge = dDirFromPrev ? getOppositeEdge(dDirFromPrev) : null;
+                
+                if (dEntryEdge) {
+                    var altExits = [];
+                    for (var ptk in vrInfoDetour.passableTransits) {
+                        if (vrInfoDetour.passableTransits[ptk] === true && ptk.indexOf(dEntryEdge + '->') === 0) {
+                            altExits.push(ptk.split('->')[1]);
+                        }
+                    }
+                    
+                    if (altExits.length > 0) {
+                        console.log('[TowerDrain] Room ' + blockedAtRoom + ' has passable exits from ' + dEntryEdge + ': ' + altExits.join(', '));
+                    }
+                    
+                    for (var ae = 0; ae < altExits.length; ae++) {
+                        var altExitDir = altExits[ae];
+                        var altExitRoom = getAdjacentRoom(blockedAtRoom, altExitDir);
+                        if (!altExitRoom || scanData._avoidRooms[altExitRoom]) continue;
+                        
+                        console.log('[TowerDrain] Trying detour via ' + blockedAtRoom + ' exit ' + altExitDir + ' -> ' + altExitRoom);
+                        
+                        var bfsStart = getPathNodeRoom(bestRoute.path[bestRoute.path.length - 1]);
+                        
+                        var detourRoute = Game.map.findRoute(altExitRoom, bfsStart, {
+                            routeCallback: function(roomName) {
+                                if (roomName === blockedAtRoom) return Infinity;
+                                if (scanData._avoidRooms[roomName]) return Infinity;
+                                return getRoomRouteCost(roomName, null);
+                            }
+                        });
+                        
+                        if (!detourRoute || detourRoute === ERR_NO_PATH || detourRoute.length === 0) {
+                            console.log('[TowerDrain] No path from ' + altExitRoom + ' to ' + bfsStart);
+                            continue;
+                        }
+                        
+                        var newRoute = fullRoute.slice(0, blockedIdx + 1);
+                        newRoute.push(altExitRoom);
+                        for (var dr = 0; dr < detourRoute.length; dr++) {
+                            var drRoom = detourRoute[dr].room;
+                            if (drRoom !== altExitRoom && newRoute.indexOf(drRoom) === -1) {
+                                newRoute.push(drRoom);
+                            }
+                        }
+                        for (var bf = 0; bf < bfsRooms.length; bf++) {
+                            if (newRoute.indexOf(bfsRooms[bf]) === -1) {
+                                newRoute.push(bfsRooms[bf]);
+                            }
+                        }
+                        if (newRoute.indexOf(op.targetRoom) === -1) {
+                            newRoute.push(op.targetRoom);
+                        }
+                        
+                        console.log('[TowerDrain] Detour route: ' + newRoute.join(' -> '));
+                        fullRoute = newRoute;
+                        detourFound = true;
+                        break;
+                    }
+                }
+            }
+            
+            if (detourFound) {
+                continue;
+            }
+            
+            // ── No detour possible: avoid the room and rebuild the route ──
+            scanData._avoidRooms[blockedAtRoom] = true;
+            console.log('[TowerDrain] Avoiding ' + blockedAtRoom + ', rebuilding route to ' + bestRoute.highwayEntry);
+            
+            var retryRoute = Game.map.findRoute(op.homeRoom, bestRoute.highwayEntry, {
+                routeCallback: function(roomName) {
+                    if (scanData._avoidRooms[roomName]) return Infinity;
+                    return getRoomRouteCost(roomName, null);
+                }
+            });
+            
+            if (!retryRoute || retryRoute === ERR_NO_PATH || retryRoute.length === 0) {
+                console.log('[TowerDrain] No route to ' + bestRoute.highwayEntry + ' with avoid list');
+                giveUpOnHighway = true;
+                break;
+            }
+            
+            fullRoute = [op.homeRoom];
+            for (var rr = 0; rr < retryRoute.length; rr++) {
+                fullRoute.push(retryRoute[rr].room);
+            }
+            for (var rb = 1; rb < bfsRooms.length; rb++) {
+                if (fullRoute.indexOf(bfsRooms[rb]) === -1) {
+                    fullRoute.push(bfsRooms[rb]);
+                }
+            }
+            if (fullRoute.indexOf(op.targetRoom) === -1) {
+                fullRoute.push(op.targetRoom);
+            }
+            console.log('[TowerDrain] Rebuilt route: ' + fullRoute.join(' -> '));
+        }
+        
+        if (routeVerified) {
+            op.route = fullRoute;
+            op.routeBack = fullRoute.slice().reverse();
+            delete scanData._selectedHighway;
+            
+            console.log('[TowerDrain] Full route (verified): ' + fullRoute.join(' -> '));
+            
+            if (op.preferredEdge) {
+                op.entryEdge = op.preferredEdge;
+            } else {
+                op.entryEdge = getEntryEdge(op.safeRoom, op.targetRoom);
+            }
+            
+            if (!op.entryEdge) {
+                console.log('[TowerDrain] FAILED: Could not determine entry edge');
+                op.status = 'failed';
+                op.failReason = 'no_entry_edge';
+                return;
+            }
+            
+            console.log('[TowerDrain] Entry edge: ' + op.entryEdge);
+            
+            if (!scanData.targetEdges) {
+                console.log('[TowerDrain] FAILED: Missing target room edge data');
+                op.status = 'failed';
+                op.failReason = 'missing_target_edge_data';
+                return;
+            }
+            
+            if (!scanData.safeEdges) {
+                console.log('[TowerDrain] FAILED: Missing safe room edge data');
+                op.status = 'failed';
+                op.failReason = 'missing_safe_edge_data';
+                return;
+            }
+            
+            var success = computeLanes(op);
+            if (!success) {
+                console.log('[TowerDrain] FAILED: Could not compute valid lanes');
+                op.status = 'failed';
+                op.failReason = 'no_valid_lanes';
+                return;
+            }
+            
+            if (op.dryRun) {
+                op.status = 'dryrun_complete';
+                console.log('[TowerDrain] \u2713 DRY RUN operation ' + opKey + ' completed successfully');
+                console.log('[TowerDrain] Route: ' + op.route.join(' -> '));
+                console.log('[TowerDrain] ' + Object.keys(op.lanes).length + ' lanes computed');
+                console.log('[TowerDrain] Body: ' + (op.longRange ? 'long-range (9T/1A/25M/15H)' : 'standard'));
+                console.log('[TowerDrain] No creeps will be spawned (dry run mode)');
+                return;
+            }
+            
+            op.status = 'ready';
+            console.log('[TowerDrain] \u2713 Cross-sector operation ' + opKey + ' is READY');
+            console.log('[TowerDrain] Route: ' + op.route.join(' -> '));
+            console.log('[TowerDrain] ' + Object.keys(op.lanes).length + ' lanes computed');
+            console.log('[TowerDrain] Body: ' + (op.longRange ? 'long-range (9T/1A/25M/15H)' : 'standard'));
+            return;
+        }
+        
+        if (giveUpOnHighway) {
+            validPaths = validPaths.filter(function(p) {
+                var last = p[p.length - 1];
+                return getPathNodeRoom(last) !== bestRoute.highwayEntry;
+            });
+            delete scanData._selectedHighway;
         }
     }
     
-    if (fullRoute.indexOf(op.targetRoom) === -1) {
-        fullRoute.push(op.targetRoom);
-    }
-    
-    op.route = fullRoute;
-    op.routeBack = fullRoute.slice().reverse();
-    
-    console.log('[TowerDrain] Full route: ' + fullRoute.join(' -> '));
-    
-    if (op.preferredEdge) {
-        op.entryEdge = op.preferredEdge;
-    } else {
-        op.entryEdge = getEntryEdge(op.safeRoom, op.targetRoom);
-    }
-    
-    if (!op.entryEdge) {
-        console.log('[TowerDrain] FAILED: Could not determine entry edge');
-        op.status = 'failed';
-        op.failReason = 'no_entry_edge';
-        return;
-    }
-    
-    console.log('[TowerDrain] Entry edge: ' + op.entryEdge);
-    
-    if (!scanData.targetEdges) {
-        console.log('[TowerDrain] FAILED: Missing target room edge data');
-        op.status = 'failed';
-        op.failReason = 'missing_target_edge_data';
-        return;
-    }
-    
-    if (!scanData.safeEdges) {
-        console.log('[TowerDrain] FAILED: Missing safe room edge data');
-        op.status = 'failed';
-        op.failReason = 'missing_safe_edge_data';
-        return;
-    }
-    
-    var success = computeLanes(op);
-    if (!success) {
-        console.log('[TowerDrain] FAILED: Could not compute valid lanes');
-        op.status = 'failed';
-        op.failReason = 'no_valid_lanes';
-        return;
-    }
-    
-    op.status = 'ready';
-    console.log('[TowerDrain] ✓ Cross-sector operation ' + opKey + ' is READY');
-    console.log('[TowerDrain] Route: ' + op.route.join(' -> '));
-    console.log('[TowerDrain] ' + Object.keys(op.lanes).length + ' lanes computed');
+    console.log('[TowerDrain] FAILED: All candidate routes blocked after full verification');
+    op.status = 'failed';
+    op.failReason = 'all_routes_blocked_after_verification';
 }
+
 
 function tryReroute(op, opKey) {
     var scanData = op.scanData;
@@ -2137,9 +2755,57 @@ function finalizeOperation(op, opKey) {
     
     var routeBlocked = false;
     var blockedRoom = null;
-    for (var i = 1; i < op.route.length; i++) {
+    if (op.route.length >= 2) {
+        var homeRoomObj = Game.rooms[op.route[0]];
+        if (homeRoomObj) {
+            var homeEdges = analyzeRoomEdges(homeRoomObj);
+            if (homeEdges) {
+                var homeExitDir = getDirectionBetweenRooms(op.route[0], op.route[1]);
+                if (homeExitDir && homeEdges[homeExitDir] && homeEdges[homeExitDir].totalWalkable === 0) {
+                    var homeAvail = [];
+                    var hDirs = ['N', 'S', 'E', 'W'];
+                    for (var hd = 0; hd < hDirs.length; hd++) {
+                        if (homeEdges[hDirs[hd]] && homeEdges[hDirs[hd]].totalWalkable > 0) homeAvail.push(hDirs[hd]);
+                    }
+                    console.log('[TowerDrain] Home room ' + op.route[0] + ' exit ' + homeExitDir + ' blocked. Available: ' + homeAvail.join(', '));
+                    routeBlocked = true;
+                    blockedRoom = op.route[0];
+                }
+            }
+        }
+    }
+    
+    for (var i = 1; !routeBlocked && i < op.route.length; i++) {
         var rn = op.route[i];
         if (rn === op.targetRoom) continue;
+        
+        if (isMyRoom(rn)) {
+            var myRoom = Game.rooms[rn];
+            if (myRoom) {
+                var prevRn = op.route[i - 1];
+                var nextRn = i < op.route.length - 1 ? op.route[i + 1] : null;
+                var myEdges = analyzeRoomEdges(myRoom);
+                if (myEdges) {
+                    var myEntryDir = getDirectionBetweenRooms(prevRn, rn);
+                    var myEntryEdge = myEntryDir ? getOppositeEdge(myEntryDir) : null;
+                    var myExitDir = nextRn ? getDirectionBetweenRooms(rn, nextRn) : null;
+                    
+                    if (myEntryEdge && myEdges[myEntryEdge] && myEdges[myEntryEdge].totalWalkable === 0) {
+                        console.log('[TowerDrain] Own room ' + rn + ' entry from ' + myEntryEdge + ' blocked (0 walkable edge tiles)');
+                        routeBlocked = true;
+                        blockedRoom = rn;
+                        break;
+                    }
+                    if (myExitDir && myEdges[myExitDir] && myEdges[myExitDir].totalWalkable === 0) {
+                        console.log('[TowerDrain] Own room ' + rn + ' exit toward ' + myExitDir + ' blocked (0 walkable edge tiles)');
+                        routeBlocked = true;
+                        blockedRoom = rn;
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
         
         if (scanData.routePassability[rn] === false) {
             routeBlocked = true;
@@ -2197,14 +2863,31 @@ function finalizeOperation(op, opKey) {
         return;
     }
     
+    if (op.dryRun) {
+        op.status = 'dryrun_complete';
+        console.log('[TowerDrain] ✓ DRY RUN operation ' + opKey + ' completed successfully');
+        console.log('[TowerDrain] Route: ' + op.route.join(' -> '));
+        console.log('[TowerDrain] ' + Object.keys(op.lanes).length + ' lanes computed');
+        console.log('[TowerDrain] Body: ' + (op.longRange ? 'long-range (9T/1A/25M/15H)' : 'standard'));
+        console.log('[TowerDrain] No creeps will be spawned (dry run mode)');
+        return;
+    }
+    
     op.status = 'ready';
     console.log('[TowerDrain] ✓ Operation ' + opKey + ' is READY');
     console.log('[TowerDrain] Route: ' + op.route.join(' -> '));
     console.log('[TowerDrain] ' + Object.keys(op.lanes).length + ' lanes computed');
+    console.log('[TowerDrain] Body: ' + (op.longRange ? 'long-range (9T/1A/25M/15H)' : 'standard'));
 }
 
 function updateOperations() {
     var ops = Memory.towerDrainOps.operations;
+    
+    var batchTestOpKey = null;
+    if (Memory.testPlayerRoutes && Memory.testPlayerRoutes.currentTest) {
+        var ct = Memory.testPlayerRoutes.currentTest;
+        batchTestOpKey = ct.homeRoom + '->' + ct.targetRoom;
+    }
     
     for (var opKey in ops) {
         var op = ops[opKey];
@@ -2220,9 +2903,45 @@ function updateOperations() {
             op.creeps = liveCreeps;
         }
         
-        if (op.status === 'ready' && op.creeps && op.creeps.length > 0) {
+        if (op.status === 'ready' && !op.dryRun && op.creeps && op.creeps.length > 0) {
             op.status = 'active';
             console.log('[TowerDrain] Operation ' + opKey + ' is now ACTIVE');
+        }
+        
+        if (opKey === batchTestOpKey) {
+            // Let runTestPlayerRoutes handle cleanup for the op it's watching
+        } else {
+            if (op.status === 'active' && (!op.creeps || op.creeps.length === 0)) {
+                op.status = 'ready';
+                console.log('[TowerDrain] Operation ' + opKey + ': all drainers dead, resetting to ready for respawn.');
+            }
+            
+            if (op.status === 'failed' || op.status === 'dryrun_complete') {
+                console.log('[TowerDrain] Auto-clearing ' + op.status + ' operation ' + opKey);
+                if (Memory.towerDrainProgress) delete Memory.towerDrainProgress[opKey];
+                delete ops[opKey];
+                continue;
+            }
+        }
+        
+        if (op.scanData && op.status !== 'scanning') {
+            if (op.status === 'ready' || op.status === 'active') {
+                delete op.scanData.candidatePaths;
+                delete op.scanData.validPaths;
+                delete op.scanData.invalidatedPaths;
+                delete op.scanData.scannedRooms;
+                delete op.scanData.routePassability;
+                delete op.scanData.roomsToScan;
+                delete op.scanData._avoidRooms;
+                delete op.scanData._highwayRetries;
+                delete op.scanData._selectedHighway;
+                delete op.scanData._homeAvailExits;
+                delete op.scanData.roomExits;
+                delete op.scanData.lastProgressTick;
+                delete op.scanData.roomsScannedCount;
+            } else if (op.status === 'dryrun_complete' || op.status === 'failed') {
+                delete op.scanData;
+            }
         }
     }
 }
@@ -2242,26 +2961,9 @@ function isCreepSpawning(creepName) {
 }
 
 // ========== CREEP BEHAVIOR ==========
-// ==========================================================================
-// PERFORMANCE OPTIMIZATION NOTES:
-// The original code used PathFinder.search for EVERY movement, including
-// the 1-tile bounce moves between the 4 lane positions. Each PathFinder
-// call rebuilds cost matrices from room.find() results (~0.5-1 CPU each).
-// With 4 drainers, that's 2-4 CPU/tick just for movement.
-//
-// Optimizations applied:
-// 1. simpleMoveToPos() - direct creep.move(direction) for 1-tile bounce
-//    moves. No PathFinder, no room.find(), ~0.001 CPU per call.
-// 2. followRoomRoute() - cached path with 5-tick reuse. PathFinder only
-//    runs once every 5 ticks or on room change.
-// 3. moveToPosition() - uses cached cost matrices when PathFinder IS
-//    needed (initial travel only).
-// 4. Per-tick find cache - room.find() results shared across all creeps.
-// ==========================================================================
 
 var roleTowerDrain = {
     run: function(creep) {
-        // Validate pre-planned data exists
         if (!creep.memory.route || !creep.memory.laneSet) {
             if (creep.name.indexOf('TowerDrain_') === 0) {
                 if (Game.time % 100 === 0) {
@@ -2282,9 +2984,13 @@ var roleTowerDrain = {
             creep.memory.state = 'returningHome';
         }
         
-        // Always self-heal when damaged
         if (creep.hits < creep.hitsMax) {
             creep.heal(creep);
+        }
+        
+        var nearbyHostiles = creep.pos.findInRange(FIND_HOSTILE_CREEPS, 1);
+        if (nearbyHostiles.length > 0) {
+            creep.attack(nearbyHostiles[0]);
         }
         
         switch (creep.memory.state) {
@@ -2309,32 +3015,19 @@ var roleTowerDrain = {
         }
     },
     
-    // ======================================================================
-    // SIMPLE 1-TILE MOVE: Used for bounce-cycle movement between the 4
-    // known lane positions. Only works when adjacent (1 tile) or crossing
-    // a room border. Falls back to moveToPosition if not adjacent.
-    // Cost: ~0.001 CPU when adjacent vs ~0.5 CPU for PathFinder fallback
-    // ======================================================================
     simpleMoveToPos: function(creep, pos) {
         if (!pos) return ERR_INVALID_ARGS;
         var targetPos = new RoomPosition(pos.x, pos.y, pos.roomName);
         if (creep.pos.isEqualTo(targetPos)) return OK;
         
-        // If adjacent (including cross-room edge tiles), direct move works
         if (creep.pos.isNearTo(targetPos)) {
             return creep.move(creep.pos.getDirectionTo(targetPos));
         }
         
-        // Not adjacent - need pathfinding (creep not on a lane position yet)
         this.moveToPosition(creep, pos);
         return OK;
     },
     
-    // ======================================================================
-    // CACHED ROUTE FOLLOWING: Path is computed once and reused for 5 ticks.
-    // Recomputes on room change or when path is stale.
-    // Cost: ~0.002 CPU on cache hit vs ~0.5-1.0 CPU for PathFinder.search
-    // ======================================================================
     followRoomRoute: function(creep, forward) {
         var route = forward ? creep.memory.route : creep.memory.routeBack;
         if (!route || route.length === 0) return ERR_NOT_FOUND;
@@ -2344,7 +3037,6 @@ var roleTowerDrain = {
         
         if (currentRoom === goalRoom) return OK;
         
-        // Build allowed rooms set
         var allowedRooms = {};
         for (var r = 0; r < route.length; r++) {
             allowedRooms[route[r]] = true;
@@ -2356,7 +3048,6 @@ var roleTowerDrain = {
             return ERR_NOT_FOUND;
         }
         
-        // Find current position in route
         var idx = route.indexOf(currentRoom);
         if (idx === -1) idx = 0;
         
@@ -2365,24 +3056,20 @@ var roleTowerDrain = {
         
         var nextRoom = route[nextIdx];
         
-        // Find exit direction to next room
         var exitDir = Game.map.findExit(currentRoom, nextRoom);
         if (exitDir < 0) return ERR_NO_PATH;
         
-        // === PATH CACHING ===
-        // Reuse cached path if: same room, same target, not expired
         var pathCache = creep.memory._pathCache;
         var cacheValid = pathCache &&
                          pathCache.room === currentRoom &&
                          pathCache.nextRoom === nextRoom &&
-                         pathCache.tick > Game.time - 5 &&  // 5-tick TTL
+                         pathCache.tick > Game.time - 5 &&
                          pathCache.path && pathCache.path.length > 0;
         
         var path;
         if (cacheValid) {
             path = pathCache.path;
         } else {
-            // Compute new path
             var exits = creep.room.find(exitDir);
             if (exits.length === 0) return ERR_NO_PATH;
             
@@ -2414,7 +3101,6 @@ var roleTowerDrain = {
             
             path = result.path;
             
-            // Cache the path (serialize positions for Memory storage)
             var serializedPath = [];
             for (var sp = 0; sp < path.length; sp++) {
                 serializedPath.push({
@@ -2431,10 +3117,8 @@ var roleTowerDrain = {
             };
         }
         
-        // Follow the cached path
         var moveResult = creep.moveByPath(path);
         if (moveResult !== OK && moveResult !== ERR_TIRED) {
-            // Invalidate cache and try direct move
             delete creep.memory._pathCache;
             if (path[0]) {
                 var pos = new RoomPosition(path[0].x, path[0].y, path[0].roomName);
@@ -2446,11 +3130,6 @@ var roleTowerDrain = {
         return OK;
     },
     
-    // ======================================================================
-    // FULL PATHFINDER MOVE: Only used during initial travel to the bounce
-    // zone (before the creep reaches its lane positions). Uses cached cost
-    // matrices to reduce CPU even when PathFinder is needed.
-    // ======================================================================
     moveToPosition: function(creep, pos, color) {
         if (!pos) return;
         
@@ -2458,7 +3137,6 @@ var roleTowerDrain = {
         
         if (creep.pos.isEqualTo(targetPos)) return;
         
-        // If adjacent (1 tile away, same room), just move directly - no PathFinder needed
         if (creep.pos.roomName === targetPos.roomName && creep.pos.getRangeTo(targetPos) === 1) {
             creep.move(creep.pos.getDirectionTo(targetPos));
             return;
@@ -2506,25 +3184,19 @@ var roleTowerDrain = {
         }
     },
     
-    /**
-     * Traveling state: Get to the drain position via the 4-tile lane
-     */
     stateTraveling: function(creep) {
         var targetRoom = creep.memory.targetRoom;
         var safeRoom = creep.memory.safeRoom;
         
-        // Not in safe room or target room yet - follow route
         if (creep.room.name !== safeRoom && creep.room.name !== targetRoom) {
             this.followRoomRoute(creep, true);
             creep.say('🚶');
             return;
         }
         
-        // In safe room - move towards edge (simple 1-tile move)
         if (creep.room.name === safeRoom) {
             var healEdgePos = creep.memory.healEdgePos;
             if (healEdgePos) {
-                // If at heal rest pos, simple move to edge; if at edge, will cross room
                 this.simpleMoveToPos(creep, healEdgePos);
                 creep.say('➡️');
             } else {
@@ -2534,7 +3206,6 @@ var roleTowerDrain = {
             return;
         }
         
-        // In target room - go to drain position
         var drainPos = creep.memory.drainPos;
         if (!drainPos) {
             console.log('[TowerDrain] ' + creep.name + ' missing drainPos');
@@ -2547,7 +3218,6 @@ var roleTowerDrain = {
             creep.memory.state = 'draining';
             creep.say('😈');
         } else {
-            // Should be 1 tile from edge - simple move
             this.simpleMoveToPos(creep, drainPos);
             creep.say('🎯');
         }
@@ -2560,7 +3230,6 @@ var roleTowerDrain = {
             return;
         }
         
-        // Stay at drain position - only move if somehow displaced
         var drainPos = creep.memory.drainPos;
         if (!drainPos) {
             creep.memory.state = 'traveling';
@@ -2586,7 +3255,6 @@ var roleTowerDrain = {
             return;
         }
         
-        // In target room - move to attack edge (1 tile), will cross to safe room
         if (creep.room.name === targetRoom) {
             if (attackEdgePos) {
                 this.simpleMoveToPos(creep, attackEdgePos);
@@ -2597,7 +3265,6 @@ var roleTowerDrain = {
             return;
         }
         
-        // In safe room - move to heal position (1 tile from edge)
         if (creep.room.name === safeRoom) {
             var targetPos = new RoomPosition(healPos.x, healPos.y, healPos.roomName);
             
@@ -2611,7 +3278,6 @@ var roleTowerDrain = {
             return;
         }
         
-        // In some other room (shouldn't happen)
         this.simpleMoveToPos(creep, healPos);
         creep.say('🏃');
     },
@@ -2622,7 +3288,6 @@ var roleTowerDrain = {
             return;
         }
         
-        // Stay at heal position - only move if somehow displaced
         var healPos = creep.memory.healPos;
         if (healPos) {
             var targetPos = new RoomPosition(healPos.x, healPos.y, healPos.roomName);
@@ -2803,6 +3468,11 @@ function getCreepMemoryForLane(homeRoom, targetRoom, laneNumber) {
         return null;
     }
     
+    if (op.dryRun) {
+        console.log('[TowerDrain] getCreepMemoryForLane: Operation ' + opKey + ' is a dry run - no spawning');
+        return null;
+    }
+    
     if (op.status !== 'ready' && op.status !== 'active') {
         console.log('[TowerDrain] getCreepMemoryForLane: Operation ' + opKey + ' not ready (status: ' + op.status + ')');
         return null;
@@ -2860,27 +3530,455 @@ function clearFailedTowerDrains() {
     var cleared = [];
     
     for (var opKey in ops) {
-        if (ops[opKey].status === 'failed') {
-            cleared.push(opKey);
+        if (ops[opKey].status === 'failed' || ops[opKey].status === 'dryrun_complete') {
+            cleared.push(opKey + '(' + ops[opKey].status + ')');
             delete ops[opKey];
         }
     }
     
     if (cleared.length > 0) {
-        console.log('[TowerDrain] Cleared ' + cleared.length + ' failed operation(s): ' + cleared.join(', '));
+        console.log('[TowerDrain] Cleared ' + cleared.length + ' operation(s): ' + cleared.join(', '));
     } else {
-        console.log('[TowerDrain] No failed operations to clear');
+        console.log('[TowerDrain] No failed/completed operations to clear');
     }
     
     return cleared.length;
 }
 
-// Global console commands
+// =============================================================================
+// testPlayerRoutes: Batch test routing to all of a player's rooms
+// =============================================================================
+
+function testPlayerRoutes(playerName, homeRoom) {
+    if (!playerName) {
+        console.log('[TestRoutes] Usage: testPlayerRoutes("PlayerName", "E2N46")');
+        return;
+    }
+    
+    initMemory();
+    
+    var homeRooms = [];
+    if (homeRoom) {
+        homeRooms = [homeRoom];
+    } else {
+        for (var rn in Game.rooms) {
+            var rm = Game.rooms[rn];
+            if (rm.controller && rm.controller.my && rm.controller.level >= 7 && rm.find(FIND_MY_SPAWNS).length > 0) {
+                homeRooms.push(rn);
+            }
+        }
+    }
+    
+    if (homeRooms.length === 0) {
+        console.log('[TestRoutes] No valid home rooms found');
+        return;
+    }
+    
+    console.log('[TestRoutes] Home rooms: ' + homeRooms.join(', '));
+    
+    Memory.testPlayerRoutes = {
+        playerName: playerName,
+        homeRooms: homeRooms,
+        phase: 'scanning',
+        targetRooms: [],
+        testQueue: [],
+        results: [],
+        currentTest: null,
+        startTick: Game.time
+    };
+    
+    console.log('[TestRoutes] Starting wideScan for ' + playerName + '...');
+    if (typeof global.wideScan === 'function') {
+        global.wideScan(playerName);
+    } else {
+        console.log('[TestRoutes] wideScan not available. Use testPlayerRoutesSetTargets() to set rooms manually.');
+    }
+}
+
+function buildTestQueue() {
+    var state = Memory.testPlayerRoutes;
+    if (!state) return;
+    
+    state.testQueue = [];
+    var edges = ['N', 'S', 'E', 'W'];
+    
+    for (var t = 0; t < state.targetRooms.length; t++) {
+        var target = state.targetRooms[t];
+        
+        var bestHome = null;
+        var bestDist = Infinity;
+        for (var h = 0; h < state.homeRooms.length; h++) {
+            var dist = Game.map.getRoomLinearDistance(state.homeRooms[h], target);
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestHome = state.homeRooms[h];
+            }
+        }
+        
+        if (!bestHome) continue;
+        
+        for (var e = 0; e < edges.length; e++) {
+            state.testQueue.push({
+                homeRoom: bestHome,
+                targetRoom: target,
+                edge: edges[e],
+                status: 'pending'
+            });
+        }
+    }
+}
+
+function runTestPlayerRoutes() {
+    if (!Memory.testPlayerRoutes) return;
+    var state = Memory.testPlayerRoutes;
+    
+    if (state.phase === 'scanning') {
+        if (Memory.wideScan && Memory.wideScan.active) {
+            if (Memory.wideScan.foundRooms && Memory.wideScan.foundRooms.length > 0) {
+                state.targetRooms = Memory.wideScan.foundRooms.slice();
+            }
+            return;
+        }
+        
+        if (state.targetRooms.length === 0) {
+            console.log('[TestRoutes] wideScan complete but no rooms found for ' + state.playerName);
+            console.log('[TestRoutes] Use testPlayerRoutesSetTargets(["W1N46"]) to set manually');
+            state.phase = 'waiting_targets';
+            return;
+        }
+        
+        state.phase = 'testing';
+        buildTestQueue();
+        console.log('[TestRoutes] Found ' + state.targetRooms.length + ' rooms: ' + state.targetRooms.join(', '));
+        console.log('[TestRoutes] ' + state.testQueue.length + ' route tests queued');
+        return;
+    }
+    
+    if (state.phase === 'waiting_targets') return;
+    
+    if (state.phase === 'testing') {
+        if (state.currentTest) {
+            var ct = state.currentTest;
+            var opKey = ct.homeRoom + '->' + ct.targetRoom;
+            var op = Memory.towerDrainOps && Memory.towerDrainOps.operations ? 
+                     Memory.towerDrainOps.operations[opKey] : null;
+            
+            if (!op) {
+                state.results.push({ homeRoom: ct.homeRoom, targetRoom: ct.targetRoom, edge: ct.edge, status: 'error', reason: 'op_disappeared' });
+                state.currentTest = null;
+            } else if (op.status === 'dryrun_complete') {
+                state.results.push({ homeRoom: ct.homeRoom, targetRoom: ct.targetRoom, edge: ct.edge, status: 'success', route: op.route, lanes: Object.keys(op.lanes).length });
+                delete Memory.towerDrainOps.operations[opKey];
+                state.currentTest = null;
+            } else if (op.status === 'failed') {
+                state.results.push({ homeRoom: ct.homeRoom, targetRoom: ct.targetRoom, edge: ct.edge, status: 'failed', reason: op.failReason || 'unknown' });
+                delete Memory.towerDrainOps.operations[opKey];
+                state.currentTest = null;
+            } else if (op.status === 'scanning') {
+                if (Game.time - (ct.startTick || Game.time) > 200) {
+                    state.results.push({ homeRoom: ct.homeRoom, targetRoom: ct.targetRoom, edge: ct.edge, status: 'timeout', reason: 'scan_timeout_200t' });
+                    delete Memory.towerDrainOps.operations[opKey];
+                    state.currentTest = null;
+                }
+                return;
+            } else {
+                return;
+            }
+        }
+        
+        if (state.testQueue.length === 0) {
+            state.phase = 'complete';
+            reportTestResults();
+            return;
+        }
+        
+        var next = state.testQueue.shift();
+        
+        var nextOpKey = next.homeRoom + '->' + next.targetRoom;
+        if (Memory.towerDrainOps && Memory.towerDrainOps.operations && Memory.towerDrainOps.operations[nextOpKey]) {
+            delete Memory.towerDrainOps.operations[nextOpKey];
+        }
+        
+        var done = state.results.length;
+        var total = done + state.testQueue.length + 1;
+        console.log('[TestRoutes] (' + (done + 1) + '/' + total + ') ' + next.homeRoom + ' -> ' + next.targetRoom + ' edge ' + next.edge);
+        
+        var result = orderTowerDrain(next.homeRoom, next.targetRoom, 2, next.edge, null);
+        // Note: batch tests always use standard body; pass null for range to get standard
+        // Internal: we need dryRun but orderTowerDrain no longer takes options directly.
+        // Use the sector functions directly.
+        if (result !== OK) {
+            // orderTowerDrain already placed the op; check if we need to patch dryRun
+        }
+        
+        // Patch dryRun onto the op after creation
+        if (Memory.towerDrainOps && Memory.towerDrainOps.operations && Memory.towerDrainOps.operations[nextOpKey]) {
+            Memory.towerDrainOps.operations[nextOpKey].dryRun = true;
+        }
+        
+        if (result !== OK) {
+            state.results.push({ homeRoom: next.homeRoom, targetRoom: next.targetRoom, edge: next.edge, status: 'failed', reason: 'order_err_' + result });
+        } else {
+            next.startTick = Game.time;
+            state.currentTest = next;
+        }
+    }
+}
+
+function reportTestResults() {
+    var state = Memory.testPlayerRoutes;
+    if (!state) return;
+    
+    var elapsed = Game.time - state.startTick;
+    
+    var lines = [];
+    lines.push('[TestRoutes] BATCH COMPLETE: ' + state.playerName);
+    lines.push('Targets: ' + state.targetRooms.join(', '));
+    lines.push('Tests: ' + state.results.length + ' | Ticks: ' + elapsed);
+    lines.push('');
+    
+    var byTarget = {};
+    for (var i = 0; i < state.results.length; i++) {
+        var r = state.results[i];
+        if (!byTarget[r.targetRoom]) byTarget[r.targetRoom] = [];
+        byTarget[r.targetRoom].push(r);
+    }
+    
+    for (var target in byTarget) {
+        var results = byTarget[target];
+        lines.push('-- ' + target + ' --');
+        
+        var bestRoute = null;
+        for (var j = 0; j < results.length; j++) {
+            var res = results[j];
+            var sym = res.status === 'success' ? 'OK' : 'X';
+            
+            if (res.status === 'success') {
+                var routeStr = res.route[0] + '...' + res.route[res.route.length - 1];
+                lines.push(sym + ' ' + res.edge + ': ' + routeStr + ' ' + res.route.length + 'rm ' + res.lanes + 'L');
+                if (!bestRoute || res.route.length < bestRoute.route.length) bestRoute = res;
+            } else {
+                lines.push(sym + ' ' + res.edge + ': ' + res.reason);
+            }
+        }
+        
+        if (bestRoute) {
+            lines.push('BEST: ' + bestRoute.edge + ' ' + bestRoute.route.length + 'rm ' + bestRoute.lanes + 'L');
+            lines.push('Route: ' + bestRoute.route.join('>'));
+        } else {
+            lines.push('NO ROUTE FOUND');
+        }
+        lines.push('');
+    }
+    
+    console.log('');
+    console.log('════════════════════════════════════════════════════════════');
+    for (var cl = 0; cl < lines.length; cl++) {
+        console.log('  ' + lines[cl]);
+    }
+    console.log('════════════════════════════════════════════════════════════');
+    
+    var MAX_CHUNK = 380;
+    var chunks = [];
+    var currentChunk = '';
+    
+    for (var nl = 0; nl < lines.length; nl++) {
+        var line = lines[nl];
+        
+        if (line.length > MAX_CHUNK) {
+            if (currentChunk.length > 0) {
+                chunks.push(currentChunk);
+                currentChunk = '';
+            }
+            var pos = 0;
+            while (pos < line.length) {
+                chunks.push(line.substring(pos, pos + MAX_CHUNK));
+                pos += MAX_CHUNK;
+            }
+            continue;
+        }
+        
+        var newLength = currentChunk.length + (currentChunk.length > 0 ? 1 : 0) + line.length;
+        if (newLength > MAX_CHUNK) {
+            chunks.push(currentChunk);
+            currentChunk = line;
+        } else {
+            if (currentChunk.length > 0) {
+                currentChunk += '\n' + line;
+            } else {
+                currentChunk = line;
+            }
+        }
+    }
+    if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
+    }
+    
+    for (var ci = 0; ci < chunks.length; ci++) {
+        var header = '[' + (ci + 1) + '/' + chunks.length + '] ';
+        Game.notify(header + chunks[ci], 0);
+    }
+    
+    console.log('[TestRoutes] Sent ' + chunks.length + ' notification(s)');
+    
+    delete Memory.testPlayerRoutes;
+}
+
+function testPlayerRoutesStatus() {
+    if (!Memory.testPlayerRoutes) { console.log('[TestRoutes] No active test.'); return; }
+    var s = Memory.testPlayerRoutes;
+    console.log('[TestRoutes] Player: ' + s.playerName + ' | Phase: ' + s.phase);
+    console.log('[TestRoutes] Targets: ' + s.targetRooms.join(', '));
+    console.log('[TestRoutes] Done: ' + s.results.length + ' | Queued: ' + s.testQueue.length);
+    if (s.currentTest) console.log('[TestRoutes] Current: ' + s.currentTest.homeRoom + '->' + s.currentTest.targetRoom + ' edge ' + s.currentTest.edge);
+    for (var i = 0; i < s.results.length; i++) {
+        var r = s.results[i];
+        console.log('  ' + (r.status === 'success' ? '✓' : '✗') + ' ' + r.targetRoom + ' ' + r.edge + ': ' + (r.status === 'success' ? r.route.length + ' rooms' : r.reason));
+    }
+}
+
+function testPlayerRoutesCancel() {
+    if (!Memory.testPlayerRoutes) { console.log('[TestRoutes] Nothing to cancel.'); return; }
+    if (Memory.testPlayerRoutes.currentTest) {
+        var ct = Memory.testPlayerRoutes.currentTest;
+        var opKey = ct.homeRoom + '->' + ct.targetRoom;
+        if (Memory.towerDrainOps && Memory.towerDrainOps.operations && Memory.towerDrainOps.operations[opKey]) {
+            delete Memory.towerDrainOps.operations[opKey];
+        }
+    }
+    delete Memory.testPlayerRoutes;
+    console.log('[TestRoutes] Cancelled.');
+}
+
+function testPlayerRoutesSetTargets(rooms) {
+    if (!Memory.testPlayerRoutes) {
+        console.log('[TestRoutes] Run testPlayerRoutes("PlayerName") first.');
+        return;
+    }
+    Memory.testPlayerRoutes.targetRooms = rooms;
+    Memory.testPlayerRoutes.phase = 'testing';
+    buildTestQueue();
+    console.log('[TestRoutes] Set ' + rooms.length + ' targets, ' + Memory.testPlayerRoutes.testQueue.length + ' tests queued');
+}
+
+global.testPlayerRoutes = testPlayerRoutes;
+global.testPlayerRoutesStatus = testPlayerRoutesStatus;
+global.testPlayerRoutesCancel = testPlayerRoutesCancel;
+global.testPlayerRoutesSetTargets = testPlayerRoutesSetTargets;
+
+// testTowerDrain: runs the full planning pipeline but never spawns creeps.
+function testTowerDrain(homeRoom, targetRoom, count, preferredEdge, range) {
+    var options = { dryRun: true, longRange: range === 'long' };
+    console.log('[TowerDrain] === DRY RUN === Planning ' + homeRoom + ' -> ' + targetRoom +
+        ' [' + (options.longRange ? 'long-range' : 'standard') + '] (no spawning)');
+
+    initMemory();
+    if (preferredEdge) preferredEdge = preferredEdge.toUpperCase();
+
+    var observerInfo = findObserverForRoom(targetRoom);
+    if (!observerInfo) {
+        console.log('[TowerDrain] Cannot start: no observer within range of ' + targetRoom);
+        return ERR_NOT_FOUND;
+    }
+
+    var opKey = homeRoom + '->' + targetRoom;
+    if (Memory.towerDrainOps.operations[opKey]) {
+        delete Memory.towerDrainOps.operations[opKey];
+    }
+
+    var requiredSafeRoom = preferredEdge ? getAdjacentRoom(targetRoom, preferredEdge) : null;
+
+    if (areInSameSector(homeRoom, targetRoom)) {
+        return orderTowerDrainSameSector(homeRoom, targetRoom, count || 1, preferredEdge, requiredSafeRoom, observerInfo, opKey, options);
+    } else {
+        return orderTowerDrainCrossSector(homeRoom, targetRoom, count || 1, preferredEdge, requiredSafeRoom, observerInfo, opKey, options);
+    }
+}
+
 global.orderTowerDrain = orderTowerDrain;
 global.cancelTowerDrainOrder = cancelTowerDrainOrder;
 global.getTowerDrainStatus = getTowerDrainStatus;
 global.clearFailedTowerDrains = clearFailedTowerDrains;
 global.getCreepMemoryForLane = getCreepMemoryForLane;
+global.testTowerDrain = testTowerDrain;
+
+global.debugPassability = function(roomName, toRoomName) {
+    var room = Game.rooms[roomName];
+    if (!room) {
+        console.log('[Debug] No vision of ' + roomName);
+        return;
+    }
+    
+    console.log('[Debug] === Passability check for ' + roomName + ' -> ' + (toRoomName || 'ALL') + ' ===');
+    
+    var startPos;
+    if (room.controller && room.controller.my) {
+        var myCreeps = room.find(FIND_MY_CREEPS);
+        if (myCreeps.length > 0) {
+            startPos = myCreeps[0].pos;
+            console.log('[Debug] Using creep position: ' + startPos);
+        } else {
+            var spawns = room.find(FIND_MY_SPAWNS);
+            if (spawns.length > 0) {
+                startPos = new RoomPosition(spawns[0].pos.x, spawns[0].pos.y - 1, roomName);
+                console.log('[Debug] Using tile near spawn: ' + startPos);
+            } else {
+                startPos = new RoomPosition(25, 25, roomName);
+                console.log('[Debug] No creeps/spawns, using center: ' + startPos);
+            }
+        }
+    } else {
+        startPos = new RoomPosition(25, 25, roomName);
+        console.log('[Debug] Not owned, using center: ' + startPos);
+    }
+    
+    var matrix = buildCostMatrix(room);
+    var structures = room.find(FIND_STRUCTURES);
+    var wallCount = 0, rampartCount = 0, myRampartCount = 0, pubRampartCount = 0;
+    for (var s = 0; s < structures.length; s++) {
+        if (structures[s].structureType === STRUCTURE_WALL) wallCount++;
+        if (structures[s].structureType === STRUCTURE_RAMPART) {
+            rampartCount++;
+            if (structures[s].my) myRampartCount++;
+            if (structures[s].isPublic) pubRampartCount++;
+        }
+    }
+    console.log('[Debug] Structures: ' + wallCount + ' walls, ' + rampartCount + ' ramparts (' + myRampartCount + ' own, ' + pubRampartCount + ' public)');
+    console.log('[Debug] Cost at start pos (' + startPos.x + ',' + startPos.y + '): ' + matrix.get(startPos.x, startPos.y));
+    
+    var exitDirs = [FIND_EXIT_TOP, FIND_EXIT_BOTTOM, FIND_EXIT_LEFT, FIND_EXIT_RIGHT];
+    var exitNames = ['N (TOP)', 'S (BOTTOM)', 'W (LEFT)', 'E (RIGHT)'];
+    
+    for (var i = 0; i < exitDirs.length; i++) {
+        var exitTiles = room.find(exitDirs[i]);
+        if (exitTiles.length === 0) {
+            console.log('[Debug] Exit ' + exitNames[i] + ': 0 tiles (no terrain exit)');
+            continue;
+        }
+        
+        var goals = [];
+        for (var j = 0; j < exitTiles.length; j++) {
+            goals.push({ pos: exitTiles[j], range: 0 });
+        }
+        
+        var rn = roomName;
+        var result = PathFinder.search(startPos, goals, {
+            roomCallback: function() {
+                return matrix;
+            },
+            maxRooms: 1,
+            maxOps: 5000
+        });
+        
+        console.log('[Debug] Exit ' + exitNames[i] + ': ' + exitTiles.length + ' tiles, pathfinder: ' +
+                    (result.incomplete ? 'INCOMPLETE' : 'OK') + ' (path: ' + result.path.length + 
+                    ', ops: ' + result.ops + ', cost: ' + result.cost + ')');
+    }
+    
+    var passResult = checkRoomPassability(room, null, toRoomName || null);
+    console.log('[Debug] checkRoomPassability result: passable=' + passResult.passable + 
+                ', reason=' + passResult.reason + ', exits=' + (passResult.availableExits || []).join(','));
+};
 
 global.debugTowerDrainRoute = function(fromRoom, toRoom, avoidRoom) {
     console.log('[TowerDrain Debug] Testing route from ' + fromRoom + ' to ' + toRoom + (avoidRoom ? ' avoiding ' + avoidRoom : ''));
@@ -2958,6 +4056,7 @@ function run() {
     
     runScanner();
     updateOperations();
+    runTestPlayerRoutes();
     
     for (var name in Game.creeps) {
         var creep = Game.creeps[name];
@@ -2971,6 +4070,8 @@ function run() {
 module.exports = {
     run: run,
     orderTowerDrain: orderTowerDrain,
+    testTowerDrain: testTowerDrain,
+    testPlayerRoutes: testPlayerRoutes,
     cancelTowerDrainOrder: cancelTowerDrainOrder,
     getTowerDrainStatus: getTowerDrainStatus,
     clearFailedTowerDrains: clearFailedTowerDrains,

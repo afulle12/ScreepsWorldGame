@@ -5,38 +5,19 @@
 //      marketSell('E1S1', RESOURCE_ZYNTHIUM, 5000)
 // - Post a sell order at a fixed price:
 //      marketSell('E1S1', RESOURCE_ZYNTHIUM, 5000, 2.75)
-//
-// Behavior:
-// 1) Validates room ownership, terminal existence, resource type, and amount.
-// 2) Ensures the room (terminal + other structures in the room) has at least AMOUNT available,
-//    otherwise fails without creating an order.
-// 3) Pricing:
-//    - If price is provided, uses it as-is.
-//    - If price is not provided:
-//      - Calculates the 2-day average price from Game.market.getHistory.
-//      - Looks up the current lowest external SELL order (not from a room you own) with remaining >= 1000
-//        and sets your price to 0.1 credits below it.
-//      - This undercut price is capped at 150% of the calculated historical average to prevent
-//        listing at manipulated/unrealistic prices.
-//      - If no such orders exist, sets price to 105% of the 2-day average from Game.market.getHistory.
-//    - Price is clamped to a minimum of 0.001 to avoid invalid values.
-// 4) After a successful order is created, it will request an in-room move into the terminal by calling
-//    terminalManager.storageToTerminal(roomName, resourceType, needed).
-//    The computation is reservation-aware: terminal stock already committed by existing SELL orders in the
-//    same room for the same resource is treated as reserved, so only unreserved terminal stock is counted.
-//    This reuses terminalManager’s local move ops and terminal bot; no hooks are installed.
-// 5) Sync/Cleanup:
-//    - Automatically runs whenever marketSell() or status() is called.
-//    - Strictly syncs with Game.market.orders.
-//    - Cancels your SELL orders that have 0 remaining amount (frees order slots).
-//    - Requests are deleted from memory if the corresponding market order no longer exists or has 0 remaining amount.
-//
-// Requirements:
-// - terminalManager.js (provided by you) must be present and export the terminalManager object.
-// - No optional chaining is used.
-// - Exactly the console API described is exported to global.
+// - Sell everything in a room (except energy):
+//      marketSell('E1S1', 'Everything')
+//      Scans terminal + storage for all resources, skips any that already have an
+//      active SELL order in the room, and creates orders for the full available amount.
 
 var terminalManager = require('terminalManager');
+var storageManager = require('storageManager');
+
+// Additional resource types that are valid to sell but may not be in
+// terminalManager's validateResource whitelist.
+var EXTRA_ALLOWED_RESOURCES = [
+    RESOURCE_OPS
+];
 
 var marketSeller = {
 
@@ -47,6 +28,14 @@ var marketSeller = {
         } else if (!Array.isArray(Memory.marketSell.requests)) {
             Memory.marketSell.requests = [];
         }
+    },
+
+    // Check if a resource is in the extra allowed list
+    isExtraAllowed: function(resourceType) {
+        for (var i = 0; i < EXTRA_ALLOWED_RESOURCES.length; i++) {
+            if (EXTRA_ALLOWED_RESOURCES[i] === resourceType) return true;
+        }
+        return false;
     },
 
     // Cancel OUR SELL orders that are fully depleted (remainingAmount === 0)
@@ -71,7 +60,8 @@ var marketSeller = {
         return canceled;
     },
 
-    // Compute how much of resourceType exists in the room total = terminal + outside terminal.
+    // Compute how much of resourceType exists in the room total = terminal + outside terminal,
+    // minus any existing storageManager reservations (so we don't double-commit resources).
     getRoomTotalAvailable: function(roomName, resourceType) {
         var room = Game.rooms[roomName];
         if (!room) return 0;
@@ -86,6 +76,12 @@ var marketSeller = {
         // Use terminalManager helper for everything outside the terminal.
         if (terminalManager && typeof terminalManager.getRoomAvailableOutsideTerminal === 'function') {
             total += terminalManager.getRoomAvailableOutsideTerminal(roomName, resourceType) || 0;
+        }
+
+        // Subtract existing reservations (from all programs including our own prior orders)
+        var info = storageManager.storageFind(roomName, resourceType);
+        if (info && info.combined && typeof info.combined.reserved === 'number') {
+            total = Math.max(0, total - info.combined.reserved);
         }
 
         return total;
@@ -123,7 +119,6 @@ var marketSeller = {
         });
 
         // Calculate historical average FIRST.
-        // We need this for the 150% cap logic even if we are undercutting.
         var hist = Game.market.getHistory(resourceType) || [];
         var count = 0;
         var sum = 0;
@@ -144,8 +139,6 @@ var marketSeller = {
             var bestPrice = validOrders[0].price;
             var p = bestPrice - 0.1;
 
-            // Limit price to 150% of the historical average.
-            // This prevents listing at unrealistic prices if the market is being manipulated.
             var maxPrice = avg * 1.5;
             if (p > maxPrice) {
                 p = maxPrice;
@@ -225,15 +218,127 @@ var marketSeller = {
         return null;
     },
 
-    // Main API: marketSell('ROOM#', RESOURCE, AMOUNT[, price])
-    marketSell: function(roomName, resourceType, amount, price) {
-        this.ensureMemory();
+    // Returns a set of resourceTypes that already have an active SELL order in this room.
+    getResourcesWithActiveSellOrders: function(roomName) {
+        var active = {};
+        var myOrders = Game.market && Game.market.orders ? Game.market.orders : null;
+        if (!myOrders) return active;
 
-        // Auto-cleanup before adding new request to prevent memory bloat
+        for (var id in myOrders) {
+            var o = myOrders[id];
+            if (!o) continue;
+            if (o.type !== ORDER_SELL) continue;
+            if (o.roomName !== roomName) continue;
+            if (typeof o.remainingAmount !== 'number' || o.remainingAmount <= 0) continue;
+            active[o.resourceType] = true;
+        }
+        return active;
+    },
+
+    // Collect all unique resource types present in terminal + storage (excluding energy).
+    getRoomResourceList: function(roomName) {
+        var room = Game.rooms[roomName];
+        if (!room) return [];
+
+        var seen = {};
+
+        var terminal = room.terminal;
+        if (terminal && terminal.store) {
+            for (var res in terminal.store) {
+                if (res === RESOURCE_ENERGY) continue;
+                if (terminal.store[res] > 0) {
+                    seen[res] = true;
+                }
+            }
+        }
+
+        var storage = room.storage;
+        if (storage && storage.store) {
+            for (var res2 in storage.store) {
+                if (res2 === RESOURCE_ENERGY) continue;
+                if (storage.store[res2] > 0) {
+                    seen[res2] = true;
+                }
+            }
+        }
+
+        var list = [];
+        for (var key in seen) {
+            list.push(key);
+        }
+        list.sort();
+        return list;
+    },
+
+    // Sell all non-energy resources in a room that don't already have active SELL orders.
+    sellEverything: function(roomName) {
+        this.ensureMemory();
         this.cleanup();
 
-        // Basic validations
-        if (!terminalManager || typeof terminalManager.validateResource !== 'function' || !terminalManager.validateResource(resourceType)) {
+        var room = Game.rooms[roomName];
+        if (!room || !room.controller || !room.controller.my) {
+            return '[MarketSell] Invalid room: ' + roomName + '. Must be a room you own.';
+        }
+        if (!room.terminal) {
+            return '[MarketSell] Room ' + roomName + ' has no terminal.';
+        }
+
+        var alreadySelling = this.getResourcesWithActiveSellOrders(roomName);
+        var allResources = this.getRoomResourceList(roomName);
+
+        var results = [];
+        var created = 0;
+        var skippedActive = 0;
+        var skippedInvalid = 0;
+
+        for (var i = 0; i < allResources.length; i++) {
+            var res = allResources[i];
+
+            if (alreadySelling[res]) {
+                skippedActive++;
+                continue;
+            }
+
+            var tmValid = terminalManager && typeof terminalManager.validateResource === 'function' && terminalManager.validateResource(res);
+            if (!tmValid && !this.isExtraAllowed(res)) {
+                skippedInvalid++;
+                continue;
+            }
+
+            var totalAvailable = this.getRoomTotalAvailable(roomName, res);
+            if (totalAvailable <= 0) continue;
+
+            var result = this.marketSell(roomName, res, totalAvailable);
+            results.push(result);
+            if (result.indexOf('Created SELL order') !== -1) {
+                created++;
+            }
+        }
+
+        var summary = '[MarketSell] sellEverything(' + roomName + '): ' + created + ' orders created';
+        if (skippedActive > 0) summary += ', ' + skippedActive + ' skipped (already selling)';
+        if (skippedInvalid > 0) summary += ', ' + skippedInvalid + ' skipped (invalid resource type)';
+        console.log(summary);
+
+        for (var j = 0; j < results.length; j++) {
+            console.log('  ' + results[j]);
+        }
+
+        return summary;
+    },
+
+    // Main API: marketSell('ROOM#', RESOURCE, AMOUNT[, price])
+    //           marketSell('ROOM#', 'Everything')
+    marketSell: function(roomName, resourceType, amount, price) {
+        if (resourceType === 'Everything') {
+            return this.sellEverything(roomName);
+        }
+
+        this.ensureMemory();
+        this.cleanup();
+
+        var tmValid = terminalManager && typeof terminalManager.validateResource === 'function' && terminalManager.validateResource(resourceType);
+        if (!tmValid && !this.isExtraAllowed(resourceType)) {
             return '[MarketSell] Invalid resource type: ' + resourceType;
         }
         if (!amount || amount <= 0) {
@@ -250,20 +355,20 @@ var marketSeller = {
             return '[MarketSell] Room ' + roomName + ' has no terminal.';
         }
 
-        // Ensure the room really has enough total stock
+        // Check available stock (respects existing reservations from all programs)
         var totalAvailable = this.getRoomTotalAvailable(roomName, resourceType);
         if (totalAvailable < amount) {
-            return '[MarketSell] Not enough ' + resourceType + ' in room ' + roomName + ' to cover order: have ' + totalAvailable + '/' + amount;
+            return '[MarketSell] Not enough ' + resourceType + ' in room ' + roomName + ' to cover order: have ' + totalAvailable + ' available (after reservations) / ' + amount + ' needed';
         }
 
-        // Determine price (if not explicitly provided)
+        // Determine price
         var finalPrice = price;
         if (typeof finalPrice !== 'number') {
             finalPrice = this.computePrice(resourceType);
         }
         if (finalPrice < 0.001) finalPrice = 0.001;
 
-        // If we're at the order cap, try freeing slots by canceling empty SELL orders
+        // If we're at the order cap, try freeing slots
         if (Game.market && Game.market.orders && Object.keys(Game.market.orders).length >= 300) {
             this.cancelZeroRemainingSellOrders();
         }
@@ -277,7 +382,6 @@ var marketSeller = {
             roomName: roomName
         });
 
-        // If we failed due to ERR_FULL, try one more time after clearing empty SELL orders
         if (result === ERR_FULL) {
             this.cancelZeroRemainingSellOrders();
             result = Game.market.createOrder({
@@ -293,7 +397,7 @@ var marketSeller = {
             return '[MarketSell] Failed to create SELL order: ' + result + ' (room ' + roomName + ', ' + resourceType + ' x ' + amount + ' @ ' + finalPrice + ')';
         }
 
-        // After success: schedule a one-time local move into the terminal (reservation-aware)
+        // Schedule local move into terminal (reservation-aware)
         var haveInTerminal = (terminal.store && terminal.store[resourceType]) ? terminal.store[resourceType] : 0;
 
         var outsideAvailable = 0;
@@ -301,26 +405,19 @@ var marketSeller = {
             outsideAvailable = terminalManager.getRoomAvailableOutsideTerminal(roomName, resourceType) || 0;
         }
 
-        // Terminal stock already committed by prior SELL orders in this room for this resource
         var reservedInTerminal = this.getExistingSellReservations(roomName, resourceType);
-
-        // What's truly free in the terminal right now
         var unreservedInTerminal = Math.max(0, haveInTerminal - reservedInTerminal);
-
-        // What we can cover right now for this new order (unreserved terminal + outside)
         var coverableNow = Math.min(amount, unreservedInTerminal + outsideAvailable);
-
-        // How much we need to move from storage into terminal to reach coverableNow
         var need = Math.max(0, coverableNow - unreservedInTerminal);
 
         var tmOpId = null;
+        var needsTransfer = false;
 
         if (need > 0) {
-            // Call terminalManager's local move (toTerminal). This will be handled by its bot.
             if (typeof terminalManager.storageToTerminal === 'function') {
                 terminalManager.storageToTerminal(roomName, resourceType, need);
-                // Try to link the operation created this tick so we can show/cancel it later.
                 tmOpId = this.tryLinkLocalOp(roomName, resourceType, need);
+                needsTransfer = true;
             } else {
                 console.log('[MarketSell] Warning: terminalManager.storageToTerminal not available.');
             }
@@ -336,7 +433,9 @@ var marketSeller = {
             resourceType: resourceType,
             amount: amount,
             price: finalPrice,
-            created: Game.time
+            created: Game.time,
+            reserved: false,              // NEW: reservation not yet placed
+            needsTransfer: needsTransfer  // NEW: whether a toTerminal op was created
         };
         if (tmOpId) entry.tmOpId = tmOpId;
         if (orderId) entry.orderId = orderId;
@@ -346,17 +445,151 @@ var marketSeller = {
         var msg = '[MarketSell] Created SELL order from ' + roomName + ': ' + amount + ' ' + resourceType + ' @ ' + finalPrice.toFixed(3);
         if (need > 0) {
             msg += ' | scheduled to move ' + need + ' into terminal' + (tmOpId ? (' (op ' + tmOpId + ')') : '');
+            msg += ' | reservation pending transfer completion';
         } else {
             msg += ' | terminal already has target amount (unreserved: ' + unreservedInTerminal + ')';
+            msg += ' | reservation will be placed on next sync';
         }
         return msg;
+    },
+
+    // ===== PERIODIC SYNC (call from main loop every ~50 ticks) =====
+    run: function() {
+        this.ensureMemory();
+        this.cleanup();
+        this.syncReservations();
+    },
+
+    // Sync storageManager reservations with live market order state.
+    // - Places reservations once storageToTerminal completes (or wasn't needed).
+    // - Updates reservation amounts as orders sell (remainingAmount decreases).
+    // - Unreserves when orders are fully sold or cancelled.
+    syncReservations: function() {
+        var list = Memory.marketSell.requests;
+        if (!list || list.length === 0) {
+            // No active requests — ensure no stale marketSell reservations remain
+            this._unreserveAll();
+            return;
+        }
+
+        // Aggregate remaining amounts by room+resource for orders that are ready to reserve
+        var aggregates = {};  // key: 'room:resource' -> total remainingAmount
+
+        for (var i = 0; i < list.length; i++) {
+            var req = list[i];
+            if (!req.orderId) continue;
+
+            var order = Game.market && Game.market.orders ? Game.market.orders[req.orderId] : null;
+            if (!order || typeof order.remainingAmount !== 'number' || order.remainingAmount <= 0) continue;
+
+            // Check if the toTerminal transfer is complete (or wasn't needed)
+            var ready = this._isTransferReady(req);
+            if (!ready) continue;
+
+            var key = req.roomName + ':' + req.resourceType;
+            if (!aggregates[key]) {
+                aggregates[key] = { roomName: req.roomName, resource: req.resourceType, total: 0 };
+            }
+            aggregates[key].total += order.remainingAmount;
+
+            // Mark this request as reserved (for status display)
+            req.reserved = true;
+        }
+
+        // Apply aggregated reservations (one per room+resource combo)
+        // Track which combos we're actively reserving
+        var activeKeys = {};
+
+        for (var k in aggregates) {
+            var agg = aggregates[k];
+            if (agg.total > 0) {
+                // Cap to what's actually in the terminal (can't reserve more than exists)
+                var room = Game.rooms[agg.roomName];
+                var terminal = room && room.terminal ? room.terminal : null;
+                var inTerminal = (terminal && terminal.store && terminal.store[agg.resource])
+                    ? terminal.store[agg.resource] : 0;
+                var reserveAmount = Math.min(agg.total, inTerminal);
+
+                if (reserveAmount > 0) {
+                    var result = storageManager.reserve(agg.roomName, agg.resource, 'terminal', 'marketSell', reserveAmount);
+                    if (!result.ok) {
+                        // If reserve failed (e.g. other reservations took priority), log but don't block
+                        if (Game.time % 100 === 0) {
+                            console.log('[MarketSell] Reserve warning for ' + agg.resource + ' in ' + agg.roomName + ': ' + result.reason);
+                        }
+                    }
+                }
+                activeKeys[k] = true;
+            }
+        }
+
+        // Unreserve any room+resource combos that are no longer active
+        this._unreserveInactive(activeKeys);
+    },
+
+    // Check if a request's toTerminal transfer is complete (or wasn't needed)
+    _isTransferReady: function(req) {
+        // No transfer was needed — ready immediately
+        if (!req.needsTransfer && !req.tmOpId) return true;
+
+        // No op ID tracked — assume ready (conservative; avoids stuck state)
+        if (!req.tmOpId) return true;
+
+        // Check the toTerminal operation status
+        var ops = (Memory.terminalManager && Array.isArray(Memory.terminalManager.operations))
+            ? Memory.terminalManager.operations : [];
+
+        for (var j = 0; j < ops.length; j++) {
+            var op = ops[j];
+            if (!op) continue;
+            if (op.id === req.tmOpId) {
+                // Transfer is done
+                if (op.status === 'completed') return true;
+                // Transfer failed — still allow reservation of whatever made it
+                if (op.status === 'failed') return true;
+                // Still in progress
+                return false;
+            }
+        }
+
+        // Op not found in memory — likely already cleaned up, treat as complete
+        return true;
+    },
+
+    // Remove marketSell reservations for combos not in activeKeys
+    _unreserveInactive: function(activeKeys) {
+        if (!Memory.storageReservations) return;
+
+        var r = Memory.storageReservations;
+        for (var roomName in r) {
+            if (!r[roomName] || !r[roomName]['terminal']) continue;
+            var termRes = r[roomName]['terminal'];
+
+            for (var material in termRes) {
+                var reservations = termRes[material];
+                if (!Array.isArray(reservations)) continue;
+
+                for (var i = 0; i < reservations.length; i++) {
+                    if (reservations[i].program === 'marketSell') {
+                        var key = roomName + ':' + material;
+                        if (!activeKeys[key]) {
+                            storageManager.unReserve(roomName, material, 'terminal', 'marketSell');
+                        }
+                        break; // only one entry per program
+                    }
+                }
+            }
+        }
+    },
+
+    // Remove all marketSell reservations (used when no requests remain)
+    _unreserveAll: function() {
+        this._unreserveInactive({});
     },
 
     // Convenience helpers for console
     status: function() {
         this.ensureMemory();
-
-        // Sync with live orders first
         this.cleanup();
 
         var list = Memory.marketSell.requests;
@@ -389,6 +622,9 @@ var marketSeller = {
                 liveInfo = ' | [Order not found/sold]';
             }
 
+            // Reservation status
+            var rsvInfo = r.reserved ? ' | RESERVED' : ' | rsv:pending';
+
             console.log(
                 '  ' + r.id +
                 ' | room: ' + r.roomName +
@@ -397,6 +633,7 @@ var marketSeller = {
                 ' | created: ' + (r.created || '-') +
                 (r.orderId ? (' | orderId: ' + r.orderId) : '') +
                 liveInfo +
+                rsvInfo +
                 progress
             );
         }
@@ -409,10 +646,18 @@ var marketSeller = {
         for (var i = list.length - 1; i >= 0; i--) {
             var r = list[i];
             if (r && r.id === id) {
+                // Cancel the toTerminal op if linked
                 if (r.tmOpId && terminalManager && typeof terminalManager.cancelOperation === 'function') {
                     terminalManager.cancelOperation(r.tmOpId);
                 }
+                // Release reservation if placed
+                if (r.reserved) {
+                    // Don't unReserve directly — syncReservations will handle it
+                    // since we're removing the request
+                }
                 list.splice(i, 1);
+                // Trigger a reservation sync to clean up
+                this.syncReservations();
                 return '[MarketSell] Cancelled associated local move and removed request: ' + id;
             }
         }
@@ -424,7 +669,6 @@ var marketSeller = {
     cleanup: function() {
         this.ensureMemory();
 
-        // Clear empty SELL orders from the market (frees order slots)
         this.cancelZeroRemainingSellOrders();
 
         var list = Memory.marketSell.requests;
@@ -435,7 +679,7 @@ var marketSeller = {
         for (var i = 0; i < list.length; i++) {
             var req = list[i];
 
-            // 1. Always keep requests created THIS tick to prevent race conditions during creation
+            // 1. Always keep requests created THIS tick
             if (req.created === Game.time) {
                 keep.push(req);
                 continue;
@@ -443,17 +687,14 @@ var marketSeller = {
 
             // 2. Ensure we have an orderId
             if (!req.orderId) {
-                // Try to find it one last time
                 var foundId = this.findOrderId(req.roomName, req.resourceType, req.amount, req.price, req.created);
                 if (foundId) {
                     req.orderId = foundId;
                 } else {
-                    // If not found and it's older than 10 ticks, it likely failed or sold instantly/vanished.
                     if ((Game.time - (req.created || 0)) > 10) {
                         removed++;
                         continue;
                     }
-                    // Grace period for very recent requests that might be lagging
                     keep.push(req);
                     continue;
                 }
@@ -463,13 +704,11 @@ var marketSeller = {
             var order = myOrders[req.orderId];
 
             if (!order) {
-                // Order is completely gone (cancelled or fully sold and wiped from market)
                 removed++;
                 continue;
             }
 
             if (order.remainingAmount <= 0) {
-                // Order exists but is fully sold (remaining is 0)
                 removed++;
                 continue;
             }
@@ -479,6 +718,12 @@ var marketSeller = {
         }
 
         Memory.marketSell.requests = keep;
+
+        // If we removed anything, sync reservations to release freed stock
+        if (removed > 0) {
+            this.syncReservations();
+        }
+
         return '[MarketSell] Sync: Pruned ' + removed + ' completed/invalid requests. Active: ' + keep.length;
     }
 };

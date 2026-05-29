@@ -3,8 +3,11 @@
 // Start profiling for 100 ticks
 //Game.profiler.profile(100);
 
-// View results
+// View results (tree view, default)
 //Game.profiler.output();
+
+// View flat results (old style)
+//Game.profiler.flat();
 
 // Profile specific functions only
 //Game.profiler.profile(100, ['runCreeps', 'runTowers']);
@@ -16,7 +19,8 @@
 let usedOnStart = 0;
 let enabled = false;
 let depth = 0;
-let parentFn = '(tick)';
+
+const parentStack = ['(tick)'];
 
 class ProfilerError extends Error {}
 
@@ -30,7 +34,8 @@ try {
 
 function setupProfiler() {
   depth = 0; // reset depth, this needs to be done each tick.
-  parentFn = '(tick)';
+  parentStack.length = 0;
+  parentStack.push('(tick)');
   Game.profiler = {
     stream(duration, filter) {
       setupMemory('stream', duration || 10, filter);
@@ -62,6 +67,7 @@ function setupProfiler() {
     },
     reset: resetMemory,
     output: Profiler.output,
+    flat: Profiler.flat,
     downloadCallgrind: Profiler.downloadCallgrind,
   };
 
@@ -109,8 +115,6 @@ const functionBlackList = [
 const commonProperties = ['length', 'name', 'arguments', 'caller', 'prototype'];
 
 function wrapFunction(name, originalFunction) {
-  // wrappedFunction.__profiler = Profiler;
-
   if (originalFunction.__profiler) {
     // eslint-disable-next-line no-param-reassign
     originalFunction.__profiler = Profiler;
@@ -125,8 +129,13 @@ function wrapFunction(name, originalFunction) {
       if (nameMatchesFilter) {
         depth++;
       }
-      const curParent = parentFn;
-      parentFn = name;
+
+      // FIX: Push onto the stack so any profiled function called from within
+      // an un-profiled intermediary still sees the correct nearest profiled
+      // ancestor as its parent, rather than a stale ancestor left over from
+      // a previous call frame.
+      parentStack.push(name);
+
       let result;
       if (this && this.constructor === wrappedFunction) {
         // eslint-disable-next-line new-cap
@@ -134,10 +143,16 @@ function wrapFunction(name, originalFunction) {
       } else {
         result = originalFunction.apply(this, arguments);
       }
-      parentFn = curParent;
+
+      // Pop before recording — the parent is now the item below us on the stack,
+      // and the grandparent is one further down.
+      parentStack.pop();
+      const currentParent = parentStack[parentStack.length - 1];
+      const currentGrandparent = parentStack.length >= 2 ? parentStack[parentStack.length - 2] : null;
+
       if (depth > 0 || !getFilter()) {
         const end = Game.cpu.getUsed();
-        profiler.record(name, end - start, parentFn);
+        profiler.record(name, end - start, currentParent, currentGrandparent);
       }
       if (nameMatchesFilter) {
         depth--;
@@ -245,19 +260,38 @@ function profileFunction(fn, functionName) {
 }
 
 const Profiler = {
+  // Split a string into chunks that each fit within maxChars, breaking only
+  // on newline boundaries so individual lines are never truncated.
+  notifyChunked(text, maxChars = 400) {
+    const lines = text.split('\n');
+    let chunk = '';
+    for (const line of lines) {
+      // +1 for the newline we'd add when joining
+      if (chunk.length && chunk.length + 1 + line.length > maxChars) {
+        Game.notify(chunk);
+        chunk = line;
+      } else {
+        chunk = chunk.length ? chunk + '\n' + line : line;
+      }
+    }
+    if (chunk.length) {
+      Game.notify(chunk);
+    }
+  },
+
   printProfile() {
     console.log(Profiler.output());
 
     // Only perform these actions if the profiling session has reached its end tick.
     // This prevents memory from being cleared prematurely if you are using stream().
     if (Memory.profiler.disableTick === Game.time) {
-      Game.notify(Profiler.output(1000));
+      Profiler.notifyChunked(Profiler.output(Infinity));
       resetMemory();
     }
   },
 
   emailProfile() {
-    Game.notify(Profiler.output(1000));
+    Profiler.notifyChunked(Profiler.output(Infinity));
   },
 
   downloadCallgrind() {
@@ -327,7 +361,7 @@ const Profiler = {
     return body;
   },
 
-  output(passedOutputLengthLimit) {
+  flat(passedOutputLengthLimit) {
     const outputLengthLimit = passedOutputLengthLimit || 1000;
     if (!Memory.profiler || !Memory.profiler.enabledTick) {
       return 'Profiler not active.';
@@ -336,7 +370,7 @@ const Profiler = {
     const endTick = Math.min(Memory.profiler.disableTick || Game.time, Game.time);
     const startTick = Memory.profiler.enabledTick;
     const elapsedTicks = endTick - startTick + 1;
-    const header = 'calls\t\ttime\t\tavg\t\tfunction';
+    const header = 'calls\t\tself\t\ttotal\t\tavg\t\tfunction';
     const footer = [
       `Avg: ${(Memory.profiler.totalTime / elapsedTicks).toFixed(2)}`,
       `Total: ${Memory.profiler.totalTime.toFixed(2)}`,
@@ -364,24 +398,160 @@ const Profiler = {
   lines() {
     const stats = Object.keys(Memory.profiler.map).map(functionName => {
       const functionCalls = Memory.profiler.map[functionName];
+      // Calculate time spent in child/sub calls
+      let childTime = 0;
+      if (functionCalls.subs) {
+        for (const subName of Object.keys(functionCalls.subs)) {
+          childTime += functionCalls.subs[subName].time;
+        }
+      }
+      const selfTime = functionCalls.time - childTime;
       return {
         name: functionName,
         calls: functionCalls.calls,
         totalTime: functionCalls.time,
+        selfTime: selfTime,
         averageTime: functionCalls.time / functionCalls.calls,
       };
     }).sort((val1, val2) => {
-      return val2.totalTime - val1.totalTime;
+      return val2.selfTime - val1.selfTime;
     });
 
     const lines = stats.map(data => {
       return [
         data.calls,
+        data.selfTime.toFixed(1),
         data.totalTime.toFixed(1),
         data.averageTime.toFixed(3),
         data.name,
       ].join('\t\t');
     });
+
+    return lines;
+  },
+
+  output(passedOutputLengthLimit, minTime) {
+    const outputLengthLimit = passedOutputLengthLimit || 4000;
+    const threshold = minTime || 1.0;
+    if (!Memory.profiler || !Memory.profiler.enabledTick) {
+      return 'Profiler not active.';
+    }
+
+    const endTick = Math.min(Memory.profiler.disableTick || Game.time, Game.time);
+    const startTick = Memory.profiler.enabledTick;
+    const elapsedTicks = endTick - startTick + 1;
+    const header = 'calls\t\tself\t\ttotal\t\tcpu/tick\tcpu/t/call\tfunction';
+    const footer = [
+      `Avg: ${(Memory.profiler.totalTime / elapsedTicks).toFixed(2)}`,
+      `Total: ${Memory.profiler.totalTime.toFixed(2)}`,
+      `Ticks: ${elapsedTicks}`,
+      `Tree threshold: ${threshold.toFixed(1)} CPU`,
+    ].join('\t');
+
+    const allLines = Profiler.treeLines(threshold, elapsedTicks);
+    const lines = [header];
+    let currentLength = header.length + 1 + footer.length;
+    let done = false;
+    while (!done && allLines.length) {
+      const line = allLines.shift();
+      if (currentLength + line.length + 1 < outputLengthLimit) {
+        lines.push(line);
+        currentLength += line.length + 1;
+      } else {
+        done = true;
+      }
+    }
+    lines.push(footer);
+    return lines.join('\n');
+  },
+
+  treeLines(threshold, elapsedTicks) {
+    const map = Memory.profiler.map;
+    const lines = [];
+    const tickSubs = map['(tick)'] && map['(tick)'].subs ? map['(tick)'].subs : {};
+
+    // Depth semantics:
+    //   depth 0 — top-level function (self + total from global map)
+    //   depth 1 — direct children, scoped via map[parent].subs[child]
+    //   depth 2 — grandchildren, scoped via map[grandparent].subs[parent].subs[child]
+    //             This is now fully path-scoped, so e.g. PowerCreep calls that
+    //             arrive through a different top-level function won't bleed into
+    //             an unrelated parent's subtree.
+    const maxDepth = 2;
+
+    // scopedSubs: when non-null, use this dict for the current node's children
+    // instead of the node's global subs. Passed down from depth 1 → depth 2.
+    const renderNode = (fnName, depth, scopedCalls, scopedTime, scopedSubs) => {
+      const fnData = map[fnName];
+      if (!fnData) return;
+
+      const displayCalls = (scopedCalls != null) ? scopedCalls : fnData.calls;
+      const displayTime = (scopedTime != null) ? scopedTime : fnData.time;
+
+      // Self time only shown for root-level rows (depth 0).
+      let selfStr = '';
+      if (depth === 0) {
+        let childTime = 0;
+        if (fnData.subs) {
+          for (const subName of Object.keys(fnData.subs)) {
+            childTime += fnData.subs[subName].time;
+          }
+        }
+        // Clamp self time to 0 so corrupted data doesn't show as negative.
+        selfStr = Math.max(0, fnData.time - childTime).toFixed(1);
+      }
+
+      const prefix = depth === 0 ? '' : '  '.repeat(depth - 1) + '└ ';
+
+      // For top-level rows, append cpu/tick and cpu/tick/call columns.
+      const cpuPerTick = (depth === 0 && elapsedTicks)
+        ? (displayTime / elapsedTicks).toFixed(2)
+        : '';
+      const cpuPerTickPerCall = (depth === 0 && elapsedTicks && displayCalls)
+        ? (displayTime / elapsedTicks / displayCalls).toFixed(4)
+        : '';
+
+      lines.push([
+        displayCalls,
+        selfStr,
+        displayTime.toFixed(1),
+        cpuPerTick,
+        cpuPerTickPerCall,
+        prefix + fnName,
+      ].join('\t\t'));
+
+      if (depth < maxDepth) {
+        // At depth 0→1: use the node's own global subs (already scoped to this
+        // parent because record() writes parent.subs[child]).
+        // At depth 1→2: use the 2-level scoped subs passed in from the parent,
+        // i.e. map[grandparent].subs[parent].subs — fully path-scoped.
+        const subsToUse = (scopedSubs != null) ? scopedSubs : fnData.subs;
+        if (!subsToUse) return;
+
+        const children = Object.keys(subsToUse).map(subName => ({
+          name: subName,
+          calls: subsToUse[subName].calls,
+          time: Math.min(subsToUse[subName].time, displayTime),
+          // Pass the 2-level subs down so depth-2 children are path-scoped.
+          subs: subsToUse[subName].subs || null,
+        })).sort((a, b) => b.time - a.time);
+
+        for (const child of children) {
+          if (child.time < Math.min(displayTime * 0.05, 0.5)) continue;
+          renderNode(child.name, depth + 1, child.calls, child.time, child.subs);
+        }
+      }
+    };
+
+    const topLevel = Object.keys(tickSubs).map(fnName => ({
+      name: fnName,
+      time: tickSubs[fnName].time,
+    })).sort((a, b) => b.time - a.time);
+
+    for (const entry of topLevel) {
+      if (entry.time < threshold) continue;
+      renderNode(entry.name, 0, null, null);
+    }
 
     return lines;
   },
@@ -443,7 +613,7 @@ const Profiler = {
     }
   },
 
-  record(functionName, time, parent) {
+  record(functionName, time, parent, grandparent) {
     this.checkMapItem(functionName);
     Memory.profiler.map[functionName].calls++;
     Memory.profiler.map[functionName].time += time;
@@ -452,6 +622,15 @@ const Profiler = {
       this.checkMapItem(functionName, Memory.profiler.map[parent].subs);
       Memory.profiler.map[parent].subs[functionName].calls++;
       Memory.profiler.map[parent].subs[functionName].time += time;
+      // Also record grandparent→parent→child so depth-2 rendering can use
+      // a fully scoped subs dict instead of the global one.
+      if (grandparent) {
+        this.checkMapItem(grandparent);
+        this.checkMapItem(parent, Memory.profiler.map[grandparent].subs);
+        this.checkMapItem(functionName, Memory.profiler.map[grandparent].subs[parent].subs);
+        Memory.profiler.map[grandparent].subs[parent].subs[functionName].calls++;
+        Memory.profiler.map[grandparent].subs[parent].subs[functionName].time += time;
+      }
     }
   },
 
@@ -538,6 +717,7 @@ module.exports = {
   },
 
   output: Profiler.output,
+  flat: Profiler.flat,
   callgrind: Profiler.callgrind,
 
   registerObject: profileObjectFunctions,

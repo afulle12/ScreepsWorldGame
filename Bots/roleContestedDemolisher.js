@@ -4,10 +4,26 @@
 //
 // USAGE (Console):
 // orderContestedDemolisher('E4N49', 'E4N51')
-// orderContestedDemolisher('E4N49', 'E4N51', true)  // towers only
+// orderContestedDemolisher('E4N49', 'E4N51', 'towers')    // towers only
+// orderContestedDemolisher('E4N49', 'E4N51', 'military')   // towers, nuker, power spawn, labs
+// orderContestedDemolisher('E4N49', 'E4N51', true)          // legacy: same as 'towers'
 // cancelContestedDemolisherOrder('E4N51')
 // getContestedDemolisherStatus()
 // resetContestedDemolisherOrder('E5N52')
+// testContestedDemolisher('E4N49', 'E4N51')
+// testContestedDemolisher('E4N49', 'E4N51', 'towers')
+// testContestedDemolisher('E4N49', 'E4N51', 'military')
+// testContestedDemolisherRoutes('PlayerName')
+// testContestedDemolisherRoutes('PlayerName', 'E4N49')
+// testContestedDemolisherRoutes('PlayerName', 'E4N49', 'towers')
+// testContestedDemolisherRoutesSetTargets(['W1N46', 'W2N43'])
+// testContestedDemolisherRoutesStatus()
+// testContestedDemolisherRoutesCancel()
+//
+// TARGET MODES:
+// - 'all'      (default) – all hostile structures except roads/containers/controllers
+// - 'towers'   – towers only
+// - 'military' – towers, nuker, power spawn, labs (in that priority order)
 //
 // IMPORTANT:
 // - Spawning is handled by spawnManager.js (manageContestedDemolisherSpawns).
@@ -27,6 +43,17 @@
 var OBSERVER_RANGE = 10;
 var MAX_CROSS_SECTOR_ROUTES = 16;
 var CROSS_SECTOR_PROGRESS_INTERVAL = 10;
+
+/**
+ * Military structure types in priority order.
+ * Towers first (highest threat), then nuker, power spawn, labs.
+ */
+var MILITARY_STRUCTURE_PRIORITY = [
+    STRUCTURE_TOWER,
+    STRUCTURE_NUKER,
+    STRUCTURE_POWER_SPAWN,
+    STRUCTURE_LAB
+];
 
 // ========== IFF INTEGRATION ==========
 
@@ -479,6 +506,43 @@ function analyzeRoomEdges(room) {
 }
 
 /**
+ * Analyze how much open ground exists between an edge and the nearest
+ * defensive structures (walls/ramparts). Higher = more room to manoeuvre.
+ * Returns { N: tiles, S: tiles, E: tiles, W: tiles }
+ */
+function analyzeApproachDepth(room) {
+    if (!room) return null;
+
+    var structures = room.find(FIND_STRUCTURES, {
+        filter: function(s) {
+            return s.structureType === STRUCTURE_WALL ||
+                   (s.structureType === STRUCTURE_RAMPART && !s.my && !s.isPublic);
+        }
+    });
+
+    if (structures.length === 0) {
+        return { N: 50, S: 50, E: 50, W: 50 };
+    }
+
+    // For each edge, find the minimum distance from that edge to any barrier
+    var minDist = { N: 50, S: 50, E: 50, W: 50 };
+
+    for (var i = 0; i < structures.length; i++) {
+        var pos = structures[i].pos;
+        // Distance from north edge (y=0)
+        if (pos.y < minDist.N) minDist.N = pos.y;
+        // Distance from south edge (y=49)
+        if ((49 - pos.y) < minDist.S) minDist.S = 49 - pos.y;
+        // Distance from west edge (x=0)
+        if (pos.x < minDist.W) minDist.W = pos.x;
+        // Distance from east edge (x=49)
+        if ((49 - pos.x) < minDist.E) minDist.E = 49 - pos.x;
+    }
+
+    return minDist;
+}
+
+/**
  * Get the opposite edge
  */
 function getOppositeEdge(edge) {
@@ -730,9 +794,10 @@ function calculateTotalPathLength(originRoom, highwayEntry, pathLengthFromHighwa
 }
 
 /**
- * Select the best route from valid cross-sector paths
+ * Select the best route from valid cross-sector paths.
+ * Factors in approach depth when target room edge data is available.
  */
-function selectBestCrossSectorRoute(originRoom, targetRoom, validPaths) {
+function selectBestCrossSectorRoute(originRoom, targetRoom, validPaths, approachDepth) {
     if (validPaths.length === 0) {
         return null;
     }
@@ -749,11 +814,33 @@ function selectBestCrossSectorRoute(originRoom, targetRoom, validPaths) {
         
         if (totalLength === Infinity) continue;
         
-        if (!best || totalLength < best.totalLength) {
+        // Determine which edge of the target room this path enters from.
+        // The first node in the BFS path is a neighbor of the target room;
+        // the direction from that neighbor INTO the target gives us the entry edge.
+        var firstNode = path[0];
+        var entryNeighbor = getPathNodeRoom(firstNode);
+        var entryEdge = getExitDirection(entryNeighbor, targetRoom);
+        // entryEdge is the direction from the neighbor TO the target, e.g. 'E' means
+        // we enter the target from the west side (the neighbor is west of target and
+        // goes east). The edge of the TARGET we enter is the OPPOSITE.
+        var targetEntryEdge = entryEdge ? getOppositeEdge(entryEdge) : null;
+        
+        // Apply approach depth bonus: reduce effective length for sides with more
+        // open ground. Each tile of depth is worth 0.5 rooms of savings (tunable).
+        var depthBonus = 0;
+        if (approachDepth && targetEntryEdge && approachDepth[targetEntryEdge] !== undefined) {
+            depthBonus = approachDepth[targetEntryEdge] * 0.5;
+        }
+        
+        var effectiveLength = totalLength - depthBonus;
+        
+        if (!best || effectiveLength < best.effectiveLength) {
             best = {
                 path: path,
                 highwayEntry: highwayEntry,
-                totalLength: totalLength
+                totalLength: totalLength,
+                effectiveLength: effectiveLength,
+                entryEdge: targetEntryEdge
             };
         }
     }
@@ -838,6 +925,117 @@ function invalidatePathsWithBlockedExit(op, roomName, blockedExits) {
     op.scanData.candidatePaths = stillValid;
 }
 
+// ========== ROUTE VALIDATION ==========
+
+/**
+ * Check if two rooms are directly adjacent (share an exit).
+ * Diagonal rooms (differ in both X and Y) are NOT adjacent.
+ */
+function areRoomsAdjacent(roomA, roomB) {
+    if (!roomA || !roomB) return false;
+    if (roomA === roomB) return true;
+    
+    var exits = Game.map.describeExits(roomA);
+    if (!exits) return false;
+    
+    for (var dir in exits) {
+        if (exits[dir] === roomB) return true;
+    }
+    return false;
+}
+
+/**
+ * Validate a route: every consecutive pair of rooms must be adjacent.
+ * Returns { valid: true } or { valid: false, breakIndex: i } where
+ * route[i] and route[i+1] are not adjacent.
+ */
+function validateRoute(route) {
+    if (!route || route.length < 2) return { valid: true };
+    
+    for (var i = 0; i < route.length - 1; i++) {
+        if (!areRoomsAdjacent(route[i], route[i + 1])) {
+            return { valid: false, breakIndex: i, from: route[i], to: route[i + 1] };
+        }
+    }
+    return { valid: true };
+}
+
+/**
+ * Repair a broken route by filling gaps between non-adjacent rooms.
+ * Uses findRoute to bridge each gap. Returns the repaired route, or null if
+ * any gap cannot be bridged.
+ */
+function repairRoute(route, targetRoom) {
+    if (!route || route.length < 2) return route;
+    
+    var repaired = [route[0]];
+    
+    for (var i = 0; i < route.length - 1; i++) {
+        var from = route[i];
+        var to = route[i + 1];
+        
+        if (areRoomsAdjacent(from, to)) {
+            repaired.push(to);
+        } else {
+            // Bridge the gap
+            console.log('[ContestedDemolisher] Repairing route gap: ' + from + ' -> ' + to);
+            var bridgeTarget = targetRoom;
+            var bridge = Game.map.findRoute(from, to, {
+                routeCallback: function(roomName) {
+                    return getRoomRouteCost(roomName, null, bridgeTarget);
+                }
+            });
+            
+            if (!bridge || bridge === ERR_NO_PATH || bridge.length === 0) {
+                console.log('[ContestedDemolisher] Cannot bridge gap ' + from + ' -> ' + to);
+                return null;
+            }
+            
+            for (var b = 0; b < bridge.length; b++) {
+                var bridgeRoom = bridge[b].room;
+                if (bridgeRoom !== from && repaired[repaired.length - 1] !== bridgeRoom) {
+                    repaired.push(bridgeRoom);
+                }
+            }
+        }
+    }
+    
+    return repaired;
+}
+
+/**
+ * Validate and repair an operation's route. Call after any route modification.
+ * Returns true if route is valid (or was repaired), false if unfixable.
+ */
+function ensureValidRoute(op) {
+    if (!op.route) return true;
+    
+    var check = validateRoute(op.route);
+    if (check.valid) return true;
+    
+    console.log('[ContestedDemolisher] Route broken at index ' + check.breakIndex +
+                ': ' + check.from + ' is not adjacent to ' + check.to);
+    
+    var fixed = repairRoute(op.route, op.targetRoom);
+    if (!fixed) {
+        console.log('[ContestedDemolisher] Route could not be repaired');
+        return false;
+    }
+    
+    // Validate the repaired route too
+    var recheck = validateRoute(fixed);
+    if (!recheck.valid) {
+        console.log('[ContestedDemolisher] Repaired route still broken at ' + 
+                    recheck.from + ' -> ' + recheck.to);
+        return false;
+    }
+    
+    console.log('[ContestedDemolisher] Route repaired: ' + fixed.join(' -> '));
+    op.route = fixed;
+    op.routeBack = fixed.slice().reverse();
+    return true;
+}
+
 // ========== MEMORY INITIALIZATION ==========
 
 function initMemory() {
@@ -863,86 +1061,224 @@ function initMemory() {
 // ---------------------------------------------------------------------------
 // GLOBAL CONSOLE COMMANDS
 // ---------------------------------------------------------------------------
-
-global.orderContestedDemolisher = function (spawnRoomName, targetRoomName, towersOnly) {
-    if (!spawnRoomName || !targetRoomName) {
-        console.log('Usage: orderContestedDemolisher("spawnRoom", "targetRoom", towersOnly?)');
-        console.log('  towersOnly: optional boolean, if true only targets towers');
+global.testContestedDemolisherRoutes = function(playerName, homeRoom, targetMode) {
+    if (!playerName) {
+        console.log('[TestCDRoutes] Usage: testContestedDemolisherRoutes("PlayerName", "homeRoom"?, "targetMode"?)');
         return;
     }
-    
+ 
     initMemory();
-    
+ 
+    var homeRooms = [];
+    if (homeRoom) {
+        homeRooms = [homeRoom];
+    } else {
+        for (var rn in Game.rooms) {
+            var rm = Game.rooms[rn];
+            if (rm.controller && rm.controller.my &&
+                rm.controller.level >= 7 &&
+                rm.find(FIND_MY_SPAWNS).length > 0) {
+                homeRooms.push(rn);
+            }
+        }
+    }
+ 
+    if (homeRooms.length === 0) {
+        console.log('[TestCDRoutes] No valid home rooms found');
+        return;
+    }
+ 
+    console.log('[TestCDRoutes] Home rooms: ' + homeRooms.join(', '));
+ 
+    Memory.testCDRoutes = {
+        playerName: playerName,
+        homeRooms: homeRooms,
+        targetMode: targetMode || 'all',
+        phase: 'scanning',
+        targetRooms: [],
+        testQueue: [],
+        results: [],
+        currentTest: null,
+        startTick: Game.time
+    };
+ 
+    console.log('[TestCDRoutes] Starting wideScan for ' + playerName + '...');
+    if (typeof global.wideScan === 'function') {
+        global.wideScan(playerName);
+    } else {
+        console.log('[TestCDRoutes] wideScan not available.');
+        console.log('[TestCDRoutes] Use testContestedDemolisherRoutesSetTargets(["W1N46", ...]) to set rooms manually.');
+    }
+};
+ 
+/**
+ * Manually set target rooms (skips wideScan step).
+ * Usage: testContestedDemolisherRoutesSetTargets(['W1N46', 'W2N43'])
+ */
+global.testContestedDemolisherRoutesSetTargets = function(rooms) {
+    if (!Memory.testCDRoutes) {
+        console.log('[TestCDRoutes] Run testContestedDemolisherRoutes("PlayerName") first.');
+        return;
+    }
+    Memory.testCDRoutes.targetRooms = rooms;
+    Memory.testCDRoutes.phase = 'testing';
+    buildCDTestQueue(Memory.testCDRoutes);
+    console.log('[TestCDRoutes] Set ' + rooms.length + ' target(s), ' +
+                Memory.testCDRoutes.testQueue.length + ' test(s) queued');
+};
+ 
+/**
+ * Print the current batch test progress.
+ * Usage: testContestedDemolisherRoutesStatus()
+ */
+global.testContestedDemolisherRoutesStatus = function() {
+    if (!Memory.testCDRoutes) {
+        console.log('[TestCDRoutes] No active batch test.');
+        return;
+    }
+    var s = Memory.testCDRoutes;
+    console.log('[TestCDRoutes] Player: ' + s.playerName + ' | Phase: ' + s.phase + ' | Mode: ' + (s.targetMode || 'all'));
+    console.log('[TestCDRoutes] Targets: ' + (s.targetRooms.join(', ') || '(none yet)'));
+    console.log('[TestCDRoutes] Done: ' + s.results.length + ' | Queued: ' + s.testQueue.length);
+    if (s.currentTest) {
+        console.log('[TestCDRoutes] Current: ' + s.currentTest.homeRoom + ' -> ' + s.currentTest.targetRoom +
+                    ' (started tick ' + s.currentTest.startTick + ')');
+    }
+    for (var i = 0; i < s.results.length; i++) {
+        var r = s.results[i];
+        var sym = r.status === 'success' ? '✓' : '✗';
+        var detail = r.status === 'success'
+            ? r.route.length + ' rooms' + (r.approachEdge ? ' approach:' + r.approachEdge : '')
+            : r.reason;
+        console.log('  ' + sym + ' ' + r.targetRoom + ': ' + detail);
+    }
+};
+ 
+/**
+ * Cancel an in-progress batch test.
+ * Usage: testContestedDemolisherRoutesCancel()
+ */
+global.testContestedDemolisherRoutesCancel = function() {
+    if (!Memory.testCDRoutes) {
+        console.log('[TestCDRoutes] Nothing to cancel.');
+        return;
+    }
+ 
+    // Clean up any in-flight dry-run order
+    if (Memory.testCDRoutes.currentTest) {
+        var ct = Memory.testCDRoutes.currentTest;
+        Memory.contestedDemolisherOrders = _.filter(Memory.contestedDemolisherOrders, function(o) {
+            return !(o && o.homeRoom === ct.homeRoom && o.targetRoom === ct.targetRoom);
+        });
+    }
+ 
+    delete Memory.testCDRoutes;
+    console.log('[TestCDRoutes] Cancelled.');
+};
+
+global.testContestedDemolisher = function(homeRoom, targetRoom, targetMode) {
+    console.log('[ContestedDemolisher] === DRY RUN === Planning ' + homeRoom + ' -> ' + targetRoom + ' (no spawning)');
+    global.orderContestedDemolisher(homeRoom, targetRoom, targetMode || 'all', { dryRun: true });
+};
+
+global.orderContestedDemolisher = function (spawnRoomName, targetRoomName, targetMode, options) {
+    if (!spawnRoomName || !targetRoomName) {
+        console.log('Usage: orderContestedDemolisher("spawnRoom", "targetRoom", targetMode?)');
+        console.log('  targetMode: "all" (default), "towers", "military", or true (legacy = towers)');
+        console.log('  military targets: towers, nuker, power spawn, labs (in priority order)');
+        return;
+    }
+ 
+    // Backward compatibility: true -> 'towers', false/undefined -> 'all'
+    if (targetMode === true) {
+        targetMode = 'towers';
+    } else if (!targetMode || targetMode === false) {
+        targetMode = 'all';
+    }
+ 
+    // Validate target mode
+    var validModes = ['all', 'towers', 'military'];
+    if (validModes.indexOf(targetMode) === -1) {
+        console.log('[ContestedDemolisher] Invalid targetMode "' + targetMode + '". Use: ' + validModes.join(', '));
+        return;
+    }
+ 
+    if (!options) options = {};
+ 
+    initMemory();
+ 
     // Validate home room
     var home = Game.rooms[spawnRoomName];
     if (!home) {
         console.log('[ContestedDemolisher] Cannot start: no vision of home room ' + spawnRoomName);
         return;
     }
-    
+ 
     if (!home.controller || !home.controller.my) {
         console.log('[ContestedDemolisher] Cannot start: ' + spawnRoomName + ' is not owned');
         return;
     }
-    
+ 
     var spawns = home.find(FIND_MY_SPAWNS);
     if (spawns.length === 0) {
         console.log('[ContestedDemolisher] Cannot start: ' + spawnRoomName + ' has no spawns');
         return;
     }
-    
+ 
     // Check for observer coverage
     var observerInfo = findObserverForRoom(targetRoomName);
     if (!observerInfo) {
         console.log('[ContestedDemolisher] Cannot start: no RCL 8 room with observer within ' + OBSERVER_RANGE + ' of ' + targetRoomName);
         return;
     }
-    
+ 
     // Check for existing order
     var exists = _.some(Memory.contestedDemolisherOrders, function (o) {
         return o && o.homeRoom === spawnRoomName && o.targetRoom === targetRoomName;
     });
-    
+ 
     if (exists) {
         console.log('[ContestedDemolisher] Order already exists for ' + spawnRoomName + ' -> ' + targetRoomName);
         return;
     }
-    
+ 
     // Check if same sector or cross-sector
     var sameSector = areInSameSector(spawnRoomName, targetRoomName);
     console.log('[ContestedDemolisher] Origin sector: ' + getSectorName(spawnRoomName) + ', Target sector: ' + getSectorName(targetRoomName));
     console.log('[ContestedDemolisher] Same sector: ' + sameSector);
-    
+ 
     if (sameSector) {
-        createSameSectorOrder(spawnRoomName, targetRoomName, towersOnly, observerInfo);
+        createSameSectorOrder(spawnRoomName, targetRoomName, targetMode, observerInfo, options);
     } else {
-        createCrossSectorOrder(spawnRoomName, targetRoomName, towersOnly, observerInfo);
+        createCrossSectorOrder(spawnRoomName, targetRoomName, targetMode, observerInfo, options);
     }
 };
 
-function createSameSectorOrder(spawnRoomName, targetRoomName, towersOnly, observerInfo) {
+function createSameSectorOrder(spawnRoomName, targetRoomName, targetMode, observerInfo, options) {
+    if (!options) options = {};
+ 
     var targetForRoute = targetRoomName;
     var routeResult = Game.map.findRoute(spawnRoomName, targetRoomName, {
         routeCallback: function(roomName) {
             return getRoomRouteCost(roomName, null, targetForRoute);
         }
     });
-    
+ 
     if (!routeResult || routeResult === ERR_NO_PATH || routeResult.length === 0) {
         console.log('[ContestedDemolisher] Cannot find direct route - falling back to cross-sector routing');
-        createCrossSectorOrder(spawnRoomName, targetRoomName, towersOnly, observerInfo);
+        createCrossSectorOrder(spawnRoomName, targetRoomName, targetMode, observerInfo, options);
         return;
     }
-    
+ 
     var route = [spawnRoomName];
     for (var i = 0; i < routeResult.length; i++) {
         if (routeResult[i] && routeResult[i].room) {
             route.push(routeResult[i].room);
         }
     }
-    
+ 
     var routeBack = route.slice().reverse();
-    
+ 
     var roomsToScan = [];
     for (var j = 1; j < route.length; j++) {
         var rn = route[j];
@@ -950,16 +1286,17 @@ function createSameSectorOrder(spawnRoomName, targetRoomName, towersOnly, observ
             roomsToScan.push(rn);
         }
     }
-    
+ 
     var squadId = 'cd-' + spawnRoomName + '-' + targetRoomName + '-' + Game.time;
-    
+ 
     Memory.contestedDemolisherOrders.push({
         homeRoom: spawnRoomName,
         targetRoom: targetRoomName,
         squadId: squadId,
-        towersOnly: !!towersOnly,
+        targetMode: targetMode,
         status: 'scanning',
         crossSector: false,
+        dryRun: !!options.dryRun,   // <-- NEW
         route: route,
         routeBack: routeBack,
         observerRoom: observerInfo.roomName,
@@ -970,66 +1307,75 @@ function createSameSectorOrder(spawnRoomName, targetRoomName, towersOnly, observ
             blockedRooms: []
         }
     });
-    
-    var modeStr = towersOnly ? ' (TOWERS ONLY)' : '';
-    console.log('[ContestedDemolisher] Created SAME-SECTOR order for ' + targetRoomName + modeStr);
+ 
+    var modeStr = targetMode !== 'all' ? ' (' + targetMode.toUpperCase() + ')' : '';
+    var dryStr  = options.dryRun ? ' [DRY RUN]' : '';
+    console.log('[ContestedDemolisher] Created SAME-SECTOR order for ' + targetRoomName + modeStr + dryStr);
     console.log('[ContestedDemolisher] Route: ' + route.join(' -> '));
     console.log('[ContestedDemolisher] Observer in: ' + observerInfo.roomName + ' (distance ' + observerInfo.distance + ')');
     console.log('[ContestedDemolisher] Rooms to scan: ' + roomsToScan.join(', '));
+ 
+    // Validate the route before proceeding
+    var newOrder = Memory.contestedDemolisherOrders[Memory.contestedDemolisherOrders.length - 1];
+    if (!ensureValidRoute(newOrder)) {
+        console.log('[ContestedDemolisher] Initial route invalid - falling back to cross-sector');
+        Memory.contestedDemolisherOrders.pop();
+        createCrossSectorOrder(spawnRoomName, targetRoomName, targetMode, observerInfo, options);
+    }
 }
 
-function createCrossSectorOrder(spawnRoomName, targetRoomName, towersOnly, observerInfo) {
-    // For cross-sector, we need to find rooms adjacent to the target to start BFS from
-    // Run BFS from ALL neighbors to get comprehensive path options
+function createCrossSectorOrder(spawnRoomName, targetRoomName, targetMode, observerInfo, options) {
+    if (!options) options = {};
+ 
+    // For cross-sector, BFS from ALL neighbors of the target
     var neighbors = getRoomNeighbors(targetRoomName);
-    
+ 
     if (neighbors.length === 0) {
         console.log('[ContestedDemolisher] Cannot start: target room has no accessible neighbors');
         return;
     }
-    
+ 
     console.log('[ContestedDemolisher] Cross-sector: BFS from all ' + neighbors.length + ' neighbors of target');
-    
-    // BFS from ALL neighbors to find paths to highways
+ 
     var allCandidatePaths = [];
     var pathsPerNeighbor = Math.ceil(MAX_CROSS_SECTOR_ROUTES / neighbors.length);
-    
+ 
     for (var n = 0; n < neighbors.length; n++) {
         var neighborRoom = neighbors[n].room;
         var pathsFromNeighbor = bfsFindHighwayPaths(neighborRoom, targetRoomName, pathsPerNeighbor);
-        
+ 
         console.log('[ContestedDemolisher]   ' + neighborRoom + ': found ' + pathsFromNeighbor.length + ' paths');
-        
+ 
         for (var p = 0; p < pathsFromNeighbor.length; p++) {
             allCandidatePaths.push(pathsFromNeighbor[p]);
         }
     }
-    
+ 
     var candidatePaths = allCandidatePaths;
-    
+ 
     if (candidatePaths.length === 0) {
         console.log('[ContestedDemolisher] BFS found no paths to highways from any neighbor');
         return;
     }
-    
+ 
     console.log('[ContestedDemolisher] Total candidate paths: ' + candidatePaths.length);
-    
-    // Deduplicate rooms to scan (include target room)
+ 
     var roomsToScan = deduplicateRooms(candidatePaths);
     if (roomsToScan.indexOf(targetRoomName) === -1) {
         roomsToScan.push(targetRoomName);
     }
-    
+ 
     var squadId = 'cd-' + spawnRoomName + '-' + targetRoomName + '-' + Game.time;
-    
+ 
     Memory.contestedDemolisherOrders.push({
         homeRoom: spawnRoomName,
         targetRoom: targetRoomName,
         squadId: squadId,
-        towersOnly: !!towersOnly,
+        targetMode: targetMode,
         status: 'scanning',
         crossSector: true,
-        route: null, // Will be determined after scanning
+        dryRun: !!options.dryRun,   // <-- NEW
+        route: null,
         routeBack: null,
         observerRoom: observerInfo.roomName,
         scanData: {
@@ -1040,12 +1386,14 @@ function createCrossSectorOrder(spawnRoomName, targetRoomName, towersOnly, obser
             candidatePaths: candidatePaths,
             validPaths: [],
             invalidatedPaths: [],
-            lastProgressTick: Game.time
+            lastProgressTick: Game.time,
+            targetApproachDepth: null
         }
     });
-    
-    var modeStr = towersOnly ? ' (TOWERS ONLY)' : '';
-    console.log('[ContestedDemolisher] Created CROSS-SECTOR order for ' + targetRoomName + modeStr);
+ 
+    var modeStr = targetMode !== 'all' ? ' (' + targetMode.toUpperCase() + ')' : '';
+    var dryStr  = options.dryRun ? ' [DRY RUN]' : '';
+    console.log('[ContestedDemolisher] Created CROSS-SECTOR order for ' + targetRoomName + modeStr + dryStr);
     console.log('[ContestedDemolisher] Candidate paths: ' + candidatePaths.length);
     console.log('[ContestedDemolisher] Total rooms to scan: ' + roomsToScan.length);
 }
@@ -1086,14 +1434,26 @@ global.getContestedDemolisherStatus = function() {
         var demolishers = _.filter(squadCreeps, function(c) { return c.memory.roleType === 'demolisher'; });
         var healers = _.filter(squadCreeps, function(c) { return c.memory.roleType === 'healer'; });
         
+        // Resolve effective target mode (backward compat with old towersOnly field)
+        var effectiveMode = op.targetMode || (op.towersOnly ? 'towers' : 'all');
+        
         console.log('');
         console.log('Order: ' + op.homeRoom + ' -> ' + op.targetRoom);
         console.log('  Squad ID: ' + op.squadId);
         console.log('  Status: ' + (op.status || 'unknown'));
         console.log('  Cross-Sector: ' + (op.crossSector ? 'YES' : 'NO'));
-        console.log('  Towers Only: ' + (op.towersOnly ? 'YES' : 'no'));
+        console.log('  Target Mode: ' + effectiveMode.toUpperCase());
         console.log('  Creeps: ' + demolishers.length + ' demolisher(s), ' + healers.length + ' healer(s)');
         console.log('  Route: ' + (op.route ? op.route.join(' -> ') : 'N/A'));
+        
+        // Approach info
+        if (op.approachEdge) {
+            console.log('  Approach Edge: ' + op.approachEdge);
+        }
+        if (op.scanData && op.scanData.targetApproachDepth) {
+            var d = op.scanData.targetApproachDepth;
+            console.log('  Approach Depth: N=' + d.N + ' S=' + d.S + ' E=' + d.E + ' W=' + d.W);
+        }
         
         // Timing info
         if (op.readyTick) {
@@ -1198,6 +1558,7 @@ global.resetContestedDemolisherOrder = function(targetRoomName) {
     
     order.status = 'scanning';
     order.failReason = null;
+    order.approachEdge = null;
     order.scanData = {
         roomsToScan: roomsToScan,
         scannedRooms: {},
@@ -1207,7 +1568,8 @@ global.resetContestedDemolisherOrder = function(targetRoomName) {
         candidatePaths: order.scanData ? order.scanData.candidatePaths : null,
         validPaths: [],
         invalidatedPaths: [],
-        lastProgressTick: Game.time
+        lastProgressTick: Game.time,
+        targetApproachDepth: null
     };
     
     console.log('[ContestedDemolisher] Reset order for ' + targetRoomName + ' - will rescan ' + roomsToScan.length + ' rooms');
@@ -1224,39 +1586,52 @@ global.resetContestedDemolisherOrder = function(targetRoomName) {
 function cleanupCompletedOperations() {
     var orders = Memory.contestedDemolisherOrders;
     if (!orders || orders.length === 0) return;
-    
+ 
+    // Guard: don't auto-clear the order the batch tester is currently watching.
+    var batchTestKey = null;
+    if (Memory.testCDRoutes && Memory.testCDRoutes.currentTest) {
+        var ct = Memory.testCDRoutes.currentTest;
+        batchTestKey = ct.homeRoom + '|' + ct.targetRoom;
+    }
+ 
     var toRemove = [];
-    
+ 
     for (var i = 0; i < orders.length; i++) {
         var op = orders[i];
         if (!op) {
             toRemove.push(i);
             continue;
         }
-        
-        // Only check active operations for completion
+ 
+        var opKey = op.homeRoom + '|' + op.targetRoom;
+ 
+        // Auto-remove completed dry-run orders (unless the batch tester is watching this one)
+        if (op.status === 'dryrun_complete' && opKey !== batchTestKey) {
+            toRemove.push(i);
+            continue;
+        }
+ 
+        // Only check active operations for natural completion
         if (op.status === 'active') {
             var squadCreeps = _.filter(Game.creeps, function(c) {
-                return c.memory.role === 'contestedDemolisher' && 
+                return c.memory.role === 'contestedDemolisher' &&
                        c.memory.squadId === op.squadId;
             });
-            
+ 
             if (squadCreeps.length === 0) {
-                // No creeps left - operation complete
                 console.log('[ContestedDemolisher] Operation ' + op.homeRoom + ' -> ' + op.targetRoom + ' COMPLETE (no creeps remaining)');
                 toRemove.push(i);
             }
         }
-        
-        // Also check for ready operations that have been waiting too long without spawning
+ 
+        // Ready ops that have been waiting too long without any creeps
         if (op.status === 'ready' && op.readyTick) {
-            // If ready for more than 3000 ticks without any creeps, assume abandoned
             if (Game.time - op.readyTick > 3000) {
                 var anyCreeps = _.some(Game.creeps, function(c) {
-                    return c.memory.role === 'contestedDemolisher' && 
+                    return c.memory.role === 'contestedDemolisher' &&
                            c.memory.squadId === op.squadId;
                 });
-                
+ 
                 if (!anyCreeps) {
                     console.log('[ContestedDemolisher] Operation ' + op.homeRoom + ' -> ' + op.targetRoom + ' EXPIRED (ready but never spawned)');
                     toRemove.push(i);
@@ -1264,8 +1639,8 @@ function cleanupCompletedOperations() {
             }
         }
     }
-    
-    // Remove completed operations (in reverse order to preserve indices)
+ 
+    // Remove in reverse order to preserve indices
     if (toRemove.length > 0) {
         for (var r = toRemove.length - 1; r >= 0; r--) {
             Memory.contestedDemolisherOrders.splice(toRemove[r], 1);
@@ -1435,14 +1810,47 @@ function processScanResult(op, roomName, room) {
     
     console.log('[ContestedDemolisher] Processing ' + roomName + ' (from: ' + prevRoom + ', to: ' + (nextRoom || 'TARGET') + ')');
     
-    // TARGET ROOM: Skip safety checks - the target is EXPECTED to be hostile!
+    // TARGET ROOM: Analyse edges for approach-direction preference but don't
+    // block the route — the target IS expected to be hostile.
     if (isTarget) {
+        var targetEdges = analyzeRoomEdges(room);
+        var targetDepth = analyzeApproachDepth(room);
+
         scanData.routePassability[roomName] = true;
         scanData.scannedRooms[roomName] = {
             tick: Game.time,
             passable: true,
-            reason: 'target_room_hostile_allowed'
+            reason: 'target_room_hostile_allowed',
+            edges: targetEdges,
+            approachDepth: targetDepth
         };
+        scanData.targetApproachDepth = targetDepth;
+
+        if (targetEdges) {
+            var bestEdge = null;
+            var bestScore = -1;
+            var dirs = ['N', 'S', 'E', 'W'];
+            for (var d = 0; d < dirs.length; d++) {
+                var dir = dirs[d];
+                var walkable = targetEdges[dir].totalWalkable;
+                var depth = targetDepth ? targetDepth[dir] : 0;
+                // Combined score: walkable tiles on the edge + approach depth
+                var score = walkable + depth * 2;
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestEdge = dir;
+                }
+            }
+            console.log('[ContestedDemolisher] Target room approach analysis:');
+            for (var d2 = 0; d2 < dirs.length; d2++) {
+                var dd = dirs[d2];
+                console.log('[ContestedDemolisher]   ' + dd + ': ' + targetEdges[dd].totalWalkable +
+                            ' walkable tiles, depth ' + (targetDepth ? targetDepth[dd] : '?'));
+            }
+            console.log('[ContestedDemolisher] Best approach: ' + bestEdge + ' (score ' + bestScore + ')');
+            op.preferredApproachEdge = bestEdge;
+        }
+
         console.log('[ContestedDemolisher] Target room ' + roomName + ' - OK (hostile allowed)');
         return;
     }
@@ -1557,6 +1965,12 @@ function processScanResult(op, roomName, room) {
         op.route = newFullRoute;
         op.routeBack = newFullRoute.slice().reverse();
         
+        // Validate the rerouted path
+        if (!ensureValidRoute(op)) {
+            console.log('[ContestedDemolisher] Rerouted path invalid - trying next exit');
+            continue;
+        }
+        
         // Update rooms to scan
         var newRoomsToScan = [];
         for (var s = 1; s < newFullRoute.length; s++) {
@@ -1628,9 +2042,44 @@ function processCrossSectorScanResult(op, roomName, room) {
         blockedExits: blockedExits
     };
     
-    // Target room is always allowed (it's hostile, that's the point!)
+    // Target room: always allowed (it's hostile, that's the point!)
+    // Also analyse approach depth for route selection.
     if (isTarget) {
+        var targetDepth = analyzeApproachDepth(room);
+        scanData.scannedRooms[roomName].approachDepth = targetDepth;
+        scanData.targetApproachDepth = targetDepth;
         scanData.routePassability[roomName] = true;
+
+        if (edgeData) {
+            var bestEdge = null;
+            var bestScore = -1;
+            var dirs = ['N', 'S', 'E', 'W'];
+            for (var d = 0; d < dirs.length; d++) {
+                var dir = dirs[d];
+                // Skip edges with zero walkable tiles
+                if (edgeData[dir].totalWalkable === 0) continue;
+                var walkable = edgeData[dir].totalWalkable;
+                var depth = targetDepth ? targetDepth[dir] : 0;
+                var score = walkable + depth * 2;
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestEdge = dir;
+                }
+            }
+            if (bestEdge) {
+                op.preferredApproachEdge = bestEdge;
+                console.log('[ContestedDemolisher] Target ' + roomName + ' preferred approach: ' + bestEdge +
+                            ' (score ' + bestScore + ')');
+            }
+
+            // Invalidate paths that enter from edges with ZERO walkable tiles
+            for (var be = 0; be < blockedExits.length; be++) {
+                // blockedExits are edges of the target room that are fully walled.
+                // Paths entering from this edge should be eliminated.
+                invalidatePathsEnteringTargetFromEdge(op, blockedExits[be]);
+            }
+        }
+
         console.log('[ContestedDemolisher] Target room ' + roomName + ' - OK (hostile allowed)');
         return;
     }
@@ -1649,6 +2098,51 @@ function processCrossSectorScanResult(op, roomName, room) {
     }
     
     scanData.routePassability[roomName] = true;
+}
+
+/**
+ * Invalidate cross-sector paths that would enter the target room from a
+ * fully-walled edge. The BFS paths are stored "outward" from the target's
+ * neighbor, so the first node is the neighbor and its entryDir tells us
+ * which edge of the TARGET the pair would cross.
+ */
+function invalidatePathsEnteringTargetFromEdge(op, blockedEdge) {
+    if (!op.scanData.candidatePaths) return;
+
+    // If a neighbor enters the target heading 'E', the pair lands on the
+    // target's WEST edge. So the TARGET edge is the opposite of the first
+    // node's exit direction toward the target.  But in our BFS data the
+    // first node's entryDir is actually the direction it was entered FROM
+    // (i.e. from the target side).  entryDir on the first node = the edge
+    // of the NEIGHBOR that faces the target = opposite of the target edge.
+    // So: if blockedEdge = 'E' (target's east edge is walled), we want to
+    // remove paths where the first node's entryDir = 'W' (neighbor entered
+    // from its west side, which faces target's east side).
+    var neighborEntry = getOppositeEdge(blockedEdge);
+    if (!neighborEntry) return;
+
+    var stillValid = [];
+    var invalidatedCount = 0;
+
+    for (var i = 0; i < op.scanData.candidatePaths.length; i++) {
+        var path = op.scanData.candidatePaths[i];
+        var firstNode = path[0];
+
+        if (typeof firstNode === 'object' && firstNode.entryDir === neighborEntry) {
+            if (!op.scanData.invalidatedPaths) op.scanData.invalidatedPaths = [];
+            op.scanData.invalidatedPaths.push(path);
+            invalidatedCount++;
+        } else {
+            stillValid.push(path);
+        }
+    }
+
+    if (invalidatedCount > 0) {
+        console.log('[ContestedDemolisher] Invalidated ' + invalidatedCount +
+                    ' paths entering target from blocked ' + blockedEdge + ' edge');
+    }
+
+    op.scanData.candidatePaths = stillValid;
 }
 
 function convertToCrossSector(op) {
@@ -1728,6 +2222,7 @@ function convertToCrossSector(op) {
     op.scanData.invalidatedPaths = [];
     op.scanData.roomsToScan = newRoomsToScan;
     op.scanData.lastProgressTick = Game.time;
+    if (!op.scanData.targetApproachDepth) op.scanData.targetApproachDepth = null;
     
     // Invalidate paths containing blocked rooms
     if (op.scanData.blockedRooms) {
@@ -1742,55 +2237,133 @@ function convertToCrossSector(op) {
 
 function finalizeOperation(op) {
     var scanData = op.scanData;
-    
+ 
     console.log('[ContestedDemolisher] Finalizing ' + op.homeRoom + ' -> ' + op.targetRoom);
-    
+ 
     // Check for blocked rooms in route
     for (var i = 1; i < op.route.length; i++) {
         var rn = op.route[i];
         if (rn === op.targetRoom) continue;
-        
+ 
         if (scanData.routePassability[rn] === false) {
             console.log('[ContestedDemolisher] Route blocked at ' + rn + ' - trying cross-sector');
             convertToCrossSector(op);
             return;
         }
     }
-    
+ 
+    // Check if current route enters from a poor approach edge and a better
+    // one is available (same-sector only, before marking ready).
+    if (op.preferredApproachEdge && op.route && op.route.length >= 2) {
+        var penultimateRoom = op.route[op.route.length - 2];
+        var currentEntryDir = getExitDirection(penultimateRoom, op.targetRoom);
+        // currentEntryDir is the direction the penultimate room exits toward
+        // the target, so the target edge is the opposite.
+        var currentTargetEdge = currentEntryDir ? getOppositeEdge(currentEntryDir) : null;
+ 
+        if (currentTargetEdge && currentTargetEdge !== op.preferredApproachEdge) {
+            console.log('[ContestedDemolisher] Current approach (' + currentTargetEdge + ') differs from preferred (' +
+                        op.preferredApproachEdge + ') - attempting reroute');
+ 
+            // Try to find a route that enters from the preferred side
+            var preferredNeighborDir = getOppositeEdge(op.preferredApproachEdge);
+            var preferredNeighbor = getAdjacentRoom(op.targetRoom, preferredNeighborDir);
+ 
+            if (preferredNeighbor) {
+                var targetForReroute = op.targetRoom;
+                var altRoute = Game.map.findRoute(op.homeRoom, preferredNeighbor, {
+                    routeCallback: function(roomName) {
+                        return getRoomRouteCost(roomName, null, targetForReroute);
+                    }
+                });
+ 
+                if (altRoute && altRoute !== ERR_NO_PATH && altRoute.length > 0) {
+                    var newRoute = [op.homeRoom];
+                    for (var ar = 0; ar < altRoute.length; ar++) {
+                        newRoute.push(altRoute[ar].room);
+                    }
+                    if (newRoute.indexOf(op.targetRoom) === -1) {
+                        newRoute.push(op.targetRoom);
+                    }
+ 
+                    // Only use if not significantly longer (within 3 rooms)
+                    if (newRoute.length <= op.route.length + 3) {
+                        op.route = newRoute;
+                        op.routeBack = newRoute.slice().reverse();
+ 
+                        if (ensureValidRoute(op)) {
+                            console.log('[ContestedDemolisher] Rerouted for preferred approach: ' + op.route.join(' -> '));
+                            op.approachEdge = op.preferredApproachEdge;
+                        } else {
+                            console.log('[ContestedDemolisher] Preferred approach route invalid, keeping original');
+                        }
+                    } else {
+                        console.log('[ContestedDemolisher] Preferred route too long (' + newRoute.length + ' vs ' + op.route.length + '), keeping original');
+                    }
+                }
+            }
+        } else {
+            op.approachEdge = currentTargetEdge;
+        }
+    }
+ 
+    // Final route validation
+    if (!ensureValidRoute(op)) {
+        console.log('[ContestedDemolisher] Final route invalid - trying cross-sector');
+        op.status = 'scanning';
+        convertToCrossSector(op);
+        return;
+    }
+ 
+    // ── DRY RUN branch ──────────────────────────────────────────────────────
+    if (op.dryRun) {
+        op.status = 'dryrun_complete';
+        op.readyTick = Game.time;
+        console.log('[ContestedDemolisher] ✓ DRY RUN ' + op.homeRoom + ' -> ' + op.targetRoom + ' COMPLETE');
+        console.log('[ContestedDemolisher] Final route: ' + op.route.join(' -> '));
+        if (op.approachEdge) {
+            console.log('[ContestedDemolisher] Approach edge: ' + op.approachEdge);
+        }
+        return;
+    }
+ 
     op.status = 'ready';
     op.readyTick = Game.time;
     console.log('[ContestedDemolisher] ✓ Operation ' + op.homeRoom + ' -> ' + op.targetRoom + ' is READY');
     console.log('[ContestedDemolisher] Final route: ' + op.route.join(' -> '));
+    if (op.approachEdge) {
+        console.log('[ContestedDemolisher] Approach edge: ' + op.approachEdge);
+    }
 }
 
 function finalizeCrossSectorOperation(op) {
     var scanData = op.scanData;
-    
+ 
     console.log('[ContestedDemolisher] Finalizing cross-sector ' + op.homeRoom + ' -> ' + op.targetRoom);
-    
+ 
     // Determine which paths are still valid
     var validPaths = [];
-    
+ 
     for (var i = 0; i < scanData.candidatePaths.length; i++) {
         var path = scanData.candidatePaths[i];
         var pathValid = true;
-        
+ 
         for (var j = 0; j < path.length; j++) {
             var node = path[j];
             var roomName = getPathNodeRoom(node);
             var roomInfo = scanData.scannedRooms[roomName];
-            
+ 
             if (!roomInfo) {
                 console.log('[ContestedDemolisher] WARNING: Room ' + roomName + ' in path was not scanned');
                 pathValid = false;
                 break;
             }
-            
+ 
             if (roomInfo.safe === false) {
                 pathValid = false;
                 break;
             }
-            
+ 
             // Check if required exits are blocked
             if (typeof node === 'object' && roomInfo.blockedExits) {
                 if (node.entryDir && roomInfo.blockedExits.indexOf(node.entryDir) !== -1) {
@@ -1803,80 +2376,103 @@ function finalizeCrossSectorOperation(op) {
                 }
             }
         }
-        
+ 
         if (pathValid) {
             validPaths.push(path);
         }
     }
-    
+ 
     scanData.validPaths = validPaths;
-    
+ 
     console.log('[ContestedDemolisher] Valid paths after scanning: ' + validPaths.length);
-    
+ 
     if (validPaths.length === 0) {
         console.log('[ContestedDemolisher] FAILED: No valid paths found');
         op.status = 'failed';
         op.failReason = 'all_paths_blocked';
         return;
     }
-    
-    // Select best route
-    var bestRoute = selectBestCrossSectorRoute(op.homeRoom, op.targetRoom, validPaths);
-    
+ 
+    // Select best route (with approach depth awareness)
+    var bestRoute = selectBestCrossSectorRoute(op.homeRoom, op.targetRoom, validPaths, scanData.targetApproachDepth);
+ 
     if (!bestRoute) {
         console.log('[ContestedDemolisher] FAILED: Could not select best route');
         op.status = 'failed';
         op.failReason = 'no_valid_route';
         return;
     }
-    
-    console.log('[ContestedDemolisher] Selected route via highway ' + bestRoute.highwayEntry + ' (total length: ' + bestRoute.totalLength + ')');
-    
+ 
+    console.log('[ContestedDemolisher] Selected route via highway ' + bestRoute.highwayEntry +
+                ' (total length: ' + bestRoute.totalLength + ', effective: ' + bestRoute.effectiveLength.toFixed(1) + ')');
+    if (bestRoute.entryEdge) {
+        console.log('[ContestedDemolisher] Target entry edge: ' + bestRoute.entryEdge);
+        op.approachEdge = bestRoute.entryEdge;
+    }
+ 
     // Build full route: origin -> highway -> reverse(BFS path) -> target
     var routeToHighway = Game.map.findRoute(op.homeRoom, bestRoute.highwayEntry, {
         routeCallback: function(roomName) {
             return getRoomRouteCost(roomName, null, op.targetRoom);
         }
     });
-    
+ 
     if (!routeToHighway || routeToHighway === ERR_NO_PATH) {
         console.log('[ContestedDemolisher] FAILED: Cannot build route to highway ' + bestRoute.highwayEntry);
         op.status = 'failed';
         op.failReason = 'no_route_to_highway';
         return;
     }
-    
+ 
     // Build complete route
     var fullRoute = [op.homeRoom];
-    
-    // Add route to highway
+ 
     for (var r = 0; r < routeToHighway.length; r++) {
         fullRoute.push(routeToHighway[r].room);
     }
-    
-    // Add BFS path reversed (highway -> entry room)
+ 
+    // Add BFS path reversed (highway -> entry room adjacent to target)
     var bfsRooms = [];
     for (var b = 0; b < bestRoute.path.length; b++) {
         bfsRooms.push(getPathNodeRoom(bestRoute.path[b]));
     }
     bfsRooms.reverse();
-    
+ 
     for (var br = 1; br < bfsRooms.length; br++) {
         if (fullRoute.indexOf(bfsRooms[br]) === -1) {
             fullRoute.push(bfsRooms[br]);
         }
     }
-    
+ 
     // Add target room
     if (fullRoute.indexOf(op.targetRoom) === -1) {
         fullRoute.push(op.targetRoom);
     }
-    
+ 
     op.route = fullRoute;
     op.routeBack = fullRoute.slice().reverse();
-    
-    console.log('[ContestedDemolisher] Full route: ' + fullRoute.join(' -> '));
-    
+ 
+    // Validate the assembled route
+    if (!ensureValidRoute(op)) {
+        console.log('[ContestedDemolisher] FAILED: Assembled cross-sector route is invalid');
+        op.status = 'failed';
+        op.failReason = 'invalid_route';
+        return;
+    }
+ 
+    console.log('[ContestedDemolisher] Full route: ' + op.route.join(' -> '));
+ 
+    // ── DRY RUN branch ──────────────────────────────────────────────────────
+    if (op.dryRun) {
+        op.status = 'dryrun_complete';
+        op.readyTick = Game.time;
+        console.log('[ContestedDemolisher] ✓ DRY RUN cross-sector ' + op.homeRoom + ' -> ' + op.targetRoom + ' COMPLETE');
+        if (op.approachEdge) {
+            console.log('[ContestedDemolisher] Approach edge: ' + op.approachEdge);
+        }
+        return;
+    }
+ 
     op.status = 'ready';
     op.readyTick = Game.time;
     console.log('[ContestedDemolisher] ✓ Cross-sector operation ' + op.homeRoom + ' -> ' + op.targetRoom + ' is READY');
@@ -1993,8 +2589,30 @@ function followRoomRoute(creep, forward) {
     
     var nextRoom = route[nextIdx];
     
-    // Find exit direction
+    // Safety check: if the next room isn't adjacent, try to find a later
+    // room in the route that IS adjacent and skip to it
     var exitDir = Game.map.findExit(currentRoom, nextRoom);
+    if (exitDir < 0) {
+        console.log('[ContestedDemolisher] WARNING: ' + creep.name + 
+                    ' route has non-adjacent hop ' + currentRoom + ' -> ' + nextRoom + ', seeking skip');
+        var skipped = false;
+        for (var sk = nextIdx + 1; sk < route.length; sk++) {
+            var tryExit = Game.map.findExit(currentRoom, route[sk]);
+            if (tryExit > 0) {
+                nextRoom = route[sk];
+                exitDir = tryExit;
+                console.log('[ContestedDemolisher] Skipping to ' + nextRoom + ' (index ' + sk + ')');
+                skipped = true;
+                break;
+            }
+        }
+        if (!skipped) {
+            // Can't find any reachable room on the route - navigate directly
+            var endRoom = forward ? creep.memory.targetRoom : creep.memory.homeRoom;
+            creep.moveTo(new RoomPosition(25, 25, endRoom), { reusePath: 10 });
+            return ERR_NO_PATH;
+        }
+    }
     if (exitDir < 0) return ERR_NO_PATH;
     
     var exits = creep.room.find(exitDir);
@@ -2111,6 +2729,12 @@ function ensureCrossState(demo, finalDestRoom) {
     };
 }
 
+/**
+ * Run crossing logic for the demolisher.
+ * FIX: When the demolisher has entered the TARGET room, skip the blind push
+ * phase entirely — the pair needs to start dismantling immediately instead of
+ * wasting ticks walking into walls/ramparts under tower fire.
+ */
 function runCrossingDemolisher(demo, healer, finalDestRoom) {
     var cross = demo.memory.cdCross;
     if (!cross) return false;
@@ -2118,6 +2742,7 @@ function runCrossingDemolisher(demo, healer, finalDestRoom) {
     if (demo.fatigue > 0) return true;
     if (healer && healer.fatigue > 0) return true;
     
+    // Still in the departure room — move to the edge and step across
     if (demo.room.name === cross.fromRoom) {
         if (!isEdgePos(demo.pos)) {
             var edgePos = getEdgeExitPosToRoom(demo, finalDestRoom);
@@ -2131,7 +2756,61 @@ function runCrossingDemolisher(demo, healer, finalDestRoom) {
         return true;
     }
     
+    // === We have crossed into a new room ===
+    
+    // If this is the TARGET room, we still need to clear the entry tile so
+    // the healer can cross behind us. Allow exactly 1 push tick. The push
+    // logic below handles blocked tiles gracefully (stops if the next tile
+    // has a wall/rampart/obstacle), so this is safe even if defences are
+    // right at the edge.
+    if (demo.room.name === demo.memory.targetRoom) {
+        if (cross.push > 1) cross.push = 1;
+    }
+    
+    // Push inward a few tiles so the healer has room to cross behind us,
+    // but stop early if the next tile is blocked.
     if (cross.push > 0) {
+        // Check whether the tile in the push direction is walkable
+        var dx = 0;
+        var dy = 0;
+        if (cross.dir === LEFT) dx = -1;
+        else if (cross.dir === RIGHT) dx = 1;
+        else if (cross.dir === TOP) dy = -1;
+        else if (cross.dir === BOTTOM) dy = 1;
+        
+        var nextX = demo.pos.x + dx;
+        var nextY = demo.pos.y + dy;
+        
+        // Bounds check (don't push off the other edge)
+        if (nextX < 1 || nextX > 48 || nextY < 1 || nextY > 48) {
+            delete demo.memory.cdCross;
+            return false;
+        }
+        
+        // Check for blocking structures on the next tile
+        var blocked = false;
+        var structs = demo.room.lookForAt(LOOK_STRUCTURES, nextX, nextY);
+        for (var si = 0; si < structs.length; si++) {
+            var s = structs[si];
+            if (s.structureType === STRUCTURE_WALL) { blocked = true; break; }
+            if (s.structureType === STRUCTURE_RAMPART && !s.my && !s.isPublic) { blocked = true; break; }
+            if (OBSTACLE_OBJECT_TYPES.indexOf(s.structureType) !== -1) { blocked = true; break; }
+        }
+        
+        // Also check terrain
+        if (!blocked) {
+            var terrain = demo.room.getTerrain();
+            if (terrain.get(nextX, nextY) === TERRAIN_MASK_WALL) {
+                blocked = true;
+            }
+        }
+        
+        if (blocked) {
+            // Stop pushing — we're next to an obstacle
+            delete demo.memory.cdCross;
+            return false;
+        }
+        
         demo.move(cross.dir);
         cross.push = cross.push - 1;
         demo.memory.cdState = 'moving';
@@ -2167,9 +2846,17 @@ function runCrossingHealer(healer, demo) {
 function runHealer(healer) {
     var demo = findPartner(healer, 'demolisher');
     if (!demo) {
-        if (healer.hits < healer.hitsMax) healer.heal(healer);
+        // Give a brief grace window in case the demolisher hasn't spawned yet
+        if (!healer.memory.partnerGraceTick) {
+            healer.memory.partnerGraceTick = Game.time;
+        }
+        if (Game.time - healer.memory.partnerGraceTick > 5) {
+            healer.suicide();
+        }
         return;
     }
+    delete healer.memory.partnerGraceTick;
+
     if (demo.spawning) {
         if (healer.hits < healer.hitsMax) healer.heal(healer);
         return;
@@ -2207,6 +2894,14 @@ function runHealer(healer) {
         return;
     }
     
+    // FIX: When in the target room, avoid standing on edge tiles to prevent
+    // accidental room-boundary oscillation.
+    if (healer.room.name === healer.memory.targetRoom && isEdgePos(healer.pos)) {
+        // Step inward toward the demolisher
+        healer.moveTo(demo, { range: 1, reusePath: 0 });
+        return;
+    }
+    
     if (healer.pos.getRangeTo(demo) > 1) {
         healer.moveTo(demo, { range: 1, reusePath: 3 });
     }
@@ -2216,20 +2911,46 @@ function runHealer(healer) {
 // DEMOLISHER (LEADER)
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolve the effective target mode for a creep, with backward compatibility.
+ * Checks creep memory first, then falls back to the order.
+ */
+function resolveTargetMode(creep) {
+    // New field takes priority
+    if (creep.memory.targetMode) return creep.memory.targetMode;
+    // Legacy boolean
+    if (creep.memory.towersOnly) return 'towers';
+    // Check the order
+    var order = _.find(Memory.contestedDemolisherOrders, function(o) {
+        return o && o.squadId === creep.memory.squadId;
+    });
+    if (order) {
+        if (order.targetMode) return order.targetMode;
+        if (order.towersOnly) return 'towers';
+    }
+    return 'all';
+}
+
 function runDemolisher(demo) {
     var healer = findPartner(demo, 'healer');
     
     demo.memory.cdState = 'waiting';
-    
-    if (!healer) return;
-    if (healer.spawning) return;
-    
+
+    // "alone" means the healer is not present in the target room with us —
+    // covers: healer dead, healer respawning in base, healer still en route.
+    var inTargetRoom = demo.room.name === demo.memory.targetRoom;
+    var healerHere   = healer && healer.room.name === demo.room.name;
+    var aloneInTargetRoom = inTargetRoom && !healerHere;
+
+    if (!healer && !aloneInTargetRoom) return;
+    if (healer && healer.spawning && !aloneInTargetRoom) return;
+
     // Mark operation as active once both creeps are ready
     if (!demo.memory.operationMarkedActive) {
         markOperationActive(demo.memory.squadId);
         demo.memory.operationMarkedActive = true;
     }
-    
+
     // Ensure route is cached on creep memory
     if (!demo.memory.route) {
         var order = _.find(Memory.contestedDemolisherOrders, function(o) {
@@ -2240,40 +2961,50 @@ function runDemolisher(demo) {
             demo.memory.routeBack = order.routeBack;
         }
     }
-    
+
     var targetRoom = demo.memory.targetRoom;
-    
+
     if (demo.memory.cdCross) {
         runCrossingDemolisher(demo, healer, targetRoom);
         return;
     }
-    
-    if (demo.room.name === healer.room.name) {
+
+    // Pair spacing — only enforce when healer is actually alongside us
+    if (healerHere) {
         if (demo.pos.getRangeTo(healer) > 1) return;
     }
-    
-    if (demo.fatigue > 0) return;
-    if (healer.fatigue > 0) return;
-    
+
+    // ── FATIGUE: movement is blocked, but we can still dismantle in place ──
+    var fatigued = demo.fatigue > 0 || (healer && healer.fatigue > 0);
+    if (fatigued) {
+        if (inTargetRoom) {
+            var targetMode = resolveTargetMode(demo);
+            var fatigueTarget = findHostileStructureTarget(demo, targetMode);
+            if (fatigueTarget && demo.pos.getRangeTo(fatigueTarget) <= 1) {
+                demo.memory.cdState = 'dismantling';
+                demo.dismantle(fatigueTarget);
+            }
+        }
+        return;
+    }
+
     // Not in target room - navigate using route
     if (demo.room.name !== targetRoom) {
-        // Check if we need the crossing mechanic (approaching room boundary)
         var route = demo.memory.route;
         if (route) {
             var currentIdx = route.indexOf(demo.room.name);
             var nextRoom = currentIdx >= 0 && currentIdx < route.length - 1 ? route[currentIdx + 1] : null;
-            
+
             if (nextRoom) {
                 var edgePos = getEdgeExitPosToRoom(demo, nextRoom);
-                
+
                 if (edgePos && demo.pos.getRangeTo(edgePos) <= 1) {
-                    // Near edge - use crossing mechanic for pair synchronization
                     if (!demo.pos.isEqualTo(edgePos)) {
                         demo.memory.cdState = 'moving';
                         demo.moveTo(edgePos, { range: 0, reusePath: 5 });
                         return;
                     }
-                    
+
                     ensureCrossState(demo, nextRoom);
                     if (demo.memory.cdCross) {
                         demo.memory.cdState = 'moving';
@@ -2283,24 +3014,172 @@ function runDemolisher(demo) {
                 }
             }
         }
-        
-        // Not near edge - use PathFinder-based route following
+
         demo.memory.cdState = 'moving';
         followRoomRoute(demo, true);
         return;
     }
-    
-    // In target room: dismantle
-    var towersOnly = demo.memory.towersOnly || false;
-    var target = findHostileStructureTarget(demo, towersOnly);
+
+    // =========================================================================
+    // IN TARGET ROOM: Find target and breach walls if needed
+    // =========================================================================
+
+    // Free entry tile so healer can follow (only when healer isn't here yet)
+    if (isEdgePos(demo.pos) && !healerHere) {
+        demo.memory.cdState = 'moving';
+
+        var terrain = demo.room.getTerrain();
+
+        var inwardDx = 0;
+        var inwardDy = 0;
+        if (demo.pos.y === 0)  inwardDy = 1;
+        else if (demo.pos.y === 49) inwardDy = -1;
+        else if (demo.pos.x === 0)  inwardDx = 1;
+        else if (demo.pos.x === 49) inwardDx = -1;
+
+        function isTileWalkable(x, y) {
+            if (x < 0 || x > 49 || y < 0 || y > 49) return false;
+            if (terrain.get(x, y) === TERRAIN_MASK_WALL) return false;
+            var structs = demo.room.lookForAt(LOOK_STRUCTURES, x, y);
+            for (var si = 0; si < structs.length; si++) {
+                var st = structs[si];
+                if (st.structureType === STRUCTURE_WALL) return false;
+                if (st.structureType === STRUCTURE_RAMPART && !st.my && !st.isPublic) return false;
+                if (OBSTACLE_OBJECT_TYPES.indexOf(st.structureType) !== -1) return false;
+            }
+            return true;
+        }
+
+        var inX = demo.pos.x + inwardDx;
+        var inY = demo.pos.y + inwardDy;
+        if (isTileWalkable(inX, inY)) {
+            demo.move(demo.pos.getDirectionTo(inX, inY));
+            return;
+        }
+
+        var lateralDirs = inwardDy !== 0
+            ? [{ dx: 1, dy: 0 }, { dx: -1, dy: 0 }]
+            : [{ dx: 0, dy: 1 }, { dx: 0, dy: -1 }];
+
+        for (var li = 0; li < lateralDirs.length; li++) {
+            var lx = demo.pos.x + lateralDirs[li].dx;
+            var ly = demo.pos.y + lateralDirs[li].dy;
+            if (lx < 0 || lx > 49 || ly < 0 || ly > 49) continue;
+            if ((lx === 0 || lx === 49) && (ly === 0 || ly === 49)) continue;
+            if (isTileWalkable(lx, ly)) {
+                demo.move(demo.pos.getDirectionTo(lx, ly));
+                return;
+            }
+        }
+
+        for (var di = 0; di < lateralDirs.length; di++) {
+            var diagX = demo.pos.x + inwardDx + lateralDirs[di].dx;
+            var diagY = demo.pos.y + inwardDy + lateralDirs[di].dy;
+            if (diagX < 0 || diagX > 49 || diagY < 0 || diagY > 49) continue;
+            if ((diagX === 0 || diagX === 49) && (diagY === 0 || diagY === 49)) continue;
+            if (isTileWalkable(diagX, diagY)) {
+                demo.move(demo.pos.getDirectionTo(diagX, diagY));
+                return;
+            }
+        }
+
+        demo.memory.cdState = 'waiting';
+        return;
+    }
+
+    var targetMode = resolveTargetMode(demo);
+    var target = findHostileStructureTarget(demo, targetMode);
     if (!target) return;
-    
+
     if (demo.pos.getRangeTo(target) > 1) {
         demo.memory.cdState = 'moving';
-        demo.moveTo(target, { reusePath: 3 });
+        moveToBreaching(demo, target);
     } else {
         demo.memory.cdState = 'dismantling';
         demo.dismantle(target);
+    }
+}
+// ---------------------------------------------------------------------------
+// BREACH-AWARE MOVEMENT
+// ---------------------------------------------------------------------------
+
+/**
+ * Move toward a target using breach-aware pathfinding.
+ * Treats walls/ramparts as very expensive (not impassable) so PathFinder
+ * produces a path that goes THROUGH them. The creep follows this path
+ * until it is adjacent to a wall/rampart, then stops (so it can dismantle).
+ */
+function moveToBreaching(creep, target) {
+    var creepId = creep.id;
+    var roomName = creep.room.name;
+    
+    var result = PathFinder.search(creep.pos, { pos: target.pos, range: 1 }, {
+        maxRooms: 1,
+        maxOps: 4000,
+        plainCost: 2,
+        swampCost: 10,
+        roomCallback: function(rn) {
+            if (rn !== roomName) return false;
+            
+            var room = Game.rooms[rn];
+            if (!room) return false;
+            
+            var costs = new PathFinder.CostMatrix();
+            
+            room.find(FIND_STRUCTURES).forEach(function(s) {
+                if (s.structureType === STRUCTURE_ROAD) {
+                    costs.set(s.pos.x, s.pos.y, 1);
+                } else if (s.structureType === STRUCTURE_WALL) {
+                    // Expensive but passable - PathFinder routes through them
+                    costs.set(s.pos.x, s.pos.y, 50);
+                } else if (s.structureType === STRUCTURE_RAMPART && !s.my && !s.isPublic) {
+                    costs.set(s.pos.x, s.pos.y, 50);
+                } else if (OBSTACLE_OBJECT_TYPES.indexOf(s.structureType) !== -1) {
+                    costs.set(s.pos.x, s.pos.y, 255);
+                }
+            });
+            
+            room.find(FIND_CREEPS).forEach(function(c) {
+                if (c.id !== creepId) {
+                    costs.set(c.pos.x, c.pos.y, 255);
+                }
+            });
+            
+            return costs;
+        }
+    });
+    
+    if (result.incomplete || result.path.length === 0) {
+        // Fallback: just moveTo normally
+        creep.moveTo(target, { reusePath: 3 });
+        return;
+    }
+    
+    // Walk the path but stop before stepping onto a wall/rampart tile
+    // (the creep needs to be ADJACENT to dismantle, not ON TOP of it)
+    var nextStep = result.path[0];
+    if (nextStep) {
+        // Check if the next step has a wall/rampart we need to dismantle first
+        var structsOnNext = creep.room.lookForAt(LOOK_STRUCTURES, nextStep.x, nextStep.y);
+        var hasBarrier = false;
+        for (var i = 0; i < structsOnNext.length; i++) {
+            var s = structsOnNext[i];
+            if (s.structureType === STRUCTURE_WALL || 
+                (s.structureType === STRUCTURE_RAMPART && !s.my && !s.isPublic)) {
+                hasBarrier = true;
+                break;
+            }
+        }
+        
+        if (hasBarrier) {
+            // Don't move - we're adjacent to a barrier, stay put and let
+            // the main loop call dismantle on findHostileStructureTarget's result
+            return;
+        }
+        
+        // Safe to move
+        var dir = creep.pos.getDirectionTo(nextStep);
+        creep.move(dir);
     }
 }
 
@@ -2308,24 +3187,232 @@ function runDemolisher(demo) {
 // TARGETING
 // ---------------------------------------------------------------------------
 
-function findHostileStructureTarget(creep, towersOnly) {
-    var targets = creep.room.find(FIND_STRUCTURES, {
+/**
+ * Find the best hostile structure target, with breach-path awareness.
+ * 
+ * @param {Creep} creep
+ * @param {string} targetMode - 'all', 'towers', or 'military'
+ *
+ * Priority order:
+ * 1. Reachable valuable structures (filtered by targetMode)
+ * 2. Wall/rampart blocking the path to the nearest valuable structure
+ * 3. Weakest wall/rampart (fallback when no valuables remain)
+ */
+function findHostileStructureTarget(creep, targetMode) {
+    var room = creep.room;
+    
+    // Step 1: Find all valuable (non-barrier) hostile structures
+    var valuableTargets = room.find(FIND_STRUCTURES, {
         filter: function (s) {
             if (s.my) return false;
             
-            if (towersOnly) {
+            if (targetMode === 'towers') {
                 return s.structureType === STRUCTURE_TOWER;
             }
             
+            if (targetMode === 'military') {
+                return MILITARY_STRUCTURE_PRIORITY.indexOf(s.structureType) !== -1;
+            }
+            
+            // 'all' mode — everything except roads/containers/controllers/portals/barriers
             if (s.structureType === STRUCTURE_ROAD) return false;
             if (s.structureType === STRUCTURE_CONTAINER) return false;
             if (s.structureType === STRUCTURE_CONTROLLER) return false;
             if (s.structureType === STRUCTURE_PORTAL) return false;
+            if (s.structureType === STRUCTURE_WALL) return false;
+            if (s.structureType === STRUCTURE_RAMPART) return false;
             
             return true;
         }
     });
     
-    if (targets.length === 0) return null;
-    return creep.pos.findClosestByRange(targets);
+    // No valuable structures left: breach the weakest barrier
+    if (valuableTargets.length === 0) {
+        var barriers = room.find(FIND_STRUCTURES, {
+            filter: function (s) {
+                if (s.my) return false;
+                return s.structureType === STRUCTURE_WALL ||
+                       s.structureType === STRUCTURE_RAMPART;
+            }
+        });
+        
+        if (barriers.length === 0) return null;
+        
+        // Target the lowest-HP barrier as the breach point
+        return _.min(barriers, 'hits');
+    }
+    
+    // Step 1b (military mode only): Sort by priority so we target towers
+    // before nukers, nukers before power spawns, etc.
+    if (targetMode === 'military' && valuableTargets.length > 1) {
+        valuableTargets.sort(function(a, b) {
+            var priA = MILITARY_STRUCTURE_PRIORITY.indexOf(a.structureType);
+            var priB = MILITARY_STRUCTURE_PRIORITY.indexOf(b.structureType);
+            if (priA !== priB) return priA - priB;
+            // Same type — prefer the closer one
+            return creep.pos.getRangeTo(a) - creep.pos.getRangeTo(b);
+        });
+    }
+    
+    // Step 2: Find the best target.
+    // For military mode, pick the highest-priority reachable structure.
+    // For other modes, pick the closest.
+    var closest;
+    if (targetMode === 'military') {
+        // Try each target in priority order; pick the first one we can
+        // path to (or breach to). Fall through to breach logic below if
+        // none are directly reachable.
+        closest = valuableTargets[0]; // highest priority, closest of its type
+    } else {
+        closest = creep.pos.findClosestByRange(valuableTargets);
+    }
+    if (!closest) return null;
+    
+    // Step 3: Check if we can reach it without going through walls
+    var directPath = PathFinder.search(creep.pos, { pos: closest.pos, range: 1 }, {
+        maxRooms: 1,
+        maxOps: 3000,
+        roomCallback: function(rn) {
+            var r = Game.rooms[rn];
+            if (!r) return false;
+            
+            var costs = new PathFinder.CostMatrix();
+            
+            r.find(FIND_STRUCTURES).forEach(function(s) {
+                if (s.structureType === STRUCTURE_ROAD) {
+                    costs.set(s.pos.x, s.pos.y, 1);
+                } else if (s.structureType === STRUCTURE_WALL) {
+                    costs.set(s.pos.x, s.pos.y, 255);
+                } else if (s.structureType === STRUCTURE_RAMPART && !s.my && !s.isPublic) {
+                    costs.set(s.pos.x, s.pos.y, 255);
+                } else if (OBSTACLE_OBJECT_TYPES.indexOf(s.structureType) !== -1) {
+                    costs.set(s.pos.x, s.pos.y, 255);
+                }
+            });
+            
+            return costs;
+        }
+    });
+    
+    // If we can reach the target directly, go for it
+    if (!directPath.incomplete) {
+        return closest;
+    }
+    
+    // Step 4: Path is blocked by walls/ramparts. Find the breach point.
+    // Pathfind THROUGH walls (expensive but passable) to determine which
+    // barrier to dismantle first.
+    var breachPath = PathFinder.search(creep.pos, { pos: closest.pos, range: 1 }, {
+        maxRooms: 1,
+        maxOps: 4000,
+        plainCost: 2,
+        swampCost: 10,
+        roomCallback: function(rn) {
+            var r = Game.rooms[rn];
+            if (!r) return false;
+            
+            var costs = new PathFinder.CostMatrix();
+            
+            r.find(FIND_STRUCTURES).forEach(function(s) {
+                if (s.structureType === STRUCTURE_ROAD) {
+                    costs.set(s.pos.x, s.pos.y, 1);
+                } else if (s.structureType === STRUCTURE_WALL) {
+                    // Treat walls as expensive but traversable for path planning
+                    costs.set(s.pos.x, s.pos.y, 50);
+                } else if (s.structureType === STRUCTURE_RAMPART && !s.my && !s.isPublic) {
+                    costs.set(s.pos.x, s.pos.y, 50);
+                } else if (OBSTACLE_OBJECT_TYPES.indexOf(s.structureType) !== -1) {
+                    costs.set(s.pos.x, s.pos.y, 255);
+                }
+            });
+            
+            return costs;
+        }
+    });
+    
+    if (!breachPath.incomplete && breachPath.path.length > 0) {
+        // Find the first barrier tile on the breach path
+        var firstBarrierPos = null;
+
+        for (var i = 0; i < breachPath.path.length; i++) {
+            var pos = breachPath.path[i];
+            var structsAtPos = room.lookForAt(LOOK_STRUCTURES, pos.x, pos.y);
+            
+            for (var j = 0; j < structsAtPos.length; j++) {
+                var s = structsAtPos[j];
+                if (s.structureType === STRUCTURE_WALL || 
+                    (s.structureType === STRUCTURE_RAMPART && !s.my && !s.isPublic)) {
+                    firstBarrierPos = pos;
+                    break;
+                }
+            }
+            if (firstBarrierPos) break;
+        }
+        
+        if (firstBarrierPos) {
+            // Collect ALL barriers adjacent to the creep (range 1) that are
+            // also near the breach point (within 2 tiles of the first barrier
+            // on the path). This captures the same wall segment while letting
+            // us pick the weakest structure in it.
+            var candidateBarriers = room.find(FIND_STRUCTURES, {
+                filter: function(s) {
+                    if (s.my) return false;
+                    if (s.structureType !== STRUCTURE_WALL && 
+                        !(s.structureType === STRUCTURE_RAMPART && !s.isPublic)) {
+                        return false;
+                    }
+                    // Must be adjacent to creep (range 1) so we can dismantle it
+                    if (creep.pos.getRangeTo(s) > 1) return false;
+                    // Must be near the breach point so we're breaking the right wall
+                    var dx = Math.abs(s.pos.x - firstBarrierPos.x);
+                    var dy = Math.abs(s.pos.y - firstBarrierPos.y);
+                    return dx <= 2 && dy <= 2;
+                }
+            });
+            
+            if (candidateBarriers.length > 0) {
+                // Pick the weakest barrier - fastest to break through
+                return _.min(candidateBarriers, 'hits');
+            }
+            
+            // Not adjacent yet - return the first barrier on the path
+            // so moveToBreaching navigates toward it
+            var firstBarrierStructs = room.lookForAt(LOOK_STRUCTURES, 
+                firstBarrierPos.x, firstBarrierPos.y);
+            for (var fb = 0; fb < firstBarrierStructs.length; fb++) {
+                var fbs = firstBarrierStructs[fb];
+                if (fbs.structureType === STRUCTURE_WALL || 
+                    (fbs.structureType === STRUCTURE_RAMPART && !fbs.my && !fbs.isPublic)) {
+                    return fbs;
+                }
+            }
+        }
+    }
+    
+    // Step 5: Fallback - target the weakest barrier adjacent to the creep,
+    // or nearest barrier if none adjacent
+    var adjacentBarriers = room.find(FIND_STRUCTURES, {
+        filter: function(s) {
+            if (s.my) return false;
+            if (s.structureType !== STRUCTURE_WALL && 
+                !(s.structureType === STRUCTURE_RAMPART && !s.isPublic)) {
+                return false;
+            }
+            return creep.pos.getRangeTo(s) <= 1;
+        }
+    });
+    
+    if (adjacentBarriers.length > 0) {
+        return _.min(adjacentBarriers, 'hits');
+    }
+    
+    var nearestBarrier = creep.pos.findClosestByRange(FIND_STRUCTURES, {
+        filter: function(s) {
+            if (s.my) return false;
+            return s.structureType === STRUCTURE_WALL ||
+                   s.structureType === STRUCTURE_RAMPART;
+        }
+    });
+    
+    return nearestBarrier || null;
 }

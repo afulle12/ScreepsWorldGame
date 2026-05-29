@@ -1,0 +1,237 @@
+================================================================================
+                        ROOM INTEL WEIGHTS REFERENCE
+================================================================================
+
+MAIN CATEGORIES
+--------------------------------------------------------------------------------
+Economic:     25%
+Military:     30%
+Dual Purpose: 45%
+TOTAL:       100%
+
+================================================================================
+ECONOMIC (25% of overall)
+================================================================================
+
+POSITIVES (100% max)
+--------------------------------------------------------------------------------
+Factory exists                    5%      Binary
+Factory level 1+                  5%      Binary (level 1 or above)
+Extractor exists                  3%      Binary
+Extractor active                  7%      Binary (creep within 1 of mineral OR
+                                          mineral amount === 0)
+Storage/Terminal diversity       13%      Scaled 0-25 non-energy resource types
+Link count                       13%      Scaled 0-4 links
+Labs present                      5%      Scaled 0-10 labs
+Labs active                       5%      Scaled (proportion where cooldown > 0
+                                          OR mineralType loaded in store)
+Market orders                    10%      Binary (any buy/sell orders for room)
+Highway deposits                  7%      Binary (metal, biomass, silicon, mist)
+Compressed commodities            7%      Binary (bars, battery)
+Regional commodities              7%      Binary (wire, cell, alloy, condensate)
+Level 1-5 commodities             7%      Binary (switch, transistor, etc.)
+Lab products                      6%      Binary (any compound like OH, XGH2O)
+--------------------------------------------------------------------------------
+POSITIVE SUBTOTAL:              100%
+
+NEGATIVES
+--------------------------------------------------------------------------------
+Storage nearly full             -10%      >90% capacity
+Energy decaying                 -10%      >1k energy on ground
+Links all empty                  -8%      All links at 0 energy
+Missing source infrastructure   -12%      Any source without a link or container
+                                          within range 3 (not all sources — any)
+--------------------------------------------------------------------------------
+NEGATIVE SUBTOTAL:              -40%
+
+================================================================================
+MILITARY (30% of overall)
+================================================================================
+
+POSITIVES (100% max)
+--------------------------------------------------------------------------------
+Tower count                      21%      Scaled 0-6 towers
+Tower protected (10M+ rampart)    1%      Binary (at least 1 tower has co-located
+                                          rampart >= 10M hits)
+Nuker exists                      3%      Binary
+Nuker ready to fire               6%      Binary (store full: energy AND ghodium
+                                          at max capacity)
+Nuker protected (10M+ rampart)    1%      Binary
+Avg defense strength             15%      Scaled to 300M hits (avg of ALL walls
+                                          AND ramparts combined)
+Spawn protected (10M+ rampart)    6%      Binary (at least 1 spawn)
+Storage protected (10M+ rampart)  5%      Binary
+Terminal protected (10M+ rampart) 5%      Binary
+Storage energy                    6%      Scaled to 1M energy
+Boosted creeps present            5%      Binary (any creep with body part boost)
+Combat boost stockpile           15%      Scaled to 30k total across storage,
+                                          terminal, and labs
+Room sign by owner                2%      Binary (controller sign username
+                                          matches owner username)
+Safe mode available               4%      Binary (safeModeAvailable > 0)
+Safe mode ready                   5%      Binary (no safeModeCooldown active)
+--------------------------------------------------------------------------------
+POSITIVE SUBTOTAL:              100%
+
+COMBAT BOOST COMPOUNDS (for stockpile check)
+--------------------------------------------------------------------------------
+Attack:        UH, UH2O, XUH2O
+Ranged Attack: KO, KHO2, XKHO2
+Heal:          LO, LHO2, XLHO2
+
+NEGATIVES
+--------------------------------------------------------------------------------
+Towers empty                    -15%      Any tower at 0 energy
+Towers low energy               -10%      Any tower > 0 but < 25% energy
+                                          (mutually exclusive with empty)
+Weak ramparts                   -12%      Any rampart < 100k hits
+No defenses                     -50%      0 walls AND 0 ramparts (RCL2+)
+No ramparts                     -25%      Walls exist but 0 ramparts (RCL2+)
+                                          (mutually exclusive with no defenses)
+Walls breached                  -15%      PathFinder finds complete path from
+                                          any edge entrance to storage
+Controller exposed              -10%      PathFinder finds complete path from
+                                          any edge entrance to controller
+Sources exposed                 -10%      PathFinder finds complete path from
+                                          any edge entrance to any source
+--------------------------------------------------------------------------------
+NEGATIVE SUBTOTAL:             -147%      (No defenses/No ramparts mutually exclusive)
+ACTUAL MAX NEGATIVE:            -97%      (accounting for mutual exclusivity)
+
+PATHFINDING NOTES
+--------------------------------------------------------------------------------
+- Entrance points sampled every 5 tiles along all 4 edges (x=0, x=49, y=0, y=49)
+- Terrain walls excluded from entrance candidates
+- Walls AND ramparts treated as impassable (cost 255) in path checks
+- Sources exposed: -10% applies once if ANY source is exposed (not per source)
+
+================================================================================
+DUAL PURPOSE (45% of overall)
+================================================================================
+
+POSITIVES (100% max)
+--------------------------------------------------------------------------------
+RCL                              17%      Scaled 1-8
+Spawn count                      14%      Scaled 0-3 spawns
+Extensions for RCL               10%      Proportional to expected count; full
+                                          10% only if at or above expected count
+Power spawn exists                6%      Binary
+Power spawn has energy            3%      Binary (energy store > 0)
+Power in room                     1%      Binary (any power > 0 in storage,
+                                          terminal, OR power spawn)
+Terminal exists                   8%      Binary
+Terminal has 1k+ energy           3%      Binary
+Terminal has resources            5%      Binary (any non-energy resource > 0)
+Storage exists                    8%      Binary
+Large creeps (30+ parts)          8%      Binary (any creep in room)
+Power creeps present              6%      Binary
+Observer present                  6%      Binary
+Has Hauler/Supplier               5%      Binary (any creep with 30+ parts
+                                          using ONLY MOVE and CARRY; checks
+                                          ALL creeps in room, not just owned)
+--------------------------------------------------------------------------------
+POSITIVE SUBTOTAL:              100%
+
+NOTE: Power spawn fueled in the old doc (4% binary) is now split:
+  - Power spawn has energy: 3% (energy store > 0)
+  - Power in room:          1% (power resource anywhere in room)
+Total is the same (4%) but the checks are independent.
+
+NEGATIVES
+--------------------------------------------------------------------------------
+Low downgrade timer             -15%      < 50k ticks
+Medium downgrade timer           -8%      < 100k ticks (mutually exclusive)
+Missing spawns                  -12%      Below expected for RCL
+Missing extensions              -10%      Below expected for RCL
+Storage empty                   -10%      < 10k total resources
+No storage                      -15%      RCL4+ without storage
+Extensions empty                -12%      0 energy total across all extensions
+Extensions critical              -8%      > 0 but < 25% energy (mutually excl.)
+Extensions low                   -5%      >= 25% but < 50% energy (mutually excl.)
+--------------------------------------------------------------------------------
+NEGATIVE SUBTOTAL:              -87%      (some mutually exclusive)
+ACTUAL MAX NEGATIVE:            -62%      (accounting for mutual exclusivity)
+
+================================================================================
+COMMODITY RESOURCE LISTS
+================================================================================
+
+HIGHWAY DEPOSITS
+--------------------------------------------------------------------------------
+metal, biomass, silicon, mist
+
+COMPRESSED COMMODITIES (Bars)
+--------------------------------------------------------------------------------
+utrium_bar, lemergium_bar, zynthium_bar, keanium_bar,
+ghodium_melt, oxidant, reductant, purifier, battery
+
+REGIONAL COMMODITIES
+--------------------------------------------------------------------------------
+wire, cell, alloy, condensate
+
+LEVEL 1-5 COMMODITIES
+--------------------------------------------------------------------------------
+Level 0 (factory): composite, crystal, liquid
+Level 1: switch, phlegm, tube, concentrate
+Level 2: transistor, tissue, fixtures, extract
+Level 3: microchip, muscle, frame, spirit
+Level 4: circuit, organoid, hydraulics, emanation
+Level 5: device, organism, machine, essence
+
+LAB PRODUCTS (Compounds)
+--------------------------------------------------------------------------------
+Tier 1: OH, ZK, UL, UH, UO, KH, KO, LH, LO, ZH, ZO, GH, GO
+Tier 2: UH2O, UHO2, KH2O, KHO2, LH2O, LHO2, ZH2O, ZHO2, GH2O, GHO2
+Tier 3: XUH2O, XUHO2, XKH2O, XKHO2, XLH2O, XLHO2, XZH2O, XZHO2, XGH2O, XGHO2
+
+================================================================================
+STRUCTURE COUNTS BY RCL
+================================================================================
+
+EXTENSIONS
+--------------------------------------------------------------------------------
+RCL 0: 0    RCL 1: 0    RCL 2: 5    RCL 3: 10
+RCL 4: 20   RCL 5: 30   RCL 6: 40   RCL 7: 50   RCL 8: 60
+
+SPAWNS
+--------------------------------------------------------------------------------
+RCL 0: 0    RCL 1: 1    RCL 2: 1    RCL 3: 1
+RCL 4: 1    RCL 5: 1    RCL 6: 1    RCL 7: 2    RCL 8: 3
+
+================================================================================
+SCORE INTERPRETATION
+================================================================================
+90-100+     ⭐ ELITE        Fully developed, active and dangerous
+75-89       🟢 STRONG       Well maintained, formidable target
+60-74       🟡 DEVELOPED    Some weaknesses exploitable
+45-59       🟠 MODERATE     Notable gaps in defense/economy
+30-44       🔴 WEAK         Significant vulnerabilities
+15-29       ⚫ STRUGGLING   Possibly neglected or rebuilding
+0-14        💀 CRITICAL     Near-abandoned or freshly claimed
+Below 0     💀 CRITICAL     Major failures detected
+
+================================================================================
+CHANGES FROM PREVIOUS VERSION
+================================================================================
+
+1. DUAL PURPOSE — Power spawn fueled (4%) split into two independent checks:
+     - Power spawn has energy: 3% (energy store > 0 in power spawn)
+     - Power in room:          1% (power resource > 0 in storage, terminal,
+                                   OR power spawn — checked separately)
+
+2. DUAL PURPOSE — Extensions now give proportional partial credit when below
+   expected count (not binary). Full 10% only at or above expected count.
+
+3. ECONOMIC — Missing source infrastructure: -12% applies when ANY source
+   lacks a link or container within range 3 (not only if ALL sources lack it).
+
+4. DUAL PURPOSE — Hauler check uses ALL creeps in room (FIND_CREEPS), not
+   just owned creeps (FIND_MY_CREEPS). Useful for scouting enemy rooms.
+
+5. ECONOMIC — Level 1-5 commodity check also includes Level 0 factory outputs:
+   composite, crystal, liquid.
+
+6. MILITARY — Labs active: a lab counts as active if cooldown > 0 OR it has
+   a mineralType loaded with resources in its store (not cooldown alone).
+
+================================================================================

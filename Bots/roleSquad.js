@@ -5,6 +5,9 @@
  * PATCHED: Fixed "Snake Mode" triggering on walls
  * PATCHED: Added "Breach Mode" to target blocking walls/ramparts when no path exists
  * PATCHED: Fixed followers trying to form up where buildings block formation
+ * PATCHED: Fixed train mode — followers now chain-follow instead of all pathing to leader
+ * PATCHED: Fixed room-boundary oscillation — followers go FORWARD not back to leader
+ * PATCHED: Added moveAsTrain fallback + findClosestByPath for stuck corners
  */
 
 var iff = require('iff');
@@ -27,14 +30,13 @@ var roleSquad = {
         var allPresent = this.checkAllPresent(squadMembers);
         var inSpawnRoom = creep.room.name === creep.memory.spawnRoom;
 
-        // Assembly phase
         if (inSpawnRoom && !allPresent) {
-             if (Game.time % 5 === 0) creep.say('Wait');
-             return;
+            if (Game.time % 5 === 0) creep.say('Wait');
+            return;
         }
 
         var actingLeader = this.getActingLeader(squadMembers);
-        if (!actingLeader) return; 
+        if (!actingLeader) return;
 
         if (creep.id === actingLeader.id && Game.time % 10 === 0) {
             console.log("Squad " + creep.memory.squadId + " Leader: " + actingLeader.name);
@@ -45,8 +47,6 @@ var roleSquad = {
             return;
         }
 
-        // --- COMBAT LOGIC ---
-        // Pass the acting leader so we can check for breach targets
         this.handleCombat(creep, squadMembers, actingLeader);
 
         if (creep.id === actingLeader.id) {
@@ -99,11 +99,23 @@ var roleSquad = {
         return members;
     },
 
+    getCreepAhead: function(creep, members, leader) {
+        var chain = [];
+        for (var i = 0; i < 4; i++) {
+            if (members[i]) chain.push(members[i]);
+        }
+        for (var i = 0; i < chain.length; i++) {
+            if (chain[i].id === creep.id) {
+                return (i > 0) ? chain[i - 1] : leader;
+            }
+        }
+        return leader;
+    },
+
     handleCombat: function(creep, members, leader) {
         var healTarget = null;
         var lowestExpectedHealth = Infinity;
 
-        // 1. Squad Healing Logic
         for (var i = 0; i < 4; i++) {
             var member = members[i];
             if (member && creep.pos.getRangeTo(member) <= 1) {
@@ -123,10 +135,8 @@ var roleSquad = {
             creep.heal(creep);
         }
 
-        // 2. Attack Logic
         var target = null;
 
-        // PRIORITY: BREACH TARGET (Walls/Ramparts marked by leader)
         if (leader && leader.memory.breachId) {
             var breachStruct = Game.getObjectById(leader.memory.breachId);
             if (breachStruct && creep.pos.inRangeTo(breachStruct, 3)) {
@@ -134,7 +144,6 @@ var roleSquad = {
             }
         }
 
-        // If no breach target, look for hostiles
         if (!target) {
             var hostiles = creep.room.find(FIND_HOSTILE_CREEPS, {
                 filter: function(c) { return iff.isHostileCreep(c); }
@@ -142,24 +151,20 @@ var roleSquad = {
             target = creep.pos.findClosestByRange(hostiles);
         }
 
-        // If no hostiles, look for other structures
         if (!target) {
             var structures = creep.room.find(FIND_HOSTILE_STRUCTURES, {
-                filter: function(s) { 
-                    return s.structureType !== STRUCTURE_CONTROLLER && 
+                filter: function(s) {
+                    return s.structureType !== STRUCTURE_CONTROLLER &&
                            s.structureType !== STRUCTURE_POWER_BANK;
                 }
             });
             target = creep.pos.findClosestByRange(structures);
         }
 
-        // Execute Attack
         if (target) {
             var range = creep.pos.getRangeTo(target);
             if (range <= 3) creep.rangedAttack(target);
             if (range <= 1) {
-                // If it's a structure, dismantle is often better if we have parts, otherwise attack
-                // Assuming standard squad with ATTACK parts here
                 creep.attack(target);
             }
         }
@@ -208,8 +213,8 @@ var roleSquad = {
         }
 
         var structures = leader.room.find(FIND_HOSTILE_STRUCTURES, {
-            filter: function(s) { 
-                return s.structureType !== STRUCTURE_CONTROLLER && 
+            filter: function(s) {
+                return s.structureType !== STRUCTURE_CONTROLLER &&
                        s.structureType !== STRUCTURE_POWER_BANK;
             }
         });
@@ -220,7 +225,7 @@ var roleSquad = {
     },
 
     handleLeaderLogic: function(leader, members, allPresent) {
-        // Clear breach target if it's destroyed or we moved away
+        // Clear breach target if destroyed
         if (leader.memory.breachId) {
             var obj = Game.getObjectById(leader.memory.breachId);
             if (!obj) delete leader.memory.breachId;
@@ -229,18 +234,58 @@ var roleSquad = {
         var inSpawnRoom = leader.room.name === leader.memory.spawnRoom;
         var targetRoom = leader.memory.targetRoom;
         var inTargetRoom = leader.room.name === targetRoom;
+        var tryingToExit = this.isNearTargetExit(leader, targetRoom);
+        var allInSameRoom = this.checkAllInSameRoom(members);
 
+        // FIX: Predict trainMode early so followers that execute before us
+        // this tick see the correct flag. moveAsTrain may override to false.
+        var needTrain = inSpawnRoom ||
+                        (tryingToExit && !inTargetRoom) ||
+                        (!allInSameRoom && !inTargetRoom);
+        leader.memory.trainMode = needTrain;
+
+        // Broken squad — solo push
         if (!allPresent && !inSpawnRoom) {
             leader.say('Broken');
+            leader.memory.trainMode = false;
             if (inTargetRoom) {
-                var repairTarget = this.findBestAttackTarget(leader);
-                if (repairTarget) leader.moveTo(repairTarget, { reusePath: 5 });
+                var target = this.findBestAttackTarget(leader);
+                if (target) leader.moveTo(target, { reusePath: 5 });
             } else {
                 leader.moveTo(new RoomPosition(25, 25, targetRoom), { reusePath: 20 });
             }
             return;
         }
 
+        // === PHASE 1: Independent movement (train mode) ===
+        // Runs BEFORE fatigue check — leader moves independently of followers
+        if (needTrain) {
+            if (this.moveAsTrain(leader, members, targetRoom)) {
+                if (inSpawnRoom) leader.say('Train');
+                else if (!allInSameRoom) leader.say('Cross');
+                else leader.say('Exit');
+                return;
+            }
+            // FIX: moveAsTrain failed (no path to exit from here).
+            // trainMode already set to false inside moveAsTrain.
+            // Fall through to normal movement instead of getting stuck.
+            leader.say('Detour');
+        }
+
+        // === PHASE 1b: Leader in target room, waiting for followers ===
+        if (!allInSameRoom && inTargetRoom) {
+            leader.say('Wait');
+            // Move away from border to clear exit tiles for followers
+            if (!this.isInSafeZone(leader)) {
+                leader.moveTo(new RoomPosition(25, 25, leader.room.name), {
+                    reusePath: 5
+                });
+            }
+            return;
+        }
+
+        // === PHASE 2: Synchronized quad movement (all in same room) ===
+        // Fatigue check only gates quad movement, not train movement
         for (var i = 0; i < 4; i++) {
             if (members[i] && members[i].fatigue > 0) {
                 leader.say('Tired');
@@ -248,33 +293,13 @@ var roleSquad = {
             }
         }
 
-        var tryingToExit = this.isNearTargetExit(leader, targetRoom);
-
-        if (inSpawnRoom || (tryingToExit && !inTargetRoom)) {
-            leader.say(inSpawnRoom ? 'Train' : 'Exit');
-            this.moveAsTrain(leader, members, targetRoom);
-            return;
-        }
-
-        var allInSameRoom = this.checkAllInSameRoom(members);
         var inSafeZone = this.isInSafeZone(leader);
         var center = new RoomPosition(25, 25, leader.room.name);
-
-        if (!allInSameRoom) {
-            leader.say('Cross');
-            if (leader.room.name !== targetRoom) {
-                 this.moveAsTrain(leader, members, targetRoom);
-            } 
-            else if (leader.pos.getRangeTo(center) > 5) {
-                leader.moveTo(center, { reusePath: 5 });
-            }
-            return;
-        }
 
         if (!inSafeZone && !tryingToExit && !inTargetRoom) {
             leader.say('Enter');
             for (var i = 0; i < 4; i++) {
-                if(members[i]) members[i].moveTo(center, { reusePath: 0 });
+                if (members[i]) members[i].moveTo(center, { reusePath: 0 });
             }
             return;
         }
@@ -290,8 +315,6 @@ var roleSquad = {
                     if (validSpot) {
                         leader.moveTo(validSpot, { reusePath: 0 });
                     } else {
-                        // If no spot to form, we force snake logic
-                        // But pathfinding below will decide if it's Snake vs Breach
                         leader.say('ForceSnake');
                         leader.memory.snakeMode = true;
                     }
@@ -313,7 +336,9 @@ var roleSquad = {
             leader.say('Move');
             var exitDir = Game.map.findExit(leader.room, targetRoom);
             if (exitDir !== ERR_NO_PATH) {
-                var exit = leader.pos.findClosestByRange(exitDir);
+                // FIX: findClosestByPath avoids unreachable exit tiles in corners
+                var exit = leader.pos.findClosestByPath(exitDir);
+                if (!exit) exit = leader.pos.findClosestByRange(exitDir); // fallback
                 if (exit) {
                     this.moveQuadWithPathfinding(leader, members, exit, false);
                 }
@@ -330,27 +355,51 @@ var roleSquad = {
             return;
         }
 
-        if (creep.room.name !== actingLeader.room.name) {
-            creep.say('Catch');
-            creep.moveTo(actingLeader, { reusePath: 5 });
+        var isDifferentRoom = creep.room.name !== actingLeader.room.name;
+        var isTrainMode = actingLeader.memory.trainMode;
+        var isSnakeMode = actingLeader.memory.snakeMode;
+
+        // === CROSS-ROOM HANDLING ===
+        // FIX: This is the key anti-oscillation fix. When the squad is split
+        // across rooms and in train mode, followers move TOWARD THE TARGET
+        // (same direction as leader) instead of back toward the leader.
+        // This prevents the "passing each other at the border" loop.
+        if (isDifferentRoom) {
+            if (isTrainMode) {
+                // Both leader and follower heading to target — keep going forward
+                creep.say('Fwd');
+                creep.moveTo(new RoomPosition(25, 25, creep.memory.targetRoom), {
+                    reusePath: 0,
+                    ignoreCreeps: true
+                });
+            } else {
+                // Not in train mode — regroup toward leader via chain-follow
+                creep.say('Catch');
+                var ahead = this.getCreepAhead(creep, members, actingLeader);
+                creep.moveTo(ahead, { reusePath: 0, ignoreCreeps: true });
+            }
             return;
         }
 
-        if (actingLeader.memory.snakeMode) {
-            creep.say('Snake');
+        // === SAME ROOM: Train or Snake — chain-follow ===
+        if (isTrainMode || isSnakeMode) {
+            creep.say(isTrainMode ? 'Train' : 'Snake');
+            var ahead = this.getCreepAhead(creep, members, actingLeader);
+            creep.moveTo(ahead, { reusePath: 0, ignoreCreeps: true });
+            return;
+        }
+
+        // === SAME ROOM: Formation mode ===
+        var leaderInSafeZone = actingLeader.pos.x >= 3 && actingLeader.pos.x <= 46 &&
+                               actingLeader.pos.y >= 3 && actingLeader.pos.y <= 46;
+        var inTargetRoom = creep.room.name === creep.memory.targetRoom;
+
+        if (!leaderInSafeZone && !inTargetRoom) {
+            creep.say('Trail');
             creep.moveTo(actingLeader, { reusePath: 0 });
             return;
         }
 
-        var leaderInSafeZone = actingLeader.pos.x >= 3 && actingLeader.pos.x <= 46 && 
-                               actingLeader.pos.y >= 3 && actingLeader.pos.y <= 46;
-        var tryingToExit = this.isNearTargetExit(actingLeader, actingLeader.memory.targetRoom);
-        var inTargetRoom = creep.room.name === creep.memory.targetRoom;
-
-        if (!leaderInSafeZone && !inTargetRoom && !tryingToExit) return;
-        if (tryingToExit && !inTargetRoom) return;
-
-        // FIX: Only try to form if the leader's position has clear space for the quad
         if (!this.isAreaClearForQuad(actingLeader, actingLeader.pos)) {
             creep.say('Blocked');
             creep.moveTo(actingLeader, { reusePath: 0 });
@@ -369,39 +418,51 @@ var roleSquad = {
         }
     },
 
+    // FIX: Now returns true/false so handleLeaderLogic can fall through on failure
     moveAsTrain: function(leader, members, targetRoom) {
+        leader.memory.snakeMode = false;
+
         var exitDir = Game.map.findExit(leader.room, targetRoom);
-        if (exitDir === ERR_NO_PATH) return;
-        var exit = leader.pos.findClosestByRange(exitDir);
-        if (!exit) return;
-
-        var sortedMembers = [];
-        for(var i=0; i<4; i++) {
-            if(members[i]) sortedMembers.push(members[i]);
-        }
-        sortedMembers.sort((a,b) => a.pos.getRangeTo(exit) - b.pos.getRangeTo(exit));
-        
-        var closest = sortedMembers[0];
-
-        if (closest.id !== leader.id) {
-            if (leader.pos.isNearTo(closest)) {
-                leader.say('Swap');
-                closest.say('Yield');
-                
-                leader.move(leader.pos.getDirectionTo(closest));
-                closest.move(closest.pos.getDirectionTo(leader));
-                return;
-            }
+        if (exitDir === ERR_NO_PATH) {
+            leader.memory.trainMode = false;
+            return false;
         }
 
-        leader.moveTo(exit, { reusePath: 0, ignoreCreeps: true });
-
-        for (var i = 0; i < 4; i++) {
-            var follower = members[i];
-            if (follower && follower.id !== leader.id) {
-                follower.moveTo(leader, { reusePath: 0, ignoreCreeps: true });
-            }
+        // If on the correct exit edge, explicitly step across.
+        // moveTo can stall at range 0 on exit tiles — this forces the crossing.
+        var pos = leader.pos;
+        if ((exitDir === FIND_EXIT_TOP && pos.y === 0) ||
+            (exitDir === FIND_EXIT_BOTTOM && pos.y === 49) ||
+            (exitDir === FIND_EXIT_LEFT && pos.x === 0) ||
+            (exitDir === FIND_EXIT_RIGHT && pos.x === 49)) {
+            leader.memory.trainMode = true;
+            leader.move(exitDir);
+            return true;
         }
+
+        // Try cross-room moveTo (handles exit selection + room crossing)
+        var result = leader.moveTo(new RoomPosition(25, 25, targetRoom), {
+            reusePath: 0,
+            ignoreCreeps: true
+        });
+
+        if (result !== ERR_NO_PATH) {
+            leader.memory.trainMode = true;
+            return true;
+        }
+
+        // FIX: Cross-room moveTo failed (stuck in corner, op limit, etc.)
+        // Try same-room path to nearest REACHABLE exit tile
+        var exitTile = leader.pos.findClosestByPath(exitDir);
+        if (exitTile) {
+            leader.memory.trainMode = true;
+            leader.moveTo(exitTile, { reusePath: 0, ignoreCreeps: true });
+            return true;
+        }
+
+        // Completely stuck — no reachable exit from this position
+        leader.memory.trainMode = false;
+        return false;
     },
 
     checkFormation: function(members) {
@@ -434,7 +495,7 @@ var roleSquad = {
     },
 
     isAreaClearForQuad: function(leader, anchorPos) {
-        if (!anchorPos) anchorPos = leader.pos; 
+        if (!anchorPos) anchorPos = leader.pos;
         var terrain = Game.map.getRoomTerrain(leader.room.name);
         for (var i = 0; i < 4; i++) {
             var vec = this.formationVectors[i];
@@ -446,8 +507,8 @@ var roleSquad = {
             var structures = pos.lookFor(LOOK_STRUCTURES);
             for (var s = 0; s < structures.length; s++) {
                 var str = structures[s];
-                if (str.structureType !== STRUCTURE_ROAD && 
-                    str.structureType !== STRUCTURE_CONTAINER && 
+                if (str.structureType !== STRUCTURE_ROAD &&
+                    str.structureType !== STRUCTURE_CONTAINER &&
                     str.structureType !== STRUCTURE_RAMPART) {
                     return false;
                 }
@@ -460,7 +521,7 @@ var roleSquad = {
         var startPos = leader.pos;
         for (var dx = -1; dx <= 1; dx++) {
             for (var dy = -1; dy <= 1; dy++) {
-                if (dx === 0 && dy === 0) continue; 
+                if (dx === 0 && dy === 0) continue;
                 var x = startPos.x + dx;
                 var y = startPos.y + dy;
                 if (x < 1 || x > 48 || y < 1 || y > 48) continue;
@@ -479,38 +540,34 @@ var roleSquad = {
             return;
         }
 
-        // Stickiness: If snake mode is on, check if we can revert
         if (leader.memory.snakeMode) {
             if (!this.isAreaClearForQuad(leader, leader.pos)) {
-                // Keep snaking
                 leader.say('Snaking');
                 leader.moveTo(targetPos, { reusePath: 0 });
                 return;
             }
         }
 
-        // 1. Try 2x2 Pathfinding
         var costs = this.getQuadCostMatrix(leader.room.name, stayInRoom);
         var result = PathFinder.search(leader.pos, { pos: targetPos, range: 1 }, {
             plainCost: 1,
             swampCost: 5,
             maxRooms: 1,
-            maxOps: 4000, // Reduced maxOps for 2x2 since we failover quickly
+            maxOps: 4000,
             roomCallback: function(roomName) {
                 if (roomName === leader.room.name) return costs;
                 return false;
             }
         });
 
-        // 2. If 2x2 succeeds, execute
         if (!result.incomplete && result.path.length > 0) {
             leader.memory.snakeMode = false;
             var nextPos = result.path[0];
             var direction = leader.pos.getDirectionTo(nextPos);
-            
+
             if (this.canQuadMove(members, direction)) {
                 for (var i = 0; i < 4; i++) {
-                    if(members[i]) members[i].move(direction);
+                    if (members[i]) members[i].move(direction);
                 }
             } else {
                 this.tryAlternativeMove(leader, members, targetPos);
@@ -518,31 +575,23 @@ var roleSquad = {
             return;
         }
 
-        // 3. If 2x2 Fails, decide between SNAKE (narrow path) vs BREACH (wall)
-        // Run a standard 1x1 search to see if ANY path exists
         var result1x1 = PathFinder.search(leader.pos, { pos: targetPos, range: 1 }, {
             plainCost: 1,
             swampCost: 5,
             maxRooms: 1,
             maxOps: 4000
-            // Default CostMatrix used here (walkable walls are blocked, roads/plains ok)
         });
 
         if (!result1x1.incomplete) {
-            // A 1x1 path exists! We should SNAKE through it.
             leader.say('Snake');
             leader.memory.snakeMode = true;
             leader.moveTo(targetPos, { reusePath: 0 });
         } else {
-            // A 1x1 path DOES NOT exist. We are completely blocked (Walls).
-            // We need to BREACH.
             leader.say('Breach');
-            leader.memory.snakeMode = false; // Stop snaking
-            
-            // Find the obstruction at the end of the partial path
-            var lastStep = (result1x1.path.length > 0) ? result1x1.path[result1x1.path.length-1] : leader.pos;
-            
-            // Scan for walls/ramparts near the blockage point
+            leader.memory.snakeMode = false;
+
+            var lastStep = (result1x1.path.length > 0) ? result1x1.path[result1x1.path.length - 1] : leader.pos;
+
             var blockage = lastStep.findInRange(FIND_STRUCTURES, 1, {
                 filter: function(s) {
                     return s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART;
@@ -550,11 +599,11 @@ var roleSquad = {
             });
 
             if (blockage.length > 0) {
-                // Pick the one closest to the TARGET (to breach in the right direction)
-                var target = blockage.sort((a,b) => a.pos.getRangeTo(targetPos) - b.pos.getRangeTo(targetPos))[0];
+                var target = blockage.sort(function(a, b) {
+                    return a.pos.getRangeTo(targetPos) - b.pos.getRangeTo(targetPos);
+                })[0];
                 leader.memory.breachId = target.id;
-                
-                // Move towards it to get in range
+
                 leader.moveTo(target, { reusePath: 0 });
             }
         }
@@ -581,7 +630,7 @@ var roleSquad = {
 
         if (bestDir !== null) {
             for (var i = 0; i < 4; i++) {
-                if(members[i]) members[i].move(bestDir);
+                if (members[i]) members[i].move(bestDir);
             }
         } else {
             leader.say('Stuck');
@@ -595,7 +644,6 @@ var roleSquad = {
         var baseCosts = new PathFinder.CostMatrix();
         var terrain = room.getTerrain();
 
-        // 1. Mark basic terrain
         for (var x = 0; x < 50; x++) {
             for (var y = 0; y < 50; y++) {
                 var tile = terrain.get(x, y);
@@ -609,18 +657,16 @@ var roleSquad = {
             }
         }
 
-        // 2. Mark structures
         var structures = room.find(FIND_STRUCTURES);
         for (var i = 0; i < structures.length; i++) {
             var s = structures[i];
-            if (s.structureType !== STRUCTURE_ROAD && 
-                s.structureType !== STRUCTURE_CONTAINER && 
+            if (s.structureType !== STRUCTURE_ROAD &&
+                s.structureType !== STRUCTURE_CONTAINER &&
                 (s.structureType !== STRUCTURE_RAMPART || !s.my)) {
                 baseCosts.set(s.pos.x, s.pos.y, 255);
             }
         }
 
-        // 3. Dilation
         var dilatedCosts = new PathFinder.CostMatrix();
         for (var x = 0; x < 50; x++) {
             for (var y = 0; y < 50; y++) {
@@ -639,7 +685,7 @@ var roleSquad = {
                 if (right === 255 || bottom === 255 || bottomRight === 255) {
                     dilatedCosts.set(x, y, 255);
                 } else {
-                    var max = Math.max(baseCosts.get(x,y), right, bottom, bottomRight);
+                    var max = Math.max(baseCosts.get(x, y), right, bottom, bottomRight);
                     dilatedCosts.set(x, y, max);
                 }
             }
@@ -669,8 +715,8 @@ var roleSquad = {
             var structures = targetPos.lookFor(LOOK_STRUCTURES);
             for (var s = 0; s < structures.length; s++) {
                 var str = structures[s];
-                if (str.structureType !== STRUCTURE_ROAD && 
-                    str.structureType !== STRUCTURE_CONTAINER && 
+                if (str.structureType !== STRUCTURE_ROAD &&
+                    str.structureType !== STRUCTURE_CONTAINER &&
                     (str.structureType !== STRUCTURE_RAMPART || !str.my)) return false;
             }
             var creeps = targetPos.lookFor(LOOK_CREEPS);

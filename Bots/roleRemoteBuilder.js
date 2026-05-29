@@ -12,7 +12,7 @@
 //   - UPDATED: If sources in target room are inaccessible while filling, return home for energy.
 //   - UPDATED: If target room is owned by a friendly player (IFF whitelist), return home for energy.
 //
-//    remoteBuilder('SpawningRoom', 'WorkingRoom', Number) to create/update an order.
+//    remoteBuilder('SpawningRoom', 'WorkingRoom', Number) to CREATE or UPDATE an order.
 //    cancelRemoteBuilder('SpawningRoom', 'WorkingRoom') to cancel an order.
 //    listRemoteBuilders() to list active orders.
 
@@ -26,6 +26,7 @@ var iff = require('iff');
 // Hard-coded rooms to avoid (edit to your needs)
 var REMOTE_AVOID_ROOMS = {
    'E8N49': true,
+   'W8N49': true,
   // 'W2N3': true
 };
 

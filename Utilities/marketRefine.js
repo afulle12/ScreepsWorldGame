@@ -23,6 +23,10 @@
 //
 // SPECIAL CASE: Battery production uses marketSell (instead of opportunisticBuy) to acquire
 // energy, since marketSell is currently the only mechanism suitable for buying energy.
+//
+// FAILURE HANDLING: When an op fails at any phase (factory refused, expired, no output
+// produced), it is marked phase='failed' and a Game.notify() is sent so the player is
+// alerted even when offline. Failed ops are cleaned up on the next tick.
 
 var getRoomState = require('getRoomState');
 
@@ -91,7 +95,16 @@ function normalizeOutput(p) {
     EXTRACT: RESOURCE_EXTRACT,
     SPIRIT: RESOURCE_SPIRIT,
     EMANATION: RESOURCE_EMANATION,
-    ESSENCE: RESOURCE_ESSENCE
+    ESSENCE: RESOURCE_ESSENCE,
+    // Decompression outputs (raw minerals)
+    UTRIUM: RESOURCE_UTRIUM,
+    LEMERGIUM: RESOURCE_LEMERGIUM,
+    ZYNTHIUM: RESOURCE_ZYNTHIUM,
+    KEANIUM: RESOURCE_KEANIUM,
+    GHODIUM: RESOURCE_GHODIUM,
+    OXYGEN: RESOURCE_OXYGEN,
+    HYDROGEN: RESOURCE_HYDROGEN,
+    CATALYST: RESOURCE_CATALYST
   };
   if (map[s]) return map[s];
   if (global[s]) return global[s];
@@ -109,16 +122,23 @@ OUTPUT_TO_INPUT[RESOURCE_UTRIUM_BAR]     = RESOURCE_UTRIUM;
 OUTPUT_TO_INPUT[RESOURCE_KEANIUM_BAR]    = RESOURCE_KEANIUM;
 OUTPUT_TO_INPUT[RESOURCE_GHODIUM_MELT]   = RESOURCE_GHODIUM;
 
-// Default buy amount for simple single-input products
-var DEFAULT_BUY_AMOUNT = 50000;
+// Default buy amount for simple single-input products (legacy fallback)
+var DEFAULT_BUY_AMOUNT = 30000;
 
-// Buy amount multiplier for multi-input recipes (how many batches to buy for)
-var RECIPE_BATCH_MULTIPLIER = 100;
+// Buy amount multiplier for multi-input recipes (how many batches to buy for).
+// compression:   500 minerals/batch × 60 = 30,000 minerals bought → 6,000 bars produced
+// decompression: 100 bars/batch    × 60 = 6,000 bars bought      → 30,000 minerals produced
+var RECIPE_BATCH_MULTIPLIER = 60;
+
+// How many ticks before a stuck buying op is abandoned and cleaned up.
+// Only applies to the 'buying' phase — once inputs are acquired and a factory
+// order is placed, the op runs until production completes regardless of age.
+var OP_EXPIRY_TICKS = 100000;
 
 /**
  * Check if a specific input for a product should be acquired via marketSell
  * instead of opportunisticBuy. Currently only energy for battery production
- * qualifies, since marketSell is only suitable for buying energy.
+ * qualifies, since marketSell is currently the only mechanism suitable for buying energy.
  * @param {string} output - The product being produced
  * @param {string} inputResource - The input resource being acquired
  * @returns {boolean} - True if marketSell should be used for this input
@@ -169,6 +189,24 @@ function getRecipeInputs(output, batchMultiplier) {
     }
 
     return null;
+}
+
+// ===== FAILURE NOTIFICATION =====
+
+/**
+ * Log a failure, send a Game.notify, and mark the op as failed.
+ * @param {Object} op - The marketRefine operation
+ * @param {string} reason - Human-readable failure reason
+ * @param {string} [detail] - Optional additional detail for the log
+ */
+function failOp(op, reason, detail) {
+    var msg = '[MarketRefine] FAILED: ' + op.id + ' (' + op.output + ' in ' + op.room + ') - ' + reason;
+    if (detail) msg += ' | ' + detail;
+    console.log(msg);
+    Game.notify(msg, 30); // group notifications within 30 minutes
+    op.phase = 'failed';
+    op.failReason = reason;
+    op.failTick = Game.time;
 }
 
 // ===== WRAPPERS FOR EXTERNAL HELPERS =====
@@ -226,6 +264,29 @@ function invokeOpportunisticBuy(roomName, resourceType, amount, maxPrice) {
     return '[MarketRefine] ERROR invoking opportunisticBuy: ' + e;
   }
   return '[MarketRefine] ERROR: Unknown opportunisticBuy API; methods: ' + opBuyMethodsString();
+}
+
+// Cancel an opportunisticBuy request for a room+resource, if one exists
+function cancelOpBuyRequest(roomName, resourceType) {
+  var opBuy = getOpBuy();
+  if (!opBuy) return;
+  try {
+    if (typeof opBuy.cancelRequest === 'function') {
+      opBuy.cancelRequest(roomName, resourceType);
+      return;
+    }
+    if (typeof opBuy.cancel === 'function') {
+      opBuy.cancel(roomName, resourceType);
+      return;
+    }
+  } catch (e) {}
+  // Direct memory fallback
+  if (Memory.opportunisticBuy && Memory.opportunisticBuy.requests) {
+    var key = roomName + '_' + resourceType;
+    if (Memory.opportunisticBuy.requests[key]) {
+      delete Memory.opportunisticBuy.requests[key];
+    }
+  }
 }
 
 // Helper to check if an opportunisticBuy request exists for a room+resource
@@ -343,6 +404,71 @@ function anyFactoryOrderAfter(roomName, product, createdTick) {
   return false;
 }
 
+// ===== EXPIRY HANDLER =====
+
+/**
+ * Handle an expired buying-phase op: cancel pending opportunisticBuy requests for
+ * each input that used opportunisticBuy, then sell whatever was already acquired.
+ * Does NOT cancel marketSell/marketBuy inputs — those are managed externally.
+ * Sends Game.notify so the player knows even when offline.
+ *
+ * NOTE: This is only called during the 'buying' phase. Once inputs are fully
+ * acquired and production has started (refining/selling), the op is never expired —
+ * it runs until the factory order completes and the output is sold.
+ */
+function expireOp(op) {
+  var age = Game.time - op.started;
+  var reason = 'Expired after ' + age + ' ticks (phase=' + op.phase + ')';
+
+  var sellParts = [];
+
+  if (op.inputs && op.inputs.length > 0) {
+    for (var k = 0; k < op.inputs.length; k++) {
+      var inp = op.inputs[k];
+      var useMS = inp.useMarketSell || shouldUseMarketSell(op.output, inp.resource);
+      var useMB = inp.useMarketBuy || shouldUseMarketBuy(op.output, inp.resource);
+
+      // Cancel the opportunisticBuy request if one was created for this input
+      if (!useMS && !useMB) {
+        if (hasActiveOpBuyRequest(op.room, inp.resource)) {
+          cancelOpBuyRequest(op.room, inp.resource);
+          console.log('[MarketRefine] Cancelled opportunisticBuy for ' + inp.resource + ' in ' + op.room);
+        }
+      }
+
+      // Sell whatever was acquired above the baseline
+      var have = countInRoom(op.room, inp.resource);
+      var baseCount = typeof inp.baseCount === 'number' ? inp.baseCount : 0;
+      var acquired = have - baseCount;
+      if (acquired > 0) {
+        callMarketSell(op.room, inp.resource, acquired);
+        sellParts.push(acquired + ' ' + inp.resource);
+      }
+    }
+  } else {
+    // Legacy single-input format
+    var legacyResource = op.input;
+    if (legacyResource && legacyResource !== '(multi)') {
+      if (hasActiveOpBuyRequest(op.room, legacyResource)) {
+        cancelOpBuyRequest(op.room, legacyResource);
+        console.log('[MarketRefine] Cancelled opportunisticBuy for ' + legacyResource + ' in ' + op.room);
+      }
+      var legacyHave = countInRoom(op.room, legacyResource);
+      var legacyBase = typeof op.baseInputCount === 'number' ? op.baseInputCount : 0;
+      var legacyAcquired = legacyHave - legacyBase;
+      if (legacyAcquired > 0) {
+        callMarketSell(op.room, legacyResource, legacyAcquired);
+        sellParts.push(legacyAcquired + ' ' + legacyResource);
+      }
+    }
+  }
+
+  var detail = sellParts.length > 0
+    ? 'Selling acquired inputs: ' + sellParts.join(', ')
+    : 'No acquired inputs to sell';
+  failOp(op, reason, detail);
+}
+
 // ===== CONSOLE API =====
 
 /**
@@ -456,6 +582,9 @@ global.marketRefineStatus = function(id) {
       if (o && o.id === id) {
         var s = [];
         s.push('[' + o.id + '] room=' + o.room + ' phase=' + o.phase);
+        var age = Game.time - (o.started || 0);
+        var expiresIn = OP_EXPIRY_TICKS - age;
+        s.push('  age=' + age + ' ticks' + (o.phase === 'buying' ? ' | expires in ' + (expiresIn > 0 ? expiresIn : 0) + ' ticks' : ' | no expiry (inputs acquired)'));
         if (o.inputs && o.inputs.length > 0) {
           for (var k = 0; k < o.inputs.length; k++) {
             var inp = o.inputs[k];
@@ -472,6 +601,9 @@ global.marketRefineStatus = function(id) {
         }
         s.push('  output: ' + o.output + (o.factoryOrderId ? (' orderId=' + o.factoryOrderId) : ''));
         s.push('  baseOutput=' + o.baseOutputCount + ' currentOutput=' + countInRoom(o.room, o.output));
+        if (o.failReason) {
+          s.push('  FAILURE: ' + o.failReason + ' (tick ' + (o.failTick || '?') + ')');
+        }
         return s.join('\n');
       }
     }
@@ -482,14 +614,20 @@ global.marketRefineStatus = function(id) {
   for (var j = 0; j < ops.length; j++) {
     var op = ops[j];
     if (!op) continue;
+    var age2 = Game.time - (op.started || 0);
+    var expiresIn2 = OP_EXPIRY_TICKS - age2;
+    var ageStr = op.phase === 'buying'
+      ? ' age=' + age2 + (expiresIn2 < 10000 ? ' EXPIRES IN ' + Math.max(0, expiresIn2) : '')
+      : ' age=' + age2;
+    var failStr = op.phase === 'failed' ? ' FAILED: ' + (op.failReason || '?') : '';
     if (op.inputs && op.inputs.length > 0) {
       var inputNames = [];
       for (var m = 0; m < op.inputs.length; m++) {
         inputNames.push(op.inputs[m].resource);
       }
-      lines.push('[' + op.id + '] ' + op.room + ' ' + inputNames.join('+') + ' -> ' + op.output + ' | phase=' + op.phase);
+      lines.push('[' + op.id + '] ' + op.room + ' ' + inputNames.join('+') + ' -> ' + op.output + ' | phase=' + op.phase + ageStr + failStr);
     } else {
-      lines.push('[' + op.id + '] ' + op.room + ' ' + op.input + ' -> ' + op.output + ' | phase=' + op.phase);
+      lines.push('[' + op.id + '] ' + op.room + ' ' + op.input + ' -> ' + op.output + ' | phase=' + op.phase + ageStr + failStr);
     }
   }
   return lines.join('\n');
@@ -536,9 +674,21 @@ function run() {
     op.lastUpdate = Game.time;
 
     // --- AUTO CLEANUP ---
-    if (op.phase === 'done' || op.phase === 'error') {
+    if (op.phase === 'done' || op.phase === 'error' || op.phase === 'failed') {
         ops.splice(i, 1);
         continue;
+    }
+
+    // --- EXPIRY CHECK (buying phase only) ---
+    // Once all inputs are acquired and a factory order is placed (refining/selling),
+    // the op runs until production completes — cancelling would waste already-purchased inputs.
+    if (op.phase === 'buying') {
+      var age = Game.time - (op.started || 0);
+      if (age > OP_EXPIRY_TICKS) {
+        expireOp(op);
+        ops.splice(i, 1);
+        continue;
+      }
     }
 
     if (op.phase === 'buying') {
@@ -576,11 +726,38 @@ function run() {
     if (op.phase === 'refining') {
       if (!op.factoryStarted) {
         var ret = startFactoryMax(op.room, op.output);
-        if (typeof ret.message === 'string' && ret.message.indexOf('REFUSED') >= 0) {
-          op.phase = 'error';
-          op.error = 'factory refused';
+        var retMsg = typeof ret.message === 'string' ? ret.message : '';
+
+        // Check for factory refusal
+        if (retMsg.indexOf('REFUSED') >= 0 || retMsg.indexOf('Unknown') >= 0 || retMsg.indexOf('unsupported') >= 0) {
+          failOp(op, 'Factory refused order', retMsg);
+
+          // Sell back the acquired inputs since we can't produce
+          var sellBackParts = [];
+          if (op.inputs && op.inputs.length > 0) {
+            for (var sb = 0; sb < op.inputs.length; sb++) {
+              var sbInp = op.inputs[sb];
+              var sbHave = countInRoom(op.room, sbInp.resource);
+              var sbBase = typeof sbInp.baseCount === 'number' ? sbInp.baseCount : 0;
+              var sbAcquired = sbHave - sbBase;
+              if (sbAcquired > 0) {
+                callMarketSell(op.room, sbInp.resource, sbAcquired);
+                sellBackParts.push(sbAcquired + ' ' + sbInp.resource);
+              }
+            }
+          }
+          if (sellBackParts.length > 0) {
+            console.log('[MarketRefine] Selling back inputs for failed op ' + op.id + ': ' + sellBackParts.join(', '));
+          }
           continue;
         }
+
+        // Check for other errors (module not available, etc.)
+        if (retMsg.indexOf('ERROR') >= 0) {
+          failOp(op, 'Factory order error', retMsg);
+          continue;
+        }
+
         op.factoryOrderId = ret.orderId || null;
         op.factoryCreated = Game.time;
         op.factoryStarted = true;
@@ -602,7 +779,7 @@ function run() {
       var nowOut = countInRoom(op.room, op.output);
       var delta = nowOut - (op.outputBaseAtFactoryStart || op.baseOutputCount || 0);
       if (delta <= 0) {
-        op.phase = 'done';
+        failOp(op, 'No output produced', 'Expected ' + op.output + ' in ' + op.room + ' but delta=' + delta + ' (current=' + nowOut + ', base=' + (op.outputBaseAtFactoryStart || op.baseOutputCount || 0) + ')');
         continue;
       }
 
