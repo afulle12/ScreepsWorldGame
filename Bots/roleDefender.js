@@ -1,3 +1,5 @@
+var getRoomState = require('getRoomState');
+
 module.exports = {
     run: function(creep) {
         // Find the closest hostile creep
@@ -77,10 +79,12 @@ function initializePatrolPoints(creep) {
         points.push([room.controller.pos.x, room.controller.pos.y]);
     }
 
-    // Spawns
-    const spawns = room.find(FIND_MY_SPAWNS);
-    for(const spawn of spawns) {
-        points.push([spawn.pos.x, spawn.pos.y]);
+    // Spawns (from getRoomState cache)
+    var rs = getRoomState.get(room.name);
+    var spawnArr = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) || [];
+    for (var si = 0; si < spawnArr.length; si++) {
+        var spawn = spawnArr[si];
+        if (spawn.my) points.push([spawn.pos.x, spawn.pos.y]);
     }
 
     // Add random points across the room

@@ -9,12 +9,21 @@
  * API:
  *   reserve(roomName, material, building, program, amount)
  *   unReserve(roomName, material, building, program)
+ *   transfer(roomName, material, building, fromProgram, toProgram, [amount])
  *   storageFind(roomName, material)   — roomName can be 'all'
  *                                      — material can be a constant or 'NATIVE_RESOURCES'
+ *   getUnreserved(roomName)           — terminal/storage maps of available inventory
+ *   printUnreserved(roomName)         — pretty-print unreserved inventory to console
+ *   cleanStale([maxAge])             — purge reservations older than maxAge ticks (default 20000)
  *   listReservations() — all reservations everywhere
  *   listReservations('E2N46') — just one room
  *   listReservations(null, 'marketSell') — all rooms, filtered to one program
  *   listReservations('E2N46', 'marketSell') — both filters
+ *   printFind(roomName, material) — pretty-print storageFind results to console
+ *
+ * Exposed constants:
+ *   MINERAL_TO_BAR — maps raw mineral constants to their compressed bar
+ *   BAR_TO_MINERAL — reverse lookup: bar → mineral
  */
 
 
@@ -159,6 +168,17 @@ function getTotalReserved(roomName, building, material) {
     return total;
 }
 
+/**
+ * Find a program reservation entry.
+ */
+function findReservationIndex(roomName, building, material, program) {
+    const reservations = getReservations(roomName, building, material);
+    for (let i = 0; i < reservations.length; i++) {
+        if (reservations[i].program === program) return i;
+    }
+    return -1;
+}
+
 // ─── PUBLIC API ──────────────────────────────────────────────────────
 
 const storageManager = {
@@ -229,6 +249,107 @@ const storageManager = {
     },
 
     /**
+     * Atomically hand off a reservation from one program to another.
+     *
+     * Source amount is decremented; destination amount is ADDED (not replaced).
+     * This is deliberately different from reserve() which REPLACES — a handoff
+     * should never erase an existing commitment, only grow it.
+     *
+     * If `amount` is omitted, the full current reservation of fromProgram is moved.
+     * If fromProgram's reservation is smaller than `amount`, transfers what exists
+     * and reports the partial in the response.
+     *
+     * Use case: labManager reserves reagents, then on broken-order liquidate
+     * hands the reservation to marketSell so the resource can't be double-sold.
+     *
+     * @param {string} roomName
+     * @param {string} material
+     * @param {string} building   - 'terminal' or 'storage'
+     * @param {string} fromProgram
+     * @param {string} toProgram
+     * @param {number} [amount]
+     * @returns {{ ok: boolean, transferred?: number, fromRemaining?: number, toTotal?: number, reason?: string }}
+     */
+    transfer: function(roomName, material, building, fromProgram, toProgram, amount) {
+        if (!roomName || !material || !building || !fromProgram || !toProgram) {
+            return { ok: false, reason: 'Missing required parameter' };
+        }
+        if (building !== 'terminal' && building !== 'storage') {
+            return { ok: false, reason: 'Building must be "terminal" or "storage"' };
+        }
+        if (fromProgram === toProgram) {
+            return { ok: true, transferred: 0, fromRemaining: 0, toTotal: 0 };
+        }
+
+        const reservations = getReservations(roomName, building, material);
+        let fromIdx = -1, toIdx = -1;
+        for (let i = 0; i < reservations.length; i++) {
+            if (reservations[i].program === fromProgram) fromIdx = i;
+            else if (reservations[i].program === toProgram) toIdx = i;
+        }
+
+        if (fromIdx < 0) {
+            return { ok: false, reason: 'No source reservation for ' + fromProgram };
+        }
+
+        const fromRes = reservations[fromIdx];
+        const transferAmt = (typeof amount === 'number' && amount > 0)
+            ? Math.min(amount, fromRes.amount)
+            : fromRes.amount;
+
+        if (transferAmt <= 0) {
+            const existingToTotal = toIdx >= 0 ? reservations[toIdx].amount : 0;
+            return {
+                ok: true,
+                transferred: 0,
+                fromRemaining: fromRes.amount,
+                toTotal: existingToTotal
+            };
+        }
+
+        fromRes.amount -= transferAmt;
+        fromRes.time = Game.time;
+
+        if (toIdx >= 0) {
+            reservations[toIdx].amount += transferAmt;
+            reservations[toIdx].time = Game.time;
+        } else {
+            reservations.push({
+                program: toProgram,
+                amount: transferAmt,
+                time: Game.time
+            });
+            toIdx = reservations.length - 1;
+        }
+
+        // Capture destination total BEFORE splicing the source. If fromIdx < toIdx
+        // and the source is fully drained, the splice shifts the destination left,
+        // so reservations[toIdx] would point at the wrong entry after cleanup.
+        var toTotal = reservations[toIdx] ? reservations[toIdx].amount : transferAmt;
+
+        // Clean up source if zero, mirror unReserve cascade
+        if (fromRes.amount <= 0) {
+            reservations.splice(fromIdx, 1);
+            if (reservations.length === 0) {
+                delete Memory.storageReservations[roomName][building][material];
+                if (Object.keys(Memory.storageReservations[roomName][building]).length === 0) {
+                    delete Memory.storageReservations[roomName][building];
+                    if (Object.keys(Memory.storageReservations[roomName]).length === 0) {
+                        delete Memory.storageReservations[roomName];
+                    }
+                }
+            }
+        }
+
+        return {
+            ok: true,
+            transferred: transferAmt,
+            fromRemaining: fromRes.amount,
+            toTotal: toTotal
+        };
+    },
+
+    /**
      * Remove a program's reservation for a material in a building.
      *
      * @param {string} roomName
@@ -265,6 +386,56 @@ const storageManager = {
         }
 
         return { ok: removed > 0, removed: removed };
+    },
+
+    /**
+     * Consume part of a reservation as the resource is physically used.
+     *
+     * This is the missing bridge between intent and actual movement.
+     * @returns {{ ok: boolean, consumed: number, remaining: number, reason?: string }}
+     */
+    consume: function(roomName, material, building, program, amount) {
+        if (!Memory.storageReservations) {
+            return { ok: false, consumed: 0, remaining: 0, reason: 'No reservations' };
+        }
+        if (!roomName || !material || !building || !program) {
+            return { ok: false, consumed: 0, remaining: 0, reason: 'Missing required parameter' };
+        }
+        if (typeof amount !== 'number' || amount <= 0) {
+            return { ok: false, consumed: 0, remaining: 0, reason: 'Amount must be a positive number' };
+        }
+
+        const r = Memory.storageReservations;
+        if (!r[roomName] || !r[roomName][building] || !r[roomName][building][material]) {
+            return { ok: false, consumed: 0, remaining: 0, reason: 'No matching reservation bucket' };
+        }
+
+        const reservations = r[roomName][building][material];
+        const idx = findReservationIndex(roomName, building, material, program);
+        if (idx < 0) {
+            return { ok: false, consumed: 0, remaining: 0, reason: 'No matching reservation for program' };
+        }
+
+        const entry = reservations[idx];
+        const consumed = Math.min(amount, entry.amount);
+        entry.amount -= consumed;
+        entry.time = Game.time;
+
+        if (entry.amount <= 0) {
+            reservations.splice(idx, 1);
+            if (reservations.length === 0) {
+                delete r[roomName][building][material];
+                if (Object.keys(r[roomName][building]).length === 0) {
+                    delete r[roomName][building];
+                    if (Object.keys(r[roomName]).length === 0) {
+                        delete r[roomName];
+                    }
+                }
+            }
+            return { ok: true, consumed: consumed, remaining: 0 };
+        }
+
+        return { ok: true, consumed: consumed, remaining: entry.amount };
     },
 
     /**
@@ -383,10 +554,96 @@ const storageManager = {
         return result;
     },
 
+    /**
+     * Return all currently unreserved materials in a room, split by building.
+     *
+     * Shape:
+     *   {
+     *     terminal: { RESOURCE_X: available, ... },
+     *     storage:  { RESOURCE_Y: available, ... }
+     *   }
+     *
+     * This reflects live reservation state, so resources committed to marketSell
+     * should be excluded from both terminal and storage once syncReservations has
+     * updated Memory.storageReservations.
+     *
+     * Only resources with a positive unreserved amount are included.
+     *
+     * Usage from console: getUnreserved('E0N0')
+     *
+     * @param {string} roomName
+     * @returns {{terminal: Object<string, number>, storage: Object<string, number>}}
+     */
+    getUnreserved: function(roomName) {
+        const room = Game.rooms[roomName];
+        const result = {
+            terminal: {},
+            storage: {}
+        };
+
+        if (!room) return result;
+
+        const scanBuilding = function(building, store) {
+            if (!store || !store.store) return;
+
+            for (const material in store.store) {
+                const total = store.store[material] || 0;
+                if (total <= 0) continue;
+
+                const reserved = getTotalReserved(roomName, building, material);
+                const available = total - reserved;
+                if (available > 0) {
+                    result[building][material] = available;
+                }
+            }
+        };
+
+        scanBuilding('terminal', room.terminal);
+        scanBuilding('storage', room.storage);
+
+        return result;
+    },
+
+    /**
+     * Pretty-print unreserved inventory for console use.
+     *
+     * Usage from console: getUnreserved('E0N0')
+     *
+     * @param {string} roomName
+     */
+    printUnreserved: function(roomName) {
+        const data = this.getUnreserved(roomName);
+        const padRight = function(str, len) {
+            str = String(str);
+            while (str.length < len) str = str + ' ';
+            return str;
+        };
+        const fmt = function(n) {
+            return (n.toLocaleString ? n.toLocaleString() : String(n));
+        };
+
+        const printSection = function(title, store) {
+            const keys = Object.keys(store).sort();
+            console.log(title + ':');
+            if (keys.length === 0) {
+                console.log('  none');
+                return;
+            }
+            for (let i = 0; i < keys.length; i++) {
+                const material = keys[i];
+                console.log('  ' + padRight(material, 24) + fmt(store[material]));
+            }
+        };
+
+        console.log('═══ ' + roomName + ' Unreserved ═══');
+        printSection('terminal', data.terminal);
+        printSection('storage', data.storage);
+    },
+
     // ── Utility: list all reservations (console debugging) ──
 
     /**
-     * Print all active reservations to console.
+     * Print all active reservations to console as one contiguous block.
      * Call from console: storageManager.listReservations()
      */
     listReservations: function(filterRoom, filterProgram) {
@@ -395,6 +652,7 @@ const storageManager = {
             return;
         }
         const r = Memory.storageReservations;
+        const rows = [];
         let count = 0;
 
         for (const roomName in r) {
@@ -405,27 +663,123 @@ const storageManager = {
                     for (let i = 0; i < reservations.length; i++) {
                         const res = reservations[i];
                         if (filterProgram && res.program !== filterProgram) continue;
-                        console.log(
-                            '[StorageManager] ' + roomName + ' | ' + building +
-                            ' | ' + material + ' | ' + res.program +
-                            ' | amount: ' + res.amount +
-                            ' | reserved at tick: ' + res.time
-                        );
+                        rows.push({
+                            roomName: roomName,
+                            building: building,
+                            material: material,
+                            program: res.program,
+                            amount: res.amount,
+                            time: res.time
+                        });
                         count++;
                     }
                 }
             }
         }
-        console.log('[StorageManager] Total reservations: ' + count);
+
+        const lines = [];
+        const roomLabel = filterRoom ? filterRoom : '*';
+        const programLabel = filterProgram ? filterProgram : '*';
+        lines.push('[StorageManager] Reservations room=' + roomLabel + ' program=' + programLabel);
+
+        if (rows.length === 0) {
+            lines.push('  none');
+            lines.push('Total reservations: 0');
+            console.log(lines.join('\n'));
+            return;
+        }
+
+        rows.sort(function(a, b) {
+            if (a.roomName !== b.roomName) return a.roomName < b.roomName ? -1 : 1;
+            if (a.building !== b.building) return a.building < b.building ? -1 : 1;
+            if (a.material !== b.material) return a.material < b.material ? -1 : 1;
+            if (a.program !== b.program) return a.program < b.program ? -1 : 1;
+            return (a.time || 0) - (b.time || 0);
+        });
+
+        function padRight(str, len) {
+            str = String(str);
+            while (str.length < len) str += ' ';
+            return str;
+        }
+
+        lines.push('room        building  material                program       amount   tick       age');
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            const age = (typeof row.time === 'number' && typeof Game.time === 'number') ? (Game.time - row.time) : '-';
+            lines.push(
+                padRight(row.roomName, 11) + ' ' +
+                padRight(row.building, 9) + ' ' +
+                padRight(row.material, 23) + ' ' +
+                padRight(row.program, 12) + ' ' +
+                padRight(row.amount, 8) + ' ' +
+                padRight(row.time, 10) + ' ' +
+                age
+            );
+        }
+
+        lines.push('Total reservations: ' + count);
+        console.log(lines.join('\n'));
+    },
+
+    /**
+     * Validate reservation state against live room inventory.
+     * Returns a list of warnings and also logs them to console.
+     *
+     * @param {string} [filterRoom]
+     * @returns {Array<string>}
+     */
+    validateReservations: function(filterRoom) {
+        var warnings = [];
+        if (!Memory.storageReservations) return warnings;
+
+        var addWarn = function(msg) {
+            warnings.push(msg);
+            console.log('[StorageManager] ' + msg);
+        };
+
+        for (var roomName in Memory.storageReservations) {
+            if (filterRoom && roomName !== filterRoom) continue;
+            var roomBuckets = Memory.storageReservations[roomName];
+            for (var building in roomBuckets) {
+                for (var material in roomBuckets[building]) {
+                    var reservations = roomBuckets[building][material] || [];
+                    var actual = getActualAmount(roomName, material, building);
+                    var reserved = 0;
+                    var seenPrograms = {};
+                    for (var i = 0; i < reservations.length; i++) {
+                        var resv = reservations[i];
+                        if (!resv) continue;
+                        reserved += resv.amount || 0;
+                        if (seenPrograms[resv.program]) {
+                            addWarn(roomName + ' | ' + building + ' | ' + material + ' has duplicate reservation program ' + resv.program);
+                        }
+                        seenPrograms[resv.program] = true;
+                    }
+                    if (reserved > actual) {
+                        addWarn(roomName + ' | ' + building + ' | ' + material + ' reserved ' + reserved + ' > actual ' + actual);
+                    }
+                }
+            }
+        }
+
+        if (warnings.length === 0) {
+            console.log('[StorageManager] Reservation validation passed.');
+        }
+        return warnings;
     },
 
     /**
      * Purge stale reservations older than maxAge ticks.
      * Useful as a periodic cleanup in the main loop.
-     * @param {number} [maxAge=5000]
+     * Default raised to 20000 to cover labManager's BROKEN_ORDER_TICKS (10000)
+     * with margin and prevent legitimate long-running factory orders from
+     * being purged mid-flight. Leaked reservations are still caught within
+     * ~5.5 hours of real time.
+     * @param {number} [maxAge=20000]
      */
     cleanStale: function(maxAge) {
-        if (maxAge === undefined) maxAge = 5000;
+        if (maxAge === undefined) maxAge = 20000;
         if (!Memory.storageReservations) return;
         const r = Memory.storageReservations;
         let cleaned = 0;

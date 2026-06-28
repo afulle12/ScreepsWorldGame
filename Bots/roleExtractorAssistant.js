@@ -11,11 +11,6 @@ var getRoomState = require('getRoomState');
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/**
- * Returns pathfinding options that block all edge squares (the entire border
- * ring at x=0, x=49, y=0, y=49) from being considered as passable terrain.
- * This prevents PathFinder from routing creeps through room borders.
- */
 function edgeAvoidingOpts(base) {
     base = base || {};
     base.costCallback = function(roomName, costMatrix) {

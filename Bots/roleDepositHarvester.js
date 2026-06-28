@@ -2,9 +2,16 @@
 // UPDATED: Added PathFinder-based route validation to detect rooms that are impassable between
 // entry/exit edges (terrain walls or player-built walls). Uses same engine as creep movement.
 // Routes are validated after loading/computing and recomputed (up to 5 attempts) avoiding blocked rooms.
-// OPTIMIZED: CPU efficiency while traveling. Exit target cached in memory (_exitTarget) to avoid
-// findClosestByRange every tick. reusePath raised to 20 for highway rooms. maxOps reduced to 1000.
+// OPTIMIZED: CPU efficiency while traveling. Per-room navigation is now corridor-constrained:
+// each hop targets a concrete exit tile toward the next route room with maxRooms:1, so the engine
+// can never detour into an off-route room. reusePath raised to 20 for highway rooms.
 // Skips redundant validation if observer already validated the job route (job.routeValidated).
+//
+// MOVEMENT FIXES (border-bounce hardening):
+//   FIX 1: corridor-constrained movement (maxRooms:1 toward a concrete exit tile).
+//   FIX 2: forward-biased off-route recovery (no backward snap on linear-distance ties).
+//   FIX 4: peel off wrong-edge exit tiles before the engine's start-of-tick auto-transfer.
+//
 // Behavior:
 //   Spawned for a single highway Deposit job.
 //   Loop:
@@ -45,6 +52,7 @@ function clearRouteData(creep) {
   delete creep.memory.depositRouteBackIndex;
   delete creep.memory.depositRouteValidated;
   delete creep.memory._exitTarget;
+  delete creep.memory._lastRoom;
 }
 
 function markJobCompleted(creep, keepRoute) {
@@ -163,7 +171,7 @@ function checkRoomTraversal(roomName, prevRoom, nextRoom) {
 
   var result = PathFinder.search(startPos, goals, {
     plainCost: 2,
-    swampCost: 10,
+    swampCost: 2,
     maxOps: 4000,
     maxRooms: 1,
     roomCallback: function (rName) {
@@ -380,156 +388,215 @@ function buildRouteFromFindRoute(fromRoom, toRoom) {
   return route;
 }
 
-// Follow the room route one room at a time using local moveTo to the correct exit.
-// - forward === true:  storage/home -> deposit  (depositRoute, depositRouteIndex)
-// - forward === false: deposit -> storage/home (depositRouteBack, depositRouteBackIndex)
+// ---------------------------------------------------------------------------
+// MOVEMENT HELPERS (route-following)
+// ---------------------------------------------------------------------------
+
+// Parse a room name into signed grid coordinates so we can test true
+// orthogonal (edge-sharing) adjacency rather than Chebyshev distance.
+function parseRoomXY(roomName) {
+  var m = /^([WE])(\d+)([NS])(\d+)$/.exec(roomName);
+  if (!m) return null;
+  var x = parseInt(m[2], 10);
+  var y = parseInt(m[4], 10);
+  if (m[1] === 'W') x = -x - 1;
+  if (m[3] === 'S') y = -y - 1;
+  return { x: x, y: y };
+}
+
+// True only when the two rooms share an edge (i.e. can be crossed directly).
+function roomsOrthogonallyAdjacent(a, b) {
+  var pa = parseRoomXY(a);
+  var pb = parseRoomXY(b);
+  if (!pa || !pb) return false;
+  return (Math.abs(pa.x - pb.x) + Math.abs(pa.y - pb.y)) === 1;
+}
+
+// FIX 2: forward-biased off-route recovery. Among route rooms that share an
+// edge with the (off-route) current room, return the one furthest along the
+// route (highest index). This pulls the creep back onto the corridor heading
+// forward instead of snapping it backward on a linear-distance tie.
+function pickRecoveryRoom(currentRoomName, route) {
+  var best = null;
+  var bestIdx = -1;
+  for (var i = 0; i < route.length; i++) {
+    if (roomsOrthogonallyAdjacent(currentRoomName, route[i]) && i > bestIdx) {
+      bestIdx = i;
+      best = route[i];
+    }
+  }
+  return best;
+}
+
+// Deep off-route fallback: nearest route room by linear distance, ties broken
+// toward the higher index (forward bias).
+function pickNearestRouteRoom(currentRoomName, route) {
+  var best = null;
+  var bestDist = Infinity;
+  var bestIdx = -1;
+  for (var i = 0; i < route.length; i++) {
+    var d = Game.map.getRoomLinearDistance(currentRoomName, route[i]);
+    if (typeof d !== 'number') continue;
+    if (d < bestDist || (d === bestDist && i > bestIdx)) {
+      bestDist = d;
+      bestIdx = i;
+      best = route[i];
+    }
+  }
+  return best;
+}
+
+// FIX 4 helpers: detect exit tiles and whether the creep sits on the edge that
+// actually leads toward its intended next room.
+function isOnExitTile(pos) {
+  return pos.x === 0 || pos.x === 49 || pos.y === 0 || pos.y === 49;
+}
+
+function isOnIntendedExitEdge(pos, exitDir) {
+  switch (exitDir) {
+    case FIND_EXIT_TOP:    return pos.y === 0;
+    case FIND_EXIT_BOTTOM: return pos.y === 49;
+    case FIND_EXIT_LEFT:   return pos.x === 0;
+    case FIND_EXIT_RIGHT:  return pos.x === 49;
+  }
+  return false;
+}
+
+// FIX 1: find (and cache) a concrete exit tile on the edge toward nextRoom so
+// movement can be constrained to the current room (maxRooms: 1). Returns null
+// if no walkable exit on that edge is reachable from the creep's position.
+function getCachedExitTarget(creep, exitDir) {
+  var cached = creep.memory._exitTarget;
+  if (cached && typeof cached.x === 'number' && typeof cached.y === 'number') {
+    return new RoomPosition(cached.x, cached.y, creep.room.name);
+  }
+  var exitPos = creep.pos.findClosestByPath(exitDir, { ignoreCreeps: true });
+  if (!exitPos) return null;
+  creep.memory._exitTarget = { x: exitPos.x, y: exitPos.y };
+  return exitPos;
+}
+
+// Follow the room route one room at a time, constrained to the validated
+// corridor. Replaces the old moveTo(25,25,nextRoom) approach, which ran its own
+// multi-room planner and could detour through off-route rooms — producing the
+// two-room border-bounce.
 //
-// CPU optimizations:
-//   - Exit target is cached in memory (_exitTarget) to avoid findClosestByRange every tick.
+// - forward === true:  storage/home -> deposit  (depositRoute, depositRouteIndex)
+// - forward === false: deposit -> storage/home  (depositRouteBack, depositRouteBackIndex)
+//
+// FIX 1: each hop targets a concrete exit tile toward the next route room with
+//        maxRooms:1, so the engine can never wander into an off-route room.
+// FIX 2: when off-route, recover toward the furthest-forward edge-adjacent route
+//        room instead of snapping backward on a linear-distance tie.
+// FIX 4: if parked on an exit tile that is NOT the intended exit edge, peel
+//        inward first so the engine's start-of-tick exit-tile auto-transfer
+//        cannot ping-pong the creep back across the border.
+//
+// CPU notes:
 //   - reusePath: 20 for highway rooms (no dynamic obstacles).
-//   - maxOps: 1000 (single room to exit is simple).
-//   - Cache is cleared on room transition.
+//   - maxOps: 2000 (allow pathing across the current room to the far exit).
+//   - The chosen exit tile is cached in memory._exitTarget and invalidated on
+//     room change, so findClosestByPath runs at most once per room.
 function followRoomRoute(creep, forward) {
   var currentRoomName = creep.room.name;
-
-  // --- EXIT BOUNCE PREVENTION ---
-  // If we are on an exit tile, move into the room immediately to avoid engine bounce.
-  if (creep.pos.x === 0 || creep.pos.x === 49 || creep.pos.y === 0 || creep.pos.y === 49) {
-    creep.moveTo(new RoomPosition(25, 25, currentRoomName), { reusePath: 3, maxOps: 500 });
-    return OK;
-  }
-  // -----------------------------------
-
   var route = forward ? creep.memory.depositRoute : creep.memory.depositRouteBack;
   if (!Array.isArray(route) || route.length === 0) {
     return ERR_NOT_FOUND;
   }
 
   var indexKey = forward ? 'depositRouteIndex' : 'depositRouteBackIndex';
-  var goalRoomName = forward
-    ? creep.memory.targetRoom
-    : creep.memory.homeRoom;
+  var goalRoomName = forward ? creep.memory.targetRoom : creep.memory.homeRoom;
 
-  // If we are already in the goal room for this leg, let the caller handle local movement.
+  // Invalidate the cached exit tile whenever the room changes.
+  if (creep.memory._lastRoom !== currentRoomName) {
+    creep.memory._lastRoom = currentRoomName;
+    delete creep.memory._exitTarget;
+  }
+
+  // Arrived at the goal room.
   if (goalRoomName && currentRoomName === goalRoomName) {
+    var goalIdx = route.indexOf(currentRoomName);
+    if (goalIdx !== -1) creep.memory[indexKey] = goalIdx;
     return OK;
   }
 
-  var idx = creep.memory[indexKey];
+  // Decide which room to head toward next.
+  var currentIdx = route.indexOf(currentRoomName);
+  var nextRoomName;
 
-  // Sync index with current room if needed (only on room transitions).
-  if (typeof idx !== 'number' ||
-      idx < 0 ||
-      idx >= route.length ||
-      route[idx] !== currentRoomName) {
-
-    // Clear cached exit target on room change.
-    delete creep.memory._exitTarget;
-
-    var foundIdx = -1;
-    for (var i = 0; i < route.length; i++) {
-      if (route[i] === currentRoomName) {
-        foundIdx = i;
-        break;
-      }
+  if (currentIdx !== -1) {
+    // On route: aim at the next room in sequence.
+    creep.memory[indexKey] = currentIdx;
+    var nextIdx = currentIdx + 1;
+    if (nextIdx >= route.length) {
+      return ERR_NOT_FOUND;
     }
-
-    if (foundIdx !== -1) {
-      idx = foundIdx;
-    } else {
-      // If we somehow appear off-route, snap to the nearest route room by linear distance.
-      var nearestIdx = 0;
-      var nearestDist = Infinity;
-      for (var j = 0; j < route.length; j++) {
-        var dist = Game.map.getRoomLinearDistance(currentRoomName, route[j]);
-        if (typeof dist === 'number' && dist < nearestDist) {
-          nearestDist = dist;
-          nearestIdx = j;
-        }
-      }
-      idx = nearestIdx;
-    }
-
-    creep.memory[indexKey] = idx;
-  }
-
-  // Determine the next room along this route.
-  var nextIdx = idx + 1;
-  if (nextIdx >= route.length) {
-    if (!goalRoomName || currentRoomName === goalRoomName) {
+    nextRoomName = route[nextIdx];
+  } else {
+    // FIX 2: off route — recover forward toward an edge-adjacent route room.
+    nextRoomName = pickRecoveryRoom(currentRoomName, route);
+    if (!nextRoomName) {
+      // Drifted 2+ rooms off the corridor: fall back to a normal multi-room
+      // move toward the nearest route room (forward-biased on ties).
+      var fallbackRoom = pickNearestRouteRoom(currentRoomName, route);
+      if (!fallbackRoom) return ERR_NOT_FOUND;
+      console.log(
+        '[DepositHarvesterRoute] ' +
+          creep.name +
+          ' deep off-route in ' +
+          currentRoomName +
+          '; recovering toward ' +
+          fallbackRoom +
+          '.'
+      );
+      creep.moveTo(new RoomPosition(25, 25, fallbackRoom), { reusePath: 20 });
       return OK;
     }
+  }
+
+  // Direction of the shared edge toward nextRoom (within the current room).
+  var exitDir = creep.room.findExitTo(nextRoomName);
+  if (exitDir < 0) {
     console.log(
       '[DepositHarvesterRoute] ' +
         creep.name +
-        ' has no further rooms in route (forward=' +
-        forward +
-        ') but is still not in goal room (current=' +
+        ' findExitTo from ' +
         currentRoomName +
-        ', goal=' +
-        goalRoomName +
-        ').'
+        ' to ' +
+        nextRoomName +
+        ' returned ' +
+        exitDir +
+        '.'
     );
-    return ERR_NOT_FOUND;
+    return ERR_NO_PATH;
   }
 
-  var nextRoomName = route[nextIdx];
-
-  // If we already crossed into the next room (border case), advance the index.
-  if (currentRoomName === nextRoomName) {
-    creep.memory[indexKey] = nextIdx;
-    delete creep.memory._exitTarget;
+  // FIX 4: parked on the wrong exit edge — pull inward before the engine yanks
+  // the creep back across the border at the start of next tick.
+  if (isOnExitTile(creep.pos) && !isOnIntendedExitEdge(creep.pos, exitDir)) {
+    creep.moveTo(new RoomPosition(25, 25, currentRoomName), { maxRooms: 1, reusePath: 0 });
     return OK;
   }
 
-  // Use cached exit target to avoid calling findClosestByRange every tick.
-  var exitTarget = creep.memory._exitTarget;
-
-  if (!exitTarget || exitTarget.nextRoom !== nextRoomName) {
-    var exitDir = Game.map.findExit(currentRoomName, nextRoomName);
-    if (exitDir < 0) {
-      console.log(
-        '[DepositHarvesterRoute] ' +
-          creep.name +
-          ' Game.map.findExit from ' +
-          currentRoomName +
-          ' to ' +
-          nextRoomName +
-          ' returned ' +
-          exitDir +
-          '.'
-      );
-      return ERR_NO_PATH;
-    }
-
-    var exitPos = creep.pos.findClosestByRange(exitDir);
-    if (!exitPos) {
-      console.log(
-        '[DepositHarvesterRoute] ' +
-          creep.name +
-          ' could not find exit ' +
-          exitDir +
-          ' in room ' +
-          currentRoomName +
-          ' toward ' +
-          nextRoomName +
-          '.'
-      );
-      return ERR_NO_PATH;
-    }
-
-    // Cache the exit target so we don't recalculate next tick.
-    exitTarget = { x: exitPos.x, y: exitPos.y, nextRoom: nextRoomName };
-    creep.memory._exitTarget = exitTarget;
+  // FIX 1: move toward a concrete exit tile, constrained to this room only.
+  var exitTarget = getCachedExitTarget(creep, exitDir);
+  if (!exitTarget) {
+    // No reachable exit tile (rare: disconnected pocket). Let the engine plan
+    // multi-room toward the next room center as a last resort.
+    console.log(
+      '[DepositHarvesterRoute] ' +
+        creep.name +
+        ' no reachable exit tile toward ' +
+        nextRoomName +
+        ' from ' +
+        currentRoomName +
+        '; falling back to multi-room moveTo.'
+    );
+    creep.moveTo(new RoomPosition(25, 25, nextRoomName), { reusePath: 20, maxOps: 2000 });
+    return OK;
   }
 
-  // Navigate to cached exit position. Highway rooms are typically empty,
-  // so high reusePath and low maxOps save CPU.
-  creep.moveTo(new RoomPosition(exitTarget.x, exitTarget.y, currentRoomName), {
-    reusePath: 20,
-    maxOps: 1000
-  });
-
+  creep.moveTo(exitTarget, { reusePath: 20, maxOps: 2000, maxRooms: 1 });
   return OK;
 }
 

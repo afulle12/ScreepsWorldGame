@@ -10,6 +10,8 @@ const FILL_TARGET_RATIO   = 0.90;  // Stop filling a tower once it reaches this
 const SPAWN_TRIGGER_RATIO = 0.75;  // Expose to spawnManager for spawn checks
 const SUICIDE_GRACE_RATIO = 0.50;  // Suicide threshold: all towers ≥ this AND no hostiles
 
+const getRoomState = require('getRoomState');
+
 module.exports = {
 
     SPAWN_TRIGGER_RATIO,
@@ -89,19 +91,40 @@ function _findCollectTarget(creep) {
     }
 
     // 2. Terminal
-    const terminals = room.find(FIND_MY_STRUCTURES, {
-        filter: s =>
-            s.structureType === STRUCTURE_TERMINAL &&
-            s.store.getUsedCapacity(RESOURCE_ENERGY) >= 200
-    });
+    const rs = getRoomState.get(room.name);
+    let terminals = [];
+    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_TERMINAL]) {
+        const tArr = rs.structuresByType[STRUCTURE_TERMINAL];
+        for (let ti = 0; ti < tArr.length; ti++) {
+            if (tArr[ti].my && tArr[ti].store.getUsedCapacity(RESOURCE_ENERGY) >= 200) {
+                terminals.push(tArr[ti]);
+            }
+        }
+    } else {
+        terminals = room.find(FIND_MY_STRUCTURES, {
+            filter: s =>
+                s.structureType === STRUCTURE_TERMINAL &&
+                s.store.getUsedCapacity(RESOURCE_ENERGY) >= 200
+        });
+    }
     if (terminals.length > 0) return terminals[0];
 
     // 3. Containers — prefer the one with the most energy
-    const containers = room.find(FIND_STRUCTURES, {
-        filter: s =>
-            s.structureType === STRUCTURE_CONTAINER &&
-            s.store.getUsedCapacity(RESOURCE_ENERGY) >= 100
-    });
+    let containers = [];
+    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_CONTAINER]) {
+        const cArr = rs.structuresByType[STRUCTURE_CONTAINER];
+        for (let ci = 0; ci < cArr.length; ci++) {
+            if (cArr[ci].store.getUsedCapacity(RESOURCE_ENERGY) >= 100) {
+                containers.push(cArr[ci]);
+            }
+        }
+    } else {
+        containers = room.find(FIND_STRUCTURES, {
+            filter: s =>
+                s.structureType === STRUCTURE_CONTAINER &&
+                s.store.getUsedCapacity(RESOURCE_ENERGY) >= 100
+        });
+    }
     if (containers.length > 0) {
         containers.sort((a, b) =>
             b.store.getUsedCapacity(RESOURCE_ENERGY) -
@@ -111,9 +134,19 @@ function _findCollectTarget(creep) {
     }
 
     // 4. Dropped energy
-    const dropped = room.find(FIND_DROPPED_RESOURCES, {
-        filter: r => r.resourceType === RESOURCE_ENERGY && r.amount >= 50
-    });
+    let dropped = [];
+    if (rs && rs.dropped) {
+        const dArr = rs.dropped;
+        for (let di = 0; di < dArr.length; di++) {
+            if (dArr[di].resourceType === RESOURCE_ENERGY && dArr[di].amount >= 50) {
+                dropped.push(dArr[di]);
+            }
+        }
+    } else {
+        dropped = room.find(FIND_DROPPED_RESOURCES, {
+            filter: r => r.resourceType === RESOURCE_ENERGY && r.amount >= 50
+        });
+    }
     if (dropped.length > 0) {
         dropped.sort((a, b) => b.amount - a.amount);
         return dropped[0];
@@ -175,14 +208,28 @@ function _fill(creep) {
 
 // Normal operation: only towers below FILL_TRIGGER_RATIO
 function _findFillTarget(creep) {
-    const towers = creep.room.find(FIND_MY_STRUCTURES, {
-        filter: s => {
-            if (s.structureType !== STRUCTURE_TOWER) return false;
+    const room = creep.room;
+    const rs = getRoomState.get(room.name);
+    let towers = [];
+    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_TOWER]) {
+        const tArr = rs.structuresByType[STRUCTURE_TOWER];
+        for (let ti = 0; ti < tArr.length; ti++) {
+            const s = tArr[ti];
+            if (!s.my) continue;
             const ratio = s.store.getUsedCapacity(RESOURCE_ENERGY) /
                           s.store.getCapacity(RESOURCE_ENERGY);
-            return ratio < FILL_TRIGGER_RATIO;
+            if (ratio < FILL_TRIGGER_RATIO) towers.push(s);
         }
-    });
+    } else {
+        towers = room.find(FIND_MY_STRUCTURES, {
+            filter: s => {
+                if (s.structureType !== STRUCTURE_TOWER) return false;
+                const ratio = s.store.getUsedCapacity(RESOURCE_ENERGY) /
+                              s.store.getCapacity(RESOURCE_ENERGY);
+                return ratio < FILL_TRIGGER_RATIO;
+            }
+        });
+    }
 
     if (towers.length === 0) return null;
 
@@ -195,12 +242,24 @@ function _findFillTarget(creep) {
 
 // TTL < 100: target every tower that isn't completely full, lowest energy first
 function _findFillTargetAll(creep) {
-    const towers = creep.room.find(FIND_MY_STRUCTURES, {
-        filter: s => {
-            if (s.structureType !== STRUCTURE_TOWER) return false;
-            return s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
+    const room = creep.room;
+    const rs = getRoomState.get(room.name);
+    let towers = [];
+    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_TOWER]) {
+        const tArr = rs.structuresByType[STRUCTURE_TOWER];
+        for (let ti = 0; ti < tArr.length; ti++) {
+            const s = tArr[ti];
+            if (!s.my) continue;
+            if (s.store.getFreeCapacity(RESOURCE_ENERGY) > 0) towers.push(s);
         }
-    });
+    } else {
+        towers = room.find(FIND_MY_STRUCTURES, {
+            filter: s => {
+                if (s.structureType !== STRUCTURE_TOWER) return false;
+                return s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
+            }
+        });
+    }
 
     if (towers.length === 0) return null;
 

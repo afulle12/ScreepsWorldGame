@@ -10,25 +10,7 @@
  *      a key; no terminal is needed. You can use any string (e.g. your main room name).
  * 2. Call opportunisticBuy.process() in your main loop (every tick is fine)
  * 3. Call opportunisticBuy.listActiveRequests() to view current orders
- * 4. Call opportunisticBuy.cancelRequest('ROOM#', RESOURCE) to delete a request
- * 
- * Behavior:
- * - Attempts at most one market deal per terminal at a time (terminal resources).
- * - Among requests for the same terminal in the same tick, prefers the one created earlier.
- * - Attempts every tick by default (configurable via `checkInterval` on each request).
- * - Caches the last successful order to reduce scanning and speed follow-up purchases.
- * - Chooses the cheapest feasible order. Among equally cheap, prefers the one allowing
- *   the largest buy amount this tick (often closest, saving energy).
- * - Validates terminal transfers by comparing terminal resource counts before and after a deal; 
- *   progress is updated only after the terminal reflects the transfer.
- * - Pending confirmations time out after 20 ticks; timed-out deals are not counted,
- *   the cached order is invalidated, and the module immediately retries new deals.
- * - Orders from our own rooms are always accepted regardless of maxPrice, since credits
- *   cycle back to us (only transfer energy is the real cost).
- * - Account-level resources (pixel, cpuUnlock, accessKey) bypass all terminal logic:
- *   no energy cost, no capacity checks, no room name in deal(), immediate confirmation.
- * 
- * @module opportunisticBuy
+ * 4. Call opportunisticBuy.cancelRequest('ROOM', RESOURCE) to delete a request
  */
 
 // Confirmation timeout in ticks for pending market deals
@@ -309,6 +291,18 @@ function process() {
     for (var key in requests) {
         var req = requests[key];
         if (!req || typeof req.remaining !== 'number' || req.remaining <= 0) continue;
+
+        // Drop terminal-resource requests whose room is no longer owned.
+        // Account-resource requests (pixel, cpuUnlock, accessKey) use the room name
+        // as a key only and are preserved.
+        if (!isAccountResource(req.resourceType) && !myRooms[req.roomName]) {
+            console.log('[OpportunisticBuy] Removing orphaned request for ' + req.remaining + '/' + req.totalAmount +
+                ' ' + req.resourceType + ' in ' + req.roomName + ' (room no longer owned); ' +
+                (req.fulfilled || 0) + ' already fulfilled.');
+            delete requests[key];
+            continue;
+        }
+
         entries.push({ key: key, req: req });
     }
     entries.sort(function(a, b) {

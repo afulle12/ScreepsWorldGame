@@ -456,8 +456,83 @@ var marketSeller = {
     // ===== PERIODIC SYNC (call from main loop every ~50 ticks) =====
     run: function() {
         this.ensureMemory();
+        this.reconcileOrders();
         this.cleanup();
         this.syncReservations();
+    },
+
+    // Reattach live market sell orders to in-memory requests after memory loss
+    // or request cleanup. Any sell order in an owned room should belong here.
+    reconcileOrders: function() {
+        this.ensureMemory();
+
+        if (!Game.market || !Game.market.orders) {
+            return '[MarketSell] No market orders to reconcile.';
+        }
+
+        var list = Memory.marketSell.requests;
+        var knownOrders = {};
+        for (var i = 0; i < list.length; i++) {
+            var req = list[i];
+            if (req && req.orderId) knownOrders[req.orderId] = true;
+        }
+
+        var attached = 0;
+        var added = 0;
+
+        for (var id in Game.market.orders) {
+            var order = Game.market.orders[id];
+            if (!order || order.type !== ORDER_SELL) continue;
+            if (typeof order.remainingAmount !== 'number' || order.remainingAmount <= 0) continue;
+            if (knownOrders[id]) continue;
+
+            var room = Game.rooms[order.roomName];
+            if (!room || !room.controller || !room.controller.my) continue;
+
+            var orderAmount = (typeof order.totalAmount === 'number') ? order.totalAmount : (typeof order.amount === 'number' ? order.amount : 0);
+            var orderPrice = (typeof order.price === 'number') ? order.price : 0;
+
+            var matched = false;
+            for (var j = 0; j < list.length; j++) {
+                var candidate = list[j];
+                if (!candidate || candidate.orderId) continue;
+                if (candidate.roomName !== order.roomName) continue;
+                if (candidate.resourceType !== order.resourceType) continue;
+                if (candidate.amount !== orderAmount) continue;
+                if (candidate.price !== orderPrice) continue;
+
+                candidate.orderId = id;
+                candidate.reconciled = true;
+                if (candidate.needsTransfer === undefined) candidate.needsTransfer = false;
+                matched = true;
+                attached++;
+                break;
+            }
+
+            if (!matched) {
+                list.push({
+                    id: 'marketsell_reconcile_' + Game.time + '_' + added,
+                    roomName: order.roomName,
+                    resourceType: order.resourceType,
+                    amount: orderAmount,
+                    price: orderPrice,
+                    created: (typeof order.created === 'number') ? order.created : Game.time,
+                    reserved: false,
+                    needsTransfer: false,
+                    orderId: id,
+                    reconciled: true
+                });
+                added++;
+            }
+
+            knownOrders[id] = true;
+        }
+
+        if (added === 0 && attached === 0) {
+            return '[MarketSell] No orphaned marketSell orders found.';
+        }
+
+        return '[MarketSell] Reconciled ' + (added + attached) + ' orphaned marketSell order(s) (' + attached + ' attached, ' + added + ' added).';
     },
 
     // Sync storageManager reservations with live market order state.
@@ -488,12 +563,10 @@ var marketSeller = {
 
             var key = req.roomName + ':' + req.resourceType;
             if (!aggregates[key]) {
-                aggregates[key] = { roomName: req.roomName, resource: req.resourceType, total: 0 };
+                aggregates[key] = { roomName: req.roomName, resource: req.resourceType, total: 0, reqs: [] };
             }
             aggregates[key].total += order.remainingAmount;
-
-            // Mark this request as reserved (for status display)
-            req.reserved = true;
+            aggregates[key].reqs.push(req);
         }
 
         // Apply aggregated reservations (one per room+resource combo)
@@ -503,21 +576,63 @@ var marketSeller = {
         for (var k in aggregates) {
             var agg = aggregates[k];
             if (agg.total > 0) {
-                // Cap to what's actually in the terminal (can't reserve more than exists)
                 var room = Game.rooms[agg.roomName];
                 var terminal = room && room.terminal ? room.terminal : null;
-                var inTerminal = (terminal && terminal.store && terminal.store[agg.resource])
-                    ? terminal.store[agg.resource] : 0;
-                var reserveAmount = Math.min(agg.total, inTerminal);
+                var storage = room && room.storage ? room.storage : null;
+                var inTerminal = (terminal && terminal.store && terminal.store[agg.resource]) ? terminal.store[agg.resource] : 0;
+                var inStorage = (storage && storage.store && storage.store[agg.resource]) ? storage.store[agg.resource] : 0;
 
-                if (reserveAmount > 0) {
-                    var result = storageManager.reserve(agg.roomName, agg.resource, 'terminal', 'marketSell', reserveAmount);
-                    if (!result.ok) {
-                        // If reserve failed (e.g. other reservations took priority), log but don't block
-                        if (Game.time % 100 === 0) {
-                            console.log('[MarketSell] Reserve warning for ' + agg.resource + ' in ' + agg.roomName + ': ' + result.reason);
+                var reserveTerminal = Math.min(agg.total, inTerminal);
+                var reserveStorage = Math.min(Math.max(0, agg.total - reserveTerminal), inStorage);
+
+                var terminalOk = true;
+                var storageOk = true;
+
+                if (reserveTerminal > 0) {
+                    var termResult = storageManager.reserve(agg.roomName, agg.resource, 'terminal', 'marketSell', reserveTerminal);
+                    terminalOk = !!(termResult && termResult.ok);
+                    if (!terminalOk && Game.time % 100 === 0) {
+                        console.log('[MarketSell] Reserve warning for ' + agg.resource + ' in ' + agg.roomName + ' terminal: ' + termResult.reason);
+                    }
+                    if (!terminalOk) {
+                        storageManager.unReserve(agg.roomName, agg.resource, 'terminal', 'marketSell');
+                    }
+                } else {
+                    var termInfo = storageManager.storageFind(agg.roomName, agg.resource);
+                    var hasTermReserve = false;
+                    if (termInfo && termInfo.terminal && Array.isArray(termInfo.terminal.reservations)) {
+                        for (var ti = 0; ti < termInfo.terminal.reservations.length; ti++) {
+                            var termResv = termInfo.terminal.reservations[ti];
+                            if (termResv && termResv.program === 'marketSell') { hasTermReserve = true; break; }
                         }
                     }
+                    if (hasTermReserve) storageManager.unReserve(agg.roomName, agg.resource, 'terminal', 'marketSell');
+                }
+
+                if (reserveStorage > 0) {
+                    var storResult = storageManager.reserve(agg.roomName, agg.resource, 'storage', 'marketSell', reserveStorage);
+                    storageOk = !!(storResult && storResult.ok);
+                    if (!storageOk && Game.time % 100 === 0) {
+                        console.log('[MarketSell] Reserve warning for ' + agg.resource + ' in ' + agg.roomName + ' storage: ' + storResult.reason);
+                    }
+                    if (!storageOk) {
+                        storageManager.unReserve(agg.roomName, agg.resource, 'storage', 'marketSell');
+                    }
+                } else {
+                    var storInfo = storageManager.storageFind(agg.roomName, agg.resource);
+                    var hasStorReserve = false;
+                    if (storInfo && storInfo.storage && Array.isArray(storInfo.storage.reservations)) {
+                        for (var si = 0; si < storInfo.storage.reservations.length; si++) {
+                            var storResv = storInfo.storage.reservations[si];
+                            if (storResv && storResv.program === 'marketSell') { hasStorReserve = true; break; }
+                        }
+                    }
+                    if (hasStorReserve) storageManager.unReserve(agg.roomName, agg.resource, 'storage', 'marketSell');
+                }
+
+                var fullyReserved = terminalOk && storageOk && (reserveTerminal + reserveStorage >= agg.total);
+                for (var ri = 0; ri < agg.reqs.length; ri++) {
+                    agg.reqs[ri].reserved = fullyReserved;
                 }
                 activeKeys[k] = true;
             }
@@ -561,21 +676,25 @@ var marketSeller = {
         if (!Memory.storageReservations) return;
 
         var r = Memory.storageReservations;
+        var buildings = ['terminal', 'storage'];
         for (var roomName in r) {
-            if (!r[roomName] || !r[roomName]['terminal']) continue;
-            var termRes = r[roomName]['terminal'];
+            for (var b = 0; b < buildings.length; b++) {
+                var building = buildings[b];
+                if (!r[roomName] || !r[roomName][building]) continue;
+                var bucket = r[roomName][building];
 
-            for (var material in termRes) {
-                var reservations = termRes[material];
-                if (!Array.isArray(reservations)) continue;
+                for (var material in bucket) {
+                    var reservations = bucket[material];
+                    if (!Array.isArray(reservations)) continue;
 
-                for (var i = 0; i < reservations.length; i++) {
-                    if (reservations[i].program === 'marketSell') {
-                        var key = roomName + ':' + material;
-                        if (!activeKeys[key]) {
-                            storageManager.unReserve(roomName, material, 'terminal', 'marketSell');
+                    for (var i = 0; i < reservations.length; i++) {
+                        if (reservations[i].program === 'marketSell') {
+                            var key = roomName + ':' + material;
+                            if (!activeKeys[key]) {
+                                storageManager.unReserve(roomName, material, building, 'marketSell');
+                            }
+                            break; // only one entry per program
                         }
-                        break; // only one entry per program
                     }
                 }
             }
@@ -588,17 +707,30 @@ var marketSeller = {
     },
 
     // Convenience helpers for console
-    status: function() {
+    status: function(filterRoom, filterResourceType) {
         this.ensureMemory();
         this.cleanup();
 
         var list = Memory.marketSell.requests;
-        if (!list || list.length === 0) return '[MarketSell] No active marketSell orders.';
+        var rows = [];
 
-        console.log('=== MARKET SELL REQUESTS (' + list.length + ' active) ===');
         for (var i = 0; i < list.length; i++) {
             var r = list[i];
-            var progress = '';
+            if (!r) continue;
+            if (filterRoom && r.roomName !== filterRoom) continue;
+            if (filterResourceType && r.resourceType !== filterResourceType) continue;
+
+            var order = (r.orderId && Game.market && Game.market.orders) ? Game.market.orders[r.orderId] : null;
+            var orderRemaining = order ? order.remainingAmount : 0;
+            var orderTotal = order ? order.totalAmount : (typeof r.amount === 'number' ? r.amount : 0);
+
+            var info = storageManager.storageFind(r.roomName, r.resourceType);
+            var termRsv = info && info.terminal && typeof info.terminal.reserved === 'number' ? info.terminal.reserved : 0;
+            var storRsv = info && info.storage && typeof info.storage.reserved === 'number' ? info.storage.reserved : 0;
+            var reservedTotal = termRsv + storRsv;
+            var shortfall = Math.max(0, orderRemaining - reservedTotal);
+
+            var progress = '-';
             if (r.tmOpId && Memory.terminalManager && Array.isArray(Memory.terminalManager.operations)) {
                 var ops = Memory.terminalManager.operations;
                 for (var j = 0; j < ops.length; j++) {
@@ -607,36 +739,80 @@ var marketSeller = {
                         var moved = op.amountMoved || 0;
                         if (moved < 0) moved = 0;
                         if (moved > op.amount) moved = op.amount;
-                        progress = ' | toTerminal: ' + moved + '/' + op.amount + ' (' + (op.status || '-') + ')';
+                        progress = moved + '/' + op.amount + ' ' + (op.status || '-');
                         break;
                     }
                 }
             }
 
-            // Get live order details if possible
-            var liveInfo = '';
-            if (r.orderId && Game.market.orders[r.orderId]) {
-                var o = Game.market.orders[r.orderId];
-                liveInfo = ' | REMAINING: ' + o.remainingAmount + '/' + o.totalAmount;
-            } else {
-                liveInfo = ' | [Order not found/sold]';
-            }
+            var state = 'live';
+            if (!order) state = 'orphan';
+            else if (!r.reserved) state = 'pending';
 
-            // Reservation status
-            var rsvInfo = r.reserved ? ' | RESERVED' : ' | rsv:pending';
-
-            console.log(
-                '  ' + r.id +
-                ' | room: ' + r.roomName +
-                ' | res: ' + r.resourceType +
-                ' | order: ' + r.amount + ' @ ' + (typeof r.price === 'number' ? r.price.toFixed(3) : r.price) +
-                ' | created: ' + (r.created || '-') +
-                (r.orderId ? (' | orderId: ' + r.orderId) : '') +
-                liveInfo +
-                rsvInfo +
-                progress
-            );
+            rows.push({
+                roomName: r.roomName,
+                resourceType: r.resourceType,
+                orderTotal: orderTotal,
+                orderRemaining: orderRemaining,
+                termRsv: termRsv,
+                storRsv: storRsv,
+                shortfall: shortfall,
+                price: typeof r.price === 'number' ? r.price : 0,
+                created: r.created || 0,
+                age: (typeof r.created === 'number' && typeof Game.time === 'number') ? (Game.time - r.created) : '-',
+                orderId: r.orderId || '-',
+                state: state,
+                progress: progress
+            });
         }
+
+        var lines = [];
+        var roomLabel = filterRoom ? filterRoom : '*';
+        var resourceLabel = filterResourceType ? filterResourceType : '*';
+        lines.push('[MarketSell] Requests room=' + roomLabel + ' resource=' + resourceLabel);
+
+        if (rows.length === 0) {
+            lines.push('  none');
+            lines.push('Total requests: 0');
+            console.log(lines.join('\n'));
+            return '[MarketSell] Status printed.';
+        }
+
+        rows.sort(function(a, b) {
+            if (a.roomName !== b.roomName) return a.roomName < b.roomName ? -1 : 1;
+            if (a.resourceType !== b.resourceType) return a.resourceType < b.resourceType ? -1 : 1;
+            return (a.created || 0) - (b.created || 0);
+        });
+
+        function padRight(str, len) {
+            str = String(str);
+            while (str.length < len) str += ' ';
+            return str;
+        }
+
+        lines.push('room        resource        state    remaining  total      termRsv  storRsv  shortfall  price     age   orderId');
+        for (var k = 0; k < rows.length; k++) {
+            var row = rows[k];
+            lines.push(
+                padRight(row.roomName, 11) + ' ' +
+                padRight(row.resourceType, 14) + ' ' +
+                padRight(row.state, 8) + ' ' +
+                padRight(row.orderRemaining, 10) + ' ' +
+                padRight(row.orderTotal, 10) + ' ' +
+                padRight(row.termRsv, 8) + ' ' +
+                padRight(row.storRsv, 8) + ' ' +
+                padRight(row.shortfall, 10) + ' ' +
+                padRight((typeof row.price === 'number' ? row.price.toFixed(3) : row.price), 8) + ' ' +
+                padRight(row.age, 5) + ' ' +
+                row.orderId
+            );
+            if (row.progress !== '-' || row.state !== 'live') {
+                lines.push('  ' + row.progress);
+            }
+        }
+
+        lines.push('Total requests: ' + rows.length);
+        console.log(lines.join('\n'));
         return '[MarketSell] Status printed.';
     },
 
@@ -732,8 +908,11 @@ var marketSeller = {
 global.marketSell = function(roomName, resourceType, amount, price) {
     return marketSeller.marketSell(roomName, resourceType, amount, price);
 };
-global.marketSellStatus = function() {
-    return marketSeller.status();
+global.marketSellStatus = function(roomName, resourceType) {
+    return marketSeller.status(roomName, resourceType);
+};
+global.marketSellReconcile = function() {
+    return marketSeller.reconcileOrders();
 };
 global.cancelMarketSellGather = function(id) {
     return marketSeller.cancelGather(id);

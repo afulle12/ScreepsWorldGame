@@ -142,10 +142,47 @@ var roleHarvester = {
                     if (occupants.length > 0 && occupants[0].name !== creep.name) {
                         // Fall through to normal behavior below
                     } else {
-                        // Walk onto the container tile (range: 0 targets the exact position)
+                        // Walk onto the container tile.
+                        // Evict stale paths older than 3 ticks — the container is
+                        // always nearby and an old long-distance path will route
+                        // straight through impassable structures like spawns.
+                        if (creep.memory._move && creep.memory._move.time < Game.time - 3) {
+                            delete creep.memory._move;
+                        }
                         if (creep.fatigue === 0) {
                             var move = this.clearIfStuck(creep);
-                            creep.moveTo(sourceContainer.pos, { reusePath: move.reusePath, maxOps: move.maxOps, ignoreCreeps: true });
+                            creep.moveTo(sourceContainer.pos, {
+                                reusePath: move.reusePath,
+                                maxOps: move.maxOps,
+                                ignoreCreeps: move.ignoreCreeps,
+                                range: 0,
+                                costCallback: function(rn) {
+                                    var matrix = new PathFinder.CostMatrix();
+                                    var base = getRoomState.get(rn);
+                                    if (!base || !base.structuresByType) return matrix;
+                                    var allStructs = base.structuresByType;
+                                    for (var type in allStructs) {
+                                        var arr = allStructs[type];
+                                        if (!arr) continue;
+                                        for (var i = 0; i < arr.length; i++) {
+                                            var s = arr[i];
+                                            if (!s) continue;
+                                            if (type === STRUCTURE_ROAD) {
+                                                matrix.set(s.pos.x, s.pos.y, 1);
+                                            } else if (type === STRUCTURE_CONTAINER) {
+                                                // containers are walkable, leave at terrain cost
+                                            } else if (type === STRUCTURE_RAMPART) {
+                                                if (!s.my && !s.isPublic) matrix.set(s.pos.x, s.pos.y, 255);
+                                            } else if (type !== STRUCTURE_WALL) {
+                                                // walls are repair targets — leave walkable so
+                                                // the creep can path adjacent to them
+                                                matrix.set(s.pos.x, s.pos.y, 255);
+                                            }
+                                        }
+                                    }
+                                    return matrix;
+                                }
+                            });
                         }
                         return;
                     }
@@ -240,7 +277,7 @@ var roleHarvester = {
         }
     },
 
-// ═══════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════
     // ANCHORED HARVESTER — extracted from run() for clarity.
     // The creep is adjacent to both source and sourceLink.
     // It never moves. Only interacts with structures in its
@@ -622,9 +659,7 @@ var roleHarvester = {
     // Returns { maxOps, reusePath, ignoreCreeps } to control the moveTo call.
     //
     // Normal:           maxOps 200,  reusePath 50, ignoreCreeps false
-    // Stuck ≥3 ticks:   maxOps 1500, reusePath 5,  ignoreCreeps false  (route around)
-    // Stuck ≥2 repaths: maxOps 1500, reusePath 3,  ignoreCreeps true   (push through)
-    // Stuck ≥5 repaths: suicide — the path is permanently blocked
+    // Stuck ≥2 ticks:   maxOps 1500, reusePath 1,  ignoreCreeps true   (route around + push through)
     // ───────────────────────────────────────────────
     clearIfStuck: function(creep) {
         var s = stuckCache[creep.name];
@@ -632,27 +667,27 @@ var roleHarvester = {
             stuckCache[creep.name] = { x: creep.pos.x, y: creep.pos.y, ticks: 0, repaths: 0 };
             return { maxOps: 200, reusePath: 50, ignoreCreeps: false };
         }
-        if (creep.pos.x === s.x && creep.pos.y === s.y) {
-            s.ticks++;
-            if (s.ticks >= 3) {
-                delete creep.memory._move;
-                s.ticks = 0;
-                s.repaths++;
 
-                var ignoreCreeps = s.repaths >= 2;
-                // Scale ops with each failed attempt: 1500, 2000, 2500, 3000 … capped at 5000
-                var maxOps = Math.min(1500 + (s.repaths - 1) * 500, 5000);
-                console.log('[Harvester] ' + creep.name + ' stuck at ' + creep.pos.x + ',' + creep.pos.y +
-                    ' — repathing (attempt ' + s.repaths + ', maxOps ' + maxOps +
-                    (ignoreCreeps ? ', pushing through' : '') + ')');
-                return { maxOps: maxOps, reusePath: 3, ignoreCreeps: ignoreCreeps };
-            }
-        } else {
-            s.x = creep.pos.x;
-            s.y = creep.pos.y;
-            s.ticks = 0;
-            s.repaths = 0;
+        if (creep.pos.x !== s.x || creep.pos.y !== s.y) {
+            // Moved — reset fully
+            s.x = creep.pos.x; s.y = creep.pos.y;
+            s.ticks = 0; s.repaths = 0;
+            return { maxOps: 200, reusePath: 50, ignoreCreeps: false };
         }
+
+        s.ticks++;
+
+        if (s.ticks >= 2) {  // Faster trigger than 3
+            // Nuke cached path EVERY stuck tick, not just on first detection
+            if (creep.memory._move) delete creep.memory._move;
+            s.repaths++;
+            s.ticks = 0;
+
+            var ignoreCreeps = s.repaths >= 1;  // Escalate faster
+            var maxOps = Math.min(1500 + s.repaths * 500, 5000);
+            return { maxOps: maxOps, reusePath: 1, ignoreCreeps: ignoreCreeps };
+        }
+
         return { maxOps: 200, reusePath: 50, ignoreCreeps: false };
     },
 
@@ -700,21 +735,20 @@ var roleHarvester = {
             return best;
         }
 
-        // Cache false sentinel — link infrastructure rarely changes
         creep.memory.sourceLinkId = false;
         creep._sourceLinkObj = null;
         return null;
     },
 
-    // ── New: Container-at-source detection (analogous to getSourceLink) ──
+    // ───────────────────────────────────────────────
+    // Container-at-source detection (analogous to getSourceLink)
+    // ───────────────────────────────────────────────
     getSourceContainer: function(creep, source, state) {
         if (creep._sourceCtnTick === Game.time) {
             return creep._sourceCtnObj || null;
         }
         creep._sourceCtnTick = Game.time;
 
-        // Don't cache false — containers are commonly placed during RCL 2-3
-        // expansion, and we want to detect them promptly on the next tick.
         if (creep.memory.sourceCtnId) {
             var cached = Game.getObjectById(creep.memory.sourceCtnId);
             if (cached) {
@@ -731,7 +765,6 @@ var roleHarvester = {
         for (var i = 0; i < containers.length; i++) {
             var c = containers[i];
             var r = source.pos.getRangeTo(c);
-            // Must be range 1 so the creep sitting on it can still harvest
             if (r <= 1 && r < bestRange) {
                 best = c;
                 bestRange = r;
@@ -739,12 +772,17 @@ var roleHarvester = {
         }
 
         if (best) {
+            // If this is a newly discovered container, nuke any stale long-distance
+            // path so the creep recomputes from its current position rather than
+            // resuming a route that was calculated before the container existed.
+            if (creep.memory.sourceCtnId !== best.id) {
+                if (creep.memory._move) delete creep.memory._move;
+            }
             creep.memory.sourceCtnId = best.id;
             creep._sourceCtnObj = best;
             return best;
         }
 
-        // Don't cache false — containers get built during expansion
         creep._sourceCtnObj = null;
         return null;
     },
@@ -884,9 +922,6 @@ var roleHarvester = {
         }
     },
 
-    // Resolve live object via Game.getObjectById to avoid stale store data
-    // from the structuresByType cache (which has a 25-tick TTL).
-    // Used by the NON-ANCHORED path. Anchored path uses hood live objects directly.
     freeEnergyCapacity: function(s) {
         if (s.structureType === STRUCTURE_POWER_SPAWN) return 0;
         var live = Game.getObjectById(s.id);

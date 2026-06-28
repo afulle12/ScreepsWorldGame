@@ -3,30 +3,9 @@
 //          1) Fill 100% energy first
 //          2) Then fill GHODIUM
 // Console: nukeFill('W1N1', { maxPrice: 1.2 })  // maxPrice optional
-// Notes:
-// - Uses getRoomState for scanning (no room.find)
-// - Uses opportunisticBuy to request GHODIUM if the room is short
-// - No optional chaining
-//
-// Screeps API reference for Nuker and resource handling (capacities, transactions)【0】【1】
 
 const getRoomState = require('getRoomState');
 const opportunisticBuy = require('opportunisticBuy');
-
-// Memory bucket:
-// Memory.nukeFillOrders = {
-//   [roomName]: {
-//     roomName,
-//     nukerId,
-//     energyTarget,
-//     ghodiumTarget,
-//     phase: 'energy' | 'ghodium' | 'done',
-//     createdAt,
-//     maxPrice,          // for opportunistic buy
-//     buyRequested,      // true once a buy request is created
-//     completed          // set true when done
-//   }
-// }
 
 if (!Memory.nukeFillOrders) Memory.nukeFillOrders = {};
 

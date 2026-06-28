@@ -105,33 +105,6 @@ module.exports = {
       }
     };
 
-    global.orderSquad = function(formRoom, attackRoom, numSquads) {
-      var n = (numSquads === undefined) ? 1 : numSquads;
-      if (!Game.rooms[formRoom] || !Game.rooms[formRoom].controller || !Game.rooms[formRoom].controller.my) {
-        return "[Squad] Invalid form room: " + formRoom + ". Must be a room you own.";
-      }
-      if (!attackRoom || n <= 0) {
-        return "[Squad] Invalid order. Use: orderSquad('formRoomName', 'attackRoomName', numSquads)";
-      }
-
-      if (!squad || typeof squad.spawnSquads !== 'function') {
-        return "[Squad] Missing squad module.";
-      }
-
-      var targetRoomObj = Game.rooms[attackRoom];
-      if (targetRoomObj && targetRoomObj.controller && targetRoomObj.controller.owner) {
-        if (iff && typeof iff.isAlly === 'function' && iff.isAlly(targetRoomObj.controller.owner.username)) {
-          return "[Squad] Cannot attack " + attackRoom + " - it's owned by ally " + targetRoomObj.controller.owner.username;
-        }
-        if (targetRoomObj.controller.my) {
-          return "[Squad] Cannot attack " + attackRoom + " - it's your own room!";
-        }
-      }
-
-      squad.spawnSquads(formRoom, attackRoom, n);
-      return "[Squad] Order placed for " + n + " squad(s) to attack " + attackRoom + " from " + formRoom + ".";
-    };
-
     global.cancelSquadOrder = function(attackRoom) {
       if (!attackRoom) {
         return "[Squad] Invalid command. Use: cancelSquadOrder('attackRoomName')";
@@ -398,7 +371,9 @@ global.listRemoteBuilders = function() {
 };
 
 
-    global.orderMineralCollect = function (roomName) {
+    global.orderMineralCollect = function (roomName, opts) {
+      if (typeof opts === 'string') opts = { targetId: opts };
+      opts = opts || {};
       var missing = ensureDeps([
         { name: 'getRoomState', value: getRoomState },
         { name: 'getCreepBody', value: getCreepBody },
@@ -428,7 +403,14 @@ global.listRemoteBuilders = function() {
       }
 
       var name = "MC_" + roomName + "_" + Game.time;
-      freeSpawn.spawnCreep(body, name, { memory: { role: 'mineralCollector', homeRoom: roomName } });
+      var memory = { role: 'mineralCollector', homeRoom: roomName };
+      if (opts.targetId) memory.targetId = opts.targetId;
+      if (opts.resourceType) memory.resourceType = opts.resourceType;
+      if (opts.amount) memory.totalToCollect = opts.amount;
+      if (opts.includeEnergy) memory.includeEnergy = true;
+
+      var result = freeSpawn.spawnCreep(body, name, { memory: memory });
+      if (result !== OK) return "[MineralCollector] Spawn failed: " + result;
       return "[MineralCollector] Spawning " + name;
     };
   }

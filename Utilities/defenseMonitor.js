@@ -7,32 +7,8 @@
 // cluster is the weakest section of wall in the room.
 //
 // Also detects incoming nukes via FIND_NUKES and sends Game.notify()
-// alerts with impact position, source room, ETA, and threatened structures.
+// alerts with impact position, source room, ETA, and threatened structures
 //
-// Spawn logic:
-//   1. Enemy damages a wall/rampart 5+ times
-//   2. BFS finds the contiguous cluster around that structure
-//   3. All wall/rampart clusters in the room are identified
-//   4. If the damaged cluster has the lowest min-hits → spawn repair bot
-//   5. Multi-structure cluster: bot repairs until no longer the weakest
-//   6. Solo structure (cluster of 1): bot repairs until hits >= room median
-//   7. Bot recycles, monitor re-evaluates and may re-spawn if still needed
-//
-// Nuke detection:
-//   1. Scans FIND_NUKES every 100 ticks in owned rooms
-//   2. On first detection: Game.notify with pos, source room, ETA, blast structures
-//   3. Milestone warnings at 10,000 and 1,000 ticks remaining
-//   4. Cleanup after landing
-//
-// Memory layout:
-//   Memory.defense = {
-//     knownHostiles:  { <roomName>: [id, id, ...] },
-//     damageEvents:   { <roomName>: { <structureId>: { count, firstTick, lastTick, damage } } },
-//     repairOrders:   { <roomName>: [ { clusterId, clusterIds, solo, assignedCreep, createdAt } ] },
-//     notifyCooldown: { <roomName>: <tick> },
-//     clusterCache:   { <roomName>: { clusters: [ { ids } ] } },  // only exists during active repairs
-//     trackedNukes:   { <nukeId>: { roomName, pos, launchRoom, landTick, notifiedAt, milestones } }
-//   }
 //
 // API:
 //   defenseMonitor.run()  -> call once per tick from main loop

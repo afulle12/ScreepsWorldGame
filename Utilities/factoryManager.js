@@ -1,11 +1,10 @@
 // factoryManager.js
 // ============================================================================
 // FIFO per room factory order manager. Refuses orders unless full resources
-// are present in the room (storage + terminal only). Spawns a stationary
-// hauler (48 CARRY / 2 MOVE) that parks adjacent to storage, terminal, and
-// factory. Orders in different rooms run concurrently.
+// are present in the room (storage + terminal only). Orders in different
+// rooms run concurrently.
 //
-// The factoryBot handles logistics (loading inputs, evacuating outputs).
+// The supplier handles logistics (loading inputs, evacuating outputs).
 // This manager handles production calls (factory.produce) and order lifecycle.
 //
 // getRecipe() falls back to the game's COMMODITIES constant for any product
@@ -22,16 +21,6 @@
 //   Orders are FIFO per room — a new order for the same room queues
 //   behind any in-progress order. Refuses immediately if the room
 //   lacks sufficient resources for the full order amount.
-//
-//   @param {string}        roomName - Target room (e.g. 'W1N1').
-//   @param {string}        product  - Product name or resource constant.
-//                                     Accepts friendly names ('Oxidant',
-//                                     'Zynthium bar', 'Utrium', 'Lemergium')
-//                                     or resource constants
-//                                     (RESOURCE_OXIDANT, RESOURCE_WIRE …).
-//   @param {number|'max'}  amount   - Units to produce.  Use 'max' to produce
-//                                     as much as current room resources allow.
-//
 //   Examples:
 //     orderFactory('W1N1', 'Oxidant', 1000)
 //     orderFactory('W1N1', 'Zynthium bar', 500)   // queues after Oxidant
@@ -45,25 +34,12 @@
 // cancelFactoryOrder(idOrRoom, product?)
 //   Cancel one or more orders.
 //
-//   @param {string}  idOrRoom - Order ID (e.g. 'W1N1_XO_1234567') OR a room
-//                               name. Passing a room name without a product
-//                               cancels ALL orders for that room.
-//   @param {string}  [product]- Optional: restrict cancellation to a specific
-//                               product in that room.
-//
 //   Examples:
 //     cancelFactoryOrder('W1N1_XO_1234567')        // cancel by exact ID
 //     cancelFactoryOrder('W1N1')                   // cancel all W1N1 orders
 //     cancelFactoryOrder('W1N1', 'Oxidant')        // cancel W1N1 Oxidant only
 //
-// ────────────────────────────────────────────────────────────
-//
 // listFactoryOrders(roomName?)
-//   List all orders globally, or filter to one room.
-//   Alias: factoryOrders(roomName?)
-//
-//   @param {string} [roomName] - Optional room to filter by.
-//
 //   Examples:
 //     listFactoryOrders()          // all rooms
 //     listFactoryOrders('W1N1')    // W1N1 only
@@ -71,9 +47,44 @@
 //
 // ============================================================================
 
-var singleSourceRoom = require('singleSourceRoom');
+var storageManager = require('storageManager');
+var getRoomState = require('getRoomState');
 
-const ROLE_NAME = 'factoryBot';
+// ─── storageManager v2 feature flag ──────────────────────────────────────────
+// Enabled for every owned room.
+function v2Enabled(roomName) {
+    var room = Game.rooms[roomName];
+    return !!(room && room.controller && room.controller.my);
+}
+
+var FACTORY_BROKEN_ORDER_TICKS = 20000;
+
+// Returns the amount of `resourceType` in room that is unreserved and
+// physically present. When v2 is disabled for the room, returns raw countInRoom.
+function effectiveAvailable(room, resourceType) {
+    var raw = countInRoom(room, resourceType);
+    if (!v2Enabled(room.name)) return raw;
+    var info = storageManager.storageFind(room.name, resourceType);
+    var factory = findFactory(room);
+    if (factory && factory.store && (factory.store[resourceType] || 0) > 0) {
+        raw = Math.max(0, raw - (factory.store[resourceType] || 0));
+    }
+    if (info && info.combined && typeof info.combined.reserved === 'number') {
+        return Math.max(0, raw - info.combined.reserved);
+    }
+    return raw;
+}
+
+// Releases all v2 reservations associated with a given order's inputs.
+function releaseOrderReservations(order) {
+    if (!order || !order.reservationProgram) return;
+    var recipe = getRecipe(order.product);
+    if (!recipe) return;
+    for (var r in recipe.inputs) {
+        storageManager.unReserve(order.room, r, 'terminal', order.reservationProgram);
+        storageManager.unReserve(order.room, r, 'storage',  order.reservationProgram);
+    }
+}
 
 // ─── Recipes (cooldown included for bot sleep calculation) ───────────────────
 
@@ -133,12 +144,33 @@ function getRecipe(product) {
 
 function ensureMemory() {
     if (!Memory.factoryOrders) Memory.factoryOrders = [];
+    if (!Array.isArray(Memory.factoryOrderHistory)) Memory.factoryOrderHistory = [];
+}
+
+function recordCompletedOrder(order) {
+    ensureMemory();
+    if (!order) return;
+    Memory.factoryOrderHistory.push({
+        id: order.id,
+        room: order.room,
+        product: order.product,
+        requested: order.requested,
+        progressOut: order.progressOut || 0,
+        completedTick: Game.time
+    });
+    if (Memory.factoryOrderHistory.length > 50) {
+        Memory.factoryOrderHistory = Memory.factoryOrderHistory.slice(-50);
+    }
 }
 
 function findFactory(room) {
-    return room.find(FIND_MY_STRUCTURES, {
-        filter: function(s) { return s.structureType === STRUCTURE_FACTORY; }
-    })[0];
+    if (!room) return null;
+    var rs = getRoomState.get(room.name);
+    var arr = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_FACTORY]) || [];
+    for (var i = 0; i < arr.length; i++) {
+        if (arr[i].my) return arr[i];
+    }
+    return null;
 }
 
 function roomOwned(room) {
@@ -147,7 +179,7 @@ function roomOwned(room) {
 
 /**
  * Count a resource in storage + terminal + factory only.
- * Containers are excluded — the factoryBot only interacts with these three.
+ * Containers are excluded — factory orders only interact with these three.
  */
 function countInRoom(room, resourceType) {
     var total = 0;
@@ -209,95 +241,6 @@ function normalizeProduct(p) {
 
 function batchesFor(amount, recipe) { return Math.ceil(amount / recipe.out); }
 
-// ─── Parking tile: must be range ≤ 1 from storage, terminal, AND factory ─────
-
-function findParkingTile(room) {
-    var factory = findFactory(room);
-    if (!factory || !room.storage || !room.terminal) return null;
-
-    var terrain = Game.map.getRoomTerrain(room.name);
-
-    for (var dx = -1; dx <= 1; dx++) {
-        for (var dy = -1; dy <= 1; dy++) {
-            if (dx === 0 && dy === 0) continue; // factory's own tile
-
-            var x = factory.pos.x + dx;
-            var y = factory.pos.y + dy;
-            if (x < 1 || x > 48 || y < 1 || y > 48) continue;
-            if (terrain.get(x, y) === TERRAIN_MASK_WALL) continue;
-
-            var pos = new RoomPosition(x, y, room.name);
-            if (pos.getRangeTo(room.storage)  > 1) continue;
-            if (pos.getRangeTo(room.terminal) > 1) continue;
-
-            // Check for obstacle structures on the tile
-            var structs = room.lookForAt(LOOK_STRUCTURES, x, y);
-            var blocked = false;
-            for (var s = 0; s < structs.length; s++) {
-                if (OBSTACLE_OBJECT_TYPES.indexOf(structs[s].structureType) !== -1) {
-                    blocked = true;
-                    break;
-                }
-            }
-            if (blocked) continue;
-
-            return { x: x, y: y };
-        }
-    }
-    return null;
-}
-
-// ─── Spawn: 48 CARRY / 2 MOVE, closest spawn to storage ─────────────────────
-
-function spawnFactoryBot(room, orderId) {
-    if (!room.storage) return ERR_NOT_FOUND;
-
-    var spawns = room.find(FIND_MY_SPAWNS);
-
-    // Find the spawn closest to storage
-    var bestSpawn = null;
-    var bestRange = Infinity;
-    for (var i = 0; i < spawns.length; i++) {
-        var s = spawns[i];
-        var r = s.pos.getRangeTo(room.storage);
-        if (r < bestRange) { bestRange = r; bestSpawn = s; }
-    }
-
-    if (!bestSpawn) return ERR_NOT_FOUND;
-
-    // Only use THIS spawn — if it's busy, wait
-    if (bestSpawn.spawning) return ERR_BUSY;
-
-    // Compute parking tile
-    var parkPos = findParkingTile(room);
-    if (!parkPos) {
-        console.log('[Factory] No valid parking tile in ' + room.name
-            + ' (need range 1 of storage + terminal + factory)');
-        return ERR_NOT_FOUND;
-    }
-
-    // 48 CARRY + 2 MOVE = 2500 energy
-    var body = [];
-    for (var c = 0; c < 48; c++) body.push(CARRY);
-    body.push(MOVE, MOVE);
-
-    var cost = 2500;
-    if (bestSpawn.room.energyAvailable < cost) return ERR_NOT_ENOUGH_ENERGY;
-
-    var name = 'FactoryBot_' + room.name + '_' + Game.time;
-    var order = (Memory.factoryOrders || []).find(function(o) { return o.id === orderId; });
-    var memory = {
-        role:     ROLE_NAME,
-        orderId:  orderId,
-        homeRoom: room.name,
-        product:  order ? order.product : undefined,
-        parkPos:  parkPos,
-        state:    'park'
-    };
-
-    return bestSpawn.spawnCreep(body, name, { memory: memory });
-}
-
 function enoughForOneBatchInFactory(factory, product) {
     var rec = getRecipe(product);
     if (!rec) return false;
@@ -326,15 +269,109 @@ function enoughForOneBatchInFactory(factory, product) {
     return true;
 }
 
+function recipeInputTotal(recipe) {
+    var total = 0;
+    if (!recipe || !recipe.inputs) return total;
+    for (var res in recipe.inputs) total += recipe.inputs[res] || 0;
+    return total;
+}
+
+function factoryCapacity(factory) {
+    if (!factory || !factory.store || typeof factory.store.getCapacity !== 'function') return 0;
+    return factory.store.getCapacity() || 0;
+}
+
+function remainingBatchesForOrder(order, recipe) {
+    if (!order || !recipe) return 0;
+    return Math.ceil(Math.max(0, (order.requested || 0) - (order.progressOut || 0)) / Math.max(1, recipe.out || 1));
+}
+
+function maxBatchesPerCycle(factory, recipe, remainingBatches) {
+    var cap = factoryCapacity(factory);
+    var perBatchIn = recipeInputTotal(recipe);
+    var perBatchOut = recipe ? (recipe.out || 0) : 0;
+    if (cap <= 0 || perBatchIn <= 0 || perBatchOut <= 0) return 0;
+
+    // Inputs are loaded before the first produce call, so reserve enough free
+    // capacity for one output batch or a full input load can deadlock ERR_FULL.
+    if (perBatchIn + perBatchOut > cap) return 0;
+    var batches = Math.floor((cap - perBatchOut) / perBatchIn);
+    if (remainingBatches != null) batches = Math.min(batches, remainingBatches);
+    return batches;
+}
+
+function factoryHasNonInputStock(factory, recipe, product) {
+    if (!factory || !factory.store) return false;
+    var inputs = (recipe && recipe.inputs) ? recipe.inputs : {};
+    for (var res in factory.store) {
+        if ((factory.store[res] || 0) <= 0) continue;
+        if (res === product) continue;
+        if (inputs[res] !== undefined && inputs[res] > 0) continue;
+        return true;
+    }
+    return false;
+}
+
+function factoryHasAnyStock(factory) {
+    if (!factory || !factory.store) return false;
+    for (var res in factory.store) {
+        if ((factory.store[res] || 0) > 0) return true;
+    }
+    return false;
+}
+
+function prepareCycle(order, factory, recipe) {
+    var remaining = remainingBatchesForOrder(order, recipe);
+    if (remaining <= 0) return false;
+
+    var cycleBatches = maxBatchesPerCycle(factory, recipe, remaining);
+    if (cycleBatches <= 0) return false;
+
+    order.phase = 'loading';
+    order.cycleBatches = cycleBatches;
+    order.cycleBatchesQueued = 0;
+    order.cycleOutputTarget = cycleBatches * (recipe.out || 1);
+    order.cycleStartedTick = Game.time;
+    order.lastProgressTick = Game.time;
+    return true;
+}
+
+function resizeCycleToFit(order, factory, recipe) {
+    if (!order || !order.cycleBatches) return;
+    var remaining = remainingBatchesForOrder(order, recipe);
+    var cycleBatches = maxBatchesPerCycle(factory, recipe, remaining);
+    if (cycleBatches <= 0 || cycleBatches >= order.cycleBatches) return;
+
+    order.cycleBatches = cycleBatches;
+    order.cycleOutputTarget = cycleBatches * (recipe.out || 1);
+    if ((order.cycleBatchesQueued || 0) > cycleBatches) {
+        order.cycleBatchesQueued = cycleBatches;
+    }
+}
+
+function cycleInputsLoaded(factory, order, recipe) {
+    if (!factory || !factory.store || !order || !recipe) return false;
+    if (!order.cycleBatches) return false;
+    if (factoryHasNonInputStock(factory, recipe, order.product)) return false;
+    for (var res in recipe.inputs) {
+        var need = (recipe.inputs[res] || 0) * order.cycleBatches;
+        var have = factory.store[res] || 0;
+        if (have < need) return false;
+    }
+    if (factory.store.getFreeCapacity && (factory.store.getFreeCapacity() || 0) < (recipe.out || 0)) return false;
+    return true;
+}
+
 function tryProduce(factory, order) {
     if (!factory || factory.cooldown) return false;
     if (!enoughForOneBatchInFactory(factory, order.product)) return false;
     var res = factory.produce(order.product);
     if (res === OK) {
         var recipe = getRecipe(order.product);
-        order.batchesQueued = (order.batchesQueued || 0) + 1;
-        order.progressOut = (order.batchesQueued * (recipe ? recipe.out : 1));
+        order.cycleBatchesQueued = (order.cycleBatchesQueued || 0) + 1;
+        order.progressOut = (order.progressOut || 0) + (recipe ? recipe.out : 1);
         order.lastProduceTick = Game.time;
+        order.lastProgressTick = Game.time;
         return true;
     }
     // Log unexpected failures — enoughForOneBatch passed but produce failed
@@ -344,6 +381,16 @@ function tryProduce(factory, order) {
             + ' (cooldown=' + factory.cooldown + ', level=' + (factory.level || 0) + ')');
     }
     return false;
+}
+
+function markBrokenOrder(order, reason) {
+    if (!order) return;
+    order.broken = true;
+    order.brokenReason = reason || 'stuck';
+    order.phase = 'unloading';
+    order.lastProgressTick = Game.time;
+    releaseOrderReservations(order);
+    console.log('[Factory] BROKEN order ' + order.id + ' in ' + order.room + ': ' + order.brokenReason);
 }
 
 function markActivePerRoom() {
@@ -364,35 +411,27 @@ function markActivePerRoom() {
     }
 }
 
-function needBotForRoom(roomName) {
-    if (singleSourceRoom.isSingleSourceActive(roomName)) return false;
-
-    var existing = _.filter(Game.creeps, function(c) {
-        return c.memory.role === ROLE_NAME && c.memory.homeRoom === roomName;
-    });
-    return existing.length === 0;
-}
-
 /**
- * Returns true if a factoryBot exists for this room and is actively working
- * (load or produce state). Used to prevent the auto-complete race condition
- * where inputs in the bot's carry are invisible to countInRoom.
+ * Returns true if a supplier is actively working on a factory task for this
+ * room. Used to prevent the auto-complete race condition where inputs in the
+ * supplier's carry are invisible to countInRoom.
  */
-function botActiveForRoom(roomName) {
+function supplierActiveForRoom(roomName) {
     return _.some(Game.creeps, function(c) {
-        if (!c.memory || c.memory.role !== ROLE_NAME) return false;
+        if (!c.memory || c.memory.role !== 'supplier') return false;
         if (c.memory.homeRoom !== roomName) return false;
-        var state = c.memory.state;
-        if (state === 'produce') return true;
-        if (state === 'load') return !c.memory.waitingForInputs;
-        return false;
+        if (!c.memory.a) return false;
+        return c.memory.a.indexOf('factory_input|') === 0
+            || c.memory.a.indexOf('factory_output|') === 0
+            || c.memory.a.indexOf('factory_drain|') === 0;
     });
 }
 
 function orderSummary(order) {
     return '[#' + order.id + '] ' + order.room + ' -> ' + order.product
         + ' | requested: ' + order.requested
-        + ', queuedOut: ' + (order.progressOut || 0)
+        + ', producedOut: ' + (order.progressOut || 0)
+        + ', phase: ' + (order.phase || 'unknown')
         + ', status: ' + order.status;
 }
 
@@ -401,7 +440,7 @@ function maxBatchesForRoom(room, recipe) {
     for (var res in recipe.inputs) {
         var perBatch = recipe.inputs[res] || 0;
         if (perBatch <= 0) continue;
-        var have = countInRoom(room, res);
+        var have = effectiveAvailable(room, res);
         var possible = Math.floor(have / perBatch);
         if (possible < minBatches) minBatches = possible;
     }
@@ -435,13 +474,9 @@ global.orderFactory = function(roomName, productLike, amount) {
             + ' is insufficient for ' + product + ' (requires level ' + recipe.level + ').';
     }
 
-    // Validate parking tile for non-single-source rooms
-    if (!singleSourceRoom.isSingleSourceActive(roomName)) {
-        var parkPos = findParkingTile(room);
-        if (!parkPos) {
-            return '[Factory] REFUSED: No valid parking tile in ' + roomName
-                + ' (need a walkable tile within range 1 of storage, terminal, and factory).';
-        }
+    var peakPerBatch = Math.max(recipeInputTotal(recipe), recipe.out || 0);
+    if (factoryCapacity(factory) < peakPerBatch) {
+        return '[Factory] REFUSED: Factory capacity in ' + roomName + ' is too small for one batch of ' + product;
     }
 
     var batches;
@@ -474,16 +509,55 @@ global.orderFactory = function(roomName, productLike, amount) {
     var order = {
         id: id, room: roomName, product: product, requested: amount,
         status: 'queued', created: Game.time,
-        batchesQueued: 0, progressOut: 0, lastProduceTick: 0
+        phase: 'loading',
+        cycleBatches: 0, cycleBatchesQueued: 0, cycleOutputTarget: 0,
+        progressOut: 0, lastProduceTick: 0, lastProgressTick: 0
     };
+
+    // ── storageManager v2: reserve inputs against this order ───────────────
+    // Each order gets a unique program name (including order id). This prevents
+    // a queued order from replacing an active order's reservation and vice versa.
+    // The memory cost is small (~60 bytes per reservation) and guarantees that
+    // queued orders that eventually become active still hold their reservations.
+    if (v2Enabled(roomName)) {
+        order.reservationProgram = 'factoryManager_' + product + '_' + id + '_' + Math.random().toString(36).substr(2, 6);
+        var reservedKeys = [];
+        var reservedOk = true;
+        for (var resR in needMap) {
+            var info = storageManager.storageFind(roomName, resR);
+            var termFree = info.terminal.total - info.terminal.reserved;
+            var storFree = info.storage.total  - info.storage.reserved;
+            var need = needMap[resR];
+            if (termFree + storFree < need) {
+                reservedOk = false;
+                break;
+            }
+            var fromTerm = Math.min(need, termFree);
+            var fromStor = need - fromTerm;
+            if (fromTerm > 0) {
+                var r1 = storageManager.reserve(roomName, resR, 'terminal', order.reservationProgram, fromTerm);
+                reservedKeys.push({ r: resR, b: 'terminal' });
+                if (!r1.ok) { reservedOk = false; break; }
+            }
+            if (fromStor > 0) {
+                var r2 = storageManager.reserve(roomName, resR, 'storage', order.reservationProgram, fromStor);
+                reservedKeys.push({ r: resR, b: 'storage' });
+                if (!r2.ok) { reservedOk = false; break; }
+            }
+        }
+        if (!reservedOk) {
+            // Roll back partial reservations before refusing
+            for (var k = 0; k < reservedKeys.length; k++) {
+                storageManager.unReserve(roomName, reservedKeys[k].r, reservedKeys[k].b, order.reservationProgram);
+            }
+            delete order.reservationProgram;
+            return '[Factory] REFUSED: Insufficient unreserved inputs in ' + roomName + ' for ' + product;
+        }
+    }
+
     Memory.factoryOrders.push(order);
 
     markActivePerRoom();
-
-    var isActive = Memory.factoryOrders.find(function(o) {
-        return o.room === roomName && o.status === 'active' && o.id === id;
-    });
-    if (isActive && needBotForRoom(roomName)) spawnFactoryBot(room, id);
 
     return '[Factory] Order accepted. ' + orderSummary(order);
 };
@@ -493,17 +567,22 @@ global.cancelFactoryOrder = function(idOrRoom, productLike) {
     if (!Memory.factoryOrders.length) return '[Factory] No orders.';
     var removed = 0;
 
+    function cancelOne(o) {
+        if (o.reservationProgram) releaseOrderReservations(o);
+        removed++;
+    }
+
     if (productLike) {
         var product = normalizeProduct(productLike);
         Memory.factoryOrders = Memory.factoryOrders.filter(function(o) {
             var match = (o.id === idOrRoom || o.room === idOrRoom) && o.product === product;
-            if (match) removed++;
+            if (match) cancelOne(o);
             return !match;
         });
     } else {
         Memory.factoryOrders = Memory.factoryOrders.filter(function(o) {
             var match = (o.id === idOrRoom || o.room === idOrRoom);
-            if (match) removed++;
+            if (match) cancelOne(o);
             return !match;
         });
     }
@@ -547,37 +626,91 @@ function run() {
         var factory = findFactory(room);
         if (!factory) continue;
 
-        // Spawn bot if needed
-        if (needBotForRoom(roomName)) spawnFactoryBot(room, order.id);
+        if (!order.phase) order.phase = 'loading';
+        if (!order.lastProgressTick) order.lastProgressTick = Game.time;
 
-        // Produce whenever factory is ready
-        tryProduce(factory, order);
-
-        // Check completion
-        if ((order.progressOut || 0) >= order.requested) {
-            order.status = 'done';
+        if (!order.broken) {
+            var stuckTicks = Game.time - (order.lastProgressTick || order.created || Game.time);
+            if (stuckTicks > FACTORY_BROKEN_ORDER_TICKS) {
+                markBrokenOrder(order, 'no progress for ' + stuckTicks + ' ticks');
+            }
         }
 
-        // Auto-complete if no more inputs available anywhere.
-        // IMPORTANT: Skip this check if a factoryBot is actively working —
-        // inputs may be in the bot's carry (invisible to countInRoom) and
-        // would cause a false "no more inputs" premature completion.
-        if (order.status === 'active') {
-            if (recipe && !enoughForOneBatchInFactory(factory, order.product)
-                    && maxBatchesForRoom(room, recipe) <= 0
-                    && !botActiveForRoom(roomName)) {
-                console.log('[Factory] Auto-completing order ' + order.id
-                    + ': not enough inputs remain for another batch ('
-                    + (order.progressOut || 0) + '/' + order.requested + ' produced).');
+        if (order.broken) {
+            order.phase = 'unloading';
+            if (!factoryHasAnyStock(factory)) {
+                order.status = 'cancelled';
+            }
+            continue;
+        }
+
+        var remainingBatches = remainingBatchesForOrder(order, recipe);
+        if (remainingBatches <= 0) {
+            if (!factoryHasAnyStock(factory)) {
                 order.status = 'done';
+            } else {
+                order.phase = 'unloading';
+            }
+            continue;
+        }
+
+        if (order.phase === 'loading') {
+            if (!order.cycleBatches && !prepareCycle(order, factory, recipe)) {
+                if (factoryHasAnyStock(factory)) {
+                    order.phase = 'unloading';
+                }
+                continue;
+            }
+
+            resizeCycleToFit(order, factory, recipe);
+
+            if (cycleInputsLoaded(factory, order, recipe)) {
+                order.phase = 'processing';
+            }
+        }
+
+        if (order.phase === 'processing') {
+            if (factory.store.getFreeCapacity && (factory.store.getFreeCapacity() || 0) < (recipe.out || 0)) {
+                order.phase = 'loading';
+                continue;
+            }
+
+            tryProduce(factory, order);
+
+            if ((order.cycleBatchesQueued || 0) >= (order.cycleBatches || 0)) {
+                order.phase = 'unloading';
+            }
+
+            if (recipe && !supplierActiveForRoom(roomName)
+                    && maxBatchesForRoom(room, recipe) <= 0
+                    && !factoryHasAnyStock(factory)
+                    && (order.progressOut || 0) > 0) {
+                order.phase = 'unloading';
+            }
+        }
+
+        if (order.phase === 'unloading') {
+            if (!factoryHasAnyStock(factory)) {
+                if ((order.progressOut || 0) >= order.requested) {
+                    order.status = 'done';
+                } else if (prepareCycle(order, factory, recipe)) {
+                    order.phase = 'loading';
+                } else {
+                    order.status = 'done';
+                }
             }
         }
     }
 
-    // Cleanup completed orders
+    // Cleanup completed orders — release v2 reservations before dropping
     var before = Memory.factoryOrders.length;
     Memory.factoryOrders = Memory.factoryOrders.filter(function(o) {
-        return o.status !== 'done' && o.status !== 'cancelled';
+        if (o.status === 'done' || o.status === 'cancelled') {
+            if (o.status === 'done') recordCompletedOrder(o);
+            releaseOrderReservations(o);
+            return false;
+        }
+        return true;
     });
     if (Memory.factoryOrders.length !== before) {
         markActivePerRoom();

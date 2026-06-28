@@ -44,7 +44,6 @@ function getBoostMgr() { if (!_boostMgr) _boostMgr = require('boostManager'); re
 const BASIC_HARVESTER = [WORK, WORK, CARRY, MOVE];
 const BASIC_DEFENDER = [TOUGH, MOVE, RANGED_ATTACK];
 const SCOUT_BODY = [MOVE, MOVE, MOVE, MOVE, MOVE];
-const SCAVENGER_BODY = [MOVE, CARRY, CARRY, MOVE];
 const MAINTAINER_BODY = [WORK, CARRY, CARRY, MOVE]; // Fixed body for maintainer
 
 const LOW_RCL_SPAWN_DELAY_TICKS = 150;
@@ -582,7 +581,8 @@ function getSingleSourceBody(role, energy) {
 
             var needsWork = false;
             if (comboRoom) {
-                var minerals = comboRoom.find(FIND_MINERALS);
+                var comboRS = getRoomState.get(comboRoom.name);
+                var minerals = (comboRS && comboRS.minerals) || comboRoom.find(FIND_MINERALS);
                 if (minerals.length > 0) {
                     var mineral = minerals[0];
                     if (mineral.mineralAmount > 0) {
@@ -752,16 +752,16 @@ function getCreepBody(role, energy) {
       1800:[WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
     },
     wallRepair: {
-      300: [WORK, CARRY,CARRY, MOVE,MOVE],
-      400: [WORK,WORK, CARRY,CARRY, MOVE,MOVE],
-      550: [WORK,WORK,WORK, CARRY,CARRY, MOVE,MOVE,MOVE],
-      800: [WORK,WORK,WORK,WORK, CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE],
-      1100:[WORK,WORK,WORK,WORK,WORK, CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
-      1600:[WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK, CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
-      1900:[WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK, CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
-      2400:[WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK, CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
-      3050:[WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK, CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
-      3550:[WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK, CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY,CARRY, MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE]
+      250:  [WORK, CARRY, MOVE, MOVE],
+      500:  [WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
+      750:  [WORK, WORK, WORK, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      1000: [WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      1250: [WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      1500: [WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      2000: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      2500: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      3000: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
+      3150: [WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, WORK, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
     },
     defenseRepair: {
       400:  [WORK, WORK, CARRY, MOVE, MOVE, MOVE],
@@ -1014,6 +1014,14 @@ function manageNukeFillSpawns() {
     var order = Memory.nukeFillOrders[roomName];
     if (!order || order.completed) continue;
 
+    var exists = _.some(Game.creeps, function(c) {
+      if (!c || !c.memory) return false;
+      if (c.memory.role !== 'nukeFill') return false;
+      var assigned = c.memory.orderRoom || c.memory.homeRoom || (c.room ? c.room.name : null);
+      return assigned === roomName;
+    });
+    if (exists) continue;
+
     var room = Game.rooms[roomName];
     if (!room || !room.controller || !room.controller.my) continue;
 
@@ -1027,14 +1035,6 @@ function manageNukeFillSpawns() {
       order.nukerId = nuker.id;
     }
     if (!nuker) continue;
-
-    var exists = _.some(Game.creeps, function(c) {
-      if (!c || !c.memory) return false;
-      if (c.memory.role !== 'nukeFill') return false;
-      var assigned = c.memory.orderRoom || c.memory.homeRoom || (c.room ? c.room.name : null);
-      return assigned === roomName;
-    });
-    if (exists) continue;
 
     var freeSpawn = null;
     if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
@@ -1083,160 +1083,19 @@ function manageNukeFillSpawns() {
 //   Healer:   25× HEAL   + 25× MOVE  (7500e)
 //   Carrier:  25× CARRY  + 25× MOVE  (2500e)
 
-function managePowerBankSpawns() {
-  var pbMem = Memory.powerBankObserver;
-  if (!pbMem || !pbMem.jobs) return;
-
-  var pbObserver = require('powerBankObserver');
-  var MAX_CARRIERS = pbObserver.MAX_CARRIERS_PER_SUBTASK;
-
-  // Pre-build attacker / healer / carrier bodies once
-  var attackerBody = [];
-  var healerBody   = [];
-  var carrierBody  = [];
-  for (var i = 0; i < 25; i++) attackerBody.push(ATTACK);
-  for (var i = 0; i < 25; i++) attackerBody.push(MOVE);
-  for (var i = 0; i < 25; i++) healerBody.push(HEAL);
-  for (var i = 0; i < 25; i++) healerBody.push(MOVE);
-  for (var i = 0; i < 25; i++) carrierBody.push(CARRY);
-  for (var i = 0; i < 25; i++) carrierBody.push(MOVE);
-
-  var attackerCost = bodyCost(attackerBody);
-  var healerCost   = bodyCost(healerBody);
-  var carrierCost  = bodyCost(carrierBody);
-
-  for (var jobId in pbMem.jobs) {
-    var job = pbMem.jobs[jobId];
-    if (job.phase === 'completed') continue;
-
-    for (var homeRoom in job.subtasks) {
-      var subtask = job.subtasks[homeRoom];
-      if (subtask.phase === 'done') continue;
-
-      var room = Game.rooms[homeRoom];
-      if (!room || !room.controller || !room.controller.my) continue;
-
-      var rs = getRoomState.get(homeRoom);
-      if (!rs) continue;
-
-      // Find a free spawn in this home room
-      var freeSpawn = null;
-      if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
-        for (var s = 0; s < rs.structuresByType[STRUCTURE_SPAWN].length; s++) {
-          var sp = rs.structuresByType[STRUCTURE_SPAWN][s];
-          if (sp.my && !sp.spawning) { freeSpawn = sp; break; }
-        }
-      }
-      if (!freeSpawn) continue;
-
-      // ── HEALER spawn ────────────────────────────────────────────────────
-      // Healer spawns first so it can be adjacent when attacker starts attacking.
-      if (!subtask.healerName || (!Game.creeps[subtask.healerName] && !isCreepSpawningByName(subtask.healerName))) {
-        if (room.energyAvailable >= healerCost &&
-            (subtask.phase === 'spawning' || subtask.phase === 'attacking')) {
-          var healerName = 'PBHealer_' + homeRoom + '_' + Game.time;
-          var healerMem = {
-            role:          'powerBankHealer',
-            homeRoom:      homeRoom,
-            bankRoom:      job.bankRoomName,
-            bankX:         job.bankX,
-            bankY:         job.bankY,
-            jobId:         jobId,
-            subtaskRoom:   homeRoom,
-            pairedAttacker: null,  // filled in after attacker is named
-            route:         subtask.route,
-            routeBack:     subtask.routeBack
-          };
-          var hResult = freeSpawn.spawnCreep(healerBody, healerName, { memory: healerMem });
-          if (hResult === OK) {
-            subtask.healerName = healerName;
-            console.log('[PowerBank] Spawning healer ' + healerName + ' in ' + homeRoom +
-              ' for bank in ' + job.bankRoomName + ' | Cost: ' + healerCost);
-            // Healer used the spawn this tick — try attacker next tick or another spawn
-            continue;
-          }
-        }
-        // No healer yet and can't spawn now — skip attacker too (don't send unhealed attackers)
-        if (subtask.phase === 'spawning' || subtask.phase === 'attacking') continue;
-      }
-
-      // ── ATTACKER spawn ──────────────────────────────────────────────────
-      if (!subtask.attackerName || (!Game.creeps[subtask.attackerName] && !isCreepSpawningByName(subtask.attackerName))) {
-        if (room.energyAvailable >= attackerCost &&
-            (subtask.phase === 'spawning' || subtask.phase === 'attacking')) {
-          var attackerName = 'PBAttacker_' + homeRoom + '_' + Game.time;
-          var attackerMem = {
-            role:         'powerBankAttacker',
-            homeRoom:     homeRoom,
-            bankRoom:     job.bankRoomName,
-            bankX:        job.bankX,
-            bankY:        job.bankY,
-            jobId:        jobId,
-            subtaskRoom:  homeRoom,
-            pairedHealer: subtask.healerName || null,
-            route:        subtask.route,
-            routeBack:    subtask.routeBack
-          };
-          var aResult = freeSpawn.spawnCreep(attackerBody, attackerName, { memory: attackerMem });
-          if (aResult === OK) {
-            subtask.attackerName = attackerName;
-            // Back-fill pairedAttacker into healer's memory if it exists
-            if (subtask.healerName && Memory.creeps[subtask.healerName]) {
-              Memory.creeps[subtask.healerName].pairedAttacker = attackerName;
-            }
-            console.log('[PowerBank] Spawning attacker ' + attackerName + ' in ' + homeRoom +
-              ' for bank in ' + job.bankRoomName + ' | Cost: ' + attackerCost);
-            continue;
-          }
-        }
-      }
-
-      // ── CARRIER spawn ───────────────────────────────────────────────────
-      if (subtask.phase === 'collecting' &&
-          subtask.carriersSpawned < MAX_CARRIERS &&
-          room.energyAvailable >= carrierCost) {
-
-        var carrierName = 'PBCarrier_' + homeRoom + '_' + Game.time + '_' + subtask.carriersSpawned;
-        var carrierMem = {
-          role:         'powerBankCarrier',
-          homeRoom:     homeRoom,
-          bankRoom:     job.bankRoomName,
-          bankX:        job.bankX,
-          bankY:        job.bankY,
-          jobId:        jobId,
-          subtaskRoom:  homeRoom,
-          route:        subtask.route,
-          routeBack:    subtask.routeBack
-        };
-        var cResult = freeSpawn.spawnCreep(carrierBody, carrierName, { memory: carrierMem });
-        if (cResult === OK) {
-          subtask.carriers.push(carrierName);
-          subtask.carriersSpawned++;
-          console.log('[PowerBank] Spawning carrier ' + carrierName + ' in ' + homeRoom +
-            ' (' + subtask.carriersSpawned + '/' + MAX_CARRIERS + ')' +
-            ' | Cost: ' + carrierCost);
-        } else if (cResult !== ERR_BUSY && cResult !== ERR_NOT_ENOUGH_ENERGY) {
-          console.log('[PowerBank] Carrier spawn error in ' + homeRoom + ': ' + cResult);
-        }
-      }
-    }
-  }
-}
-
 // Helper: check if a creep with a given name is currently being spawned
 function isCreepSpawningByName(creepName) {
   for (var roomName in Game.rooms) {
-    var spawns = Game.rooms[roomName].find(FIND_MY_SPAWNS);
+    var rs = getRoomState.get(roomName);
+    var spawns = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) || Game.rooms[roomName].find(FIND_MY_SPAWNS);
     for (var i = 0; i < spawns.length; i++) {
-      if (spawns[i].spawning && spawns[i].spawning.name === creepName) return true;
+      if (spawns[i].my && spawns[i].spawning && spawns[i].spawning.name === creepName) return true;
     }
   }
   return false;
 }
 
 function manageSpawnsPerRoom(perRoomRoleCounts) {
-  if (Memory.claimOrders && Memory.claimOrders.length > 0) return;
-
   manageHarvesterSpawns();
 
   for (var roomName in Game.rooms) {
@@ -1327,7 +1186,7 @@ function manageSpawnsPerRoom(perRoomRoleCounts) {
       }
 
       var energyForSpawn = room.energyAvailable;
-      var body;
+      var body = undefined;
 
       if (global.__boostActive && getBoostMgr().isActive(roomName, roleToSpawn)) {
         var boostBody = getBoostMgr().getBody(roomName, roleToSpawn);
@@ -1553,117 +1412,6 @@ function buildHarvesterBodyForDistance(distance, energyBudget) {
 // Spawn functions (grouped)
 // ============================================================================
 
-function manageHarvesterSpawns() {
-  for (var roomName in Game.rooms) {
-    var room = Game.rooms[roomName];
-    if (singleSourceRoom.isSingleSourceActive(roomName)) continue;
-    if (!room.controller || !room.controller.my) continue;
-
-    var storageEnergy = 0;
-    var rs = getRoomState.get(roomName);
-    var storage = rs ? rs.storage : null;
-    if (storage && storage.store) {
-      storageEnergy = storage.store[RESOURCE_ENERGY] || 0;
-    }
-
-    var meta = ensureSourceMetaCache(room);
-    if (!meta || !meta.byId) continue;
-
-    var allSpawns = [];
-    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
-      allSpawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my; });
-    }
-    if (allSpawns.length === 0) continue;
-
-    var perSourceCounts = {};
-    for (var initSid in meta.byId) perSourceCounts[initSid] = 0;
-
-    for (var name in Game.creeps) {
-      var c = Game.creeps[name];
-      if (!c || !c.memory) continue;
-      if (c.memory.role !== 'harvester') continue;
-      var assignedRoom = c.memory.homeRoom || c.memory.assignedRoom || (c.room ? c.room.name : null);
-      if (assignedRoom !== room.name) continue;
-      if (c.memory.sourceId && perSourceCounts[c.memory.sourceId] !== undefined) {
-        perSourceCounts[c.memory.sourceId]++;
-      }
-    }
-
-    if (storageEnergy >= 700000) {
-      var allSourcesCovered = true;
-      for (var checkSid in meta.byId) {
-        if ((perSourceCounts[checkSid] || 0) === 0) { allSourcesCovered = false; break; }
-      }
-      if (allSourcesCovered) continue;
-    }
-
-    var needsHarvester = [];
-    for (var sourceId in meta.byId) {
-      var count = perSourceCounts[sourceId] || 0;
-      if (count === 0) {
-        needsHarvester.push({
-          id: sourceId,
-          meta: meta.byId[sourceId],
-          range: meta.byId[sourceId].range || 9999
-        });
-      }
-    }
-    if (needsHarvester.length === 0) continue;
-
-    needsHarvester.sort(function(a, b) { return a.range - b.range; });
-
-    var sourceToSpawn = needsHarvester[0];
-    var smeta = sourceToSpawn.meta;
-    var sourcePos = new RoomPosition(smeta.pos.x, smeta.pos.y, smeta.pos.roomName);
-
-    var closestSpawn = null;
-    var bestSpawnRange = Infinity;
-    for (var si = 0; si < allSpawns.length; si++) {
-      var sp = allSpawns[si];
-      var r = sp.pos.getRangeTo(sourcePos);
-      if (r < bestSpawnRange) {
-        bestSpawnRange = r;
-        closestSpawn = sp;
-      }
-    }
-    if (!closestSpawn) continue;
-
-    if (closestSpawn.spawning) continue;
-
-    var spawn = closestSpawn;
-    var distance = bestSpawnRange < Infinity ? bestSpawnRange : (smeta.range || 10);
-    var energyBudget = spawn.room.energyAvailable;
-    var body = buildHarvesterBodyForDistance(distance, energyBudget);
-    if (!body) continue;
-
-    var shortId = sourceToSpawn.id.slice(-6);
-    var hName = 'H_' + roomName + '_' + shortId + '_' + Game.time;
-    var memory = {
-      role: 'harvester',
-      assignedRoom: room.name,
-      homeRoom: room.name,
-      sourceId: sourceToSpawn.id
-    };
-
-    var cost = bodyCost(body);
-    var directions = getSpawnDirections(spawn.pos, sourcePos);
-    var spawnOpts = { memory: memory };
-    if (directions) spawnOpts.directions = directions;
-    var res = spawn.spawnCreep(body, hName, spawnOpts);
-
-    if (res === OK) {
-      console.log(
-        "Spawning harvester in " + room.name +
-        " for source " + shortId +
-        " (distFromSpawn: " + distance + ") | Parts: " + body.length +
-        " | Cost: " + cost
-      );
-    } else if (res !== ERR_BUSY && res !== ERR_NOT_ENOUGH_ENERGY) {
-      console.log("Failed to spawn harvester in " + room.name + " for " + shortId + ": " + res);
-    }
-  }
-}
-
 function spawnEmergencyHarvester(room, spawn) {
   if (!room || !spawn) return false;
   var meta = ensureSourceMetaCache(room);
@@ -1747,6 +1495,15 @@ function manageDefenseRepairSpawns() {
     var orders = Memory.defense.repairOrders[roomName];
     if (!orders || orders.length === 0) continue;
 
+    var unassignedOrder = null;
+    for (var oi = 0; oi < orders.length; oi++) {
+      if (!orders[oi].assignedCreep || !Game.creeps[orders[oi].assignedCreep]) {
+        unassignedOrder = orders[oi];
+        break;
+      }
+    }
+    if (!unassignedOrder) continue;
+
     var room = Game.rooms[roomName];
     if (!room || !room.controller || !room.controller.my) continue;
 
@@ -1774,16 +1531,6 @@ function manageDefenseRepairSpawns() {
       }
     }
     if (existingCount >= 2) continue;
-
-    // Find an unassigned order
-    var unassignedOrder = null;
-    for (var oi = 0; oi < orders.length; oi++) {
-      if (!orders[oi].assignedCreep || !Game.creeps[orders[oi].assignedCreep]) {
-        unassignedOrder = orders[oi];
-        break;
-      }
-    }
-    if (!unassignedOrder) continue;
 
     // Find free spawn
     var freeSpawn = null;
@@ -1881,32 +1628,6 @@ function migrateLegacyLabOrders() {
   }
 
   Memory._labOrdersMigrated = true;
-}
-
-function spawnScavengers() {
-  if (!Game.events) return;
-  for (const event of Game.events) {
-    if (event.event === EVENT_OBJECT_DESTROYED && event.data.type === 'creep') {
-      const destroyer = Game.getObjectById(event.data.destroyerId);
-      if (destroyer &&
-          destroyer.structureType === STRUCTURE_TOWER &&
-          destroyer.my) {
-        const room = destroyer.room;
-        var rs = getRoomState.get(room.name);
-        if (!rs) continue;
-        var freeSpawns = [];
-        if (rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
-          freeSpawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my && !s.spawning; });
-        }
-        if (freeSpawns.length > 0) {
-          const spawn = freeSpawns[0];
-          const name = 'Scavenger_' + room.name + '_' + Game.time;
-          const memory = { role: 'scavenger', homeRoom: room.name };
-          spawn.spawnCreep(SCAVENGER_BODY, name, { memory: memory });
-        }
-      }
-    }
-  }
 }
 
 function manageRemoteBuilderSpawns() {
@@ -2067,9 +1788,10 @@ function manageSquadSpawns(perRoomRoleCounts) {
     var creep = Game.creeps[creepName];
 
     var isSpawning = false;
-    var spawns = room.find(FIND_MY_SPAWNS);
+    var squadRS = getRoomState.get(room.name);
+    var spawns = (squadRS && squadRS.structuresByType && squadRS.structuresByType[STRUCTURE_SPAWN]) || room.find(FIND_MY_SPAWNS);
     for (var k = 0; k < spawns.length; k++) {
-      if (spawns[k].spawning && spawns[k].spawning.name === creepName) {
+      if (spawns[k].my && spawns[k].spawning && spawns[k].spawning.name === creepName) {
         isSpawning = true;
         break;
       }
@@ -2113,196 +1835,12 @@ function manageSquadSpawns(perRoomRoleCounts) {
     order.spawnedCount = (order.spawnedCount || 0) + 1;
   }
 }
-const REPAIRBOT_CRITICAL_STRUCTURES = [
-  STRUCTURE_SPAWN, STRUCTURE_TERMINAL, STRUCTURE_NUKER,
-  STRUCTURE_STORAGE, STRUCTURE_LAB, STRUCTURE_TOWER, STRUCTURE_FACTORY
-];
-const REPAIRBOT_RAMPART_LOW_HP = 10000000; // 10 M
- 
-/**
- * Returns true if any room-owned rampart that sits within range 1 of a
- * critical structure has fewer than REPAIRBOT_RAMPART_LOW_HP hits.
- */
-function roomHasCriticalRampartWork(rs) {
-  if (!rs || !rs.structuresByType) return false;
- 
-  var ramparts = rs.structuresByType[STRUCTURE_RAMPART] || [];
-  if (ramparts.length === 0) return false;
- 
-  // Collect all critical-structure positions once.
-  var critPos = [];
-  for (var ci = 0; ci < REPAIRBOT_CRITICAL_STRUCTURES.length; ci++) {
-    var arr = rs.structuresByType[REPAIRBOT_CRITICAL_STRUCTURES[ci]] || [];
-    for (var ai = 0; ai < arr.length; ai++) {
-      if (arr[ai] && arr[ai].pos) critPos.push(arr[ai].pos);
-    }
-  }
-  if (critPos.length === 0) return false;
- 
-  for (var ri = 0; ri < ramparts.length; ri++) {
-    var ramp = ramparts[ri];
-    if (!ramp || !ramp.my || typeof ramp.hits !== 'number') continue;
-    if (ramp.hits >= REPAIRBOT_RAMPART_LOW_HP) continue;
- 
-    for (var pi = 0; pi < critPos.length; pi++) {
-      if (ramp.pos.getRangeTo(critPos[pi]) <= 1) return true;
-    }
-  }
- 
-  return false;
-}
 
-function manageContestedDemolisherSpawns() {
-  if (!Memory.contestedDemolisherOrders || Memory.contestedDemolisherOrders.length === 0) return;
 
-  for (var i = Memory.contestedDemolisherOrders.length - 1; i >= 0; i--) {
-    var order = Memory.contestedDemolisherOrders[i];
-    if (!order) continue;
-
-    var homeRoom = order.homeRoom;
-    var targetRoom = order.targetRoom;
-    var squadId = order.squadId || ('cd-' + targetRoom + '-' + Game.time);
-
-    if (order.status !== 'ready' && order.status !== 'active') {
-      if (Game.time % 50 === 0 && order.status === 'scanning') {
-        console.log("[ContestedDemolisher] Order " + homeRoom + " -> " + targetRoom + " still scanning route...");
-      }
-      continue;
-    }
-
-    // Once the pair has been fully spawned, never create replacements
-    if (order.pairSpawned) continue;
-
-    var home = Game.rooms[homeRoom];
-    if (!home || !home.controller || !home.controller.my) {
-      console.log("[ContestedDemolisher] Invalid home room " + homeRoom + ". Removing order.");
-      Memory.contestedDemolisherOrders.splice(i, 1);
-      continue;
-    }
-
-    var rsHome = getRoomState.get(homeRoom);
-    if (!rsHome) continue;
-
-    var allSpawns = [];
-    if (rsHome.structuresByType && rsHome.structuresByType[STRUCTURE_SPAWN]) {
-      allSpawns = rsHome.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my; });
-    }
-    if (allSpawns.length === 0) continue;
-
-    var isSpawningSquad = false;
-    for (var s = 0; s < allSpawns.length; s++) {
-      if (allSpawns[s].spawning) {
-        var mem = Memory.creeps[allSpawns[s].spawning.name];
-        if (mem && mem.squadId === squadId) {
-          isSpawningSquad = true;
-          break;
-        }
-      }
-    }
-    if (isSpawningSquad) continue;
-
-    var spawns = allSpawns.filter(function(s){ return !s.spawning; });
-    if (spawns.length === 0) continue;
-
-    var spawn = spawns[0];
-
-    var demolisher = _.find(Game.creeps, function(c){
-      return c.memory.role === 'contestedDemolisher' &&
-             c.memory.squadId === squadId &&
-             c.memory.roleType === 'demolisher' &&
-             c.ticksToLive > 100;
-    });
-
-    var healer = _.find(Game.creeps, function(c){
-      return c.memory.role === 'contestedDemolisher' &&
-             c.memory.squadId === squadId &&
-             c.memory.roleType === 'healer' &&
-             c.ticksToLive > 100;
-    });
-
-    if (!demolisher) {
-      var demoBody = [];
-      for(var m=0; m<25; m++) demoBody.push(MOVE);
-      for(var w=0; w<25; w++) demoBody.push(WORK);
-
-      var cost = bodyCost(demoBody);
-      if (cost <= spawn.room.energyAvailable) {
-        var name = "CD_Demo_" + squadId + "_" + Game.time;
-        var mem = {
-          role: 'contestedDemolisher',
-          roleType: 'demolisher',
-          squadId: squadId,
-          targetRoom: targetRoom,
-          homeRoom: homeRoom,
-          towersOnly: order.towersOnly || false,
-          route: order.route,
-          routeBack: order.routeBack
-        };
-        var res = spawn.spawnCreep(demoBody, name, { memory: mem });
-        if (res === OK) {
-          order.demolisherName = name;
-          console.log("[ContestedDemolisher] Spawning Demolisher (" + name + ") for " + targetRoom + " | Route: " + (order.route ? order.route.join(' -> ') : 'N/A'));
-          order.status = 'active';
-
-          // Lock if healer was already alive from a previous tick
-          if (order.healerName) {
-            order.pairSpawned = true;
-            console.log("[ContestedDemolisher] Pair complete for squad " + squadId + " — no further spawns.");
-          }
-        }
-      } else if (Game.time % 20 === 0) {
-        console.log("[ContestedDemolisher] Not enough energy for Demolisher in " + homeRoom + ". Have: " + spawn.room.energyAvailable + ", Need: " + cost);
-      }
-    } else if (!healer) {
-      var healBody = [];
-      for(var m2=0; m2<25; m2++) healBody.push(MOVE);
-      for(var h=0; h<25; h++) healBody.push(HEAL);
-      var healCost = bodyCost(healBody);
-      if (healCost <= spawn.room.energyAvailable) {
-        var healName = "CD_Heal_" + squadId + "_" + Game.time;
-        var healMem = {
-          role: 'contestedDemolisher',
-          roleType: 'healer',
-          squadId: squadId,
-          targetRoom: targetRoom,
-          homeRoom: homeRoom,
-          route: order.route,
-          routeBack: order.routeBack
-        };
-        var healRes = spawn.spawnCreep(healBody, healName, { memory: healMem });
-        if (healRes === OK) {
-          order.healerName = healName;
-          console.log("[ContestedDemolisher] Spawning Healer (" + healName + ") for " + targetRoom);
-
-          // Lock if demolisher was already alive
-          if (order.demolisherName) {
-            order.pairSpawned = true;
-            console.log("[ContestedDemolisher] Pair complete for squad " + squadId + " — no further spawns.");
-          }
-        }
-      } else if (Game.time % 20 === 0) {
-        console.log("[ContestedDemolisher] Not enough energy for Healer in " + homeRoom + ". Have: " + spawn.room.energyAvailable + ", Need: " + healCost);
-      }
-    }
-
-    if (demolisher && healer) {
-      if (order.status !== 'active') {
-        order.status = 'active';
-        console.log("[ContestedDemolisher] Squad " + squadId + " complete and active.");
-      }
-      // Both already alive — lock now in case pairSpawned wasn't set yet
-      if (!order.pairSpawned) {
-        order.pairSpawned = true;
-        console.log("[ContestedDemolisher] Pair complete for squad " + squadId + " — no further spawns.");
-      }
-    }
-  }
-}
- 
 // ─── REPLACEMENT manageRepairBotSpawns ───────────────────────────────────────
 // ─── REPLACEMENT manageRepairBotSpawns ───────────────────────────────────────
 // Drop-in replacement for manageRepairBotSpawns() in spawnManager.js.
-// Now also triggers a spawn when any container is below 200k hits,
+// Now also triggers a spawn when any container is below 150k hits,
 // and passes container targets to roleRepairBot via the same spawn path.
 // The CONTAINER_TRIGGER_HITS value here must stay in sync with the constant
 // of the same name in roleRepairBot.js.
@@ -2332,13 +1870,13 @@ function manageRepairBotSpawns() {
     for (var ci = 0; ci < contArr.length; ci++) {
       var cont = contArr[ci];
       if (!cont || typeof cont.hits !== 'number') continue;
-      if (cont.hits < 200000) containersBelowTrigger++;
+      if (cont.hits < 150000) containersBelowTrigger++;
     }
 
     // Skip if there is nothing to do.
     if (roadsBelow75 === 0 && containersBelowTrigger === 0) continue;
 
-    // Spawn condition: 3+ roads below 50%, OR at least one container below 200k.
+    // Spawn condition: 3+ roads below 50%, OR at least one container below 150k.
     if (roadsBelow50 < 3 && containersBelowTrigger === 0) continue;
 
     // Max 1 repairBot per room — check alive and spawning.
@@ -2370,8 +1908,8 @@ function manageRepairBotSpawns() {
     if (spawning) continue;
 
     // ── Cooldown guard — respect the delay written by the bot on suicide ─────
-    var cooldownKey = 'repairBotCooldown_' + roomName;
-    if (Memory[cooldownKey] && Game.time < Memory[cooldownKey]) continue;
+    var _rbCd = (Memory.repairBotCooldown && Memory.repairBotCooldown[roomName]) || Memory['repairBotCooldown_' + roomName];
+    if (_rbCd && Game.time < _rbCd) continue;
 
     // Find a free spawn.
     var freeSpawn = null;
@@ -2397,11 +1935,12 @@ function manageRepairBotSpawns() {
 
     var res = freeSpawn.spawnCreep(body, newName, { memory: memory });
     if (res === OK) {
-      delete Memory[cooldownKey]; // clear stale cooldown on successful spawn
+      if (Memory.repairBotCooldown) delete Memory.repairBotCooldown[roomName];
+      delete Memory['repairBotCooldown_' + roomName];
       console.log('[RepairBot] Spawning ' + newName + ' in ' + roomName +
         ' | Roads <50%: ' + roadsBelow50 +
         ' | Roads <75%: ' + roadsBelow75 +
-        ' | Containers <200k: ' + containersBelowTrigger +
+        ' | Containers <150k: ' + containersBelowTrigger +
         ' | Parts: ' + body.length + ' | Cost: ' + cost);
     } else if (res !== ERR_BUSY && res !== ERR_NOT_ENOUGH_ENERGY) {
       console.log('[RepairBot] Failed to spawn in ' + roomName + ': ' + res);
@@ -2410,8 +1949,6 @@ function manageRepairBotSpawns() {
 }
 
 function manageRampartBotSpawns() {
-  if (Memory.cpuStats && Memory.cpuStats.average > 19) return;
-
   var _rbPause = Memory.spawnPause && Memory.spawnPause.rampartBot;
 
   for (var roomName in Game.rooms) {
@@ -2424,6 +1961,7 @@ function manageRampartBotSpawns() {
     }
 
     var rcl = room.controller.level;
+    if (rcl < 2) continue;
 
     var rs = getRoomState.get(roomName);
     if (!rs || !rs.structuresByType) continue;
@@ -2431,57 +1969,76 @@ function manageRampartBotSpawns() {
     var ramparts = rs.structuresByType[STRUCTURE_RAMPART] || [];
     if (ramparts.length === 0) continue;
 
-    var needsSpawn = false;
-
-    for (var pi = 0; pi < RAMPARTBOT_PROTECTED_STRUCTURES.length && !needsSpawn; pi++) {
-      var sType = RAMPARTBOT_PROTECTED_STRUCTURES[pi];
-      var sTarget = RAMPARTBOT_STRUCTURE_TARGETS[sType];
-      var spawnAt = sTarget - RAMPARTBOT_SPAWN_OFFSET;
-      var structs = rs.structuresByType[sType] || [];
-
-      for (var si2 = 0; si2 < structs.length && !needsSpawn; si2++) {
-        if (!structs[si2] || !structs[si2].pos) continue;
-        var sPos = structs[si2].pos;
-
-        for (var ri = 0; ri < ramparts.length; ri++) {
-          var ramp = ramparts[ri];
-          if (!ramp || !ramp.my || typeof ramp.hits !== 'number') continue;
-          if (ramp.hits >= spawnAt) continue;
-          if (ramp.pos.getRangeTo(sPos) <= 1) { needsSpawn = true; break; }
+    // Per-rampart threshold: spawn when any rampart drops below
+    // (its per-structure target − RAMPARTBOT_SPAWN_OFFSET).
+    var structurePositions = [];
+    for (var spi = 0; spi < RAMPARTBOT_PROTECTED_STRUCTURES.length; spi++) {
+      var spType = RAMPARTBOT_PROTECTED_STRUCTURES[spi];
+      var spTarget = RAMPARTBOT_STRUCTURE_TARGETS[spType];
+      var spArr = rs.structuresByType[spType] || [];
+      for (var spj = 0; spj < spArr.length; spj++) {
+        if (spArr[spj] && spArr[spj].pos) {
+          structurePositions.push({ pos: spArr[spj].pos, target: spTarget });
         }
       }
     }
 
-    if (!needsSpawn) {
-      var extSpawnAt = RAMPARTBOT_EXTERNAL_TARGET - RAMPARTBOT_SPAWN_OFFSET;
-      for (var ri2 = 0; ri2 < ramparts.length; ri2++) {
-        var ramp2 = ramparts[ri2];
-        if (!ramp2 || !ramp2.my || typeof ramp2.hits !== 'number') continue;
-        if (ramp2.hits >= extSpawnAt) continue;
-        var x = ramp2.pos.x;
-        var y = ramp2.pos.y;
-        if (x <= RAMPARTBOT_PERIMETER_RANGE || x >= 49 - RAMPARTBOT_PERIMETER_RANGE ||
-            y <= RAMPARTBOT_PERIMETER_RANGE || y >= 49 - RAMPARTBOT_PERIMETER_RANGE) {
-          needsSpawn = true;
-          break;
+    var rclCap = RAMPART_HITS_MAX[rcl] || 0;
+    var pr = RAMPARTBOT_PERIMETER_RANGE;
+
+    // Sort protected-structure positions by target descending once per room so
+    // rampartTargetFor can break on the first adjacent match (which is the max
+    // target by construction). Replaces getRangeTo with inline Chebyshev
+    // (equivalent for same-room positions; all entries come from the same rs).
+    structurePositions.sort(function(a, b) { return b.target - a.target; });
+
+    function rampartTargetFor(ramp) {
+      var rx = ramp.pos.x, ry = ramp.pos.y;
+      var maxTarget = 0;
+      for (var k = 0; k < structurePositions.length; k++) {
+        var ssp = structurePositions[k];
+        if (Math.abs(rx - ssp.pos.x) <= 1 && Math.abs(ry - ssp.pos.y) <= 1) {
+          maxTarget = ssp.target;
+          break; // first match in descending-target order is the max
         }
+      }
+      if (maxTarget === 0) {
+        if (rx <= pr || rx >= 49 - pr || ry <= pr || ry >= 49 - pr) {
+          maxTarget = RAMPARTBOT_EXTERNAL_TARGET;
+        } else {
+          return 0;
+        }
+      }
+      if (rclCap > 0 && maxTarget > rclCap) maxTarget = rclCap;
+      return maxTarget;
+    }
+
+    var needsSpawn = false;
+    for (var i = 0; i < ramparts.length; i++) {
+      var ramp = ramparts[i];
+      if (!ramp || !ramp.my || typeof ramp.hits !== 'number') continue;
+      var target = rampartTargetFor(ramp);
+      if (target <= 0) continue;
+      if (ramp.hits < target - RAMPARTBOT_SPAWN_OFFSET) {
+        needsSpawn = true;
+        break;
       }
     }
 
     if (!needsSpawn) continue;
 
-    // ── SHARED SLOT: don't spawn if a wallRepair is already covering this room ──
-    var combinedRepairCount = 0;
+    // Per-role slot: a rampartBot already in (or spawning for) this room
+    // is enough — wallRepair in the same room no longer suppresses us.
+    var aliveCount = 0;
     for (var name in Game.creeps) {
       var c = Game.creeps[name];
       if (!c || !c.memory) continue;
-      var r = c.memory.role;
-      if ((r === 'wallRepair' || r === 'rampartBot') &&
+      if (c.memory.role === 'rampartBot' &&
           (c.memory.homeRoom === roomName || c.memory.assignedRoom === roomName)) {
-        combinedRepairCount++;
+        aliveCount++;
       }
     }
-    if (combinedRepairCount >= 1) continue;
+    if (aliveCount >= 1) continue;
 
     var spawning = false;
     if (rs.structuresByType[STRUCTURE_SPAWN]) {
@@ -2489,7 +2046,7 @@ function manageRampartBotSpawns() {
         var chk = rs.structuresByType[STRUCTURE_SPAWN][si];
         if (chk.my && chk.spawning) {
           var chkMem = Memory.creeps[chk.spawning.name];
-          if (chkMem && (chkMem.role === 'wallRepair' || chkMem.role === 'rampartBot') &&
+          if (chkMem && chkMem.role === 'rampartBot' &&
               chkMem.homeRoom === roomName) {
             spawning = true;
             break;
@@ -2511,7 +2068,7 @@ function manageRampartBotSpawns() {
     }
     if (!freeSpawn) continue;
 
-    var body;
+    var body = undefined;
     var boostActive = global.__boostActive && getBoostMgr().isActive(roomName, 'rampartBot');
 
     if (boostActive) {
@@ -2573,6 +2130,7 @@ function manageRampartBotSpawns() {
 }
 
 
+
 function manageLabBotSpawns() {
   migrateLegacyLabOrders();
  
@@ -2584,11 +2142,14 @@ function manageLabBotSpawns() {
  
     var labOrders = Memory.labOrders && Memory.labOrders[roomName];
     var hasActiveOrder = labOrders && (labOrders.active || (labOrders.queue && labOrders.queue.length > 0));
+    var activeOrder = labOrders && labOrders.active;
+    var activeMarketLabOrder = activeOrder && (activeOrder.origin === 'marketLab' || activeOrder.marketOpId);
  
     // ── NEW: Check if boost labs need work too ──
     var hasBoostWork = global.__boostActive ? getBoostMgr().needsLabBot(roomName) : false; 
     // Skip if neither production nor boost work exists
     if (!hasActiveOrder && !hasBoostWork) continue;
+    if (activeMarketLabOrder) continue;
  
     // If only production orders exist, check if labManager actually needs work
     if (hasActiveOrder && !hasBoostWork && !labManager.labsNeedWork(roomName)) {
@@ -2769,6 +2330,16 @@ function manageDemolitionSpawns() {
     const homeRoom  = order.homeRoom;
     const targetRoom = order.targetRoom;
     const teamCount  = order.teamCount;
+
+    const existingDemolishers = _.filter(Game.creeps, function(c) {
+      if (!c.memory) return false;
+      if (c.memory.role !== 'demolition') return false;
+      if (c.memory.targetRoom !== targetRoom) return false;
+      if (c.memory.homeRoom !== homeRoom) return false;
+      if (c.memory.demolitionRole && c.memory.demolitionRole !== 'demolisher') return false;
+      return true;
+    });
+    if (existingDemolishers.length >= teamCount) continue;
  
     const home = Game.rooms[homeRoom];
     if (!home || !home.controller || !home.controller.my) {
@@ -2786,16 +2357,7 @@ function manageDemolitionSpawns() {
       });
     }
     if (spawns.length === 0) continue;
- 
-    const existingDemolishers = _.filter(Game.creeps, function(c) {
-      if (!c.memory) return false;
-      if (c.memory.role !== 'demolition') return false;
-      if (c.memory.targetRoom !== targetRoom) return false;
-      if (c.memory.homeRoom !== homeRoom) return false;
-      if (c.memory.demolitionRole && c.memory.demolitionRole !== 'demolisher') return false;
-      return true;
-    });
- 
+
     const needed = teamCount - existingDemolishers.length;
     if (needed <= 0) continue;
  
@@ -2906,6 +2468,28 @@ function manageContestedDemolisherSpawns() {
     var targetRoom = order.targetRoom;
     var squadId = order.squadId || ('cd-' + targetRoom + '-' + Game.time);
 
+    var demolisher = _.find(Game.creeps, function(c){
+      return c.memory.role === 'contestedDemolisher' &&
+             c.memory.squadId === squadId &&
+             c.memory.roleType === 'demolisher' &&
+             c.ticksToLive > 100;
+    });
+
+    var healer = _.find(Game.creeps, function(c){
+      return c.memory.role === 'contestedDemolisher' &&
+             c.memory.squadId === squadId &&
+             c.memory.roleType === 'healer' &&
+             c.ticksToLive > 100;
+    });
+
+    if (demolisher && healer) {
+      if (order.status !== 'active') {
+        order.status = 'active';
+        console.log("[ContestedDemolisher] Squad " + squadId + " complete and active.");
+      }
+      continue;
+    }
+
     if (order.status !== 'ready' && order.status !== 'active') {
       if (Game.time % 50 === 0 && order.status === 'scanning') {
         console.log("[ContestedDemolisher] Order " + homeRoom + " -> " + targetRoom + " still scanning route...");
@@ -2946,20 +2530,6 @@ function manageContestedDemolisherSpawns() {
 
     var spawn = spawns[0];
     var spawnedSomething = false;
-
-    var demolisher = _.find(Game.creeps, function(c){
-      return c.memory.role === 'contestedDemolisher' &&
-             c.memory.squadId === squadId &&
-             c.memory.roleType === 'demolisher' &&
-             c.ticksToLive > 100;
-    });
-
-    var healer = _.find(Game.creeps, function(c){
-      return c.memory.role === 'contestedDemolisher' &&
-             c.memory.squadId === squadId &&
-             c.memory.roleType === 'healer' &&
-             c.ticksToLive > 100;
-    });
 
     if (!demolisher) {
       var demoBody = [];
@@ -3023,123 +2593,6 @@ function manageContestedDemolisherSpawns() {
   }
 }
 
-// ============================================================================
-// Wall-repair auto-order management
-// ============================================================================
-
-/**
- * Creates or refreshes a wallRepair order for `roomName` based on RCL
- * thresholds, without touching any order flagged as _manual.
- *
- * Called at the start of manageWallRepairSpawns() each tick so every owned
- * room gets an order automatically — no console command required.
- *
- * Manual override rules:
- *   - orderWallRepair() sets _manual:true and is never touched here.
- *   - cancelWallRepair() deletes the order entirely (manual or auto).
- *   - Auto orders are recreated each cycle if work is still needed.
- */
-function ensureWallRepairOrder(roomName, room, rs, rcl) {
-  var threshold      = WALLREPAIR_THRESHOLD_BY_RCL[rcl] || 0;
-  var spawnThreshold = WALLREPAIR_SPAWN_BY_RCL[rcl]     || 0;
-  var desiredCount   = WALLREPAIR_COUNT_BY_RCL[rcl]     || 1;
-
-  // RCL has no wall-repair targets yet
-  if (threshold === 0) return;
-
-  if (!Memory.wallRepairOrders) Memory.wallRepairOrders = {};
-
-  var existing = Memory.wallRepairOrders[roomName];
-
-  // Never overwrite a manually-issued order
-  if (existing && existing._manual) return;
-
-  // Check whether any perimeter WALL (not rampart — rampartBot handles those)
-  // is below the spawn trigger
-  var needsWork = false;
-
-  if (rs && rs.structuresByType) {
-    var wallArr = rs.structuresByType[STRUCTURE_WALL];
-    if (wallArr) {
-      for (var i = 0; i < wallArr.length; i++) {
-        var w = wallArr[i];
-        if (!w || w.hits >= spawnThreshold) continue;
-        // Perimeter check (mirrors roleWallRepair's PERIMETER_RANGE = 5)
-        var px = w.pos.x, py = w.pos.y;
-        if (px > WALLREPAIR_PERIMETER_RANGE && px < 49 - WALLREPAIR_PERIMETER_RANGE &&
-            py > WALLREPAIR_PERIMETER_RANGE && py < 49 - WALLREPAIR_PERIMETER_RANGE) continue;
-        needsWork = true;
-        break;
-      }
-    }
-  }
-
-  if (!needsWork) {
-    // No work needed — deactivate any existing auto order so creeps idle
-    if (existing && !existing._manual) {
-      existing.active = false;
-    }
-    return;
-  }
-
-  // If an active auto order already exists with the same threshold, leave it
-  // alone so roleWallRepair can manage its own queue.
-  if (existing && existing.active && existing.threshold === threshold) return;
-
-  // Build initial queue: perimeter WALLS only (ramparts are rampartBot's job),
-  // sorted closest-to-storage first so creeps start with the nearest targets.
-  var queue = [];
-  if (rs && rs.structuresByType) {
-    var wallArr2 = rs.structuresByType[STRUCTURE_WALL];
-    if (wallArr2) {
-      for (var j = 0; j < wallArr2.length; j++) {
-        var w2 = wallArr2[j];
-        if (!w2 || w2.hits >= threshold) continue;
-        var px2 = w2.pos.x, py2 = w2.pos.y;
-        if (px2 > WALLREPAIR_PERIMETER_RANGE && px2 < 49 - WALLREPAIR_PERIMETER_RANGE &&
-            py2 > WALLREPAIR_PERIMETER_RANGE && py2 < 49 - WALLREPAIR_PERIMETER_RANGE) continue;
-        queue.push(w2);
-      }
-    }
-  }
-
-  // Sort by range from storage (or room centre) so work starts near home
-  var originPos = (room.storage)
-    ? room.storage.pos
-    : new RoomPosition(25, 25, roomName);
-
-  queue.sort(function(a, b) {
-    return originPos.getRangeTo(a.pos) - originPos.getRangeTo(b.pos);
-  });
-
-  var queueIds = queue.map(function(w3) { return w3.id; });
-
-  Memory.wallRepairOrders[roomName] = {
-    active:          true,
-    threshold:       threshold,
-    count:           desiredCount,
-    interiorIncluded: false,
-    queue:           queueIds,
-    skipped:         existing ? (existing.skipped || {}) : {},
-    originId:        room.storage ? room.storage.id : null,
-    createdAt:       existing ? existing.createdAt : Game.time,
-    completedAt:     null,
-    _manual:         false,  // auto-managed; safe to update next cycle
-    _rcl:            rcl,
-    _serial:         existing ? (existing._serial || 0) : 0
-  };
-
-  if (!existing) {
-    console.log('[WallRepair] Auto-order created for ' + roomName +
-      ' (RCL ' + rcl + ', threshold=' + threshold +
-      ', creeps=' + desiredCount +
-      ', queued=' + queueIds.length + ')');
-  } else {
-    console.log('[WallRepair] Auto-order refreshed for ' + roomName +
-      ' (threshold=' + threshold + ', queued=' + queueIds.length + ')');
-  }
-}
-
 function manageWallRepairSpawns() {
   var _wrPause = Memory.spawnPause && Memory.spawnPause.wallRepair;
 
@@ -3162,26 +2615,25 @@ function manageWallRepairSpawns() {
     var rs = getRoomState.get(roomName);
     if (!rs || !rs.structuresByType) continue;
 
-    // ── SHARED SLOT: don't spawn if a rampartBot is already covering this room ──
+    // ── Per-role slot: a wallRepair already in (or spawning for) this room
+    // is enough — a rampartBot in the same room no longer suppresses us.
     var combinedRepairCount = 0;
     for (var name in Game.creeps) {
       var c = Game.creeps[name];
       if (!c || !c.memory) continue;
-      var r = c.memory.role;
-      if ((r === 'wallRepair' || r === 'rampartBot') &&
+      if (c.memory.role === 'wallRepair' &&
           (c.memory.homeRoom === roomName || c.memory.assignedRoom === roomName)) {
         combinedRepairCount++;
       }
     }
 
-    // Also check spawning queue for either role
     var spawning = false;
     if (rs.structuresByType[STRUCTURE_SPAWN]) {
       for (var si = 0; si < rs.structuresByType[STRUCTURE_SPAWN].length; si++) {
         var chk = rs.structuresByType[STRUCTURE_SPAWN][si];
         if (chk.my && chk.spawning) {
           var chkMem = Memory.creeps[chk.spawning.name];
-          if (chkMem && (chkMem.role === 'wallRepair' || chkMem.role === 'rampartBot') &&
+          if (chkMem && chkMem.role === 'wallRepair' &&
               chkMem.homeRoom === roomName) {
             spawning = true;
             break;
@@ -3262,6 +2714,11 @@ function manageWallRepairSpawns() {
 }
 
 
+// Keep in sync with MIN_ENERGY_DROP in roleThief.js
+// (or require it: const { MIN_ENERGY_DROP } = require('roleThief');
+//  after adding MIN_ENERGY_DROP to roleThief's module.exports)
+var MIN_ENERGY_DROP = 200;
+
 function manageThiefSpawns() {
   if (!Memory.thiefOrders || Memory.thiefOrders.length === 0) return;
   const activeOrders = Memory.thiefOrders.filter(function(order) {
@@ -3280,13 +2737,48 @@ function manageThiefSpawns() {
         if (st.store && st.store.getUsedCapacity() > 0) { hasResources = true; break; }
       }
     }
-
-    // Also check for dropped resources if we have live vision of the room
+    // Also check for dropped resources / ruins if we have live vision of the room.
+    // Drops are filtered the same way the thief filters them (ignore small
+    // energy piles), so a room with only a 50-energy pile doesn't keep the
+    // order alive while the thieves refuse to touch it.
     if (!hasResources && Game.rooms[order.targetRoom]) {
-      var dropped = Game.rooms[order.targetRoom].find(FIND_DROPPED_RESOURCES);
-      if (dropped.length > 0) hasResources = true;
+      var liveRoom = Game.rooms[order.targetRoom];
+      var liveRS = getRoomState.get(order.targetRoom);
+      if (liveRS && liveRS.dropped) {
+        var liveDropped = liveRS.dropped;
+        for (var li = 0; li < liveDropped.length; li++) {
+          var r = liveDropped[li];
+          if (r.resourceType !== RESOURCE_ENERGY || r.amount >= MIN_ENERGY_DROP) {
+            hasResources = true;
+            break;
+          }
+        }
+      } else {
+        var dropped = liveRoom.find(FIND_DROPPED_RESOURCES, {
+          filter: function(r) {
+            return r.resourceType !== RESOURCE_ENERGY || r.amount >= MIN_ENERGY_DROP;
+          }
+        });
+        if (dropped.length > 0) hasResources = true;
+      }
+      if (!hasResources) {
+        if (liveRS && liveRS.ruins) {
+          var liveRuins = liveRS.ruins;
+          for (var li2 = 0; li2 < liveRuins.length; li2++) {
+            var ruin = liveRuins[li2];
+            if (ruin.store && ruin.store.getUsedCapacity() > 0) {
+              hasResources = true;
+              break;
+            }
+          }
+        } else {
+          var ruins = liveRoom.find(FIND_RUINS, {
+            filter: function(r) { return r.store && r.store.getUsedCapacity() > 0; }
+          });
+          if (ruins.length > 0) hasResources = true;
+        }
+      }
     }
-
     if (!hasResources) {
       console.log("[Thief] Target room " + order.targetRoom + " appears to be empty. Cancelling operation.");
       return false;
@@ -3650,51 +3142,6 @@ function manageExtractorSpawns() {
   }
 }
 
-function manageClaimbotSpawns() {
-  if (!Memory.claimSpawnQueue) Memory.claimSpawnQueue = [];
-  if (Memory.claimSpawnQueue.length === 0) return;
-
-  const order = Memory.claimSpawnQueue[0];
-
-  const existing = _.find(Game.creeps, function(c){
-    return c.memory && c.memory.role === 'claimbot' && c.memory.targetRoom === order.targetRoom;
-  });
-  if (existing) {
-    Memory.claimSpawnQueue.shift();
-    return;
-  }
-
-  const rs = getRoomState.get(order.spawnRoom);
-  if (!rs || !rs.structuresByType || !rs.structuresByType[STRUCTURE_SPAWN]) return;
-
-  const spawn = rs.structuresByType[STRUCTURE_SPAWN].find(function(s){
-    return s.my && !s.spawning;
-  });
-  if (!spawn) return;
-
-  const body = [
-    MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE,
-    ATTACK, CLAIM
-  ];
-
-  const cost = bodyCost(body);
-  if (spawn.room.energyAvailable < cost) return;
-
-  const name = 'Claimbot_' + order.targetRoom + '_' + Game.time;
-  const res = spawn.spawnCreep(body, name, {
-    memory: {
-      role: 'claimbot',
-      targetRoom: order.targetRoom,
-      precomputedRoute: order.route
-    }
-  });
-
-  if (res === OK) {
-    console.log('[Claimbot] Spawning ' + name + ' from ' + order.spawnRoom + ' -> ' + order.targetRoom);
-    Memory.claimSpawnQueue.shift();
-  }
-}
-
 
 /*function spawnCreepInRoom(role, body, spawn, roomName) {
   const newName = role + "_" + roomName + "_" + Game.time;
@@ -3717,6 +3164,13 @@ function manageClaimbotSpawns() {
 function shouldSpawnSupplier(roomName) {
   var room = Game.rooms[roomName];
   if (!room || !room.controller || !room.controller.my) return 0;
+
+  if (Memory.factoryOrders && Array.isArray(Memory.factoryOrders)) {
+    for (var i = 0; i < Memory.factoryOrders.length; i++) {
+      var order = Memory.factoryOrders[i];
+      if (order && order.room === roomName && order.status === 'active') return 1;
+    }
+  }
 
   if (room.controller.level !== 8) return 1;
 
@@ -3806,7 +3260,8 @@ function scheduleUpgraderDelayRCL8(roomName) {
   var room = Game.rooms[roomName];
   if (!room) return;
 
-  var minerals = room.find(FIND_MINERALS);
+  var rs = getRoomState.get(roomName);
+  var minerals = (rs && rs.minerals) || room.find(FIND_MINERALS);
   var mineral = minerals.length > 0 ? minerals[0] : null;
 
   if (!mineral) {
@@ -3990,16 +3445,16 @@ function manageTowerFillerSpawns() {
         if (!room.controller || !room.controller.my) continue;
 
         // ── 1. Require at least one hostile creep in the room ─────────────────
-        var hostiles = room.find(FIND_HOSTILE_CREEPS, {
-            filter: function(c) {
-                return c.owner.username !== 'Invader' &&
-                       c.owner.username !== 'Source Keeper';
-            }
+        var rs = getRoomState.get(roomName);
+        var hostiles = (rs && rs.hostiles) || room.find(FIND_HOSTILE_CREEPS);
+        hostiles = hostiles.filter(function(c) {
+            if (!c || !c.owner) return false;
+            if (c.owner.username === 'Invader' || c.owner.username === 'Source Keeper') return false;
+            return !isPureScout(c);
         });
         if (hostiles.length === 0) continue;
 
         // ── 2. Require at least one tower at or below the spawn trigger ───────
-        var rs = getRoomState.get(roomName);
         if (!rs || !rs.structuresByType) continue;
 
         var towers = rs.structuresByType[STRUCTURE_TOWER] || [];
@@ -4086,41 +3541,12 @@ function manageTowerFillerSpawns() {
     }
 }
 
-function checkExtractorSpawnConditions(rs, containers) {
-  if (!rs) return false;
-  
-  var extractor = null;
-  if (rs.structuresByType && rs.structuresByType[STRUCTURE_EXTRACTOR]) {
-    var list = rs.structuresByType[STRUCTURE_EXTRACTOR].filter(function(s){ return s.my; });
-    extractor = list[0];
-  }
-  if (!extractor) return false;
-
-  var mineral = (rs.minerals && rs.minerals.length > 0) ? rs.minerals[0] : null;
-  if (!mineral || mineral.mineralAmount === 0) return false;
-
-  var container = null;
-  var contList = containers || [];
-  for (var i = 0; i < contList.length; i++) {
-    if (contList[i].pos.getRangeTo(extractor.pos) <= 1) {
-      container = contList[i];
-      break;
+function isPureScout(creep) {
+    if (!creep || !creep.body || creep.body.length === 0) return true;
+    for (var i = 0; i < creep.body.length; i++) {
+        if (creep.body[i].type !== MOVE) return false;
     }
-  }
-  if (!container) return false;
-
-  for (var cname in Game.creeps) {
-    var c = Game.creeps[cname];
-    if (!c || !c.memory) continue;
-    if (c.memory.role === 'extractor' && c.memory.extractorId === extractor.id) {
-      var ttl = c.ticksToLive;
-      if (ttl === undefined || ttl > 80 || c.spawning) {
-        return false;
-      }
-    }
-  }
-
-  return true;
+    return true;
 }
 
 
@@ -4244,26 +3670,101 @@ function manageHarvesterSpawns() {
 // One-call orchestrator for spawn systems
 // ============================================================================
 
+function manageRepairerSpawns() {
+  if (!Memory.repairSpawnRequests) return;
+  var pause = Memory.spawnPause && Memory.spawnPause.repairer;
+
+  for (var roomName in Memory.repairSpawnRequests) {
+    if (pause && (pause.global || (pause.rooms && pause.rooms[roomName]))) continue;
+    var room = Game.rooms[roomName];
+    if (!room || !room.controller || !room.controller.my) continue;
+    var requests = Memory.repairSpawnRequests[roomName];
+    if (!requests || requests.length === 0) continue;
+
+    requests.sort(function(a, b) { return (a.priority || 99) - (b.priority || 99); });
+
+    for (var i = requests.length - 1; i >= 0; i--) {
+      var old = requests[i];
+      if (old.spawned || old.s || Game.time - (old.ct || old.createdAt || Game.time) > 100) requests.splice(i, 1);
+    }
+    if (requests.length === 0) continue;
+
+    var rs = getRoomState.get(roomName);
+    if (!rs || !rs.structuresByType || !rs.structuresByType[STRUCTURE_SPAWN]) continue;
+
+    var freeSpawn = null;
+    for (var si = 0; si < rs.structuresByType[STRUCTURE_SPAWN].length; si++) {
+      var sp = rs.structuresByType[STRUCTURE_SPAWN][si];
+      if (sp.my && !sp.spawning) { freeSpawn = sp; break; }
+    }
+    if (!freeSpawn) continue;
+
+    for (var ri = 0; ri < requests.length; ri++) {
+      var req = requests[ri];
+      if (!req || req.spawned) continue;
+      if (req.kind === 'extra') {
+        if (!room.storage || room.storage.store[RESOURCE_ENERGY] < 300000) {
+          req.blockedReason = 'storage below 300k';
+          continue;
+        }
+      }
+      var body = req.body;
+      if (!body && req.b) {
+        body = [];
+        var order = [WORK, CARRY, MOVE, TOUGH, ATTACK, RANGED_ATTACK, HEAL, CLAIM];
+        for (var bi = 0; bi < order.length; bi++) {
+          var part = order[bi];
+          var count = req.b[part] || 0;
+          for (var pi = 0; pi < count; pi++) body.push(part);
+        }
+      }
+      if (!body || !body.length) { requests.splice(ri, 1); ri--; continue; }
+      var cost = req.cost || bodyCost(body);
+      if (freeSpawn.room.energyAvailable < cost) {
+        req.blockedReason = 'need ' + cost + ' energy';
+        continue;
+      }
+
+      var name = 'Repairer_' + roomName + '_' + req.kind + '_' + (Game.time % 10000);
+      var memory = {
+        role: 'repairer',
+        homeRoom: roomName,
+        repairKind: req.kind,
+        task: req.task
+      };
+      var result = freeSpawn.spawnCreep(body, name, { memory: memory });
+      if (result === OK) {
+        console.log('[RepairManager] Spawning ' + name + ' in ' + roomName +
+          ' | kind:' + req.kind + ' | cost:' + cost + ' | parts:' + body.length);
+        requests.splice(ri, 1);
+      } else if (result !== ERR_BUSY && result !== ERR_NOT_ENOUGH_ENERGY) {
+        console.log('[RepairManager] Failed to spawn repairer in ' + roomName + ': ' + result);
+      }
+      break;
+    }
+  }
+}
+
 function run(perRoomRoleCounts) {
   // 1. Run low-priority spawns
   if (Game.time % 5 === 0)  manageDemolitionSpawns();
-  if (Game.time % 10 === 0) manageClaimbotSpawns();
   if (Game.time % 5 === 0)  manageAttackerSpawns();
   if (Game.time % 5 === 0)  manageTowerDrainSpawns();
   if (Game.time % 5 === 0)  manageThiefSpawns();
   if (Game.time % 5 === 0)  manageExtractorSpawns();
-  if (Game.time % 10 === 0) spawnScavengers();
   if (Game.time % 2 === 0)  manageLabBotSpawns();
-  if (Game.time % 10 === 0) manageWallRepairSpawns();
+  // Legacy repair spawns are replaced by repairManager + repairer.
+  // Existing old-role creeps keep running until they naturally expire.
+  // if (Game.time % 10 === 0) manageWallRepairSpawns();
   if (Game.time % 10 === 0) manageNukeFillSpawns();
   if (Game.time % 5 === 0) manageRemoteBuilderSpawns();
   if (Game.time % 5 === 0) manageContestedDemolisherSpawns();
   if (Game.time % 5 === 0) manageSKAttackerSpawns();
-  if (Game.time % 10 === 0) manageDefenseRepairSpawns();
+  // if (Game.time % 10 === 0) manageDefenseRepairSpawns();
   // Single-source rooms use their own spawn logic
   if (Game.time % 10 === 0) manageSingleSourceSpawns(perRoomRoleCounts);
-  if (Game.time % 10 === 0) manageRepairBotSpawns();
-  if (Game.time % 10 === 0) manageRampartBotSpawns();
+  // if (Game.time % 10 === 0) manageRepairBotSpawns();
+  // if (Game.time % 10 === 0) manageRampartBotSpawns();
   if (Game.time % 5 === 0) manageRemoteSupplierSpawns();
   if (Game.time % 10 === 0) manageControllerAttackerSpawns();
   if (Game.time % 10 === 0) manageExtractorAssistantSpawns();
@@ -4272,6 +3773,10 @@ function run(perRoomRoleCounts) {
   if (needsNewCreeps(perRoomRoleCounts) || Game.time % 10 === 0) {
     manageSpawnsPerRoom(perRoomRoleCounts);
   }
+
+  // Repairers are intentionally lower spawn priority than harvesters,
+  // suppliers, and tower fillers.
+  if (Game.time % 10 === 0) manageRepairerSpawns();
 
   // 3. Run Squad Spawns (AFTER economy)
   if (Game.time % 5 === 0)  manageSquadSpawns(perRoomRoleCounts); 
@@ -4393,15 +3898,14 @@ module.exports = {
   manageHarvesterSpawns,
   manageDemolitionSpawns,
   manageContestedDemolisherSpawns,
-  manageClaimbotSpawns,
   manageAttackerSpawns,
   manageTowerDrainSpawns,
   manageThiefSpawns,
   manageExtractorSpawns,
   manageLabBotSpawns,
   manageWallRepairSpawns,
+  manageRepairerSpawns,
   manageSquadSpawns,
-  spawnScavengers,
   manageNukeFillSpawns,
   manageRemoteBuilderSpawns,
   manageSKAttackerSpawns,

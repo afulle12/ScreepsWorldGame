@@ -210,9 +210,15 @@ module.exports = {
                     var recipe = getRecipe(factoryProduct);
                     if (recipe && recipe.inputs[mineralType]) {
                         var factoryHas = hood.factory.store[mineralType] || 0;
-                        if (factoryHas < recipe.inputs[mineralType]) {
-                            creep.transfer(hood.factory, mineralType);
-                            transferred = true;
+                        var cycleBatches = Math.max(1, factoryOrder.cycleBatches || 1);
+                        var mineralNeed = recipe.inputs[mineralType] * cycleBatches;
+                        if (factoryHas < mineralNeed) {
+                            var factoryFree = hood.factory.store.getFreeCapacity ? (hood.factory.store.getFreeCapacity() || 0) : creep.store[mineralType];
+                            var transferAmount = Math.min(creep.store[mineralType] || 0, mineralNeed - factoryHas, factoryFree);
+                            if (transferAmount > 0) {
+                                creep.transfer(hood.factory, mineralType, transferAmount);
+                                transferred = true;
+                            }
                         }
                     }
                 }
@@ -449,14 +455,18 @@ module.exports = {
     tryTransferFactoryInput: function(creep, factory, order) {
         var recipe = getRecipe(order.product);
         if (!recipe || !recipe.inputs) return false;
+        var cycleBatches = Math.max(1, order.cycleBatches || 1);
         for (var res in recipe.inputs) {
-            var need = recipe.inputs[res] || 0;
+            var need = (recipe.inputs[res] || 0) * cycleBatches;
             var factoryHas = factory.store[res] || 0;
             var deficit = need - factoryHas;
             if (deficit <= 0) continue;
             var creepHas = creep.store[res] || 0;
             if (creepHas > 0) {
-                creep.transfer(factory, res, Math.min(creepHas, deficit));
+                var free = factory.store.getFreeCapacity ? (factory.store.getFreeCapacity() || 0) : creepHas;
+                var amount = Math.min(creepHas, deficit, free);
+                if (amount <= 0) return false;
+                creep.transfer(factory, res, amount);
                 return true;
             }
         }
@@ -466,20 +476,25 @@ module.exports = {
     tryWithdrawFactoryInput: function(creep, hood, order) {
         var recipe = getRecipe(order.product);
         if (!recipe || !recipe.inputs) return false;
+        var cycleBatches = Math.max(1, order.cycleBatches || 1);
         var bestRes = null;
         var bestDeficit = 0;
         for (var res in recipe.inputs) {
-            var need = recipe.inputs[res] || 0;
+            var need = (recipe.inputs[res] || 0) * cycleBatches;
             var factoryHas = hood.factory ? (hood.factory.store[res] || 0) : 0;
             var deficit = need - factoryHas;
             if (deficit > bestDeficit) { bestDeficit = deficit; bestRes = res; }
         }
         if (!bestRes) return false;
+        var factoryFree = hood.factory && hood.factory.store && hood.factory.store.getFreeCapacity
+            ? (hood.factory.store.getFreeCapacity() || 0) : creep.store.getFreeCapacity();
+        var amount = Math.min(bestDeficit, factoryFree, creep.store.getFreeCapacity());
+        if (amount <= 0) return false;
         if (hood.terminal && hood.terminal.store && (hood.terminal.store[bestRes] || 0) > 0) {
-            creep.withdraw(hood.terminal, bestRes); return true;
+            creep.withdraw(hood.terminal, bestRes, Math.min(amount, hood.terminal.store[bestRes] || 0)); return true;
         }
         if (hood.storage && hood.storage.store && (hood.storage.store[bestRes] || 0) > 0) {
-            creep.withdraw(hood.storage, bestRes); return true;
+            creep.withdraw(hood.storage, bestRes, Math.min(amount, hood.storage.store[bestRes] || 0)); return true;
         }
         return false;
     },

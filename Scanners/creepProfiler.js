@@ -219,8 +219,11 @@ var SUPPLIER_TASK_LABELS = {
     'container_empty':        'Empty Containers',
     'materials_drain_energy': 'Drain Materials (Energy)',
     'container_drain':        'Drain Containers',
-    'materials_empty':        'Empty Materials (Minerals)',
     'terminal_balance':       'Balance Terminal',
+    'terminal_stock':         'Terminal Stock',
+    'factory_input':          'Factory Input',
+    'factory_output':         'Factory Output',
+    'factory_drain':          'Factory Drain',
     'ground_mineral_pickup':  'Ground Mineral Pickup',
     'fallback_dump':          'Fallback Dump',
     'idle':                   'Idle'

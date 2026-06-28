@@ -748,15 +748,6 @@ function getPathNodeRoom(node) {
     return (typeof node === 'string') ? node : node.room;
 }
 
-function getPathNodeDirections(path, roomName) {
-    for (var i = 0; i < path.length; i++) {
-        var node = path[i];
-        if (typeof node === 'object' && node.room === roomName) {
-            return { entryDir: node.entryDir, exitDir: node.exitDir };
-        }
-    }
-    return null;
-}
 
 function calculateTotalPathLength(originRoom, highwayEntry, pathLengthToHighway) {
     var routeToHighway = Game.map.findRoute(originRoom, highwayEntry, {
@@ -1189,7 +1180,6 @@ function orderTowerDrainCrossSector(homeRoom, targetRoom, count, preferredEdge, 
             candidatePaths: candidatePaths,
             validPaths: [],
             invalidatedPaths: [],
-            roomsScannedCount: 0,
             lastProgressTick: Game.time
         }
     };
@@ -1307,7 +1297,7 @@ function runScanner() {
         
         if (room && op) {
             if (op.crossSector) {
-                processCrossSectorScanResult(op, state.activeRoom, room, state.opKey);
+                processCrossSectorScanResult(op, state.activeRoom, room);
             } else {
                 processScanResult(op, state.activeRoom, room);
             }
@@ -1363,7 +1353,7 @@ function runScanner() {
         
         if (Game.rooms[nextRoom]) {
             if (op.crossSector) {
-                processCrossSectorScanResult(op, nextRoom, Game.rooms[nextRoom], opKey);
+                processCrossSectorScanResult(op, nextRoom, Game.rooms[nextRoom]);
             } else {
                 processScanResult(op, nextRoom, Game.rooms[nextRoom]);
             }
@@ -1583,7 +1573,7 @@ function checkTransitPassability(room, edgeData, blockedExits) {
     return passableTransits;
 }
 
-function processCrossSectorScanResult(op, roomName, room, opKey) {
+function processCrossSectorScanResult(op, roomName, room) {
     var scanData = op.scanData;
     
     var safetyResult = checkRoomSafety(room);
@@ -1857,7 +1847,6 @@ function finalizeCrossSectorOperation(op, opKey) {
                 
                 op.route = fullRoute;
                 op.routeBack = fullRoute.slice().reverse();
-                if (!scanData._selectedHighway) scanData._selectedHighway = bestRoute.highwayEntry;
                 return; // stay in scanning state
             }
             
@@ -2193,8 +2182,7 @@ function finalizeCrossSectorOperation(op, opKey) {
         if (routeVerified) {
             op.route = fullRoute;
             op.routeBack = fullRoute.slice().reverse();
-            delete scanData._selectedHighway;
-            
+
             console.log('[TowerDrain] Full route (verified): ' + fullRoute.join(' -> '));
             
             if (op.preferredEdge) {
@@ -2257,7 +2245,6 @@ function finalizeCrossSectorOperation(op, opKey) {
                 var last = p[p.length - 1];
                 return getPathNodeRoom(last) !== bestRoute.highwayEntry;
             });
-            delete scanData._selectedHighway;
         }
     }
     
@@ -2503,10 +2490,7 @@ function processScanResult(op, roomName, room) {
     }
     
     var passResult = checkRoomPassability(room, prevRoom, nextRoom);
-    
-    if (!scanData.roomExits) scanData.roomExits = {};
-    scanData.roomExits[roomName] = passResult.availableExits || [];
-    
+
     var transitSafetyResult = checkRoomSafety(room);
     if (!transitSafetyResult.safe) {
         console.log('[TowerDrain] Room ' + roomName + ' is UNSAFE to transit: ' + transitSafetyResult.reason);
@@ -2934,11 +2918,8 @@ function updateOperations() {
                 delete op.scanData.roomsToScan;
                 delete op.scanData._avoidRooms;
                 delete op.scanData._highwayRetries;
-                delete op.scanData._selectedHighway;
                 delete op.scanData._homeAvailExits;
-                delete op.scanData.roomExits;
                 delete op.scanData.lastProgressTick;
-                delete op.scanData.roomsScannedCount;
             } else if (op.status === 'dryrun_complete' || op.status === 'failed') {
                 delete op.scanData;
             }
@@ -2991,6 +2972,18 @@ var roleTowerDrain = {
         var nearbyHostiles = creep.pos.findInRange(FIND_HOSTILE_CREEPS, 1);
         if (nearbyHostiles.length > 0) {
             creep.attack(nearbyHostiles[0]);
+        } else if (creep.room.name === creep.memory.targetRoom) {
+            var nearbyStructures = creep.pos.findInRange(FIND_STRUCTURES, 1, {
+                filter: function(s) { return !s.my; }
+            });
+            if (nearbyStructures.length > 0) {
+                nearbyStructures.sort(function(a, b) {
+                    var aWall = a.structureType === STRUCTURE_WALL || a.structureType === STRUCTURE_RAMPART;
+                    var bWall = b.structureType === STRUCTURE_WALL || b.structureType === STRUCTURE_RAMPART;
+                    return (aWall ? 1 : 0) - (bWall ? 1 : 0);
+                });
+                creep.attack(nearbyStructures[0]);
+            }
         }
         
         switch (creep.memory.state) {
@@ -3130,7 +3123,7 @@ var roleTowerDrain = {
         return OK;
     },
     
-    moveToPosition: function(creep, pos, color) {
+    moveToPosition: function(creep, pos) {
         if (!pos) return;
         
         var targetPos = new RoomPosition(pos.x, pos.y, pos.roomName);
@@ -3707,10 +3700,7 @@ function runTestPlayerRoutes() {
         // Note: batch tests always use standard body; pass null for range to get standard
         // Internal: we need dryRun but orderTowerDrain no longer takes options directly.
         // Use the sector functions directly.
-        if (result !== OK) {
-            // orderTowerDrain already placed the op; check if we need to patch dryRun
-        }
-        
+
         // Patch dryRun onto the op after creation
         if (Memory.towerDrainOps && Memory.towerDrainOps.operations && Memory.towerDrainOps.operations[nextOpKey]) {
             Memory.towerDrainOps.operations[nextOpKey].dryRun = true;

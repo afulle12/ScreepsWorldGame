@@ -3,42 +3,57 @@
 //
 // In main.js add:
 //   const roadBuilder = require('roadBuilder');
-//   global.buildRoad  = roadBuilder.buildRoad;
-//   global.removeRoad = roadBuilder.removeRoad;
+//   global.buildRoad     = roadBuilder.buildRoad;
+//   global.removeRoad    = roadBuilder.removeRoad;
+//   global.removeAllRoads = roadBuilder.removeAllRoads;
 //
 // Then call from the Screeps console:
 //   buildRoad('E2N46', 8, 36, 42, 2)
 //   buildRoad('E2N46', 8, 36, 42, 2, { plainCost: 2, swampCost: 10 })  // optional overrides
 //   removeRoad('E2N46', 8, 36, 42, 2)
 //   removeRoad('E2N46', 8, 36, 42, 2, { plainCost: 2, swampCost: 10 }) // optional overrides
+//   removeAllRoads('E2N46')
 
 'use strict';
 
-/**
- * Build a shared CostMatrix for a room, used by both buildRoad and removeRoad.
- * Existing roads are cheap (1); blocking structures are impassable (255).
- */
+var getRoomState = require('getRoomState');
+
+function _flattenStructures(structuresByType) {
+    var out = [];
+    for (var t in structuresByType) {
+        if (!structuresByType.hasOwnProperty(t)) continue;
+        var arr = structuresByType[t];
+        for (var i = 0; i < arr.length; i++) out.push(arr[i]);
+    }
+    return out;
+}
+
 function _roomCostMatrix(name) {
     var r = Game.rooms[name];
     if (!r) return;
     var costs = new PathFinder.CostMatrix();
+    var rs = getRoomState.get(name);
+    var allStructures = (rs && rs.structuresByType) ? _flattenStructures(rs.structuresByType) : r.find(FIND_STRUCTURES);
 
-    r.find(FIND_STRUCTURES).forEach(function(s) {
+    for (var i = 0; i < allStructures.length; i++) {
+        var s = allStructures[i];
         if (s.structureType === STRUCTURE_ROAD) {
             costs.set(s.pos.x, s.pos.y, 1);
         } else if (s.structureType !== STRUCTURE_CONTAINER &&
                    s.structureType !== STRUCTURE_RAMPART) {
             costs.set(s.pos.x, s.pos.y, 255);
         }
-    });
+    }
 
-    r.find(FIND_CONSTRUCTION_SITES).forEach(function(s) {
-        if (s.structureType !== STRUCTURE_ROAD &&
-            s.structureType !== STRUCTURE_CONTAINER &&
-            s.structureType !== STRUCTURE_RAMPART) {
-            costs.set(s.pos.x, s.pos.y, 255);
+    var sites = (rs && rs.constructionSites) ? rs.constructionSites : r.find(FIND_CONSTRUCTION_SITES);
+    for (var j = 0; j < sites.length; j++) {
+        var s2 = sites[j];
+        if (s2.structureType !== STRUCTURE_ROAD &&
+            s2.structureType !== STRUCTURE_CONTAINER &&
+            s2.structureType !== STRUCTURE_RAMPART) {
+            costs.set(s2.pos.x, s2.pos.y, 255);
         }
-    });
+    }
 
     return costs;
 }
@@ -208,6 +223,60 @@ function removeRoad(roomName, fromX, fromY, toX, toY, opts) {
 
 // ---------------------------------------------------------------------------
 
+/**
+ * Remove every built road and every road construction site in a room.
+ *
+ * @param {string} roomName - The room name, e.g. 'E2N46'
+ */
+function removeAllRoads(roomName) {
+    var room = Game.rooms[roomName];
+    if (!room) {
+        console.log('[removeAllRoads] ERROR: No vision in room ' + roomName + '. A creep or structure must be present there.');
+        return;
+    }
+
+    var demolished = 0;
+    var cancelled  = 0;
+    var errors     = [];
+
+    var rs = getRoomState.get(roomName);
+    var roads = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_ROAD]) || [];
+    if (roads.length === 0) {
+        room.find(FIND_STRUCTURES).forEach(function(s) {
+            if (s.structureType === STRUCTURE_ROAD) roads.push(s);
+        });
+    }
+    for (var i = 0; i < roads.length; i++) {
+        var s = roads[i];
+        if (s.structureType !== STRUCTURE_ROAD) continue;
+        var code = s.destroy();
+        if (code === OK) {
+            demolished++;
+        } else {
+            errors.push('destroy (' + s.pos.x + ',' + s.pos.y + ') code=' + code + ' (' + _errorCode(code) + ')');
+        }
+    }
+
+    var sites = (rs && rs.constructionSites) ? rs.constructionSites : room.find(FIND_CONSTRUCTION_SITES);
+    for (var j = 0; j < sites.length; j++) {
+        var st = sites[j];
+        if (st.structureType !== STRUCTURE_ROAD) continue;
+        var code2 = st.remove();
+        if (code2 === OK) {
+            cancelled++;
+        } else {
+            errors.push('remove site (' + st.pos.x + ',' + st.pos.y + ') code=' + code2 + ' (' + _errorCode(code2) + ')');
+        }
+    }
+
+    console.log('[removeAllRoads] Done in ' + roomName + '. Demolished=' + demolished + ' Cancelled=' + cancelled + ' Errors=' + errors.length);
+    if (errors.length > 0) {
+        console.log('[removeAllRoads] Error details: ' + errors.join(' | '));
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 function _errorCode(code) {
     var map = {
         '0':   'OK',
@@ -220,4 +289,4 @@ function _errorCode(code) {
     return map[String(code)] || 'UNKNOWN';
 }
 
-module.exports = { buildRoad: buildRoad, removeRoad: removeRoad };
+module.exports = { buildRoad: buildRoad, removeRoad: removeRoad, removeAllRoads: removeAllRoads };

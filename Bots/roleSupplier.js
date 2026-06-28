@@ -11,7 +11,7 @@ const LINK_FILL_THRESHOLD        = 100;
 const LINK_DRAIN_THRESHOLD       = 600;
 const DONOR_DRAIN_THRESHOLD      = 200;
 const POWER_SPAWN_FILL_THRESHOLD = 1000;
-const ASSIGNMENT_TTL             = 75;
+const ASSIGNMENT_TTL             = 75;   // ticks WITHOUT PROGRESS (refreshed on every successful withdraw/transfer)
 const NO_PATH_TTL                = 6;
 const AVOID_PAIR_TTL             = 5;
 const EXT_ROUTE_SKIP_LIMIT       = 8;
@@ -21,6 +21,9 @@ const TERMINAL_MIN               = 19500;
 const TERMINAL_MAX               = 20500;
 
 const getRoomState    = require("getRoomState");
+const factoryManager  = require("factoryManager");
+const labManager      = require("labManager");
+const storageManager  = require("storageManager");
 const terminalManager = require("terminalManager");
 
 // ─── PRIORITIES ────────────────────────────────────────────────────────────────
@@ -35,8 +38,15 @@ const TASK_PRIORITY = {
     container_empty:      40,
     materials_drain_energy: 45,
     container_drain:      50,
-    //materials_empty:      55,
     terminal_balance:     60,
+    lab_unload:           55,
+    lab_load:             56,
+    market_lab_stage:     57,
+    factory_input:        58,
+    factory_output:       59,
+    factory_drain:        61,
+    terminal_stock:       68,
+    dropped_pickup:       70,
 };
 
 // ─── UTILITY ───────────────────────────────────────────────────────────────────
@@ -166,6 +176,15 @@ function clearAssignment(creep, reason, shouldAvoid) {
     if (SUPPLIER_DEBUG) console.log("[SUP] " + creep.name + " clear: " + reason);
 }
 
+// Mark progress on the current assignment so the TTL only fires for tasks
+// that are genuinely stalled, not for long multi-trip jobs (terminal balance,
+// power spawn fill, big tower top-ups) that are actively making round trips.
+function refreshProgress(creep, a) {
+    if (!a) return;
+    a.assignedTick = Game.time;
+    setAssignment(creep, a);
+}
+
 // ─── MOVEMENT ──────────────────────────────────────────────────────────────────
 function smartMove(creep, target, extraOpts) {
     var h = getHeap(creep.name);
@@ -234,8 +253,10 @@ function getRoomView(room) {
         towers:       resolve(STRUCTURE_TOWER,        function(t) { return t.my; }),
         links:        resolve(STRUCTURE_LINK,         function(l) { return l.my; }),
         extensions:   resolve(STRUCTURE_EXTENSION,    function(e) { return e.my; }),
+        labs:         resolve(STRUCTURE_LAB,          function(l) { return l.my; }),
         powerSpawns:  resolve(STRUCTURE_POWER_SPAWN,  function(s) { return s.my; }),
         nukers:       resolve(STRUCTURE_NUKER,        function(n) { return n.my; }),
+        factory:      resolve(STRUCTURE_FACTORY,     function(f) { return f.my; })[0] || null,
         suppliers:    (base.myCreeps || []).filter(function(c) { return c.memory && c.memory.role === "supplier"; }),
         towerFillers: (base.myCreeps || []).filter(function(c) { return c.memory && c.memory.role === "towerFiller"; }),
     };
@@ -316,6 +337,204 @@ function isClaimed(view, creep, type, taskId, targetId) {
     var c = getClaimCache(view);
     var owner = c[type + '|' + taskId + '|' + (targetId || '')];
     return owner && owner !== creep.name;
+}
+
+function getFactoryTaskResource(a) {
+    return parseExtra(a && a.extra, "res") || parseExtra(a && a.extra, "resource");
+}
+
+function getMarketLabStageResource(a) {
+    return parseExtra(a && a.extra, "res") || parseExtra(a && a.extra, "resource");
+}
+
+function getLabTaskResource(a) {
+    return parseExtra(a && a.extra, "res") || parseExtra(a && a.extra, "resource");
+}
+
+function getLabTaskLabId(a) {
+    return parseExtra(a && a.extra, "lab");
+}
+
+function getTerminalStockResource(a) {
+    return parseExtra(a && a.extra, "res") || parseExtra(a && a.extra, "resource");
+}
+
+function getCarriedFactoryInputResource(creep, recipe) {
+    if (!creep || !recipe || !recipe.inputs) return null;
+    var keys = Object.keys(creep.store);
+    for (var i = 0; i < keys.length; i++) {
+        var res = keys[i];
+        if ((creep.store[res] || 0) <= 0) continue;
+        if (recipe.inputs[res] !== undefined) return res;
+    }
+    return null;
+}
+
+function recoverFactoryInputAssignment(creep, view) {
+    if (!creep || !view || !view.factory) return false;
+
+    var activeOrder = getActiveFactoryOrder(view.roomName);
+    if (!activeOrder) return false;
+
+    var recipe = factoryManager.getRecipe(activeOrder.product);
+    if (!recipe || !recipe.inputs) return false;
+
+    var carriedRes = getCarriedFactoryInputResource(creep, recipe);
+    if (!carriedRes) return false;
+
+    var desiredTaskId = activeOrder.id + ':' + carriedRes;
+    var curA = getAssignment(creep);
+    if (curA && curA.type !== 'factory_input') return false;
+    if (curA && curA.type === 'factory_input' && curA.taskId === desiredTaskId && curA.targetId === view.factory.id) {
+        return false;
+    }
+
+    setAssignment(creep, {
+        type: 'factory_input',
+        taskId: desiredTaskId,
+        targetId: view.factory.id,
+        amount: creep.store[carriedRes] || 0,
+        assignedTick: Game.time,
+        extra: 'res=' + carriedRes + (activeOrder.reservationProgram ? ',program=' + activeOrder.reservationProgram : '')
+    });
+    creep.memory.s = 'delivering';
+    delete creep.memory.sl;
+    return true;
+}
+
+function findTerminalOpById(opId) {
+    var ops = Memory.terminalManager && Array.isArray(Memory.terminalManager.operations) ? Memory.terminalManager.operations : [];
+    for (var i = 0; i < ops.length; i++) {
+        if (ops[i] && ops[i].id === opId) return ops[i];
+    }
+    return null;
+}
+
+function getLabOrder(roomName) {
+    var rm = Memory.labOrders && Memory.labOrders[roomName];
+    return rm && rm.active ? rm.active : null;
+}
+
+function getMarketLabLayout(room, order) {
+    if (!room || !order || !labManager) return null;
+    if (order.type === 'breakdown' && typeof labManager.getBreakdownLayout === 'function') {
+        return labManager.getBreakdownLayout(room);
+    }
+    if (typeof labManager.getLayout === 'function') return labManager.getLayout(room);
+    return null;
+}
+
+function getLayoutLabs(layout) {
+    var labs = [], seen = {};
+    if (!layout || !layout.groups) return labs;
+    function add(lab) {
+        if (!lab || seen[lab.id]) return;
+        seen[lab.id] = true;
+        labs.push(lab);
+    }
+    for (var g = 0; g < layout.groups.length; g++) {
+        var group = layout.groups[g];
+        add(group.in1);
+        add(group.in2);
+        for (var i = 0; i < group.outs.length; i++) add(group.outs[i]);
+    }
+    return labs;
+}
+
+function labHasMineral(lab) {
+    return lab && (lab.mineralAmount || 0) > 0 && lab.mineralType;
+}
+
+function chooseLabLoadSource(room, resourceType, reservationProgram) {
+    if (!room || !resourceType) return null;
+    var storage = room.storage;
+    var terminal = room.terminal;
+    var terminalAvail = terminal ? (terminal.store[resourceType] || 0) : 0;
+    var storageAvail = storage ? (storage.store[resourceType] || 0) : 0;
+    var terminalReserved = reservationProgram ? getProgramReserved(room.name, resourceType, reservationProgram, 'terminal') : 0;
+    var storageReserved = reservationProgram ? getProgramReserved(room.name, resourceType, reservationProgram, 'storage') : 0;
+
+    if (reservationProgram && terminalReserved > 0 && terminalAvail > 0) return terminal;
+    if (reservationProgram && storageReserved > 0 && storageAvail > 0) return storage;
+    if (terminalAvail > 0) return terminal;
+    if (storageAvail > 0) return storage;
+    return null;
+}
+
+function getProgramReserved(roomName, material, program, building) {
+    if (!roomName || !material || !program || !building) return 0;
+    var info = storageManager.storageFind(roomName, material);
+    var bucket = info && info[building] && Array.isArray(info[building].reservations)
+        ? info[building].reservations : [];
+    for (var i = 0; i < bucket.length; i++) {
+        if (bucket[i] && bucket[i].program === program) return bucket[i].amount || 0;
+    }
+    return 0;
+}
+
+function consumeProgramReservation(roomName, material, program, building, amount) {
+    if (!roomName || !material || !program || !building || !amount) return;
+    storageManager.consume(roomName, material, building, program, amount);
+}
+
+function getActiveFactoryOrder(roomName) {
+    var orders = Memory.factoryOrders || [];
+    for (var i = 0; i < orders.length; i++) {
+        var order = orders[i];
+        if (order && order.room === roomName && order.status === "active") return order;
+    }
+    return null;
+}
+
+function chooseFactorySink(room) {
+    if (!room) return null;
+    if (room.storage && room.storage.store.getFreeCapacity() > 0) return room.storage;
+    if (room.terminal && room.terminal.store.getFreeCapacity() > 0) return room.terminal;
+    return null;
+}
+
+function chooseFactorySource(room, resourceType, reservationProgram) {
+    if (!room || !resourceType) return null;
+
+    var storage = room.storage;
+    var terminal = room.terminal;
+    var storageAvail = storage ? (storage.store[resourceType] || 0) : 0;
+    var terminalAvail = terminal ? (terminal.store[resourceType] || 0) : 0;
+    var storageReserved = reservationProgram ? getProgramReserved(room.name, resourceType, reservationProgram, 'storage') : 0;
+    var terminalReserved = reservationProgram ? getProgramReserved(room.name, resourceType, reservationProgram, 'terminal') : 0;
+
+    if (reservationProgram && storageReserved > 0 && storageAvail > 0) return storage;
+    if (reservationProgram && terminalReserved > 0 && terminalAvail > 0) return terminal;
+    if (storageAvail > 0) return storage;
+    if (terminalAvail > 0) return terminal;
+    return null;
+}
+
+function factoryCycleInputTotal(factory, recipe) {
+    if (!factory || !factory.store || !recipe || !recipe.inputs) return 0;
+    var total = 0;
+    for (var res in recipe.inputs) total += factory.store[res] || 0;
+    return total;
+}
+
+function factoryCycleTargetTotal(order, recipe) {
+    if (!order || !recipe || !recipe.inputs) return 0;
+    var batches = Math.max(0, order.cycleBatches || 0);
+    var total = 0;
+    for (var res in recipe.inputs) total += (recipe.inputs[res] || 0) * batches;
+    return total;
+}
+
+function factoryInputLoadBudget(factory, order, recipe) {
+    var remainingInput = Math.max(0, factoryCycleTargetTotal(order, recipe) - factoryCycleInputTotal(factory, recipe));
+    var free = factory && factory.store && factory.store.getFreeCapacity ? (factory.store.getFreeCapacity() || 0) : remainingInput;
+    return Math.max(0, Math.min(remainingInput, free));
+}
+
+function factoryInputDeficit(factory, order, recipe, resourceType) {
+    if (!factory || !factory.store || !order || !recipe || !recipe.inputs || recipe.inputs[resourceType] === undefined) return 0;
+    var need = (recipe.inputs[resourceType] || 0) * Math.max(0, order.cycleBatches || 0);
+    return Math.max(0, need - (factory.store[resourceType] || 0));
 }
 
 // ─── ENERGY CAPACITY HELPER ────────────────────────────────────────────────────
@@ -606,6 +825,213 @@ function scanRoomTasks(room, view) {
         }
     }
 
+    // ── TERMINAL STOCK (small local moves via supplier) ─────────────────────
+    if (view.storage && view.terminal && terminalManager && typeof terminalManager.getSupplierTasks === "function") {
+        var supplierTasks = terminalManager.getSupplierTasks(view.roomName);
+        for (var sti = 0; sti < supplierTasks.length; sti++) {
+            var st = supplierTasks[sti];
+            if (!st || st.amount <= 0) continue;
+            var stOp = findTerminalOpById(st.opId);
+            if (!stOp || stOp.status === 'completed' || stOp.status === 'failed') continue;
+            var stRemaining = Math.max(0, stOp.amount - (stOp.amountMoved || 0));
+            if (stRemaining <= 0) continue;
+
+            var stSource = st.type === 'toTerminal' ? view.storage : view.terminal;
+            var stTarget = st.type === 'toTerminal' ? view.terminal : view.storage;
+            if (!stSource || !stTarget || !stSource.store || !stTarget.store) continue;
+
+            var stAvailable = stSource.store.getUsedCapacity(st.resourceType) || 0;
+            var stFree = stTarget.store.getFreeCapacity(st.resourceType) || 0;
+            if (stAvailable <= 0 || stFree <= 0) continue;
+
+            var stAmt = Math.min(stRemaining, stAvailable, stFree);
+            if (stAmt <= 0) continue;
+            tasks.push({
+                type: 'terminal_stock',
+                taskId: stSource.id,
+                targetId: stTarget.id,
+                amount: stAmt,
+                priority: TASK_PRIORITY.terminal_stock,
+                extra: 'res=' + st.resourceType + ',op=' + st.opId + ',program=' + (st.reservationProgram || '') + ',type=' + st.type
+            });
+        }
+    }
+
+    // ── MARKET LAB ACTIVE ORDER LOGISTICS ─────────────────────────────────
+    // Lab manager owns the exact load/unload jobs for marketLab-origin orders.
+    if (labManager && typeof labManager.getSupplierLabTasks === "function") {
+        var labTasks = labManager.getSupplierLabTasks(view.roomName) || [];
+        for (var lt = 0; lt < labTasks.length; lt++) tasks.push(labTasks[lt]);
+    }
+
+    // ── MARKET LAB STAGING ───────────────────────────────────────────────
+    if (view.storage && view.terminal) {
+        var marketLabQueues = [];
+        if (Memory.marketLabForward && Memory.marketLabForward.rooms && Memory.marketLabForward.rooms[view.roomName]) {
+            marketLabQueues.push(Memory.marketLabForward.rooms[view.roomName]);
+        }
+        if (Memory.marketLabReverse && Memory.marketLabReverse.rooms && Memory.marketLabReverse.rooms[view.roomName]) {
+            marketLabQueues.push(Memory.marketLabReverse.rooms[view.roomName]);
+        }
+
+        for (var qi = 0; qi < marketLabQueues.length; qi++) {
+            var queue = marketLabQueues[qi];
+            for (var oi = 0; oi < queue.length; oi++) {
+                var op = queue[oi];
+                if (!op || op.state !== 'STAGING' || !op.expectedOutputs) continue;
+
+                for (var res in op.expectedOutputs) {
+                    if (!op.expectedOutputs.hasOwnProperty(res)) continue;
+                    var expected = op.expectedOutputs[res] || 0;
+                    if (expected <= 0) continue;
+
+                    var stageProgram = op.stageReservationProgram || null;
+                    var terminalHave = view.terminal.store[res] || 0;
+                    var storageHave = view.storage.store[res] || 0;
+                    var reserved = stageProgram ? getProgramReserved(view.roomName, res, stageProgram, 'storage') : 0;
+                    var remaining = Math.max(0, expected - terminalHave);
+                    var free = view.terminal.store.getFreeCapacity(res) || 0;
+                    var amount = Math.min(remaining, storageHave, free);
+                    if (amount <= 0) continue;
+
+                    tasks.push({
+                        type: 'market_lab_stage',
+                        taskId: 'market_lab_stage:' + op.id + ':' + res,
+                        targetId: view.terminal.id,
+                        amount: amount,
+                        priority: TASK_PRIORITY.market_lab_stage,
+                        extra: 'res=' + res + ',op=' + op.id + (stageProgram ? ',program=' + stageProgram : '') + ',reserved=' + reserved
+                    });
+                }
+            }
+        }
+    }
+
+    // ── FACTORY LOGISTICS ──────────────────────────────────────────────────
+    if (view.factory) {
+        var factory = view.factory;
+        var activeOrder = getActiveFactoryOrder(view.roomName);
+        var sink = chooseFactorySink(room);
+
+        if (activeOrder) {
+            var recipe = factoryManager.getRecipe(activeOrder.product);
+            var phase = activeOrder.phase || "loading";
+            if (recipe && recipe.inputs) {
+                if (phase === "loading") {
+                    var cycleBatches = activeOrder.cycleBatches || 0;
+                    for (var storedResLoad in factory.store) {
+                        if ((factory.store[storedResLoad] || 0) <= 0) continue;
+                        if (!sink) break;
+
+                        var excess = 0;
+                        var keepAmount = 0;
+                        if (recipe.inputs[storedResLoad] !== undefined && recipe.inputs[storedResLoad] > 0) {
+                            var targetInput = (recipe.inputs[storedResLoad] || 0) * cycleBatches;
+                            keepAmount = targetInput;
+                            excess = Math.max(0, (factory.store[storedResLoad] || 0) - targetInput);
+                            if (excess <= 0) continue;
+                        } else {
+                            excess = factory.store[storedResLoad] || 0;
+                        }
+
+                        tasks.push({
+                            type: "factory_drain",
+                            taskId: activeOrder.id + ":loaddrain:" + storedResLoad,
+                            targetId: sink.id,
+                            amount: excess,
+                            priority: TASK_PRIORITY.factory_input - 1,
+                            extra: "res=" + storedResLoad + ",keep=" + keepAmount
+                        });
+                    }
+
+                    var loadBudget = factoryInputLoadBudget(factory, activeOrder, recipe);
+                    for (var resType in recipe.inputs) {
+                        var perBatch = recipe.inputs[resType] || 0;
+                        if (perBatch <= 0 || cycleBatches <= 0 || loadBudget <= 0) continue;
+                        var need = perBatch * cycleBatches;
+                        var have = factory.store[resType] || 0;
+                        var deficit = Math.max(0, need - have);
+                        if (deficit <= 0) continue;
+                        var src = chooseFactorySource(room, resType, activeOrder.reservationProgram);
+                        var srcAvailable = src ? (src.store[resType] || 0) : 0;
+                        if (srcAvailable <= 0) continue;
+                        var loadAmount = Math.min(deficit, srcAvailable, loadBudget);
+                        if (loadAmount <= 0) continue;
+
+                        tasks.push({
+                            type: "factory_input",
+                            taskId: activeOrder.id + ":" + resType,
+                            targetId: factory.id,
+                            amount: loadAmount,
+                            priority: TASK_PRIORITY.factory_input,
+                            extra: "res=" + resType + (activeOrder.reservationProgram ? ",program=" + activeOrder.reservationProgram : "")
+                        });
+                        loadBudget -= loadAmount;
+                    }
+                } else if (phase === "unloading") {
+                    if ((factory.store[activeOrder.product] || 0) > 0 && sink) {
+                        tasks.push({
+                            type: "factory_output",
+                            taskId: activeOrder.id + ":product",
+                            targetId: sink.id,
+                            amount: factory.store[activeOrder.product] || 0,
+                            priority: TASK_PRIORITY.factory_output,
+                            extra: "res=" + activeOrder.product
+                        });
+                    }
+
+                    for (var storedRes in factory.store) {
+                        if ((factory.store[storedRes] || 0) <= 0) continue;
+                        if (storedRes === activeOrder.product) continue;
+                        if (!sink) break;
+                        tasks.push({
+                            type: "factory_drain",
+                            taskId: activeOrder.id + ":drain:" + storedRes,
+                            targetId: sink.id,
+                            amount: factory.store[storedRes] || 0,
+                            priority: TASK_PRIORITY.factory_drain,
+                            extra: "res=" + storedRes
+                        });
+                    }
+                }
+            }
+        } else if (sink) {
+            for (var drainRes in factory.store) {
+                if ((factory.store[drainRes] || 0) <= 0) continue;
+                tasks.push({
+                    type: "factory_drain",
+                    taskId: factory.id + ":" + drainRes,
+                    targetId: sink.id,
+                    amount: factory.store[drainRes] || 0,
+                    priority: TASK_PRIORITY.factory_drain,
+                    extra: "res=" + drainRes
+                });
+            }
+        }
+    }
+
+    // ── DROPPED ENERGY (cleanup near storage) ───────────────────────────────
+    if (view.storage) {
+        var roomBase = getRoomState.get(room.name);
+        var droppedList = (roomBase && roomBase.dropped) || [];
+        for (var dpi = 0; dpi < droppedList.length; dpi++) {
+            var drop = droppedList[dpi];
+            if (!drop) continue;
+            try {
+                if (drop.resourceType !== RESOURCE_ENERGY) continue;
+                if ((drop.amount || 0) < 50) continue;
+                if (cheb(drop.pos, view.storage.pos) > 4) continue;
+                if (!view.storage.store.getFreeCapacity ||
+                    view.storage.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) continue;
+                tasks.push({ type: "dropped_pickup", taskId: drop.id, targetId: view.storage.id,
+                              amount: drop.amount, priority: TASK_PRIORITY.dropped_pickup });
+            } catch (e) {
+                // Cached Resource object went stale (decayed/picked up) before this tick.
+                continue;
+            }
+        }
+    }
+
     // ── SORT BY PRIORITY ────────────────────────────────────────────────────
     var custom = room.memory.supplierPriorities;
     tasks.sort(function(a, b) {
@@ -645,11 +1071,14 @@ function pickTask(creep, view, h) {
             h.extRoute = buildExtensionRoute(creep, view);
             h.extRouteTick = Game.time;
             creep.memory.s = energyUsed > 0 ? "delivering" : "fetching";
-        } else if (t.type === "materials_empty" && energyUsed > 0) {
-            // Need to dump energy before fetching minerals
-            creep.memory.s = "delivering";
-            a.extra = (a.extra ? a.extra + "," : "") + "dump_energy";
-            setAssignment(creep, a);
+        } else if (t.type === "factory_input") {
+            creep.memory.s = creep.store.getUsedCapacity() > 0 ? "delivering" : "fetching";
+        } else if (t.type === "factory_output" || t.type === "factory_drain") {
+            creep.memory.s = creep.store.getUsedCapacity() > 0 ? "delivering" : "fetching";
+        } else if (t.type === "market_lab_stage" || t.type === "terminal_stock") {
+            creep.memory.s = creep.store.getUsedCapacity() > 0 ? "delivering" : "fetching";
+        } else if (t.type === "lab_unload" || t.type === "lab_load") {
+            creep.memory.s = creep.store.getUsedCapacity() > 0 ? "delivering" : "fetching";
         } else if (isWithdrawTask(t.type)) {
             // Withdraw-type: if already carrying enough for a delivery task, deliver
             if (shouldDeliverImmediately(t.type, energyUsed)) {
@@ -667,6 +1096,9 @@ function pickTask(creep, view, h) {
     }
 
     // Nothing to do — idle
+    if (energyUsed > 0) {
+        if (tryFallbackDump(creep, view)) return false;
+    }
     h.consecutiveIdlePicks = (h.consecutiveIdlePicks || 0) + 1;
     creep.memory.s = "idle";
     delete creep.memory._move;
@@ -681,9 +1113,8 @@ function pickTask(creep, view, h) {
 }
 
 var WITHDRAW_TASKS = {
-    container_empty: true, container_drain: true, materials_drain_energy: true,
-    materials_empty: true, link_drain: true, link_fill: true,
-    terminal_balance: true
+    container_empty: true, container_drain: true,     materials_drain_energy: true, link_drain: true, link_fill: true,
+    terminal_balance: true, dropped_pickup: true
 };
 
 function isWithdrawTask(type) { return WITHDRAW_TASKS[type] === true; }
@@ -695,8 +1126,28 @@ function shouldDeliverImmediately(type, energyUsed) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-//  EXTENSION ROUTE (greedy nearest-neighbor, with waypoint-aware positions)
+//  EXTENSION ROUTE (optimal capacity split, seeded from depot, no dribble-filling)
 // ════════════════════════════════════════════════════════════════════════════════
+
+function nnOrder(nodes, startPos) {
+    var remaining = nodes.slice(), order = [], cur = startPos;
+    while (remaining.length > 0) {
+        var bestIdx = 0, bestDist = cheb(cur, remaining[0].pos);
+        for (var j = 1; j < remaining.length; j++) {
+            var d = cheb(cur, remaining[j].pos);
+            if (d < bestDist) { bestDist = d; bestIdx = j; }
+        }
+        var picked = remaining.splice(bestIdx, 1)[0];
+        order.push(picked);
+        cur = picked.pos;
+    }
+    return order;
+}
+
+function nodeById(nodes, id) {
+    for (var i = 0; i < nodes.length; i++) if (nodes[i].id === id) return nodes[i];
+    return null;
+}
 
 function buildExtensionRoute(creep, view) {
     var emptyExts = view._emptyExts;
@@ -721,89 +1172,84 @@ function buildExtensionRoute(creep, view) {
     if (emptyExts.length === 0) return [];
 
     var wpMap = view._extWpMap;
-    var extMap = {};
+    function posOf(e) { return (wpMap && wpMap[e.id]) ? wpMap[e.id] : e.pos; }
+
+    // Build nodes: id, pos (waypoint if available), cap (free capacity)
+    var nodes = [];
     for (var i = 0; i < emptyExts.length; i++) {
-        var ext = emptyExts[i];
-        extMap[ext.id] = {
-            pos: (wpMap && wpMap[ext.id]) ? wpMap[ext.id] : ext.pos,
-            cap: ext.store.getCapacity(RESOURCE_ENERGY) || 200
-        };
+        var e = emptyExts[i];
+        nodes.push({
+            id: e.id,
+            pos: posOf(e),
+            cap: e.store.getFreeCapacity(RESOURCE_ENERGY) || (e.store.getCapacity(RESOURCE_ENERGY) || 200)
+        });
     }
 
-    // Greedy nearest-neighbor tour using waypoint positions
-    var remaining = emptyExts.map(function(e) { return e.id; });
-    var rawRoute = [];
-    var cur = creep.pos;
-    while (remaining.length > 0) {
-        var bestIdx = 0, bestDist = cheb(cur, extMap[remaining[0]].pos);
-        for (var j = 1; j < remaining.length; j++) {
-            var d = cheb(cur, extMap[remaining[j]].pos);
-            if (d < bestDist) { bestDist = d; bestIdx = j; }
-        }
-        var pickedId = remaining.splice(bestIdx, 1)[0];
-        rawRoute.push(pickedId);
-        cur = extMap[pickedId].pos;
-    }
+    var fullCap = getEnergyCapacity(creep);
+    if (fullCap <= 0) return nodes.map(function(n){ return n.id; });
 
-    if (!view.storage) return rawRoute;
+    // No storage to refuel at: just NN from current position
+    if (!view.storage) return nnOrder(nodes, creep.pos).map(function(n){ return n.id; });
+    var depot = view.storage.pos;
 
-    // Insert REFUEL sentinels where the creep would run out of energy
-    var storagePos = view.storage.pos;
-    var fullCap    = getEnergyCapacity(creep);
+    // 1) NN tour seeded from the DEPOT (storage), not the creep's scattered
+    //    field position. Runs start at storage, so this keeps segments
+    //    spatially coherent and radiating outward from the depot.
+    var order = nnOrder(nodes, depot);
+    var n = order.length;
 
-    if (fullCap <= 0) return rawRoute;
+    // 2) Optimal capacity split (Prins' "Split"): given the fixed visiting
+    //    order, choose trip boundaries that minimize total depot round-trips.
+    //    Each trip starts full at storage and carries <= fullCap.
+    var cost = new Array(n + 1), prev = new Array(n + 1);
+    cost[0] = 0;
+    for (var b = 1; b <= n; b++) { cost[b] = Infinity; prev[b] = -1; }
 
-    var energy     = creep.store.getUsedCapacity(RESOURCE_ENERGY);
-    var result     = [];
-    var segStart   = 0;
-    var segOrigin  = creep.pos;
-    var ri         = 0;
-
-    var refuelCount = 0;
-    var maxRefuels  = rawRoute.length + 1;
-
-    while (ri < rawRoute.length) {
-        var id = rawRoute[ri];
-        var ed = extMap[id];
-        if (!ed) { ri++; continue; }
-
-        if (energy >= ed.cap) {
-            result.push(id);
-            energy -= ed.cap;
-            ri++;
-            continue;
-        }
-
-        refuelCount++;
-        if (refuelCount > maxRefuels) {
-            while (ri < rawRoute.length) { result.push(rawRoute[ri]); ri++; }
-            break;
-        }
-
-        // Find cheapest insertion point for the REFUEL sentinel
-        var lastPos = result.length > segStart
-            ? extMap[result[result.length - 1]].pos : segOrigin;
-        var bestOverhead = cheb(lastPos, storagePos) + cheb(storagePos, ed.pos) - cheb(lastPos, ed.pos);
-        var bestJ = result.length;
-
-        var jStart = (segOrigin === storagePos) ? segStart + 1 : segStart;
-        for (var j = jStart; j < result.length; j++) {
-            var pPos = (j === segStart) ? segOrigin : extMap[result[j - 1]].pos;
-            var nPos = extMap[result[j]].pos;
-            var overhead = cheb(pPos, storagePos) + cheb(storagePos, nPos) - cheb(pPos, nPos);
-            if (overhead < bestOverhead) { bestOverhead = overhead; bestJ = j; }
-        }
-
-        result.splice(bestJ, 0, "REFUEL");
-        segStart  = bestJ + 1;
-        segOrigin = storagePos;
-        energy    = fullCap;
-        for (var k = segStart; k < result.length; k++) {
-            if (result[k] !== "REFUEL" && extMap[result[k]]) energy -= extMap[result[k]].cap;
+    for (var s = 0; s < n; s++) {
+        var load = 0, tripCost = 0;
+        for (var j = s; j < n; j++) {
+            load += order[j].cap;
+            if (load > fullCap && j > s) break;          // can't extend this trip
+            if (j === s) {
+                tripCost = cheb(depot, order[j].pos) * 2; // out and back
+            } else {
+                tripCost += cheb(order[j-1].pos, order[j].pos)
+                          + cheb(order[j].pos, depot)
+                          - cheb(order[j-1].pos, depot);
+            }
+            if (cost[s] + tripCost < cost[j + 1]) {
+                cost[j + 1] = cost[s] + tripCost;
+                prev[j + 1] = s;
+            }
         }
     }
 
-    return result;
+    // Reconstruct trip start indices (in ascending order).
+    var bounds = [], k = n;
+    while (k > 0) { bounds.push(prev[k]); k = prev[k]; }
+    bounds.reverse();
+
+    // 3) Emit route with REFUEL at each trip start.
+    var route = [];
+    for (var t = 0; t < bounds.length; t++) {
+        route.push("REFUEL");
+        var start = bounds[t];
+        var end = (t + 1 < bounds.length) ? bounds[t + 1] : n;
+        for (var m = start; m < end; m++) route.push(order[m].id);
+    }
+
+    // 4) Drop the leading refuel only if we already hold enough for the whole
+    //    first trip — otherwise refuel first (avoids dribble-filling).
+    if (route[0] === "REFUEL") {
+        var need = 0;
+        for (var f = 1; f < route.length && route[f] !== "REFUEL"; f++) {
+            var fn = nodeById(nodes, route[f]);
+            if (fn) need += fn.cap;
+        }
+        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) >= need) route.shift();
+    }
+
+    return route;
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -815,6 +1261,73 @@ function isAssignmentDone(creep, view, a, h) {
 
     var src = Game.getObjectById(a.taskId);
     var dst = a.targetId ? Game.getObjectById(a.targetId) : src;
+    var factoryRes = getFactoryTaskResource(a);
+
+    if (a.type === "factory_input") {
+        var factoryIn = dst;
+        if (!factoryIn || !factoryIn.store || !factoryRes) return true;
+        var orderIn = getActiveFactoryOrder(view.roomName);
+        if (!orderIn) return true;
+        if ((orderIn.phase || "loading") !== "loading") return true;
+        var recipeIn = factoryManager.getRecipe(orderIn.product);
+        if (!recipeIn || !recipeIn.inputs || recipeIn.inputs[factoryRes] === undefined) return true;
+        var needIn = (recipeIn.inputs[factoryRes] || 0) * Math.max(0, orderIn.cycleBatches || 0);
+        return (factoryIn.store[factoryRes] || 0) >= needIn;
+    }
+
+    if (a.type === "factory_output") {
+        var factoryOut = view.factory;
+        if (!factoryOut || !factoryOut.store || !factoryRes) return true;
+        var orderOut = getActiveFactoryOrder(view.roomName);
+        if (!orderOut || (orderOut.phase || "loading") !== "unloading") return true;
+        return (factoryOut.store[factoryRes] || 0) <= 0;
+    }
+
+    if (a.type === "factory_drain") {
+        var factoryDrain = view.factory;
+        if (!factoryDrain || !factoryDrain.store) return true;
+        var orderDrain = getActiveFactoryOrder(view.roomName);
+        if (!orderDrain) return true;
+        if (orderDrain && (orderDrain.phase || "loading") === "processing") return true;
+        var drainRes = factoryRes;
+        if (!drainRes) {
+            for (var k in factoryDrain.store) {
+                if ((factoryDrain.store[k] || 0) > 0) { drainRes = k; break; }
+            }
+        }
+        if (!drainRes) return true;
+        var keepDrain = parseExtra(a.extra, "keep");
+        if (keepDrain !== null) return (factoryDrain.store[drainRes] || 0) <= (+keepDrain || 0);
+        return (factoryDrain.store[drainRes] || 0) <= 0;
+    }
+
+    if (a.type === "market_lab_stage") {
+        var stageRes = getMarketLabStageResource(a);
+        var stageProgram = parseExtra(a.extra, "program");
+        if (!view.storage || !stageRes || !stageProgram) return true;
+        var stageReserved = getProgramReserved(view.roomName, stageRes, stageProgram, 'storage');
+        return stageReserved <= 0 && (creep.store[stageRes] || 0) <= 0;
+    }
+
+    if (a.type === "lab_unload") {
+        var unloadRes = getLabTaskResource(a);
+        var unloadLab = Game.getObjectById(getLabTaskLabId(a));
+        return (!unloadLab || !labHasMineral(unloadLab)) && (!unloadRes || (creep.store[unloadRes] || 0) <= 0);
+    }
+
+    if (a.type === "lab_load") {
+        var loadRes = getLabTaskResource(a);
+        var loadLab = Game.getObjectById(getLabTaskLabId(a));
+        if (!loadLab || !loadRes) return true;
+        if (loadLab.mineralType && loadLab.mineralType !== loadRes) return true;
+        if ((a.amount || 0) <= 0) return true;
+        var loadTargetAmt = +parseExtra(a.extra, "target") || 0;
+        if (loadTargetAmt > 0 && (loadLab.mineralAmount || 0) >= loadTargetAmt) return true;
+        var order = getLabOrder(view.roomName);
+        if (!order || order.origin !== 'marketLab' || order.evacuating || order.needsPreEvacuation) return true;
+        if ((creep.store[loadRes] || 0) > 0) return false;
+        return (loadLab.store.getFreeCapacity(loadRes) || 0) <= 0;
+    }
 
     // Extension: done when route is empty and no empties remain
     if (a.type === "extension") {
@@ -832,6 +1345,14 @@ function isAssignmentDone(creep, view, a, h) {
         return true;
     }
 
+    // FIX: fallback_dump previously fell through to "return false", so after
+    // dumping, the creep flipped back to "fetching", withdrew from storage,
+    // and re-delivered to the same storage in a loop until the TTL fired.
+    if (a.type === "fallback_dump") {
+        return creep.store.getUsedCapacity(RESOURCE_ENERGY) <= 0 ||
+               !dst || !dst.store || dst.store.getFreeCapacity(RESOURCE_ENERGY) <= 0;
+    }
+
     if (!src) return true;
 
     if (a.type === "spawn" || a.type === "power_spawn_fill") {
@@ -847,6 +1368,7 @@ function isAssignmentDone(creep, view, a, h) {
                - (dst.store.getUsedCapacity(RESOURCE_ENERGY) || 0)) <= 0;
     }
     if (a.type === "link_drain") {
+        if ((creep.store[RESOURCE_ENERGY] || 0) > 0) return false;
         return !src.store || (src.store.getUsedCapacity(RESOURCE_ENERGY) || 0) <= LINK_FILL_THRESHOLD;
     }
     if (a.type === "container_drain" || a.type === "container_empty" || a.type === "materials_drain_energy") {
@@ -857,10 +1379,6 @@ function isAssignmentDone(creep, view, a, h) {
         }
         return srcE <= 0 || !dst || !dst.store || dst.store.getFreeCapacity(RESOURCE_ENERGY) <= 0;
     }
-    if (a.type === "materials_empty") {
-        if (!src.store) return true;
-        return (src.store.getUsedCapacity() || 0) - (src.store.getUsedCapacity(RESOURCE_ENERGY) || 0) < 1000;
-    }
     if (a.type === "terminal_balance") {
         if (!view.storage || !view.terminal) return true;
         var tE = view.terminal.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
@@ -868,8 +1386,120 @@ function isAssignmentDone(creep, view, a, h) {
         if (a.taskId === view.storage.id) return tE > TERMINAL_MIN;
         return true;
     }
+    if (a.type === "terminal_stock") {
+        var opIdDone = parseExtra(a.extra, 'op');
+        if (!opIdDone) return true;
+        var opDone = findTerminalOpById(opIdDone);
+        if (!opDone || opDone.status === 'completed' || opDone.status === 'failed') return true;
+        var movedDone = opDone.amountMoved || 0;
+        return movedDone >= opDone.amount;
+    }
+    if (a.type === "dropped_pickup") {
+        if (!src || (src.amount || 0) <= 0) return true;
+        return !dst || !dst.store || dst.store.getFreeCapacity(RESOURCE_ENERGY) <= 0;
+    }
 
     return false;
+}
+
+// Completion check that accounts for the transfer we just issued THIS tick.
+// Store objects don't update until end of tick, so isAssignmentDone() can't
+// see the energy we just sent — this simulates it for fill-type targets.
+// Returns true/false, or null to fall back to isAssignmentDone().
+function simulateFillDone(a, view, target, sent) {
+    if (!target || !target.store) return true;
+    var tE = (target.store.getUsedCapacity(RESOURCE_ENERGY) || 0) + sent;
+    var cap = target.store.getCapacity(RESOURCE_ENERGY) || 0;
+
+    if (a.type === "market_lab_stage") {
+        var stageRes = getMarketLabStageResource(a);
+        var stageTarget = view.terminal;
+        if (!stageTarget || !stageTarget.store || !stageRes) return true;
+        var stageNeed = a.amount || 0;
+        if (stageNeed <= 0) return true;
+        var stageProgram = parseExtra(a.extra, "program");
+        if (!stageProgram) return true;
+        return getProgramReserved(view.roomName, stageRes, stageProgram, 'storage') <= 0;
+    }
+
+    if (a.type === "lab_load") {
+        var loadRes = getLabTaskResource(a);
+        var loadTarget = target;
+        if (!loadTarget || !loadTarget.store || !loadRes) return true;
+        var loadTargetAmt = +parseExtra(a.extra, "target") || 0;
+        if (loadTargetAmt <= 0) return true;
+        return Math.max(0, (loadTarget.store[loadRes] || 0) + sent) >= loadTargetAmt;
+    }
+
+    if (a.type === "factory_input") {
+        var inputRes = getFactoryTaskResource(a);
+        var factoryIn = target;
+        var orderIn = getActiveFactoryOrder(view.roomName);
+        if (!factoryIn || !factoryIn.store || !inputRes || !orderIn) return true;
+        if ((orderIn.phase || "loading") !== "loading") return true;
+        var recipeIn = factoryManager.getRecipe(orderIn.product);
+        if (!recipeIn || !recipeIn.inputs || recipeIn.inputs[inputRes] === undefined) return true;
+        var needIn = (recipeIn.inputs[inputRes] || 0) * Math.max(0, orderIn.cycleBatches || 0);
+        return Math.max(0, (factoryIn.store[inputRes] || 0) + sent) >= needIn;
+    }
+
+    if (a.type === "factory_output" || a.type === "factory_drain") {
+        var outRes = getFactoryTaskResource(a);
+        var factoryOut = view.factory;
+        if (!factoryOut || !factoryOut.store || !outRes) return true;
+        var orderOut = getActiveFactoryOrder(view.roomName);
+        if (a.type === "factory_output" && (!orderOut || (orderOut.phase || "loading") !== "unloading")) return true;
+        if (a.type === "factory_drain" && !orderOut) return true;
+        if (a.type === "factory_drain" && orderOut && (orderOut.phase || "loading") === "processing") return true;
+        var keepOut = parseExtra(a.extra, "keep");
+        if (keepOut !== null) return Math.max(0, (factoryOut.store[outRes] || 0) - sent) <= (+keepOut || 0);
+        return Math.max(0, (factoryOut.store[outRes] || 0) - sent) <= 0;
+    }
+
+    if (a.type === "spawn" || a.type === "power_spawn_fill") {
+        return tE >= cap;
+    }
+    if (a.type === "tower") {
+        return tE >= cap * 0.9;
+    }
+    if (a.type === "link_fill") {
+        return Math.min(LINK_DRAIN_THRESHOLD, cap) - tE <= 0;
+    }
+    if (a.type === "terminal_balance") {
+        if (view.terminal && a.targetId === view.terminal.id) return tE > TERMINAL_MIN;
+        // terminal -> storage direction: completion depends on the terminal
+        // (the source), whose store already reflects last tick's withdrawal.
+        if (view.terminal) return (view.terminal.store.getUsedCapacity(RESOURCE_ENERGY) || 0) < TERMINAL_MAX;
+        return true;
+    }
+    if (a.type === "terminal_stock") {
+        var opIdSim = parseExtra(a.extra, 'op');
+        if (!opIdSim) return true;
+        var opSim = findTerminalOpById(opIdSim);
+        if (!opSim || opSim.status === 'completed' || opSim.status === 'failed') return true;
+        var movedSim = (opSim.amountMoved || 0) + sent;
+        return movedSim >= opSim.amount;
+    }
+    if (a.type === "container_drain" || a.type === "container_empty" ||
+        a.type === "link_drain" || a.type === "materials_drain_energy") {
+        // Source-side data is fresh (our withdrawal applied last tick); the
+        // only stale piece is the dump target's free space, shrunk by `sent`.
+        var srcObj = Game.getObjectById(a.taskId);
+        var srcE = (srcObj && srcObj.store) ? (srcObj.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
+        if (a.type === "link_drain" && srcE <= LINK_FILL_THRESHOLD) return true;
+        if (a.type === "container_drain") {
+            var mde = parseExtra(a.extra, "mde");
+            if (mde && srcE < +mde) return true;
+        }
+        return srcE <= 0 ||
+               (target.store.getFreeCapacity(RESOURCE_ENERGY) || 0) - sent <= 0;
+    }
+    if (a.type === "dropped_pickup") {
+        var srcP = Game.getObjectById(a.taskId);
+        if (!srcP || (srcP.amount || 0) <= 0) return true;
+        return (target.store.getFreeCapacity(RESOURCE_ENERGY) || 0) - sent <= 0;
+    }
+    return null;
 }
 
 function parseExtra(extra, key) {
@@ -880,6 +1510,214 @@ function parseExtra(extra, key) {
         if (kv[0] === key) return kv[1];
     }
     return null;
+}
+
+function findNextLabUnloadTask(creep, view, currentAssignment, resourceType) {
+    if (!creep || !view || !currentAssignment || !resourceType) return null;
+    if (!view.terminal || !view.terminal.store) return null;
+    if ((view.terminal.store.getFreeCapacity(resourceType) || 0) <= 0) return null;
+
+    var tasks = scanRoomTasks(creep.room, view);
+    for (var i = 0; i < tasks.length; i++) {
+        var t = tasks[i];
+        if (!t || t.type !== 'lab_unload') continue;
+        if (t.taskId === currentAssignment.taskId) continue;
+        if (isClaimed(view, creep, t.type, t.taskId, t.targetId)) continue;
+        if (isAvoided(getHeap(creep.name), t.type, t.taskId, t.targetId)) continue;
+        if (getLabTaskResource(t) !== resourceType) continue;
+
+        var labId = getLabTaskLabId(t);
+        var lab = labId ? Game.getObjectById(labId) : null;
+        if (!lab || !lab.mineralType || lab.mineralType !== resourceType) continue;
+        if ((lab.mineralAmount || 0) <= 0) continue;
+
+        return t;
+    }
+    return null;
+}
+
+function dumpAll(creep, room) {
+    if (!room) room = creep.room;
+    var keys = Object.keys(creep.store);
+    for (var i = 0; i < keys.length; i++) {
+        var res = keys[i];
+        if ((creep.store[res] || 0) <= 0) continue;
+        if (room.storage && room.storage.store.getFreeCapacity(res) > 0) {
+            creep.transfer(room.storage, res);
+            return;
+        }
+        if (room.terminal && room.terminal.store.getFreeCapacity(res) > 0) {
+            creep.transfer(room.terminal, res);
+            return;
+        }
+        break;
+    }
+}
+
+function dumpResource(creep, room, resourceType) {
+    if (!room) room = creep.room;
+    if (!resourceType || (creep.store[resourceType] || 0) <= 0) return false;
+    var target = null;
+    if (room.storage && room.storage.store.getFreeCapacity(resourceType) > 0) target = room.storage;
+    else if (room.terminal && room.terminal.store.getFreeCapacity(resourceType) > 0) target = room.terminal;
+    if (!target) return false;
+    if (cheb(creep.pos, target.pos) > 1) {
+        smartMove(creep, target);
+        return true;
+    }
+    return creep.transfer(target, resourceType) === OK;
+}
+
+function dumpEnergy(creep, room) {
+    return dumpResource(creep, room, RESOURCE_ENERGY);
+}
+
+function dumpNonEnergy(creep, room, keepResource) {
+    if (!room) room = creep.room;
+    var keys = Object.keys(creep.store);
+    for (var i = 0; i < keys.length; i++) {
+        var res = keys[i];
+        if (res === RESOURCE_ENERGY || res === keepResource || (creep.store[res] || 0) <= 0) continue;
+        if (dumpResource(creep, room, res)) return true;
+    }
+    return false;
+}
+
+function onlyCarriesResource(creep, resourceType) {
+    var keys = Object.keys(creep.store);
+    for (var i = 0; i < keys.length; i++) {
+        var res = keys[i];
+        if ((creep.store[res] || 0) <= 0) continue;
+        if (res !== resourceType) return false;
+    }
+    return true;
+}
+
+function storeSignature(creep) {
+    var keys = Object.keys(creep.store).sort();
+    var parts = [];
+    for (var i = 0; i < keys.length; i++) {
+        var amt = creep.store[keys[i]] || 0;
+        if (amt > 0) parts.push(keys[i] + ':' + amt);
+    }
+    return parts.join(',');
+}
+
+function deliveryNoProgressWatchdog(creep, a, h) {
+    if (!a || creep.memory.s !== "delivering") {
+        h.deliveryWatchKey = null;
+        h.deliveryWatchCount = 0;
+        return false;
+    }
+
+    var target = Game.getObjectById(a.targetId || a.taskId);
+    if (!target || !target.pos || cheb(creep.pos, target.pos) > 1) {
+        h.deliveryWatchKey = null;
+        h.deliveryWatchCount = 0;
+        return false;
+    }
+
+    var key = creep.memory.a + '|' + creep.memory.s + '|' +
+              creep.pos.roomName + ':' + creep.pos.x + ':' + creep.pos.y + '|' +
+              storeSignature(creep);
+
+    if (h.deliveryWatchKey === key) {
+        h.deliveryWatchCount = (h.deliveryWatchCount || 0) + 1;
+    } else {
+        h.deliveryWatchKey = key;
+        h.deliveryWatchCount = 0;
+    }
+
+    if (h.deliveryWatchCount >= 3) {
+        clearAssignment(creep, "delivery no progress", true);
+        h.deliveryWatchKey = null;
+        h.deliveryWatchCount = 0;
+        return true;
+    }
+
+    return false;
+}
+
+function cleanupCargoForTask(creep, a) {
+    var hasEnergy = (creep.store[RESOURCE_ENERGY] || 0) > 0;
+    var hasNonEnergy = hasNonEnergyCarry(creep);
+
+    if (a && a.type && a.type.indexOf('factory_') === 0) {
+        var factoryRes = getFactoryTaskResource(a);
+        if (hasEnergy) {
+            // Don't dump energy when the factory task itself is for energy
+            // (e.g. Composite, Oxidant, Battery). Otherwise we withdraw from
+            // storage and immediately dump it back in a loop.
+            if (factoryRes !== RESOURCE_ENERGY) {
+                if (dumpEnergy(creep, creep.room)) return true;
+                clearAssignment(creep, "factory cargo blocked", true);
+                return true;
+            }
+        }
+        if (hasNonEnergy) {
+            if (factoryRes && onlyCarriesResource(creep, factoryRes)) return false;
+            if (dumpNonEnergy(creep, creep.room, factoryRes)) return true;
+            clearAssignment(creep, "factory cargo blocked", true);
+            return true;
+        }
+        return false;
+    }
+
+    if (a && a.type === 'market_lab_stage') {
+        var stageRes = getMarketLabStageResource(a);
+        if (hasEnergy) {
+            if (dumpEnergy(creep, creep.room)) return true;
+            clearAssignment(creep, "stage cargo blocked", true);
+            return true;
+        }
+        if (hasNonEnergy) {
+            if (stageRes && onlyCarriesResource(creep, stageRes)) return false;
+            if (dumpNonEnergy(creep, creep.room, stageRes)) return true;
+            clearAssignment(creep, "stage cargo blocked", true);
+            return true;
+        }
+        return false;
+    }
+
+    if (a && (a.type === 'lab_load' || a.type === 'lab_unload')) {
+        var labRes = getLabTaskResource(a);
+        if (hasEnergy) {
+            if (dumpEnergy(creep, creep.room)) return true;
+            clearAssignment(creep, "lab cargo blocked", true);
+            return true;
+        }
+        if (hasNonEnergy) {
+            if (labRes && onlyCarriesResource(creep, labRes)) return false;
+            if (dumpNonEnergy(creep, creep.room, labRes)) return true;
+            clearAssignment(creep, "lab cargo blocked", true);
+            return true;
+        }
+        return false;
+    }
+
+    if (a && a.type === 'terminal_stock') {
+        var stockCargoRes = getTerminalStockResource(a);
+        if (hasEnergy) {
+            if (dumpEnergy(creep, creep.room)) return true;
+            clearAssignment(creep, "terminal stock cargo blocked", true);
+            return true;
+        }
+        if (hasNonEnergy) {
+            if (stockCargoRes && onlyCarriesResource(creep, stockCargoRes)) return false;
+            if (dumpNonEnergy(creep, creep.room, stockCargoRes)) return true;
+            clearAssignment(creep, "terminal stock cargo blocked", true);
+            return true;
+        }
+        return false;
+    }
+
+    if (hasNonEnergy) {
+        if (dumpNonEnergy(creep, creep.room)) return true;
+        clearAssignment(creep, "cargo blocked", true);
+        return true;
+    }
+
+    return false;
 }
 
 function hasNonEnergyCarry(creep) {
@@ -901,51 +1739,430 @@ function executeFetch(creep, a, view, h) {
         return;
     }
 
-    // --- Extension: fetch = go to storage ---
+    // --- Extension: fetch = go to storage (or any energy source as fallback) ---
     if (a.type === "extension") {
         var stor = view.storage;
-        if (!stor || (stor.store.getUsedCapacity(RESOURCE_ENERGY) || 0) === 0) {
-            clearAssignment(creep, "ext: storage empty", true);
+        var refSrc = (stor && (stor.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0)
+                     ? stor
+                     : findEnergySource(creep, view, h);
+        if (!refSrc) {
+            // No refuel source anywhere. If we still carry something, keep
+            // working the route with what we have instead of abandoning it.
+            if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                creep.memory.s = "delivering";
+                return;
+            }
+            clearAssignment(creep, "ext: no energy source", true);
             return;
         }
-        if (creep.pos.isNearTo(stor)) {
+        if (creep.pos.isNearTo(refSrc)) {
             delete creep.memory._move;
-            creep.withdraw(stor, RESOURCE_ENERGY);
+            creep.withdraw(refSrc, RESOURCE_ENERGY);
             creep.memory.s = "delivering";
-            // Move toward first route extension after refill
+            refreshProgress(creep, a);
             var route = h.extRoute;
-            if (route && route.length > 0) {
+            // FIX: consume the REFUEL sentinel NOW — we just refueled. Without
+            // this, the deliver state sees the sentinel next tick and bounces
+            // straight back to fetching, wasting two ticks per refuel stop.
+            while (route && route.length > 0 && route[0] === "REFUEL") route.shift();
+            // Pipeline: move toward the first route extension this same tick
+            if (route) {
                 for (var pi = 0; pi < route.length; pi++) {
                     if (route[pi] === "REFUEL") break;
                     var peek = Game.getObjectById(route[pi]);
-                    if (peek && cheb(creep.pos, peek.pos) > 1) {
-                        smartMove(creep, peek);
+                    if (peek) {
+                        var wpm = view._extWpMap;
+                        var pp = (wpm && wpm[peek.id]) ? wpm[peek.id] : peek.pos;
+                        if (cheb(creep.pos, pp) > 1) smartMove(creep, pp);
                         break;
                     }
                 }
             }
         } else {
-            smartMove(creep, stor);
+            smartMove(creep, refSrc);
         }
         return;
     }
 
-    // --- Materials empty: fetch minerals, not energy ---
-    if (a.type === "materials_empty") {
-        var matSrc = Game.getObjectById(a.taskId);
-        if (!matSrc) { clearAssignment(creep, "mat src gone", true); return; }
-        var resType = null;
-        var sk = Object.keys(matSrc.store);
-        for (var i = 0; i < sk.length; i++) {
-            if (sk[i] !== RESOURCE_ENERGY && matSrc.store[sk[i]] > 0) { resType = sk[i]; break; }
+    // --- Dropped pickup: fetch the pile with creep.pickup(), then deliver to storage ---
+    if (a.type === "dropped_pickup") {
+        var pile = Game.getObjectById(a.taskId);
+        if (!pile || (pile.amount || 0) <= 0) {
+            // Pile gone — if carrying energy, deliver it; otherwise abandon
+            if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                creep.memory.s = "delivering"; return;
+            }
+            clearAssignment(creep, "drop gone", true); return;
         }
-        if (!resType) { clearAssignment(creep, "mat no minerals", true); return; }
-
-        if (cheb(creep.pos, matSrc.pos) > 1) { smartMove(creep, matSrc); return; }
+        if (cheb(creep.pos, pile.pos) > 1) { smartMove(creep, pile); return; }
         delete creep.memory._move;
-        var wr = creep.withdraw(matSrc, resType);
-        if (wr === OK || wr === ERR_FULL) creep.memory.s = "delivering";
-        else if (wr !== ERR_NOT_IN_RANGE) clearAssignment(creep, "mat withdraw err " + wr, true);
+        var pRes = creep.pickup(pile);
+        if (pRes === OK) {
+            creep.memory.s = "delivering";
+            refreshProgress(creep, a);
+            if (view.storage && cheb(creep.pos, view.storage.pos) > 1)
+                smartMove(creep, view.storage);
+        } else if (pRes === ERR_FULL) {
+            creep.memory.s = "delivering";
+        } else if (pRes !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "pickup err " + pRes, true);
+        }
+        return;
+    }
+
+    if (a.type === "lab_unload") {
+        var unloadRes = getLabTaskResource(a);
+        var unloadLab = Game.getObjectById(getLabTaskLabId(a));
+        if (!unloadLab || !unloadLab.store || !unloadRes) {
+            clearAssignment(creep, "lab unload source gone", true);
+            return;
+        }
+
+        if (creep.store.getUsedCapacity() > 0) {
+            if ((creep.store[unloadRes] || 0) > 0) {
+                if (creep.store.getFreeCapacity() <= 0) {
+                    creep.memory.s = "delivering";
+                    return;
+                }
+            } else {
+                dumpNonEnergy(creep, creep.room, unloadRes);
+                return;
+            }
+        }
+
+        if ((unloadLab.store[unloadRes] || 0) <= 0) {
+            if ((creep.store[unloadRes] || 0) > 0 && creep.store.getFreeCapacity() > 0) {
+                var nextUnloadEmpty = findNextLabUnloadTask(creep, view, a, unloadRes);
+                if (nextUnloadEmpty) {
+                    setAssignment(creep, {
+                        type: nextUnloadEmpty.type,
+                        taskId: nextUnloadEmpty.taskId,
+                        targetId: nextUnloadEmpty.targetId,
+                        amount: nextUnloadEmpty.amount,
+                        assignedTick: Game.time,
+                        extra: nextUnloadEmpty.extra || ''
+                    });
+                    h.fetchSourceId = getLabTaskLabId(nextUnloadEmpty);
+                    creep.memory.s = "fetching";
+                    delete creep.memory._move;
+                    var nextLabEmpty = Game.getObjectById(getLabTaskLabId(nextUnloadEmpty));
+                    if (nextLabEmpty && cheb(creep.pos, nextLabEmpty.pos) > 1) smartMove(creep, nextLabEmpty);
+                    return;
+                }
+            }
+
+            if ((creep.store[unloadRes] || 0) > 0) {
+                creep.memory.s = "delivering";
+                if (view.terminal && cheb(creep.pos, view.terminal.pos) > 1) smartMove(creep, view.terminal);
+                return;
+            }
+
+            clearAssignment(creep, "lab unload empty", true);
+            return;
+        }
+
+        h.fetchSourceId = unloadLab.id;
+        if (cheb(creep.pos, unloadLab.pos) > 1) { smartMove(creep, unloadLab); return; }
+        delete creep.memory._move;
+
+        var unloadAmt = Math.min(a.amount || unloadLab.store[unloadRes] || 0, unloadLab.store[unloadRes] || 0, creep.store.getFreeCapacity());
+        var unloadCode = creep.withdraw(unloadLab, unloadRes, unloadAmt);
+        if (unloadCode === OK || unloadCode === ERR_FULL) {
+            refreshProgress(creep, a);
+            if (creep.store.getFreeCapacity() > 0) {
+                var nextUnload = findNextLabUnloadTask(creep, view, a, unloadRes);
+                if (nextUnload) {
+                    setAssignment(creep, {
+                        type: nextUnload.type,
+                        taskId: nextUnload.taskId,
+                        targetId: nextUnload.targetId,
+                        amount: nextUnload.amount,
+                        assignedTick: Game.time,
+                        extra: nextUnload.extra || ''
+                    });
+                    h.fetchSourceId = getLabTaskLabId(nextUnload);
+                    creep.memory.s = "fetching";
+                    delete creep.memory._move;
+                    var nextLab = Game.getObjectById(getLabTaskLabId(nextUnload));
+                    if (nextLab && cheb(creep.pos, nextLab.pos) > 1) smartMove(creep, nextLab);
+                    return;
+                }
+            }
+
+            creep.memory.s = "delivering";
+            if (view.terminal && cheb(creep.pos, view.terminal.pos) > 1) smartMove(creep, view.terminal);
+        } else if (unloadCode === ERR_NOT_ENOUGH_RESOURCES) {
+            if ((creep.store[unloadRes] || 0) > 0 && creep.store.getFreeCapacity() > 0) {
+                var nextUnloadMissing = findNextLabUnloadTask(creep, view, a, unloadRes);
+                if (nextUnloadMissing) {
+                    setAssignment(creep, {
+                        type: nextUnloadMissing.type,
+                        taskId: nextUnloadMissing.taskId,
+                        targetId: nextUnloadMissing.targetId,
+                        amount: nextUnloadMissing.amount,
+                        assignedTick: Game.time,
+                        extra: nextUnloadMissing.extra || ''
+                    });
+                    h.fetchSourceId = getLabTaskLabId(nextUnloadMissing);
+                    creep.memory.s = "fetching";
+                    delete creep.memory._move;
+                    return;
+                }
+            }
+
+            if ((creep.store[unloadRes] || 0) > 0) {
+                creep.memory.s = "delivering";
+                if (view.terminal && cheb(creep.pos, view.terminal.pos) > 1) smartMove(creep, view.terminal);
+                return;
+            }
+
+            clearAssignment(creep, "lab unload empty", true);
+        } else if (unloadCode !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "lab unload withdraw err " + unloadCode, true);
+        }
+        return;
+    }
+
+    if (a.type === "lab_load") {
+        var loadRes = getLabTaskResource(a);
+        var loadLab = Game.getObjectById(getLabTaskLabId(a));
+        if (!loadLab || !loadLab.store || !loadRes) {
+            clearAssignment(creep, "lab load target gone", true);
+            return;
+        }
+
+        if (creep.store.getUsedCapacity() > 0) {
+            if ((creep.store[loadRes] || 0) > 0) creep.memory.s = "delivering";
+            else dumpNonEnergy(creep, creep.room, loadRes);
+            return;
+        }
+
+        if (loadLab.mineralType && loadLab.mineralType !== loadRes) {
+            clearAssignment(creep, "lab load blocked", true);
+            return;
+        }
+
+        var loadProgram = parseExtra(a.extra, "program");
+        var loadSource = chooseLabLoadSource(creep.room, loadRes, loadProgram);
+        if (!loadSource || !loadSource.store) {
+            clearAssignment(creep, "lab load source empty", true);
+            return;
+        }
+
+        h.fetchSourceId = loadSource.id;
+        if (cheb(creep.pos, loadSource.pos) > 1) { smartMove(creep, loadSource); return; }
+        delete creep.memory._move;
+
+        var loadAvailable = loadSource.store[loadRes] || 0;
+        var loadFree = creep.store.getFreeCapacity();
+        var loadAmt = Math.min(a.amount || loadAvailable, loadAvailable, loadFree);
+        var loadCode = creep.withdraw(loadSource, loadRes, loadAmt);
+        if (loadCode === OK || loadCode === ERR_FULL) {
+            creep.memory.s = "delivering";
+            refreshProgress(creep, a);
+            if (loadProgram && (loadSource.structureType === STRUCTURE_STORAGE || loadSource.structureType === STRUCTURE_TERMINAL)) {
+                consumeProgramReservation(creep.room.name, loadRes, loadProgram,
+                    loadSource.structureType === STRUCTURE_STORAGE ? 'storage' : 'terminal',
+                    Math.min(loadAmt, loadAvailable));
+            }
+            if (loadLab && cheb(creep.pos, loadLab.pos) > 1) smartMove(creep, loadLab);
+        } else if (loadCode === ERR_NOT_ENOUGH_RESOURCES) {
+            clearAssignment(creep, "lab load source empty", true);
+        } else if (loadCode !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "lab load withdraw err " + loadCode, true);
+        }
+        return;
+    }
+
+    if (a.type === "market_lab_stage") {
+        var stageRes = getMarketLabStageResource(a);
+        var stageSource = view.storage;
+        if (!stageRes || !stageSource || !stageSource.store) {
+            clearAssignment(creep, "market lab stage source gone", true);
+            return;
+        }
+
+        if (creep.store.getUsedCapacity() > 0) {
+            if ((creep.store[stageRes] || 0) > 0) {
+                creep.memory.s = "delivering";
+            } else {
+                dumpNonEnergy(creep, creep.room, stageRes);
+            }
+            return;
+        }
+
+        h.fetchSourceId = stageSource.id;
+        if (cheb(creep.pos, stageSource.pos) > 1) { smartMove(creep, stageSource); return; }
+        delete creep.memory._move;
+
+        var stageAvailable = stageSource.store.getUsedCapacity(stageRes) || 0;
+        var stageFree = creep.store.getFreeCapacity();
+        var stageAmt = Math.min(a.amount || stageAvailable, stageAvailable, stageFree);
+        var stageCode = creep.withdraw(stageSource, stageRes, stageAmt);
+        if (stageCode === OK || stageCode === ERR_FULL) {
+            creep.memory.s = "delivering";
+            refreshProgress(creep, a);
+            if (view.terminal && cheb(creep.pos, view.terminal.pos) > 1) smartMove(creep, view.terminal);
+            if (a.extra) {
+                var stageProgram = parseExtra(a.extra, "program");
+                var stageReserved = stageProgram ? getProgramReserved(creep.room.name, stageRes, stageProgram, 'storage') : 0;
+                if (stageProgram && stageReserved > 0) {
+                    consumeProgramReservation(creep.room.name, stageRes, stageProgram, 'storage', Math.min(stageAmt, stageAvailable, stageReserved));
+                }
+            }
+        } else if (stageCode === ERR_NOT_ENOUGH_RESOURCES) {
+            clearAssignment(creep, "market lab stage empty", true);
+        } else if (stageCode !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "market lab stage withdraw err " + stageCode, true);
+        }
+        return;
+    }
+
+    if (a.type === "terminal_stock") {
+        var stockRes = getTerminalStockResource(a);
+        var stockSource = Game.getObjectById(a.taskId);
+        if (!stockRes || !stockSource || !stockSource.store) {
+            clearAssignment(creep, "terminal stock source gone", true);
+            return;
+        }
+
+        if (creep.store.getUsedCapacity() > 0) {
+            if ((creep.store[stockRes] || 0) > 0) {
+                creep.memory.s = "delivering";
+            } else {
+                dumpNonEnergy(creep, creep.room, stockRes);
+            }
+            return;
+        }
+
+        var stockAvailable = stockSource.store.getUsedCapacity(stockRes) || 0;
+        if (stockAvailable <= 0) {
+            clearAssignment(creep, "terminal stock source empty", true);
+            return;
+        }
+
+        h.fetchSourceId = stockSource.id;
+        if (cheb(creep.pos, stockSource.pos) > 1) { smartMove(creep, stockSource); return; }
+        delete creep.memory._move;
+
+        var stockFree = creep.store.getFreeCapacity();
+        var stockAmt = Math.min(a.amount || stockAvailable, stockAvailable, stockFree);
+        var stockCode = creep.withdraw(stockSource, stockRes, stockAmt);
+        if (stockCode === OK || stockCode === ERR_FULL) {
+            creep.memory.s = "delivering";
+            refreshProgress(creep, a);
+            var stockProgram = parseExtra(a.extra, 'program');
+            if (stockProgram) {
+                var stockSourceType = stockSource.structureType === STRUCTURE_STORAGE ? 'storage' : 'terminal';
+                var stockReserved = getProgramReserved(creep.room.name, stockRes, stockProgram, stockSourceType);
+                if (stockReserved > 0) {
+                    consumeProgramReservation(creep.room.name, stockRes, stockProgram, stockSourceType, Math.min(stockAmt, stockAvailable, stockReserved));
+                }
+            }
+            var stockTarget = Game.getObjectById(a.targetId);
+            if (stockTarget && cheb(creep.pos, stockTarget.pos) > 1) smartMove(creep, stockTarget);
+        } else if (stockCode === ERR_NOT_ENOUGH_RESOURCES) {
+            clearAssignment(creep, "terminal stock empty", true);
+        } else if (stockCode !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "terminal stock withdraw err " + stockCode, true);
+        }
+        return;
+    }
+
+    if (a.type === "factory_input") {
+        var inputRes = getFactoryTaskResource(a);
+        var inputFactory = Game.getObjectById(a.targetId);
+        if (!inputFactory || !inputFactory.store || !inputRes) {
+            clearAssignment(creep, "factory input target gone", true);
+            return;
+        }
+
+        if (creep.store.getUsedCapacity() > 0) {
+            if ((creep.store[inputRes] || 0) > 0) {
+                creep.memory.s = "delivering";
+            } else {
+                dumpNonEnergy(creep, creep.room, inputRes);
+            }
+            return;
+        }
+
+        var inputProgram = parseExtra(a.extra, "program");
+        source = chooseFactorySource(creep.room, inputRes, inputProgram);
+        if (!source) {
+            clearAssignment(creep, "factory input source empty", true);
+            return;
+        }
+
+        var fetchOrder = getActiveFactoryOrder(view.roomName);
+        var fetchRecipe = fetchOrder ? factoryManager.getRecipe(fetchOrder.product) : null;
+        var fetchDeficit = factoryInputDeficit(inputFactory, fetchOrder, fetchRecipe, inputRes);
+        if (fetchDeficit <= 0) {
+            clearAssignment(creep, "factory input satisfied", true);
+            return;
+        }
+
+        h.fetchSourceId = source.id;
+        if (cheb(creep.pos, source.pos) > 1) { smartMove(creep, source); return; }
+        delete creep.memory._move;
+
+        var inputAvailable = source.store.getUsedCapacity(inputRes) || 0;
+        var inputFree = creep.store.getFreeCapacity();
+        var inputAmt = Math.min(a.amount || inputAvailable, inputAvailable, inputFree, fetchDeficit);
+        var inputResCode = creep.withdraw(source, inputRes, inputAmt);
+        if (inputResCode === OK || inputResCode === ERR_FULL) {
+            creep.memory.s = "delivering";
+            refreshProgress(creep, a);
+            if (inputProgram && (source.structureType === STRUCTURE_STORAGE || source.structureType === STRUCTURE_TERMINAL)) {
+                consumeProgramReservation(creep.room.name, inputRes, inputProgram,
+                    source.structureType === STRUCTURE_STORAGE ? 'storage' : 'terminal',
+                    Math.min(inputAmt, inputAvailable));
+            }
+            var inputFactoryPos = Game.getObjectById(a.targetId);
+            if (inputFactoryPos && cheb(creep.pos, inputFactoryPos.pos) > 1) smartMove(creep, inputFactoryPos);
+        } else if (inputResCode === ERR_NOT_ENOUGH_RESOURCES) {
+            clearAssignment(creep, "factory input empty", true);
+        } else if (inputResCode !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "factory input withdraw err " + inputResCode, true);
+        }
+        return;
+    }
+
+    if (a.type === "factory_output" || a.type === "factory_drain") {
+        var outRes = getFactoryTaskResource(a);
+        var outFactory = view.factory;
+        var outSink = Game.getObjectById(a.targetId);
+        if (!outFactory || !outFactory.store || !outRes || !outSink || !outSink.store) {
+            clearAssignment(creep, "factory output target gone", true);
+            return;
+        }
+
+        if (creep.store.getUsedCapacity() > 0) {
+            if ((creep.store[outRes] || 0) > 0) {
+                creep.memory.s = "delivering";
+            } else {
+                dumpNonEnergy(creep, creep.room, outRes);
+            }
+            return;
+        }
+
+        source = outFactory;
+        h.fetchSourceId = source.id;
+        if (cheb(creep.pos, source.pos) > 1) { smartMove(creep, source); return; }
+        delete creep.memory._move;
+
+        var outAvailable = source.store.getUsedCapacity(outRes) || 0;
+        var outFree = creep.store.getFreeCapacity();
+        var outAmt = Math.min(a.amount || outAvailable, outAvailable, outFree);
+        var outResCode = creep.withdraw(source, outRes, outAmt);
+        if (outResCode === OK || outResCode === ERR_FULL) {
+            creep.memory.s = "delivering";
+            refreshProgress(creep, a);
+            if (outSink && cheb(creep.pos, outSink.pos) > 1) smartMove(creep, outSink);
+        } else if (outResCode === ERR_NOT_ENOUGH_RESOURCES) {
+            clearAssignment(creep, "factory output empty", true);
+        } else if (outResCode !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "factory output withdraw err " + outResCode, true);
+        }
         return;
     }
 
@@ -956,13 +2173,29 @@ function executeFetch(creep, a, view, h) {
         // Withdraw tasks: source IS the taskId
         source = Game.getObjectById(a.taskId);
         if (!source || (source.store.getUsedCapacity(RESOURCE_ENERGY) || 0) <= 0) {
+            // FIX: don't abandon while holding a load — deliver it first.
+            // (e.g. the container got emptied by someone else mid-task)
+            if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                creep.memory.s = "delivering";
+                return;
+            }
             clearAssignment(creep, "fetch src empty", true);
             return;
         }
     } else {
         // Transfer tasks: find energy source
         source = findEnergySource(creep, view, h);
-        if (!source) { clearAssignment(creep, "no energy source", true); return; }
+        if (!source) {
+            // FIX: no refuel source, but if we're carrying anything, deliver
+            // it instead of dropping the task (this is what made fills "stop"
+            // when storage dipped under 500 with containers empty).
+            if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                creep.memory.s = "delivering";
+                return;
+            }
+            clearAssignment(creep, "no energy source", true);
+            return;
+        }
         h.fetchSourceId = source.id;
     }
 
@@ -973,7 +2206,11 @@ function executeFetch(creep, a, view, h) {
 
     if (a.type === "link_drain") {
         var maxDrain = Math.max(0, available - LINK_FILL_THRESHOLD);
-        if (maxDrain <= 0) { clearAssignment(creep, "link drained enough", true); return; }
+        if (maxDrain <= 0) {
+            if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) { creep.memory.s = "delivering"; return; }
+            clearAssignment(creep, "link drained enough", true);
+            return;
+        }
         amt = Math.min(a.amount || maxDrain, maxDrain, free);
     } else if (a.type === "link_fill") {
         var lnk = Game.getObjectById(a.targetId);
@@ -994,7 +2231,13 @@ function executeFetch(creep, a, view, h) {
     var wRes = amt != null ? creep.withdraw(source, RESOURCE_ENERGY, amt) : creep.withdraw(source, RESOURCE_ENERGY);
     if (wRes === OK || wRes === ERR_FULL) {
         creep.memory.s = "delivering";
+        refreshProgress(creep, a);
+        // Pipeline: the move intent is still free this tick — start walking
+        // toward the delivery target immediately instead of standing still.
+        var dlv = Game.getObjectById(a.targetId || a.taskId);
+        if (dlv && dlv.id !== source.id && cheb(creep.pos, dlv.pos) > 1) smartMove(creep, dlv);
     } else if (wRes === ERR_NOT_ENOUGH_RESOURCES) {
+        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) { creep.memory.s = "delivering"; return; }
         clearAssignment(creep, "not enough res", true);
     } else if (wRes !== ERR_NOT_IN_RANGE) {
         clearAssignment(creep, "withdraw err " + wRes, true);
@@ -1078,22 +2321,184 @@ function executeDeliver(creep, a, view, h) {
         return;
     }
 
-    // --- Materials empty: dump energy first ---
-    if (a.type === "materials_empty" && a.extra && a.extra.indexOf("dump_energy") >= 0) {
-        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-            // Energy dumped, strip flag and switch to fetch minerals
-            a.extra = a.extra.replace(/,?dump_energy/, "");
-            setAssignment(creep, a);
-            creep.memory.s = "fetching";
+    if (a.type === "lab_unload") {
+        var unloadRes = getLabTaskResource(a);
+        var unloadTarget = view.terminal;
+        if (!unloadRes || !unloadTarget || !unloadTarget.store) {
+            clearAssignment(creep, "lab unload target missing", true);
             return;
         }
-        var dumpTgt = view.storage || view.terminal;
-        if (!dumpTgt || dumpTgt.store.getFreeCapacity(RESOURCE_ENERGY) <= 0) {
-            clearAssignment(creep, "no dump target", true); return;
+        if ((creep.store[unloadRes] || 0) <= 0) {
+            clearAssignment(creep, "lab unload empty", true);
+            return;
         }
-        if (cheb(creep.pos, dumpTgt.pos) > 1) { smartMove(creep, dumpTgt); return; }
+        if (cheb(creep.pos, unloadTarget.pos) > 1) { smartMove(creep, unloadTarget); return; }
         delete creep.memory._move;
-        creep.transfer(dumpTgt, RESOURCE_ENERGY);
+
+        var unloadCarried = creep.store[unloadRes] || 0;
+        var unloadFree = unloadTarget.store.getFreeCapacity(unloadRes) || unloadCarried;
+        var unloadSent = Math.min(unloadCarried, unloadFree);
+        var unloadTransfer = creep.transfer(unloadTarget, unloadRes, unloadSent);
+        if (unloadTransfer === OK) {
+            refreshProgress(creep, a);
+            if (isAssignmentDone(creep, view, a, h)) {
+                clearAssignment(creep, "lab unload complete", true);
+            } else if (unloadCarried - unloadSent <= 0) {
+                creep.memory.s = "fetching";
+            }
+        } else if (unloadTransfer === ERR_FULL) {
+            clearAssignment(creep, "lab unload target full", true);
+        } else if (unloadTransfer !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "lab unload transfer err " + unloadTransfer, true);
+        }
+        return;
+    }
+
+    if (a.type === "lab_load") {
+        var loadRes = getLabTaskResource(a);
+        var loadTarget = Game.getObjectById(a.targetId || getLabTaskLabId(a));
+        if (!loadRes || !loadTarget || !loadTarget.store) {
+            clearAssignment(creep, "lab load target missing", true);
+            return;
+        }
+        if ((creep.store[loadRes] || 0) <= 0) {
+            clearAssignment(creep, "lab load empty", true);
+            return;
+        }
+        if (loadTarget.mineralType && loadTarget.mineralType !== loadRes) {
+            clearAssignment(creep, "lab load target blocked", true);
+            return;
+        }
+        if (cheb(creep.pos, loadTarget.pos) > 1) { smartMove(creep, loadTarget); return; }
+        delete creep.memory._move;
+
+        var loadCarried = creep.store[loadRes] || 0;
+        var loadFree = loadTarget.store.getFreeCapacity(loadRes) || loadCarried;
+        var loadSent = Math.min(loadCarried, loadFree, a.amount || loadCarried);
+        var loadTransfer = creep.transfer(loadTarget, loadRes, loadSent);
+        if (loadTransfer === OK) {
+            a.amount = Math.max(0, (a.amount || 0) - loadSent);
+            setAssignment(creep, a);
+            refreshProgress(creep, a);
+            var loadDone = simulateFillDone(a, view, loadTarget, loadSent);
+            if (loadDone === true) {
+                clearAssignment(creep, "lab load target met", true);
+                return;
+            }
+            if (parseExtra(a.extra, "record") === "1" && labManager && typeof labManager.recordDelivery === 'function') {
+                labManager.recordDelivery(creep.room.name, loadRes, loadSent);
+            }
+            if (isAssignmentDone(creep, view, a, h)) {
+                clearAssignment(creep, "lab load complete", true);
+            } else if (loadCarried - loadSent <= 0) {
+                creep.memory.s = "fetching";
+            }
+        } else if (loadTransfer === ERR_FULL) {
+            clearAssignment(creep, "lab load target full", true);
+        } else if (loadTransfer !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "lab load transfer err " + loadTransfer, true);
+        }
+        return;
+    }
+
+    if (a.type === "market_lab_stage") {
+        var stageRes = getMarketLabStageResource(a);
+        var stageTarget = Game.getObjectById(a.targetId);
+        if (!stageRes || !stageTarget || !stageTarget.store) {
+            clearAssignment(creep, "market lab stage target missing", true);
+            return;
+        }
+
+        if ((creep.store[stageRes] || 0) <= 0) {
+            clearAssignment(creep, "market lab stage empty", true);
+            return;
+        }
+
+        if (cheb(creep.pos, stageTarget.pos) > 1) {
+            smartMove(creep, stageTarget);
+            return;
+        }
+        delete creep.memory._move;
+
+        var stageCarried = creep.store[stageRes] || 0;
+        var stageFree = stageTarget.store.getFreeCapacity(stageRes) || stageCarried;
+        if (stageFree <= 0) {
+            clearAssignment(creep, "market lab stage target full", true);
+            return;
+        }
+        var stageSent = Math.min(stageCarried, stageFree);
+        var stageTransfer = creep.transfer(stageTarget, stageRes, stageSent);
+        if (stageTransfer === ERR_FULL) {
+            clearAssignment(creep, "market lab stage full", true);
+            return;
+        }
+        if (stageTransfer === OK) {
+            refreshProgress(creep, a);
+            var stageDone = simulateFillDone(a, view, stageTarget, stageSent);
+            if (stageDone === null) stageDone = isAssignmentDone(creep, view, a, h);
+            if (stageDone) { clearAssignment(creep, "market lab stage complete", true); return; }
+            if (stageCarried - stageSent <= 0) creep.memory.s = "fetching";
+        } else if (stageTransfer !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "market lab stage transfer err " + stageTransfer, true);
+        }
+        return;
+    }
+
+    if (a.type === "terminal_stock") {
+        var stockResD = getTerminalStockResource(a);
+        var stockTargetD = Game.getObjectById(a.targetId);
+        if (!stockResD || !stockTargetD || !stockTargetD.store) {
+            clearAssignment(creep, "terminal stock target missing", true);
+            return;
+        }
+
+        if ((creep.store[stockResD] || 0) <= 0) {
+            clearAssignment(creep, "terminal stock empty", true);
+            return;
+        }
+
+        if (cheb(creep.pos, stockTargetD.pos) > 1) {
+            smartMove(creep, stockTargetD);
+            return;
+        }
+        delete creep.memory._move;
+
+        var stockCarried = creep.store[stockResD] || 0;
+        var stockFreeD = stockTargetD.store.getFreeCapacity(stockResD) || stockCarried;
+        if (stockFreeD <= 0) {
+            clearAssignment(creep, "terminal stock target full", true);
+            return;
+        }
+        var stockSent = Math.min(stockCarried, stockFreeD);
+        var stockTransfer = creep.transfer(stockTargetD, stockResD, stockSent);
+        if (stockTransfer === ERR_FULL) {
+            clearAssignment(creep, "terminal stock full", true);
+            return;
+        }
+        if (stockTransfer === OK) {
+            refreshProgress(creep, a);
+            // Credit operation progress so terminalManager can complete the op.
+            var stockOpId = parseExtra(a.extra, 'op');
+            var stockType = parseExtra(a.extra, 'type');
+            var stockProgram = parseExtra(a.extra, 'program');
+            if (stockOpId) {
+                var stockOp = findTerminalOpById(stockOpId);
+                if (stockOp) {
+                    if (typeof stockOp.amountMoved !== 'number') stockOp.amountMoved = 0;
+                    stockOp.amountMoved += stockSent;
+                    if (stockProgram && terminalManager && typeof terminalManager.consumeOperationStock === 'function') {
+                        var stockDestBuilding = stockType === 'toTerminal' ? 'terminal' : 'storage';
+                        terminalManager.consumeOperationStock(stockOp, creep.room.name, stockResD, stockDestBuilding, stockSent, stockProgram);
+                    }
+                }
+            }
+            var stockDone = simulateFillDone(a, view, stockTargetD, stockSent);
+            if (stockDone === null) stockDone = isAssignmentDone(creep, view, a, h);
+            if (stockDone) { clearAssignment(creep, "terminal stock complete", true); return; }
+            if (stockCarried - stockSent <= 0) creep.memory.s = "fetching";
+        } else if (stockTransfer !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "terminal stock transfer err " + stockTransfer, true);
+        }
         return;
     }
 
@@ -1104,31 +2509,98 @@ function executeDeliver(creep, a, view, h) {
     }
 
     // --- Determine target and resource type ---
+    if (a.type === "factory_input" || a.type === "factory_output" || a.type === "factory_drain") {
+        var factoryRes = getFactoryTaskResource(a);
+        var factory = view.factory;
+        var target = Game.getObjectById(a.targetId);
+
+        if (!factoryRes || !factory || !target || !target.store) {
+            clearAssignment(creep, "factory target missing", true);
+            return;
+        }
+
+        if (cheb(creep.pos, target.pos) > 1) {
+            smartMove(creep, target);
+            return;
+        }
+        delete creep.memory._move;
+
+        if (a.type === "factory_input") {
+            if ((creep.store[factoryRes] || 0) <= 0) {
+                clearAssignment(creep, "factory input empty", true);
+                return;
+            }
+
+            var inputOrder = getActiveFactoryOrder(view.roomName);
+            var inputRecipe = inputOrder ? factoryManager.getRecipe(inputOrder.product) : null;
+            var inputDeficit = factoryInputDeficit(target, inputOrder, inputRecipe, factoryRes);
+            if (inputDeficit <= 0) {
+                clearAssignment(creep, "factory input satisfied", true);
+                return;
+            }
+
+            var inputCarried = creep.store[factoryRes] || 0;
+            var inputFree = target.store.getFreeCapacity ? (target.store.getFreeCapacity(factoryRes) || 0) : inputCarried;
+            if (inputFree <= 0) {
+                creep.memory.s = "delivering";
+                return;
+            }
+            var inputSent = Math.min(inputCarried, inputFree, inputDeficit);
+            var inputTransfer = creep.transfer(target, factoryRes, inputSent);
+            if (inputTransfer === ERR_FULL) {
+                creep.memory.s = "delivering";
+                return;
+            }
+            if (inputTransfer === OK) {
+                refreshProgress(creep, a);
+                var inputDone = simulateFillDone(a, view, target, inputSent);
+                if (inputDone === null) inputDone = isAssignmentDone(creep, view, a, h);
+                if (inputDone && (creep.store[factoryRes] || 0) <= 0) { clearAssignment(creep, "task complete", true); return; }
+                if ((creep.store[factoryRes] || 0) > 0) creep.memory.s = "delivering";
+                else if (inputDone) { clearAssignment(creep, "task complete", true); return; }
+                else creep.memory.s = "fetching";
+            } else if (inputTransfer !== ERR_NOT_IN_RANGE) {
+                if ((creep.store[factoryRes] || 0) > 0) {
+                    creep.memory.s = "delivering";
+                    return;
+                }
+                clearAssignment(creep, "factory input transfer err " + inputTransfer, true);
+            }
+            return;
+        }
+
+        if ((creep.store[factoryRes] || 0) <= 0) {
+            clearAssignment(creep, "factory output empty", true);
+            return;
+        }
+
+        var outputCarried = creep.store[factoryRes] || 0;
+        var outputFree = target.store.getFreeCapacity(factoryRes) || outputCarried;
+        var outputSent = Math.min(outputCarried, outputFree);
+        var outputTransfer = creep.transfer(target, factoryRes, outputSent);
+        if (outputTransfer === ERR_FULL) {
+            clearAssignment(creep, "factory sink full", true);
+            return;
+        }
+        if (outputTransfer === OK) {
+            refreshProgress(creep, a);
+            var outputDone = simulateFillDone(a, view, target, outputSent);
+            if (outputDone === null) outputDone = isAssignmentDone(creep, view, a, h);
+            if (outputDone) { clearAssignment(creep, "task complete", true); return; }
+            if (outputCarried - outputSent <= 0) creep.memory.s = "fetching";
+        } else if (outputTransfer !== ERR_NOT_IN_RANGE) {
+            clearAssignment(creep, "factory transfer err " + outputTransfer, true);
+        }
+        return;
+    }
+
     var target = Game.getObjectById(a.targetId || a.taskId);
     if (!target) { clearAssignment(creep, "target gone", true); return; }
 
     var resType = RESOURCE_ENERGY;
-    if (a.type === "materials_empty") {
-        var found = false;
-        var ck = Object.keys(creep.store);
-        for (var i = 0; i < ck.length; i++) {
-            if (ck[i] !== RESOURCE_ENERGY && creep.store[ck[i]] > 0) { resType = ck[i]; found = true; break; }
-        }
-        if (!found) {
-            if (!isAssignmentDone(creep, view, a, h)) { creep.memory.s = "fetching"; return; }
-            clearAssignment(creep, "materials done", true); return;
-        }
-    }
 
     // Check target capacity
     if (target.store && target.store.getFreeCapacity && target.store.getFreeCapacity(resType) <= 0) {
-        // Try alternate target for mineral types
-        if (a.type === "materials_empty") {
-            var alt = null;
-            if (view.storage && view.storage.id !== target.id && view.storage.store.getFreeCapacity(resType) > 0) alt = view.storage;
-            else if (view.terminal && view.terminal.id !== target.id && view.terminal.store.getFreeCapacity(resType) > 0) alt = view.terminal;
-            if (alt) { a.targetId = alt.id; setAssignment(creep, a); return; }
-        }
         clearAssignment(creep, "target full", true);
         return;
     }
@@ -1157,14 +2629,59 @@ function executeDeliver(creep, a, view, h) {
 
     var res = amt != null ? creep.transfer(target, resType, amt) : creep.transfer(target, resType);
 
-    if (res === OK || res === ERR_FULL) {
-        if (isAssignmentDone(creep, view, a, h)) {
-            clearAssignment(creep, "task complete", true);
-        } else if (creep.store.getUsedCapacity() === 0 ||
-                   (a.type === "materials_empty" || a.type === "terminal_balance")) {
-            creep.memory.s = "fetching";
+    if (res === ERR_FULL) {
+        // Fresh info straight from the intent: target genuinely has no room.
+        clearAssignment(creep, "target full", true);
+        return;
+    }
+
+    if (res === OK) {
+        refreshProgress(creep, a);
+
+        // Store data is stale until end of tick — simulate what we just sent
+        // so we can keep the shuttle moving without dead ticks or premature
+        // clears.
+        var carried = creep.store.getUsedCapacity(resType) || 0;
+        var tFree = (target.store && target.store.getFreeCapacity)
+                    ? (target.store.getFreeCapacity(resType) || 0) : carried;
+        var sent = Math.min(carried, tFree);
+        if (amt != null) sent = Math.min(sent, amt);
+        var leftAfter = carried - sent;
+
+        // Fallback dump completes as soon as the load is gone
+        if (a.type === "fallback_dump") {
+            if (leftAfter <= 0) clearAssignment(creep, "dump complete", true);
+            return;
         }
-    } else if (res !== ERR_NOT_IN_RANGE) {
+
+        var done = simulateFillDone(a, view, target, sent);
+        if (done === null) done = isAssignmentDone(creep, view, a, h);
+        if (done) {
+            clearAssignment(creep, "task complete", true);
+            return; // same-tick re-pick in run() takes over
+        }
+
+        if (leftAfter > 0) return; // still holding more for this target — keep delivering
+
+        // Empty after this transfer but the task ISN'T finished — go fetch
+        // the next load right away, and use the still-free move intent to
+        // start walking back to the source this same tick.
+        creep.memory.s = "fetching";
+        var nextSrc = null;
+        if (isWithdrawTask(a.type)) {
+            nextSrc = Game.getObjectById(a.taskId);
+        } else if (view.storage && (view.storage.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0) {
+            nextSrc = view.storage;
+        } else {
+            nextSrc = findEnergySource(creep, view, h);
+        }
+        if (nextSrc && nextSrc.id !== target.id && cheb(creep.pos, nextSrc.pos) > 1) {
+            smartMove(creep, nextSrc);
+        }
+        return;
+    }
+
+    if (res !== ERR_NOT_IN_RANGE) {
         clearAssignment(creep, "transfer err " + res, true);
     }
 }
@@ -1241,7 +2758,6 @@ function executeExtensionDeliver(creep, a, view, h) {
     var targetPos = (wpMap && wpMap[target.id]) ? wpMap[target.id] : target.pos;
 
     if (cheb(creep.pos, targetPos) > 1) {
-        tryOpportunisticFill(creep, route, view);
         smartMove(creep, targetPos);
         return;
     }
@@ -1249,7 +2765,10 @@ function executeExtensionDeliver(creep, a, view, h) {
 
     var energyHave = creep.store.getUsedCapacity(RESOURCE_ENERGY);
     var energyNeed = target.store.getFreeCapacity(RESOURCE_ENERGY) || 0;
-    if (energyHave < energyNeed) {
+    // FIX: only detour to refuel if the creep can actually carry more.
+    // A creep whose total capacity is smaller than one extension's need used
+    // to bounce fetch<->deliver forever here without ever transferring.
+    if (energyHave < energyNeed && creep.store.getFreeCapacity() > 0) {
         route.unshift("REFUEL");  // re-insert so we return here after refuel
         creep.memory.s = "fetching";
         if (view.storage && cheb(creep.pos, view.storage.pos) > 1) {
@@ -1261,6 +2780,20 @@ function executeExtensionDeliver(creep, a, view, h) {
     var res = creep.transfer(target, RESOURCE_ENERGY);
     if (res === OK || res === ERR_FULL) {
         route.shift();
+
+        // Partial fill (creep at max capacity but smaller than the extension's
+        // need): queue this extension again after a refuel.
+        if (res === OK && energyHave < energyNeed) {
+            route.unshift(target.id);
+            route.unshift("REFUEL");
+            creep.memory.s = "fetching";
+            if (view.storage && cheb(creep.pos, view.storage.pos) > 1) {
+                smartMove(creep, view.storage);
+            }
+            return;
+        }
+
+        refreshProgress(creep, a);
 
         var energyAfter = creep.store.getUsedCapacity(RESOURCE_ENERGY) - energyNeed;
         // Move only if the immediate next extension is out of reach
@@ -1287,32 +2820,6 @@ function executeExtensionDeliver(creep, a, view, h) {
             smartMove(creep, moveTarget);
         }
     }
-}
-
-// ── OPPORTUNISTIC FILL: while walking toward route head, fill any adjacent
-//    route extension we happen to pass by.
-//    Note: RCL8 guard is intentionally absent here. The scanner prevents
-//    dispatching a supplier specifically for partial extensions at RCL8, but
-//    if the creep is already adjacent while en route, filling them is free. ──
-function tryOpportunisticFill(creep, route, view) {
-    if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) return false;
-
-    for (var i = 1; i < route.length; i++) {
-        if (route[i] === "REFUEL") break; // don't look past refuel boundaries
-        var ext = Game.getObjectById(route[i]);
-        if (!ext) continue;
-        if (cheb(creep.pos, ext.pos) > 1) continue;
-        if ((ext.store.getFreeCapacity(RESOURCE_ENERGY) || 0) <= 0) continue;
-
-        // Adjacent and needs energy — fill it now
-        var res = creep.transfer(ext, RESOURCE_ENERGY);
-        if (res === OK || res === ERR_FULL) {
-            route.splice(i, 1); // remove from route since we just filled it
-            return true;
-        }
-        break; // only one transfer intent per tick
-    }
-    return false;
 }
 
 // ─── FALLBACK DUMP ──────────────────────────────────────────────────────────
@@ -1454,6 +2961,11 @@ var roleSupplier = {
         var view = getRoomView(creep.room);
         if (!view) return;
 
+        // If we are already carrying a factory input resource, keep that cargo
+        // attached to the factory task so it cannot fall through to the generic
+        // storage dump path when the assignment changes mid-route.
+        recoverFactoryInputAssignment(creep, view);
+
         // ── PRIORITY: DEPOSIT NON-ENERGY MINERALS ──────────────────────────
         // If carrying minerals and NOT on a mineral pickup task, deposit immediately.
         var mineralType = null;
@@ -1463,7 +2975,7 @@ var roleSupplier = {
         }
         if (mineralType) {
             var curAM = getAssignment(creep);
-            if (!curAM || curAM.type !== "materials_empty") {
+            if (!curAM) {
                 var depTgt = null;
                 if (view.storage && view.storage.store.getFreeCapacity(mineralType) > 0) depTgt = view.storage;
                 else if (view.terminal && view.terminal.store.getFreeCapacity(mineralType) > 0) depTgt = view.terminal;
@@ -1477,19 +2989,40 @@ var roleSupplier = {
             }
         }
 
-        // ── VALIDATE / PICK ASSIGNMENT ─────────────────────────────────────
-        var a = getAssignment(creep);
+        // Cargo policy: clear incompatible cargo before attempting tasks.
+        var currentAssignment = getAssignment(creep);
+        if (deliveryNoProgressWatchdog(creep, currentAssignment, h)) return;
+        if (cleanupCargoForTask(creep, currentAssignment)) return;
 
-        // TTL check
+        // ── VALIDATE / PICK ASSIGNMENT ─────────────────────────────────────
+        var a = currentAssignment;
+
+        // TTL check — assignedTick is refreshed on every successful withdraw
+        // or transfer, so this now only fires for tasks making NO progress.
         if (a && a.assignedTick && Game.time - a.assignedTick > ASSIGNMENT_TTL) {
             clearAssignment(creep, "TTL", true);
             a = null;
         }
 
-        // Completion check (skip on tick assigned — just validated by scanner)
+        // Completion check (skip on tick assigned/progressed — store data for
+        // intents issued that tick is stale)
         if (a && a.assignedTick !== Game.time && isAssignmentDone(creep, view, a, h)) {
-            clearAssignment(creep, "done", true);
-            a = null;
+            // Keep factory_input assignments alive while we still carry the
+            // matching resource. Otherwise the creep can abandon a valid
+            // load mid-route and dump it back to storage before reaching the
+            // factory.
+            if (a.type === "factory_input") {
+                var carriedFactoryRes = getFactoryTaskResource(a);
+                if (carriedFactoryRes && (creep.store[carriedFactoryRes] || 0) > 0) {
+                    creep.memory.s = "delivering";
+                } else {
+                    clearAssignment(creep, "done", true);
+                    a = null;
+                }
+            } else {
+                clearAssignment(creep, "done", true);
+                a = null;
+            }
         }
 
         // Pick new task if idle
@@ -1502,6 +3035,7 @@ var roleSupplier = {
             if (!pickTask(creep, view, h)) return; // idle, sleeping
             a = getAssignment(creep);
             if (!a) return;
+            if (cleanupCargoForTask(creep, a)) return;
         }
 
         // ── EXECUTE STATE ──────────────────────────────────────────────────
@@ -1521,6 +3055,7 @@ var roleSupplier = {
             if (pickTask(creep, view, h)) {
                 a = getAssignment(creep);
                 if (a) {
+                    if (cleanupCargoForTask(creep, a)) return;
                     if (creep.memory.s === "fetching") {
                         executeFetch(creep, a, view, h);
                     } else if (creep.memory.s === "delivering") {

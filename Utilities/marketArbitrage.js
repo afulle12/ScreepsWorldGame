@@ -4,125 +4,6 @@
  * Scans for profitable buy-sell spreads: buys resources cheaply from sell orders,
  * waits for terminal cooldown, then immediately sells to open buy orders at a profit.
  *
- * Self-arbitrage on OWN sell orders:
- * - Scans Game.market.orders for our active sell orders.
- * - If a buy order exists at a price above our asking price, and the spread
- *   covers energy costs, we deal() on the buy order directly from that terminal.
- * - This is better than waiting for natural fills when buyPrice - sellPrice > energyCost,
- *   because natural fills cost us nothing (buyer pays energy), but the buy order
- *   might disappear before anyone fills our sell order.
- * - After a verified sale, cancels the (now unfunded) sell order.
- * - Energy IS counted: profit = (buyPrice - ourSellPrice) * amount - energyCost * energyPrice.
- * - Uses MIN_SELF_ARB_PROFIT as a minimum credit threshold to avoid dust trades.
- *
- * Self-fulfill integration with opportunisticBuy:
- * - If an opportunisticBuy request exists for a resource we're about to sell,
- *   compares the value of self-fulfilling (terminal.send) vs external sale.
- * - Self-fulfill value = maxPrice * amount (credits saved) - send energy cost.
- * - Only self-fulfills if purchase price <= oppBuy maxPrice.
- * - Picks whichever option yields more value (with SELF_FULFILL_ADVANTAGE bias).
- * - Updates the opportunisticBuy request progress when self-fulfilling.
- *
- * Self-fulfill advantage (SELF_FULFILL_ADVANTAGE):
- * - When an opportunisticBuy request exists for a resource, arbitrage will only
- *   prefer selling externally if the buy order price exceeds our maxPrice by
- *   this factor (default 1.25 = 25%). Otherwise we buy it for ourselves.
- * - Applied both at opportunity scanning (skips arb if external isn't worth it)
- *   and at sell-time value comparison (biases toward self-fulfill).
- * - Example: oppBuy maxPrice=100, sell@90, external buy@110.
- *   Required external: 100*1.25=125. Since 110<125, we self-fulfill instead of arb.
- *
- * Floor sweep (FLOOR_SWEEP_PRICE):
- * - If any non-energy commodity is listed at or below FLOOR_SWEEP_PRICE (default 1 cr),
- *   it is purchased unconditionally even if no buy order currently exists for it.
- * - The purchase enters the normal state machine (pending_buy_verify -> pending_sell)
- *   and, if still no buyer is found, flows into the buffer where it waits and sells
- *   opportunistically -- identical to any other buffered entry.
- * - Only fires when a terminal has no regular arb opportunity, so it never
- *   displaces profitable trades.
- * - Full cost basis (purchase price + buy-leg energy cost) is computed upfront.
- *   If no buy order exists at or above that basis, the historical average cap
- *   (150%) must exceed it -- otherwise the sweep is skipped entirely since there
- *   is no realistic exit. At ~28 cr/energy, energy can easily dwarf the nominal
- *   purchase price for cheap commodities transacted across distant rooms.
- * - Respects all standard guards: exposure cap, buffered-resource skip,
- *   ghost-order blacklist, single-terminal restriction, energy availability.
- * - Use setFloorSweepPrice(0) to disable.
- *
- * Cost basis tracking (costBasis field):
- * - Every op and buffer entry stores costBasis = sellPrice + buyLegEnergy*energyPrice/amount.
- * - The buffer profitability check uses costBasis (not just sellPrice) as the floor,
- *   ensuring the sell-leg price covers both the original purchase AND the energy
- *   spent receiving the goods.
- * - The || sellPrice fallback handles legacy Memory entries without costBasis.
- *
- * Account-level resource arbitrage (pixel, cpuUnlock, accessKey):
- * - These resources go to your account, not a terminal.
- * - No energy costs on either leg, no terminal cooldown, no capacity checks.
- * - deal() is called without a room name.
- * - State machine: pending_buy_verify -> ready_to_sell -> pending_sell_verify -> complete.
- * - Buy verification and sell can happen in the same scan tick (no cooldown).
- * - Only one account-resource operation at a time (serialized).
- * - Verified via Game.resources balance check (buy) and outgoingTransactions (sell).
- * - If the target buy order disappears, searches for replacements or holds until
- *   BUFFER_TIMEOUT, then abandons.
- *
- * Accounts for energy costs on BOTH transaction legs (receiving and sending).
- * Energy is valued using marketBuy.computeBuyPrice(RESOURCE_ENERGY).
- *
- * PWR_OPERATE_TERMINAL awareness:
- * - All energy cost calculations check for an active PWR_OPERATE_TERMINAL effect
- *   on the terminal and apply the corresponding percentage reduction.
- * - POWER_INFO[PWR_OPERATE_TERMINAL].effect stores cost multipliers [0.9..0.5],
- *   meaning 90% to 50% of base cost at levels 0-4.
- * - This prevents overestimating energy costs on powered terminals, which would
- *   otherwise cause missed opportunities and undersized trades.
- * - Active operations in 'pending_sell' state are checked every tick (not just
- *   scan ticks) so powered terminals with shorter cooldowns can execute their
- *   sell leg as soon as cooldown clears. Only terminals with cooldown === 0
- *   are processed; other states wait for the next scan tick. Order book data
- *   is cached from the last scan tick for this inter-scan processing.
- *
- * Idle terminal processing order:
- * - Idle terminals are pre-scored by estimated profit and processed highest-first.
- * - This ensures the most profitable terminal-opportunity pairings execute before
- *   less profitable ones consume limited sell/buy order capacity.
- *
- * Single-terminal resources (SINGLE_TERMINAL_RESOURCES):
- * - Resources like 'ops' are restricted to one terminal at a time to avoid
- *   multiple low-value split trades clogging terminals.
- * - These resources skip the per-terminal share splitting and are blocked from
- *   new terminals if any terminal already has that resource in-flight.
- *
- * Adaptive scan interval:
- * - Every 100 ticks, reads Memory.cpuStats.history (same data as statusReport).
- * - If average CPU < CPU_TARGET (18), decreases SCAN_INTERVAL by 1 (more frequent).
- * - If average CPU > CPU_TARGET, increases SCAN_INTERVAL by 1 (less frequent).
- * - Clamped to [MIN_SCAN_INTERVAL, MAX_SCAN_INTERVAL].
- *
- * Filters:
- * - Buy orders must have >= MIN_BUY_ORDER_AMOUNT remaining (filters scam/dust orders).
- * - Net profit must be >= MIN_PROFIT_MARGIN of total cost (credits + energy value).
- * - Only uses terminals in rooms RCL 7+.
- *
- * State machine per terminal:
- *   idle -> pending_buy_verify -> pending_sell -> pending_verify -> idle
- *        (deal on sell order;  (confirmed buy;  (deal on buy order; (confirmed sale;
- *         verify resources      wait cooldown,    verify resources    decrement and
- *         arrived via           then sell)        left via            complete or
- *         incomingTransactions)                   outgoingTransactions) continue)
- *
- * Verification:
- *   Neither terminal.store nor Game.market.credits updates within the same tick
- *   after deal(). We use incomingTransactions / outgoingTransactions on the NEXT
- *   scan to confirm deals actually executed. This prevents "ghost deals" where
- *   deal() returns OK but the order was already filled by another player.
- *
- * If the sell target disappears:
- *   pending_sell -> buffered (separate from active ops, terminal freed for new arb)
- *   buffered: checked every SCAN_INTERVAL ticks using same order books as new-opportunity scan
- *   buffered -> sold (profitable buy order found) or marketSell (after BUFFER_TIMEOUT ticks)
- *
  * Usage:
  *   marketArbitrage.run()                 -- call every tick from main loop
  *   marketArbitrage.status()              -- view active operations + buffered entries
@@ -132,15 +13,17 @@
  *   marketArbitrage.setEnabled(true)      -- resume arbitrage activity
  *   marketArbitrage.setMargin(0.05)       -- change minimum profit margin
  *   marketArbitrage.setMinBuyAmount(100)  -- change min buy-order size filter
+ *   marketArbitrage.setMinBuyOrderPrice(10) -- change min buy-order price per unit
+ *   marketArbitrage.setMinArbBuyVolume(49) -- change min total buy depth for arb candidates
  *   marketArbitrage.setBufferTimeout(10000) -- change buffer hold duration
  *   marketArbitrage.setSelfFulfillAdvantage(1.5) -- change self-fulfill bias (1.0 = no bias)
  *   marketArbitrage.setFloorSweepPrice(0.5) -- buy anything at or below this price (0 = disabled)
  *
- * @module marketArbitrage
  */
 
 var marketBuyer  = require('marketBuy');
 var marketSeller = require('marketSell');
+var pricing      = require('marketPricing');
 
 // === CONFIGURATION ===
 var ENABLED              = true;    // Set to false to suspend all arbitrage activity
@@ -150,48 +33,38 @@ var MAX_SCAN_INTERVAL    = 100;     // Ceiling for adaptive scan interval
 var CPU_TARGET           = 18;      // Target CPU average -- interval adjusts around this
 var MIN_PROFIT_MARGIN    = 0.005;   // Minimum profit over total cost
 var MIN_BUY_ORDER_AMOUNT = 6;       // Filter out likely-scam buy orders below this size
+var MIN_BUY_ORDER_PRICE  = 10;      // Ignore buy orders below this price per unit
 var MAX_SELLS_PER_RESOURCE = 10;    // CPU guard: only inspect top N cheapest sells per resource
 var BUFFER_TIMEOUT       = 50000;   // Ticks to hold buffered resources before falling back to marketSell
 var VERIFY_TIMEOUT       = 6;       // Ticks to wait for transaction confirmation (3 scan cycles)
 var ACCOUNT_VERIFY_TIMEOUT = 3;     // Account resources verify faster (no terminal involved)
 var MIN_AMOUNT_PER_TERMINAL = 500;  // Minimum share per terminal when splitting
 var MAX_RESOURCE_EXPOSURE = 50000;  // Max total units of one resource in-flight across ALL terminals + buffered
+var BUY_DEPTH = 3;                  // Number of top buyers to consider for depth-aware sizing/staged selling
+var MIN_ARB_BUY_VOLUME = 49;        // Minimum total buy depth (sum of top BUY_DEPTH buyers) for a candidate to be considered
 
 var GHOST_SELL_COOLDOWN   = 100;    // Ticks to blacklist a sell order after a buy ghost
+
+// Grouped-logging tuning
+var SELL_GHOST_FAIL_THRESHOLD = 3;  // mark a group member as failed after this many sell-verify ghosts
+var GROUP_STALE_TICKS         = 200; // warn if a group hasn't fully resolved within this many ticks
 
 // Resources restricted to a single terminal at a time to avoid low-value split trades
 var SINGLE_TERMINAL_RESOURCES = { ops: true };
 
 var MIN_SELF_ARB_PROFIT   = 1;      // Minimum absolute credit profit for self-arb (filters dust)
 
-// Self-fulfill advantage: when an opportunisticBuy request exists for a resource,
-// external buy orders must exceed our maxPrice by this factor to prefer arb over self-fulfill.
-// 1.25 = external must pay 25% more than our own valuation, otherwise we buy it for ourselves.
 var SELF_FULFILL_ADVANTAGE = 1.25;
 
-// Floor sweep: unconditionally buy any commodity listed at or below this price,
-// then buffer it and sell opportunistically. Set to 0 to disable.
-// Note: full cost basis (purchase price + buy-leg energy) must be recoverable via
-// an existing buy order or the historical average cap before the sweep is executed.
 var FLOOR_SWEEP_PRICE = 7;
 
-// Resources excluded from floor sweeps. Energy is always excluded separately.
-// Add any resource type string to block it from being swept.
-// Modify at runtime: marketArbitrage.addFloorSweepBan('Z') / removeFloorSweepBan('Z')
-var FLOOR_SWEEP_BANNED = { Z: true, zynthium: true };
+var FLOOR_SWEEP_BANNED = { Z: true, zynthium: true, ops: true};
 
-// Enable verbose logging for floor sweep to diagnose why opportunities are skipped.
-// Toggle at runtime: marketArbitrage.setFloorSweepDebug(true)
 var FLOOR_SWEEP_DEBUG = false;
 
-// Account-level resources that go to your account, not a terminal
 var ACCOUNT_RESOURCES = { pixel: true, cpuUnlock: true, accessKey: true };
 
-/**
- * Check if a resource type is an account-level resource (no terminal needed).
- * @param {string} resourceType
- * @returns {boolean}
- */
+
 function isAccountResource(resourceType) {
     return !!ACCOUNT_RESOURCES[resourceType];
 }
@@ -216,6 +89,11 @@ if (!Memory.marketArbitrage.selfArbPending) {
 // States: pending_buy_verify -> ready_to_sell -> pending_sell_verify -> (complete/deleted)
 if (Memory.marketArbitrage.accountOp === undefined) {
     Memory.marketArbitrage.accountOp = null;
+}
+// groups: { groupKey -> { ... } } -- tracks split arbitrage operations for aggregated logging.
+// See module header comment for structure and lifecycle.
+if (!Memory.marketArbitrage.groups) {
+    Memory.marketArbitrage.groups = {};
 }
 // Restore adaptive scan interval from Memory so it survives global resets
 if (typeof Memory.marketArbitrage.scanInterval === 'number') {
@@ -244,10 +122,17 @@ function getMyRooms() {
  * accounting for PWR_OPERATE_TERMINAL if active.
  *
  * POWER_INFO[PWR_OPERATE_TERMINAL].effect contains cost multipliers:
- *   [0.9, 0.8, 0.7, 0.6, 0.5] -> 10% to 50% reduction at levels 0-4.
+ *   [0.9, 0.7, 0.5, 0.35, 0.2] -> 10% to 80% reduction at levels 1-5.
+ *   (90% to 20% of base cost, indexed by power level 1-5)
  *
  * Game.market.calcTransactionCost() always returns the BASE (unpowered) cost,
  * so we must apply the multiplier ourselves to predict actual deal() cost.
+ *
+ * FIX (2025-06-02): effect.level is 1-5 (not 0-4), so we must use
+ * effect[level - 1] to index the POWER_INFO.effect array.
+ * Previously effect[level] caused an off-by-one error:
+ *   - Level 1 read effect[1]=0.7 instead of effect[0]=0.9
+ *   - Level 5 read effect[5]=undefined, falling back to base (no reduction)
  *
  * Handles both formats defensively:
  *   < 1  -> multiplier (e.g. 0.5 = 50% of base)
@@ -259,60 +144,110 @@ function getMyRooms() {
  * @param {StructureTerminal} [terminal] - If provided, checks for active power effect
  * @returns {number} Effective energy cost (reduced if powered)
  */
-function calcEffectiveEnergyCost(amount, fromRoom, toRoom, terminal) {
-    var base = Game.market.calcTransactionCost(amount, fromRoom, toRoom);
-    if (!terminal || !terminal.effects) return base;
+// Game.market.calcTransactionCost(amount, from, to) == ceil(amount * (1 - exp(-dist/30)))
+// where dist = Game.map.getRoomLinearDistance(from, to, true).
+// Room distances never change, so this cache is heap-persistent across ticks/scans.
+var _costFactorCache = {};
 
+function getCostFactor(fromRoom, toRoom) {
+    var key = fromRoom + '|' + toRoom;
+    var f = _costFactorCache[key];
+    if (f === undefined) {
+        var dist = Game.map.getRoomLinearDistance(fromRoom, toRoom, true);
+        f = 1 - Math.exp(-dist / 30);
+        _costFactorCache[key] = f;
+    }
+    return f;
+}
+
+/**
+ * Returns the PWR_OPERATE_TERMINAL cost multiplier for a terminal (1 = no reduction).
+ *
+ * FIX (2025-06-02): effect.level is 1-5 (not 0-4), so we must use
+ * effect[level - 1] to index the POWER_INFO.effect array.
+ *
+ * Per-scan cache: terminal effects do not change within a tick, so cache the
+ * multiplier by terminal id to avoid re-scanning effects on every energy cost
+ * calculation.
+ */
+var _powerMultiplierCache = {};
+
+function getPowerMultiplier(terminal) {
+    if (!terminal || !terminal.effects) return 1;
+    var id = terminal.id;
+    if (id && _powerMultiplierCache[id] !== undefined) return _powerMultiplierCache[id];
     for (var i = 0; i < terminal.effects.length; i++) {
         var eff = terminal.effects[i];
         if (eff.effect === PWR_OPERATE_TERMINAL && eff.ticksRemaining > 0) {
             var info = (typeof POWER_INFO !== 'undefined') ? POWER_INFO[PWR_OPERATE_TERMINAL] : null;
-            if (info && info.effect && typeof info.effect[eff.level] === 'number') {
-                var effectValue = info.effect[eff.level];
-                if (effectValue > 0 && effectValue < 1) {
-                    // Multiplier format: 0.9 = 90% of base cost (10% reduction)
-                    return Math.ceil(base * effectValue);
-                } else if (effectValue >= 1 && effectValue <= 100) {
-                    // Percentage format fallback: 10 = 10% reduction
-                    return Math.ceil(base * (1 - effectValue / 100));
+            if (info && info.effect) {
+                // CRITICAL FIX: effect.level is 1-indexed (1-5), but array is 0-indexed (0-4)
+                var lvlIndex = eff.level - 1;
+                if (lvlIndex < 0 || lvlIndex >= info.effect.length) {
+                    if (id) _powerMultiplierCache[id] = 1;
+                    return 1;
+                }
+                var effectValue = info.effect[lvlIndex];
+                if (typeof effectValue === 'number') {
+                    var mult = 1;
+                    if (effectValue > 0 && effectValue < 1) {
+                        // Multiplier format: 0.9 = 90% of base cost (10% reduction)
+                        mult = effectValue;
+                    } else if (effectValue >= 1 && effectValue <= 100) {
+                        // Percentage format fallback: 10 = 10% reduction
+                        mult = 1 - effectValue / 100;
+                    }
+                    if (id) _powerMultiplierCache[id] = mult;
+                    return mult;
                 }
             }
-            return base;
+            if (id) _powerMultiplierCache[id] = 1;
+            return 1;
         }
     }
-    return base;
+    if (id) _powerMultiplierCache[id] = 1;
+    return 1;
 }
 
 /**
- * Binary-search the largest amount whose effective energy cost fits within energyAvail.
- * Accounts for PWR_OPERATE_TERMINAL if terminal is provided.
+ * Effective energy cost for a deal/send, accounting for PWR_OPERATE_TERMINAL.
+ * Closed-form -- no Game.market.calcTransactionCost() call.
+ */
+function calcEffectiveEnergyCost(amount, fromRoom, toRoom, terminal) {
+    if (amount <= 0) return 0;
+    var base = Math.ceil(amount * getCostFactor(fromRoom, toRoom));
+    var mult = getPowerMultiplier(terminal);
+    return mult < 1 ? Math.ceil(base * mult) : base;
+}
+
+/**
+ * Largest amount whose effective energy cost fits within energyAvail.
+ * Closed-form estimate (inverted cost factor) with a small linear correction
+ * for ceil() rounding -- replaces the old O(log n) binary search.
  */
 function capByEnergy(desired, fromRoom, toRoom, energyAvail, terminal) {
     if (energyAvail <= 0 || desired <= 0) return 0;
-    var low = 0, high = desired;
-    while (low < high) {
-        var mid = low + Math.ceil((high - low) / 2);
-        if (calcEffectiveEnergyCost(mid, fromRoom, toRoom, terminal) <= energyAvail) low = mid;
-        else high = mid - 1;
-    }
-    return low;
+    var f = getCostFactor(fromRoom, toRoom) * getPowerMultiplier(terminal);
+    if (f <= 0) return desired;
+    var amt = Math.min(desired, Math.floor(energyAvail / f));
+    while (amt > 0 && calcEffectiveEnergyCost(amt, fromRoom, toRoom, terminal) > energyAvail) amt--;
+    return amt;
 }
 
 /**
- * Binary-search largest amount whose combined effective energy for BOTH legs
- * fits within energyAvail. Accounts for PWR_OPERATE_TERMINAL.
+ * Largest amount whose combined effective energy for BOTH legs fits within
+ * energyAvail. Closed-form estimate with linear correction.
  */
 function capByEnergyBothLegs(desired, ourRoom, sellRoom, buyRoom, energyAvail, terminal) {
     if (energyAvail <= 0 || desired <= 0) return 0;
-    var low = 0, high = desired;
-    while (low < high) {
-        var mid = low + Math.ceil((high - low) / 2);
-        var cost = calcEffectiveEnergyCost(mid, ourRoom, sellRoom, terminal)
-                 + calcEffectiveEnergyCost(mid, ourRoom, buyRoom, terminal);
-        if (cost <= energyAvail) low = mid;
-        else high = mid - 1;
-    }
-    return low;
+    var mult = getPowerMultiplier(terminal);
+    var f = (getCostFactor(ourRoom, sellRoom) + getCostFactor(ourRoom, buyRoom)) * mult;
+    if (f <= 0) return desired;
+    var amt = Math.min(desired, Math.floor(energyAvail / f));
+    while (amt > 0 &&
+        (calcEffectiveEnergyCost(amt, ourRoom, sellRoom, terminal) +
+         calcEffectiveEnergyCost(amt, ourRoom, buyRoom, terminal)) > energyAvail) amt--;
+    return amt;
 }
 
 /**
@@ -389,6 +324,95 @@ function findAccountOutgoingTx(resourceType, orderId, sinceTime) {
 }
 
 // -----------------------------------------------------------------------------
+// Grouped-logging helpers
+// -----------------------------------------------------------------------------
+
+/**
+ * Returns the number of group members that still need to reach the current
+ * stage before the aggregate summary line for that stage can be printed.
+ * (members minus anyone already recorded as failed)
+ */
+function groupExpectedCount(grp) {
+    return grp.members.length - Object.keys(grp.failedRooms).length;
+}
+
+/**
+ * Build the " | Failed: roomA(stage/reason,amount), roomB(...)" suffix for a
+ * group summary line, or '' if nothing has failed.
+ */
+function groupFailedSuffix(grp) {
+    var keys = Object.keys(grp.failedRooms);
+    if (!keys.length) return '';
+    return ' | Failed: ' + keys.map(function (r) {
+        var f = grp.failedRooms[r];
+        return r + '(' + f.stage + '/' + f.reason + ',' + f.amount + ')';
+    }).join(', ');
+}
+
+/** Print the BUY CONFIRMED summary line for a group. */
+function logBuyConfirmed(grp) {
+    var total = 0;
+    for (var r in grp.buyConfirmedRooms) total += grp.buyConfirmedRooms[r];
+    console.log('[Arbitrage] BUY CONFIRMED ' + grp.resource + ' from ' + grp.sellRoom +
+        ' | Total: ' + total + '/' + grp.totalAmount +
+        ' across ' + Object.keys(grp.buyConfirmedRooms).length + ' rooms' +
+        groupFailedSuffix(grp));
+}
+
+/** Print the SELL INITIATED summary line for a group. */
+function logSellInitiated(grp) {
+    var total = 0;
+    for (var r in grp.sellInitRooms) total += grp.sellInitRooms[r];
+    console.log('[Arbitrage] SELL INITIATED ' + grp.resource +
+        ' | Total: ' + total + '/' + grp.totalAmount +
+        ' -> (' + Object.keys(grp.sellRoomsActual).join(', ') + ')' +
+        groupFailedSuffix(grp));
+}
+
+/** Print the SELL CONFIRMED summary line for a group. */
+function logSellConfirmed(grp) {
+    var totalAmt = 0, totalProfit = 0;
+    for (var r in grp.sellConfirmedRooms) {
+        totalAmt += grp.sellConfirmedRooms[r].amount;
+        totalProfit += grp.sellConfirmedRooms[r].profit;
+    }
+    console.log('[Arbitrage] SELL CONFIRMED ' + grp.resource + ' -> ' + grp.buyRoom +
+        ' | Total: ' + totalAmt + '/' + grp.totalAmount +
+        ' | Realized Profit: ' + totalProfit.toFixed(2) +
+        ' (' + (grp.margin * 100).toFixed(1) + '%)' +
+        groupFailedSuffix(grp));
+}
+
+/**
+ * Periodic watchdog: report groups that haven't fully resolved within
+ * GROUP_STALE_TICKS, re-warning every 100 ticks thereafter, listing exactly
+ * which rooms are still pending at which stage.
+ */
+function checkStaleGroups() {
+    var groups = Memory.marketArbitrage.groups;
+    if (!groups) return;
+    for (var gk in groups) {
+        var grp = groups[gk];
+        var age = Game.time - grp.createdTick;
+        if (age < GROUP_STALE_TICKS) continue;
+        if ((age - GROUP_STALE_TICKS) % 100 !== 0) continue;
+
+        var pendingBuy = [], pendingSell = [];
+        for (var i = 0; i < grp.members.length; i++) {
+            var rm = grp.members[i];
+            if (grp.failedRooms[rm]) continue;
+            if (!grp.buyConfirmedRooms[rm]) { pendingBuy.push(rm); continue; }
+            if (!grp.sellConfirmedRooms[rm]) pendingSell.push(rm);
+        }
+
+        console.log('[Arbitrage] GROUP STALE (' + age + 't) ' + grp.resource + ' ' + grp.sellRoom + '->' + grp.buyRoom +
+            (pendingBuy.length ? ' | Waiting on buy: (' + pendingBuy.join(', ') + ')' : '') +
+            (pendingSell.length ? ' | Waiting on sell: (' + pendingSell.join(', ') + ')' : '') +
+            groupFailedSuffix(grp));
+    }
+}
+
+// -----------------------------------------------------------------------------
 // History Cache (per-scan)
 // -----------------------------------------------------------------------------
 
@@ -405,10 +429,10 @@ var _historyCache = {};
  * Cached data is only used for replacement order search and self-fulfill
  * comparison -- acceptable to be slightly stale between scans.
  */
-var _cachedBuysByRes = {};
 var _cachedOppBuyRequests = {};
 var _cachedEnergyPrice = 0;
 var _cachedMyRooms = {};
+var _cachedBooks = null;
 
 /**
  * Get the average-of-last-two-days price cap for a resource.
@@ -419,7 +443,11 @@ var _cachedMyRooms = {};
  */
 function getHistoryCap(resource, multiplier) {
     if (_historyCache[resource] === undefined) {
-        var hist = Game.market.getHistory(resource) || [];
+        // Use the shared per-tick history cache from marketPricing so
+        // Game.market.getHistory(resource) is called at most once per resource
+        // per tick across both modules. _historyCache still memoizes the
+        // computed 2-day average within this scan.
+        var hist = pricing.getHistDays(resource) || [];
         var hC = 0, hS = 0;
         if (hist.length >= 1 && hist[hist.length-1] && typeof hist[hist.length-1].avgPrice === 'number') { hS += hist[hist.length-1].avgPrice; hC++; }
         if (hist.length >= 2 && hist[hist.length-2] && typeof hist[hist.length-2].avgPrice === 'number') { hS += hist[hist.length-2].avgPrice; hC++; }
@@ -458,119 +486,169 @@ function getOwnSellResources() {
  * two-full-pass approach.
  */
 function buildOrderBooks(myRooms, oppBuyRequests) {
-    var allOrders  = Game.market.getAllOrders();
+    // Use the shared per-tick raw orders cache from marketPricing so
+    // Game.market.getAllOrders() is called at most once per tick across both
+    // modules. The derived books (buysByRes/sellsByRes) are built with this
+    // module's own filtering logic on the shared raw array (read-only).
+    var allOrders  = pricing.getRawOrders();
     var buysByRes  = {};
     var sellsByRes = {};
     var viable     = {};
     var sellBuffer = []; // pre-filtered sells awaiting viable check
+    var maxBuyPriceByRes = {};   // highest external buy price per resource
+    var hasFloorSweepSell = {};  // resources with a sell at/below FLOOR_SWEEP_PRICE
+    var ghosts = Memory.marketArbitrage.ghostSellOrders;
 
-    // Single pass: build buys + viable, collect candidate sells
+    function keepCheapestSell(list, order) {
+        if (list.length < MAX_SELLS_PER_RESOURCE) {
+            list.push(order);
+            return;
+        }
+
+        var worstIndex = 0;
+        var worstPrice = list[0].price;
+        for (var i = 1; i < list.length; i++) {
+            if (list[i].price > worstPrice) {
+                worstPrice = list[i].price;
+                worstIndex = i;
+            }
+        }
+
+        if (order.price < worstPrice) list[worstIndex] = order;
+    }
+
+    // Single pass: build buys, track best buy price, collect candidate sells
     for (var i = 0; i < allOrders.length; i++) {
         var o = allOrders[i];
         if (!o || o.resourceType === RESOURCE_ENERGY) continue;
+        var isAcct = isAccountResource(o.resourceType);
 
         if (o.type === ORDER_BUY) {
-            if ((o.remainingAmount || o.amount || 0) < MIN_BUY_ORDER_AMOUNT) continue;
+            var buyAmt = o.remainingAmount || o.amount || 0;
+            if (buyAmt < MIN_BUY_ORDER_AMOUNT) continue;
             if (o.roomName && myRooms[o.roomName]) continue;
+            // Price floor applies to terminal resources only; account resources
+            // have their own economics and are handled separately.
+            if (!isAcct && o.price < MIN_BUY_ORDER_PRICE) continue;
             if (!buysByRes[o.resourceType]) buysByRes[o.resourceType] = [];
             buysByRes[o.resourceType].push(o);
             viable[o.resourceType] = true;
+            if (o.price > (maxBuyPriceByRes[o.resourceType] || 0)) {
+                maxBuyPriceByRes[o.resourceType] = o.price;
+            }
         } else if (o.type === ORDER_SELL && (o.amount || 0) > 0 && !(o.roomName && myRooms[o.roomName])) {
+            // Skip known-ghosted sell orders (terminal resources only).
+            if (!isAcct && ghosts && ghosts[o.id] && Game.time - ghosts[o.id] <= GHOST_SELL_COOLDOWN) continue;
             sellBuffer.push(o);
+            if (FLOOR_SWEEP_PRICE > 0 && o.price <= FLOOR_SWEEP_PRICE) {
+                hasFloorSweepSell[o.resourceType] = true;
+            }
         }
     }
 
-    for (var r in oppBuyRequests) viable[r] = true;
-
-    // Floor sweep: mark all resources with cheap sell orders as viable so they
-    // appear in sellsByRes even when no buy order exists for that resource.
-    if (FLOOR_SWEEP_PRICE > 0) {
-        for (var j = 0; j < sellBuffer.length; j++) {
-            if (sellBuffer[j].price <= FLOOR_SWEEP_PRICE) viable[sellBuffer[j].resourceType] = true;
-        }
-    }
+    // Viability requires a real exit: external buyers, floor-sweep opportunity,
+    // or an internal opportunistic buy request. Rebuild the set explicitly so
+    // resources whose only buyers were filtered out (e.g. by MIN_BUY_ORDER_PRICE)
+    // are not scanned as if they still had a market.
+    viable = {};
+    for (var r in maxBuyPriceByRes) viable[r] = true;
+    for (var r2 in hasFloorSweepSell) viable[r2] = true;
+    for (var r3 in oppBuyRequests) viable[r3] = true;
 
     // Second pass over sell buffer only (~half of allOrders)
     for (var k = 0; k < sellBuffer.length; k++) {
         var so = sellBuffer[k];
         if (!viable[so.resourceType]) continue;
+        // Skip sells priced above the best buyer unless they are cheap enough
+        // for floor sweep. Account resources bypass this cap.
+        if (!isAccountResource(so.resourceType)) {
+            var maxBuy = maxBuyPriceByRes[so.resourceType] || 0;
+            if (so.price > maxBuy && so.price > FLOOR_SWEEP_PRICE) continue;
+        }
         if (!sellsByRes[so.resourceType]) sellsByRes[so.resourceType] = [];
-        sellsByRes[so.resourceType].push(so);
+        keepCheapestSell(sellsByRes[so.resourceType], so);
     }
 
-    for (var r1 in buysByRes) buysByRes[r1].sort(function(a, b) { return b.price - a.price; });
+    // NOTE: buysByRes is intentionally left unsorted here. Sorting is deferred
+    // to ensureSortedBuys() and paid only for resources that actually need
+    // ordered iteration (i.e. resources with a viable sell, or resources we
+    // own/buffer) -- most resources with buy orders never reach that point.
     for (var r2 in sellsByRes) {
         sellsByRes[r2].sort(function(a, b) { return a.price - b.price; });
-        if (sellsByRes[r2].length > MAX_SELLS_PER_RESOURCE)
-            sellsByRes[r2] = sellsByRes[r2].slice(0, MAX_SELLS_PER_RESOURCE);
     }
 
-    return { sellsByRes: sellsByRes, buysByRes: buysByRes };
+    return { sellsByRes: sellsByRes, buysByRes: buysByRes, _sortedBuys: {} };
 }
 
-/** Find best arb opportunity for a terminal. Accounts for committed sell/buy amounts
- *  and global per-resource exposure limits. Caps per-terminal share for splitting.
- *  Uses calcEffectiveEnergyCost for PWR_OPERATE_TERMINAL awareness.
- *  Single-terminal resources (SINGLE_TERMINAL_RESOURCES) skip splitting and are
- *  blocked if another terminal already has that resource in-flight.
- *  Self-fulfill advantage: if an oppBuy request exists for this resource and the
- *  sell price is within our maxPrice, external buy orders must exceed our maxPrice
- *  by SELF_FULFILL_ADVANTAGE factor -- otherwise we skip the arb and let oppBuy
- *  purchase it for ourselves.
- *
- * EFFICIENCY: sell.price > maxBuyPrice uses break (not continue) because sells are
- * sorted ascending -- once one exceeds the cap all remaining ones do too. */
-function findBestOpportunity(terminal, books, energyPrice, committedBuyAmounts, committedSellAmounts, numIdleTerminals, resourceExposure, bufferedResources, ownSellResources, activeResourceTypes, oppBuyRequests) {
-    var roomName        = terminal.room.name;
-    var availableEnergy = terminal.store[RESOURCE_ENERGY] || 0;
-    var freeCapacity    = terminal.store.getFreeCapacity() || 0;
-    var credits         = Game.market.credits;
-    if (freeCapacity <= 0 || availableEnergy < 100 || credits < 1) return null;
+/**
+ * Sort books.buysByRes[resource] by price descending, on first access only.
+ * Most resources in buysByRes never have a matching viable sell order, so
+ * deferring the sort until something actually needs ordered iteration skips
+ * the vast majority of sorts entirely.
+ */
+function ensureSortedBuys(books, resource) {
+    if (!books) return null;
+    var list = books.buysByRes[resource];
+    if (!list || books._sortedBuys[resource]) return list;
+    list.sort(function (a, b) { return b.price - a.price; });
+    books._sortedBuys[resource] = true;
+    return list;
+}
 
-    var bestOpp = null, bestProfit = 0;
+var CANDIDATE_LIMIT = 25; // shortlist size scanned per idle terminal
+
+/**
+ * Build a per-scan shortlist of (sell, topBuy) candidates across all resources,
+ * ranked by rough (pre-energy) margin. Replaces the old per-terminal O(R*S) scan
+ * with a single O(R*S) pass, followed by O(T*C) per-terminal evaluation where
+ * C = CANDIDATE_LIMIT.
+ *
+ * Only the single cheapest viable sell per resource enters the list -- if that
+ * one isn't profitable for any terminal, deeper sells for the same resource
+ * won't be either (sells are ascending, topBuy is fixed).
+ */
+function buildArbCandidates(books, oppBuyRequests, committedBuyAmounts, committedSellAmounts, resourceExposure, bufferedResources, ownSellResources, activeResourceTypes) {
+    var candidates = [];
 
     for (var resource in books.sellsByRes) {
-        var sells = books.sellsByRes[resource];
-        if (!sells || !sells.length) continue;
-
-        // Skip account-level resources -- handled by processAccountArbitrage
         if (isAccountResource(resource)) continue;
-
-        // Don't buy more of a resource that's already stuck in buffer unsold
         if (bufferedResources[resource]) continue;
-
-        // Don't buy resources we already have listed for sale -- self-arb handles those
         if (ownSellResources && ownSellResources[resource]) continue;
-
-        // Single-terminal resources: skip if another terminal already has this in-flight
         if (SINGLE_TERMINAL_RESOURCES[resource] && activeResourceTypes[resource]) continue;
 
-        // Global exposure cap: how much more of this resource can we take on?
         var currentExposure = resourceExposure[resource] || 0;
         var exposureRoom = MAX_RESOURCE_EXPOSURE - currentExposure;
         if (exposureRoom <= 0) continue;
 
-        var topBuy = null, topBuyAmt = 0;
-        if (books.buysByRes[resource]) {
-            for (var bi = 0; bi < books.buysByRes[resource].length; bi++) {
-                var cb = books.buysByRes[resource][bi];
+        var sells = books.sellsByRes[resource];
+        if (!sells || !sells.length) continue;
+
+        var buys = ensureSortedBuys(books, resource);
+        // Collect top 3 viable buyers for depth-aware sizing. No discount applied to
+        // deeper buyers; each is independently checked against MIN_PROFIT_MARGIN later
+        // (accounting for that buyer's per-unit energy cost).
+        var buyDepth = [];
+        if (buys) {
+            for (var bi = 0; bi < buys.length && buyDepth.length < BUY_DEPTH; bi++) {
+                var cb = buys[bi];
                 var eff = (cb.remainingAmount || cb.amount || 0) - (committedBuyAmounts[cb.id] || 0);
-                if (eff > 0) { topBuy = cb; topBuyAmt = eff; break; }
+                if (eff > 0) buyDepth.push({ order: cb, available: eff });
             }
         }
+        if (buyDepth.length === 0) continue;
+        var topBuy = buyDepth[0].order;
+        var topBuyAmt = buyDepth[0].available;
+        // buyAvailable is the sum across the depth window so evaluateCandidate can
+        // size to total buyer depth, not just the top bid.
+        var depthTotal = 0;
+        for (var di = 0; di < buyDepth.length; di++) depthTotal += buyDepth[di].available;
 
         // -- Self-fulfill advantage --
-        // If we have an active oppBuy request for this resource and the cheapest
-        // sell order is affordable (within our maxPrice), only allow arb if the
-        // external buy price exceeds our maxPrice by the SELF_FULFILL_ADVANTAGE
-        // factor. Otherwise skip -- let oppBuy grab the cheap sell order instead.
         if (oppBuyRequests && oppBuyRequests[resource] && oppBuyRequests[resource].length > 0) {
             var bestOppMaxPrice = oppBuyRequests[resource][0].maxPrice; // sorted desc
             var cheapestSellPrice = sells[0].price;
             if (cheapestSellPrice <= bestOppMaxPrice) {
-                if (!topBuy || topBuy.price < bestOppMaxPrice * SELF_FULFILL_ADVANTAGE) {
-                    continue; // skip this resource -- self-fulfill is better
-                }
+                if (topBuy.price < bestOppMaxPrice * SELF_FULFILL_ADVANTAGE) continue;
             }
         }
 
@@ -582,58 +660,158 @@ function findBestOpportunity(terminal, books, energyPrice, committedBuyAmounts, 
             // EFFICIENCY: break (not continue) -- sells are sorted ascending by price,
             // so once one exceeds maxBuyPrice all subsequent ones do too.
             if (sell.price > maxBuyPrice) break;
-            if (!topBuy || sell.price >= topBuy.price) break;
+            if (sell.price >= topBuy.price) break;
             if (sell.roomName && topBuy.roomName && sell.roomName === topBuy.roomName) continue;
 
-            // Account for other terminals already committed to this sell order
             var sellCommitted = committedSellAmounts[sell.id] || 0;
             var sellAvailable = sell.amount - sellCommitted;
             if (sellAvailable <= 0) continue;
 
-            // Single-terminal resources or small orders (<50) get the full amount
-            // to avoid spreading tiny trades across many terminals.
-            var perTerminalShare;
-            if (SINGLE_TERMINAL_RESOURCES[resource] || sellAvailable < 50) {
-                perTerminalShare = sellAvailable;
-            } else {
-                var remainingTerminals = Math.max(1, numIdleTerminals);
-                perTerminalShare = Math.ceil(sellAvailable / remainingTerminals);
-                if (perTerminalShare < MIN_AMOUNT_PER_TERMINAL) {
-                    if (sellAvailable >= MIN_AMOUNT_PER_TERMINAL * remainingTerminals) {
-                        perTerminalShare = MIN_AMOUNT_PER_TERMINAL;
-                    }
-                }
-            }
+            var roughMargin = (topBuy.price - sell.price) / sell.price;
+            // Safe filter: real margin is always strictly less than roughMargin
+            // (energy costs reduce profit), so candidates below the gate can
+            // never be profitable. Sells are ascending by price, so break.
+            if (roughMargin <= MIN_PROFIT_MARGIN) break;
+            // Pragmatic filter: skip tiny buy depths that aren't worth a
+            // terminal cooldown and the evaluateCandidate CPU cost.
+            if (depthTotal < MIN_ARB_BUY_VOLUME) break;
 
-            // Cap by global resource exposure
-            var maxAmt = Math.min(perTerminalShare, sellAvailable, topBuyAmt, freeCapacity, Math.floor(credits / sell.price), exposureRoom);
-            if (maxAmt <= 0) continue;
-            var feasible = capByEnergyBothLegs(maxAmt, roomName, sell.roomName, topBuy.roomName, availableEnergy, terminal);
-            if (feasible <= 0) continue;
+            candidates.push({
+                resource: resource,
+                sell: sell,
+                buy: topBuy,
+                buyDepth: buyDepth,
+                sellAvailable: sellAvailable,
+                buyAvailable: depthTotal,
+                exposureRoom: exposureRoom,
+                roughMargin: roughMargin
+            });
+            break; // cheapest viable sell for this resource only
+        }
+    }
 
-            var creditCost    = sell.price * feasible;
-            var creditRevenue = topBuy.price * feasible;
-            var buyEnergy     = calcEffectiveEnergyCost(feasible, roomName, sell.roomName, terminal);
-            var sellEnergy    = calcEffectiveEnergyCost(feasible, roomName, topBuy.roomName, terminal);
-            var energyCostCr  = (buyEnergy + sellEnergy) * energyPrice;
-            var totalCost     = creditCost + energyCostCr;
-            var profit        = creditRevenue - totalCost;
-            var margin        = totalCost > 0 ? profit / totalCost : 0;
+    candidates.sort(function (a, b) { return b.roughMargin - a.roughMargin; });
+    if (candidates.length > CANDIDATE_LIMIT) candidates.length = CANDIDATE_LIMIT;
+    return candidates;
+}
 
-            if (margin >= MIN_PROFIT_MARGIN && profit > bestProfit) {
-                bestProfit = profit;
-                bestOpp = {
-                    resourceType: resource,
-                    sellOrder:    { id: sell.id, roomName: sell.roomName, price: sell.price, amount: sell.amount },
-                    buyOrder:     { id: topBuy.id, roomName: topBuy.roomName, price: topBuy.price, amount: topBuyAmt },
-                    amount: feasible, creditCost: creditCost, creditRevenue: creditRevenue,
-                    buyEnergy: buyEnergy, sellEnergy: sellEnergy, energyCostCr: energyCostCr,
-                    profit: profit, margin: margin
-                };
+/**
+ * Cheap per-terminal evaluation of a single candidate. Mirrors the inner-loop
+ * math from the old findBestOpportunity, but operates on one (sell, buy) pair
+ * instead of scanning all resources/sells. Uses calcEffectiveEnergyCost for
+ * PWR_OPERATE_TERMINAL awareness.
+ */
+function evaluateCandidate(cand, terminal, energyPrice, numIdleTerminals, activeResourceTypes) {
+    var resource = cand.resource;
+    if (SINGLE_TERMINAL_RESOURCES[resource] && activeResourceTypes[resource]) return null;
+    if (cand.sellAvailable <= 0 || cand.buyAvailable <= 0 || cand.exposureRoom <= 0) return null;
+
+    var roomName        = terminal.room.name;
+    var availableEnergy = terminal.store[RESOURCE_ENERGY] || 0;
+    var freeCapacity    = terminal.store.getFreeCapacity() || 0;
+    var credits         = Game.market.credits;
+    if (freeCapacity <= 0 || availableEnergy < 100 || credits < 1) return null;
+
+    var sell = cand.sell, topBuy = cand.buy;
+
+    // Single-terminal resources or small orders (<50) get the full amount
+    // to avoid spreading tiny trades across many terminals.
+    var perTerminalShare;
+    if (SINGLE_TERMINAL_RESOURCES[resource] || cand.sellAvailable < 50) {
+        perTerminalShare = cand.sellAvailable;
+    } else {
+        var remainingTerminals = Math.max(1, numIdleTerminals);
+        perTerminalShare = Math.ceil(cand.sellAvailable / remainingTerminals);
+        if (perTerminalShare < MIN_AMOUNT_PER_TERMINAL) {
+            if (cand.sellAvailable >= MIN_AMOUNT_PER_TERMINAL * remainingTerminals) {
+                perTerminalShare = MIN_AMOUNT_PER_TERMINAL;
             }
         }
     }
-    return bestOpp;
+
+    var maxAmt = Math.min(
+        perTerminalShare, cand.sellAvailable, cand.buyAvailable,
+        freeCapacity, Math.floor(credits / sell.price), cand.exposureRoom
+    );
+    if (maxAmt <= 0) return null;
+
+    // Energy cap uses the TOP buyer's room as a conservative upper bound. Deeper
+    // buyers in buyDepth may be closer (cheaper) so actual energy use will be
+    // <= this estimate. This preserves the same closed-form math as before -- no
+    // iterative solve -- and is safe.
+    var energyCap = capByEnergyBothLegs(maxAmt, roomName, sell.roomName, topBuy.roomName, availableEnergy, terminal);
+    if (energyCap <= 0) return null;
+
+    // Greedily allocate energyCap across up to BUY_DEPTH buyers. Each buyer must
+    // individually clear MIN_PROFIT_MARGIN accounting for its own per-unit energy
+    // cost. No artificial discount for deeper buyers; if a deeper buyer's
+    // per-unit economics fail the margin gate we stop and do not skip to the next.
+    var depth = cand.buyDepth || [{ order: topBuy, available: topBuyAmt }];
+    var remaining = energyCap;
+    var totalRevenue = 0;
+    var totalSellEnergy = 0;
+    var totalCreditCost = 0;
+    var allocation = [];
+    var primaryBuyer = null;
+
+    for (var bi2 = 0; bi2 < depth.length && remaining > 0; bi2++) {
+        var bd = depth[bi2];
+        var amtToBuyer = Math.min(remaining, bd.available);
+        if (amtToBuyer <= 0) break;
+
+        var energyToBuyer = calcEffectiveEnergyCost(amtToBuyer, roomName, bd.order.roomName, terminal);
+        var ccThisBuyer = sell.price * amtToBuyer;
+        var revThisBuyer = bd.order.price * amtToBuyer;
+        var energyCrThisBuyer = energyToBuyer * energyPrice;
+        var profitThisBuyer = revThisBuyer - ccThisBuyer - energyCrThisBuyer;
+        var denom = ccThisBuyer + energyCrThisBuyer;
+        var marginThisBuyer = denom > 0 ? profitThisBuyer / denom : 0;
+
+        if (marginThisBuyer < MIN_PROFIT_MARGIN || profitThisBuyer <= 0) break;
+
+        allocation.push({
+            order: { id: bd.order.id, roomName: bd.order.roomName, price: bd.order.price },
+            amount: amtToBuyer
+        });
+        if (!primaryBuyer) {
+            primaryBuyer = { id: bd.order.id, roomName: bd.order.roomName, price: bd.order.price, amount: cand.buyAvailable };
+        }
+        totalRevenue += revThisBuyer;
+        totalSellEnergy += energyToBuyer;
+        totalCreditCost += ccThisBuyer;
+        remaining -= amtToBuyer;
+    }
+
+    var feasible = energyCap - remaining;
+    if (feasible <= 0 || !primaryBuyer) return null;
+
+    var buyEnergy = calcEffectiveEnergyCost(feasible, roomName, sell.roomName, terminal);
+    var energyCostCr = (buyEnergy + totalSellEnergy) * energyPrice;
+    var totalCost = totalCreditCost + energyCostCr;
+    var profit = totalRevenue - totalCost;
+    var margin = totalCost > 0 ? profit / totalCost : 0;
+
+    if (margin < MIN_PROFIT_MARGIN || profit <= 0) return null;
+
+    return {
+        resourceType: resource,
+        sellOrder: { id: sell.id, roomName: sell.roomName, price: sell.price, amount: sell.amount },
+        buyOrder: primaryBuyer,
+        buyDepthAllocation: allocation,
+        amount: feasible, creditCost: totalCreditCost, creditRevenue: totalRevenue,
+        buyEnergy: buyEnergy, sellEnergy: totalSellEnergy, energyCostCr: energyCostCr,
+        profit: profit, margin: margin
+    };
+}
+
+function cachedOpportunityStillValid(cand, opp, ghosts, activeResourceTypes) {
+    if (!cand || !opp) return false;
+    if (ghosts && ghosts[cand.sell.id]) return false;
+    if (SINGLE_TERMINAL_RESOURCES[cand.resource] && activeResourceTypes[cand.resource]) return false;
+    if (cand.sellAvailable < opp.amount) return false;
+    if (cand.buyAvailable < opp.amount) return false;
+    if (cand.exposureRoom < opp.amount) return false;
+    return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -808,8 +986,13 @@ function findFloorSweepOpportunity(terminal, books, energyPrice, committedSellAm
  * calling Game.market.getAllOrders() per sell order.
  *
  * PWR_OPERATE_TERMINAL: uses calcEffectiveEnergyCost to account for powered terminals.
+ *
+ * SELF-FULFILL FIX: The comparison against external buy orders now uses per-unit
+ * net values (not totals) and considers buyers at ANY price -- not just above ourPrice.
+ * Previously `if (bo.price <= ourPrice) break` hid buyers between maxPrice and ourPrice,
+ * causing self-fulfills that lost value relative to available external sales.
  */
-function processOwnSellOrders(energyPrice, myRooms, committedBuyAmounts, buysByRes, oppBuyRequests, usedTerminals) {
+function processOwnSellOrders(books, energyPrice, myRooms, committedBuyAmounts, oppBuyRequests, usedTerminals) {
     var pending = Memory.marketArbitrage.selfArbPending;
     var ops = Memory.marketArbitrage.operations;
 
@@ -888,7 +1071,7 @@ function processOwnSellOrders(energyPrice, myRooms, committedBuyAmounts, buysByR
 
         var ourPrice = order.price;
 
-        // -- Self-fulfill path (own inventory, no maxPrice constraint) --
+        // -- Self-fulfill path (terminal.send -- no verification needed) --
         var oppList = oppBuyRequests[order.resourceType];
         if (oppList) {
             for (var oi = 0; oi < oppList.length; oi++) {
@@ -899,28 +1082,33 @@ function processOwnSellOrders(energyPrice, myRooms, committedBuyAmounts, buysByR
                 if (sfAmt <= 0) continue;
 
                 var sfE = calcEffectiveEnergyCost(sfAmt, roomName, opp.roomName, terminal);
-                var sfVal = opp.maxPrice * sfAmt - sfE * energyPrice;
+                // Net per unit: what the opp request saves us vs energy cost.
+                // Compared per-unit (not total) so quantity differences don't
+                // distort the comparison against the best external disposal option.
+                var sfNetPerUnit = opp.maxPrice - (sfAmt > 0 ? sfE * energyPrice / sfAmt : 0);
 
-                // Check external buy orders to see if any significantly beat self-fulfill
-                var buyOrders = buysByRes[order.resourceType];
-                var bestExtVal = 0;
+                // Check external buy orders at ANY price -- no break on ourPrice.
+                // The true disposal value of our inventory may be below our listing.
+                // We need the realistic best exit to decide if self-fulfilling beats selling.
+                var buyOrders = ensureSortedBuys(books, order.resourceType);
+                var bestExtNetPerUnit = 0;
                 if (buyOrders) {
                     for (var bi = 0; bi < buyOrders.length; bi++) {
                         var bo = buyOrders[bi];
-                        if (bo.price <= ourPrice) break;
                         var effAmt = (bo.remainingAmount || bo.amount || 0) - (committedBuyAmounts[bo.id] || 0);
                         if (effAmt < MIN_BUY_ORDER_AMOUNT) continue;
 
                         var extAmt = Math.min(sellableAmount, effAmt);
+                        if (extAmt <= 0) continue;
                         var extE = calcEffectiveEnergyCost(extAmt, roomName, bo.roomName, terminal);
-                        var extVal = bo.price * extAmt - extE * energyPrice;
-                        if (extVal > bestExtVal) bestExtVal = extVal;
+                        var extNetPerUnit = bo.price - (extE * energyPrice / extAmt);
+                        if (extNetPerUnit > bestExtNetPerUnit) bestExtNetPerUnit = extNetPerUnit;
                     }
                 }
 
-                // Self-fulfill advantage: only skip self-fulfill if external value
-                // exceeds our self-fulfill value by the advantage factor.
-                if (sfVal * SELF_FULFILL_ADVANTAGE > bestExtVal) {
+                // Compare per-unit: self-fulfill only when its avoided-acquisition
+                // value (maxPrice) beats the best external disposal net per unit.
+                if (sfNetPerUnit * SELF_FULFILL_ADVANTAGE > bestExtNetPerUnit) {
                     if (terminal.send(order.resourceType, sfAmt, opp.roomName) === OK) {
                         console.log('[Arbitrage] OWN-SELL self-fulfill ' + sfAmt + ' ' + order.resourceType +
                             ' -> ' + opp.roomName + ' (maxPrice ' + opp.maxPrice + ', listed @ ' + ourPrice + ')');
@@ -943,8 +1131,8 @@ function processOwnSellOrders(energyPrice, myRooms, committedBuyAmounts, buysByR
         }
         if (usedTerminals[roomName]) continue;
 
-        // -- Use shared buysByRes instead of getAllOrders per sell order --
-        var buyOrders = buysByRes[order.resourceType];
+        // -- Use shared books instead of getAllOrders per sell order --
+        var buyOrders = ensureSortedBuys(books, order.resourceType);
         if (!buyOrders || !buyOrders.length) continue;
 
         var best = null, bestProfit = 0;
@@ -1021,9 +1209,10 @@ function findAccountOpportunity(books, committedBuyAmounts, committedSellAmounts
         if (exposureRoom <= 0) continue;
 
         var topBuy = null, topBuyAmt = 0;
-        if (books.buysByRes[resource]) {
-            for (var bi = 0; bi < books.buysByRes[resource].length; bi++) {
-                var cb = books.buysByRes[resource][bi];
+        var acctBuys = ensureSortedBuys(books, resource);
+        if (acctBuys) {
+            for (var bi = 0; bi < acctBuys.length; bi++) {
+                var cb = acctBuys[bi];
                 var eff = (cb.remainingAmount || cb.amount || 0) - (committedBuyAmounts[cb.id] || 0);
                 if (eff > 0) { topBuy = cb; topBuyAmt = eff; break; }
             }
@@ -1169,7 +1358,7 @@ function processAccountOpSellAndScan(books, committedBuyAmounts, committedSellAm
 
             if (!buyOrder || buyRemaining <= 0) {
                 console.log('[Arbitrage] Account buy order ' + (op.buyOrderId || 'none') + ' gone. Searching replacement...');
-                var repls = (books.buysByRes[op.resourceType] || []).filter(function(o) {
+                var repls = (ensureSortedBuys(books, op.resourceType) || []).filter(function(o) {
                     return (o.remainingAmount || o.amount || 0) >= MIN_BUY_ORDER_AMOUNT &&
                            !(o.roomName && myRooms[o.roomName]);
                 });
@@ -1300,9 +1489,18 @@ function enterBuffered(op, ops, roomName) {
         '). Watching for up to ' + BUFFER_TIMEOUT + ' ticks.');
 }
 
-/** Confirm initial buy arrived via incomingTransactions. Ghost -> clean up. */
+/**
+ * Confirm initial buy arrived via incomingTransactions. Ghost -> clean up.
+ *
+ * GROUPED LOGGING: if op.groupKey is set, per-room "Buy verified"/"BUY GHOST"
+ * messages are suppressed in favor of a single aggregate "BUY CONFIRMED" line
+ * once every group member has either verified or failed. Members that ghost
+ * are recorded in grp.failedRooms and reported in that summary.
+ */
 function processPendingBuyVerify(terminal, op, ops, roomName) {
     var tx = findIncomingTx(roomName, op.resourceType, op.sellOrderId, op.buyVerifyTick);
+    var grp = op.groupKey && Memory.marketArbitrage.groups[op.groupKey];
+
     if (tx) {
         var actual = tx.amount;
         if (actual < op.amount) {
@@ -1312,7 +1510,15 @@ function processPendingBuyVerify(terminal, op, ops, roomName) {
         op.state = 'pending_sell';
         op.arrivedTick = Game.time;
         delete op.buyVerifyTick;
-        console.log('[Arbitrage] Buy verified: ' + actual + ' ' + op.resourceType + ' in ' + roomName);
+
+        if (grp) {
+            grp.buyConfirmedRooms[roomName] = actual;
+            if (Object.keys(grp.buyConfirmedRooms).length >= groupExpectedCount(grp)) {
+                logBuyConfirmed(grp);
+            }
+        } else {
+            console.log('[Arbitrage] Buy verified: ' + actual + ' ' + op.resourceType + ' in ' + roomName);
+        }
         return;
     }
     if (Game.time - op.buyVerifyTick >= VERIFY_TIMEOUT) {
@@ -1322,36 +1528,107 @@ function processPendingBuyVerify(terminal, op, ops, roomName) {
         if (op.sellOrderId) {
             Memory.marketArbitrage.ghostSellOrders[op.sellOrderId] = Game.time;
         }
+
+        if (grp) {
+            grp.failedRooms[roomName] = { stage: 'buy', reason: 'ghost', amount: op.amount, tick: Game.time };
+            grp.totalAmount -= op.amount;
+            console.log('[Arbitrage] GROUP ' + grp.resource + ' ' + grp.sellRoom + '->' + grp.buyRoom +
+                ': ' + roomName + ' FAILED at buy stage (ghost), removed from group');
+
+            var expected = groupExpectedCount(grp);
+            if (expected <= 0 || Object.keys(grp.buyConfirmedRooms).length >= expected) {
+                logBuyConfirmed(grp);
+            }
+            if (expected <= 0) delete Memory.marketArbitrage.groups[op.groupKey];
+        }
         delete ops[roomName];
     }
 }
 
-/** Confirm sell completed via outgoingTransactions. Ghost -> back to pending_sell. */
+/**
+ * Confirm sell completed via outgoingTransactions. Ghost -> back to pending_sell.
+ *
+ * GROUPED LOGGING: if op.groupKey is set, per-room "VERIFIED sale"/"Arbitrage
+ * complete" messages are suppressed in favor of a single aggregate "SELL
+ * CONFIRMED" line once every group member has either verified or been marked
+ * failed. Repeated sell-verify ghosts (>= SELL_GHOST_FAIL_THRESHOLD) mark a
+ * member as failed so the group can still close out.
+ */
 function processPendingVerify(terminal, op, ops, roomName) {
     var tx = findOutgoingTx(roomName, op.resourceType, op.verifyOrderId, op.verifyTick);
+    var grp = op.groupKey && Memory.marketArbitrage.groups[op.groupKey];
+
     if (tx) {
         var actual = tx.amount;
-        console.log('[Arbitrage] VERIFIED sale of ' + actual + ' ' + op.resourceType +
-            ' from ' + roomName + ' @ ' + (tx.order ? tx.order.price : '?') +
-            ' -> ' + (tx.to || '?'));
+        if (!grp) {
+            console.log('[Arbitrage] VERIFIED sale of ' + actual + ' ' + op.resourceType +
+                ' from ' + roomName + ' @ ' + (tx.order ? tx.order.price : '?') +
+                ' -> ' + (tx.to || '?'));
+        }
         op.amount -= actual;
+        // Track per-buyer consumption in the depth allocation. The current depth
+        // entry is op.buyDepth[op.buyDepthIndex] -- the buyer we just dealt with.
+        // If it is fully consumed, advance the pointer so processPendingSell picks
+        // up the next buyer on the next tick.
+        if (op.buyDepth && op.buyDepthIndex !== undefined && op.buyDepth[op.buyDepthIndex]) {
+            op.buyDepth[op.buyDepthIndex].amount -= actual;
+            if (op.buyDepth[op.buyDepthIndex].amount <= 0) {
+                op.buyDepthIndex++;
+            }
+        }
         if (op.amount <= 0) {
-            console.log('[Arbitrage] Arbitrage complete in ' + roomName +
-                '. Est. profit: ' + op.profit.toFixed(2) + ' (' + (op.margin * 100).toFixed(1) + '%)');
+            if (grp) {
+                grp.sellConfirmedRooms[roomName] = { amount: actual, profit: op.profit };
+                if (Object.keys(grp.sellConfirmedRooms).length >= groupExpectedCount(grp)) {
+                    logSellConfirmed(grp);
+                    delete Memory.marketArbitrage.groups[op.groupKey];
+                }
+            } else {
+                console.log('[Arbitrage] Arbitrage complete in ' + roomName +
+                    '. Est. profit: ' + op.profit.toFixed(2) + ' (' + (op.margin * 100).toFixed(1) + '%)');
+            }
             delete ops[roomName];
         } else {
             op.state = 'pending_sell';
             delete op.verifyTick; delete op.verifyOrderId; delete op.verifyAmount;
-            console.log('[Arbitrage] Partial verify, ' + op.amount + ' remaining in ' + roomName);
+            if (!grp) console.log('[Arbitrage] Partial verify, ' + op.amount + ' remaining in ' + roomName);
         }
         return;
     }
     if (Game.time - op.verifyTick >= VERIFY_TIMEOUT) {
-        console.log('[Arbitrage] SELL GHOST in ' + roomName + ': ' + op.verifyAmount + ' ' +
-            op.resourceType + ' -- no outgoing tx after ' + (Game.time - op.verifyTick) + ' ticks.');
+        if (!grp) {
+            console.log('[Arbitrage] SELL GHOST in ' + roomName + ': ' + op.verifyAmount + ' ' +
+                op.resourceType + ' -- no outgoing tx after ' + (Game.time - op.verifyTick) + ' ticks.');
+        }
         op.state = 'pending_sell';
         op.buyOrderId = null;
+        // Advance depth pointer past the ghosted entry so the next processPendingSell
+        // call tries a different buyer in the depth, not the same one.
+        if (op.buyDepth && op.buyDepthIndex !== undefined && op.buyDepth[op.buyDepthIndex]) {
+            op.buyDepth[op.buyDepthIndex].amount = 0;
+            op.buyDepthIndex++;
+        }
         delete op.verifyTick; delete op.verifyOrderId; delete op.verifyAmount;
+
+        if (grp) {
+            grp.sellGhostCounts[roomName] = (grp.sellGhostCounts[roomName] || 0) + 1;
+            if (grp.sellGhostCounts[roomName] >= SELL_GHOST_FAIL_THRESHOLD && !grp.failedRooms[roomName]) {
+                grp.failedRooms[roomName] = { stage: 'sell', reason: 'repeated-ghost', amount: op.amount, tick: Game.time };
+                grp.totalAmount -= op.amount;
+                console.log('[Arbitrage] GROUP ' + grp.resource + ' ' + grp.sellRoom + '->' + grp.buyRoom +
+                    ': ' + roomName + ' FAILED at sell stage (' + grp.sellGhostCounts[roomName] +
+                    ' ghosts), removed from group, ' + op.amount + ' left in terminal');
+
+                // Hand the leftover resources to the buffer so they aren't stranded.
+                enterBuffered(op, ops, roomName);
+
+                var expected = groupExpectedCount(grp);
+                if (expected <= 0 || Object.keys(grp.sellConfirmedRooms).length >= expected) {
+                    logSellConfirmed(grp);
+                    delete Memory.marketArbitrage.groups[op.groupKey];
+                }
+            }
+        }
     }
 }
 
@@ -1441,7 +1718,7 @@ function processBufferedEntries(buffered, books, oppBuyRequests, myRooms, energy
         if (handled) continue;
 
         // -- Sell to buy order --
-        var buys = books.buysByRes[buf.resourceType];
+        var buys = ensureSortedBuys(books, buf.resourceType);
         if (!buys || !buys.length) continue;
         var bestBuy = null, bestBuyEff = 0;
         for (var bk = 0; bk < buys.length; bk++) {
@@ -1478,10 +1755,15 @@ function processBufferedEntries(buffered, books, oppBuyRequests, myRooms, energy
  * Process pending_sell: self-fulfill check, then external sell via deal() -> pending_verify.
  *
  * PWR_OPERATE_TERMINAL: uses calcEffectiveEnergyCost for all energy calculations.
+ *
+ * GROUPED LOGGING: if op.groupKey is set, the per-room "deal() OK" message is
+ * suppressed in favor of a single aggregate "SELL INITIATED" line once every
+ * group member has placed its sell deal.
  */
-function processPendingSell(terminal, op, ops, roomName, myRooms, energyPrice, oppBuyRequests, buysByRes) {
+function processPendingSell(terminal, op, ops, roomName, myRooms, energyPrice, oppBuyRequests, books) {
     if (terminal.cooldown > 0) return;
     var availEnergy = terminal.store[RESOURCE_ENERGY] || 0;
+    var grp = op.groupKey && Memory.marketArbitrage.groups[op.groupKey];
 
     // Verify resources present
     var store = terminal.store[op.resourceType] || 0;
@@ -1524,20 +1806,110 @@ function processPendingSell(terminal, op, ops, roomName, myRooms, energyPrice, o
                     if (or.remaining <= 0) { delete Memory.opportunisticBuy.requests[opp.key]; }
                 }
                 op.amount -= sfAmt;
-                if (op.amount <= 0) { delete ops[roomName]; }
+                if (op.amount <= 0) {
+                    if (grp) {
+                        // Treat self-fulfill as a successful sell for this member, with
+                        // zero realized "profit" tracked here (it left via send(), not
+                        // a deal(), so there's no transaction price to report against
+                        // the group's deal-based profit accounting).
+                        grp.sellConfirmedRooms[roomName] = { amount: sfAmt, profit: 0 };
+                        if (Object.keys(grp.sellConfirmedRooms).length >= groupExpectedCount(grp)) {
+                            logSellConfirmed(grp);
+                            delete Memory.marketArbitrage.groups[op.groupKey];
+                        }
+                    }
+                    delete ops[roomName];
+                }
                 return;
             }
         }
     }
 
-    // -- External buy order --
+    // -- External buy order: walk op.buyDepth (depth-aware staged selling) --
+    // Each tick we sell to ONE buyer in the depth (terminal cooldown). On the
+    // next tick, after verification, we move to the next buyer in the list.
+    // If a buyer is gone or empty, we skip it. If the entire depth is
+    // exhausted, we fall back to a live replacement search.
+    var depth = op.buyDepth;
+    if (op.buyDepthIndex === undefined) op.buyDepthIndex = 0;
+    var depthExhausted = false;
+
+    if (depth && depth.length && op.buyDepthIndex < depth.length) {
+        // Iterative walk: skip empty/gone entries until we find one to sell to,
+        // or exhaust the depth. Capped at BUY_DEPTH iterations to bound CPU.
+        for (var depthTries = 0; depthTries < BUY_DEPTH; depthTries++) {
+            var di = op.buyDepthIndex;
+            while (di < depth.length && depth[di].amount <= 0) di++;
+            if (di >= depth.length) { depthExhausted = true; break; }
+
+            var depthEntry = depth[di];
+            var liveBuy = Game.market.getOrderById(depthEntry.order.id);
+            var liveBuyAmt = liveBuy ? (liveBuy.remainingAmount || liveBuy.amount || 0) : 0;
+            if (!liveBuy || liveBuyAmt <= 0) {
+                // Buyer gone -- mark consumed and advance
+                depth[di].amount = 0;
+                op.buyDepthIndex = di + 1;
+                continue;
+            }
+
+            var targetAmt = Math.min(op.amount, depthEntry.amount, liveBuyAmt);
+            var capped = capByEnergy(targetAmt, roomName, depthEntry.order.roomName, availEnergy, terminal);
+            if (capped <= 0) {
+                // Insufficient energy for this buyer's distance -- stop trying
+                console.log('[Arbitrage] Insufficient energy for depth buyer ' + depthEntry.order.id + ' in ' + roomName);
+                return;
+            }
+
+            if (Game.market.deal(depthEntry.order.id, capped, roomName) === OK) {
+                // Do NOT decrement op.amount or depth[di].amount here -- processPendingVerify
+                // does that on the next scan when the outgoing tx is confirmed. This
+                // matches the original single-buyer behavior where the verify step owns
+                // the amount bookkeeping (to handle ghost deals cleanly).
+                op.buyDepthIndex = di;
+                op.state = 'pending_verify';
+                op.verifyTick = Game.time;
+                op.verifyOrderId = depthEntry.order.id;
+                op.verifyAmount = capped;
+
+                if (grp) {
+                    grp.sellInitRooms[roomName] = capped;
+                    grp.sellRoomsActual[depthEntry.order.roomName] = true;
+                    if (Object.keys(grp.sellInitRooms).length >= groupExpectedCount(grp)) {
+                        logSellInitiated(grp);
+                    }
+                } else {
+                    console.log('[Arbitrage] deal() OK ' + capped + ' ' + op.resourceType +
+                        ' -> ' + depthEntry.order.roomName + ' @ ' + depthEntry.order.price +
+                        ' (depth ' + (di + 1) + '/' + depth.length + ') | Verifying...');
+                }
+                return;
+            } else {
+                // Deal failed with buyer still present -- likely energy/credits glitch.
+                // Don't keep retrying this buyer; advance.
+                console.log('[Arbitrage] deal() failed for depth buyer ' + depthEntry.order.id + ' in ' + roomName);
+                depth[di].amount = 0;
+                op.buyDepthIndex = di + 1;
+                continue;
+            }
+        }
+        if (!depthExhausted && op.buyDepthIndex >= depth.length) depthExhausted = true;
+    } else {
+        depthExhausted = true;
+    }
+
+    // -- Replacement search (depth exhausted or no depth on this op) --
     var buyOrder     = op.buyOrderId ? Game.market.getOrderById(op.buyOrderId) : null;
     var buyRemaining = buyOrder ? (buyOrder.remainingAmount || buyOrder.amount || 0) : 0;
 
     if (!buyOrder || buyRemaining <= 0) {
+        if (!depthExhausted) {
+            // Depth still has entries but we couldn't sell this tick (e.g. cooldown).
+            // Don't go searching for replacements yet.
+            return;
+        }
         console.log('[Arbitrage] Buy order ' + (op.buyOrderId || 'none') + ' gone. Searching replacement...');
 
-        var repls = buysByRes[op.resourceType] || [];
+        var repls = ensureSortedBuys(books, op.resourceType) || [];
 
         var found = null;
         for (var ri = 0; ri < repls.length; ri++) {
@@ -1565,12 +1937,32 @@ function processPendingSell(terminal, op, ops, roomName, myRooms, energyPrice, o
                             if (fr.remaining <= 0) delete Memory.opportunisticBuy.requests[fb.key];
                         }
                         op.amount -= fbAmt;
-                        if (op.amount <= 0) { delete ops[roomName]; }
+                        if (op.amount <= 0) {
+                            if (grp) {
+                                grp.sellConfirmedRooms[roomName] = { amount: fbAmt, profit: 0 };
+                                if (Object.keys(grp.sellConfirmedRooms).length >= groupExpectedCount(grp)) {
+                                    logSellConfirmed(grp);
+                                    delete Memory.marketArbitrage.groups[op.groupKey];
+                                }
+                            }
+                            delete ops[roomName];
+                        }
                         return;
                     }
                 }
             }
             enterBuffered(op, ops, roomName);
+            if (grp) {
+                // Member is leaving the group's deal-based flow for the buffer.
+                // Mark it failed-but-buffered so the group can still close.
+                grp.failedRooms[roomName] = { stage: 'sell', reason: 'buffered', amount: op.amount, tick: Game.time };
+                grp.totalAmount -= op.amount;
+                var expected = groupExpectedCount(grp);
+                if (expected <= 0 || Object.keys(grp.sellConfirmedRooms).length >= expected) {
+                    logSellConfirmed(grp);
+                    delete Memory.marketArbitrage.groups[op.groupKey];
+                }
+            }
             return;
         }
     }
@@ -1583,8 +1975,17 @@ function processPendingSell(terminal, op, ops, roomName, myRooms, energyPrice, o
     if (Game.market.deal(buyOrder.id, capped, roomName) === OK) {
         op.state = 'pending_verify';
         op.verifyTick = Game.time; op.verifyOrderId = buyOrder.id; op.verifyAmount = capped;
-        console.log('[Arbitrage] deal() OK ' + capped + ' ' + op.resourceType +
-            ' -> ' + buyOrder.roomName + ' @ ' + buyOrder.price + ' | Verifying...');
+
+        if (grp) {
+            grp.sellInitRooms[roomName] = capped;
+            grp.sellRoomsActual[buyOrder.roomName] = true;
+            if (Object.keys(grp.sellInitRooms).length >= groupExpectedCount(grp)) {
+                logSellInitiated(grp);
+            }
+        } else {
+            console.log('[Arbitrage] deal() OK ' + capped + ' ' + op.resourceType +
+                ' -> ' + buyOrder.roomName + ' @ ' + buyOrder.price + ' | Verifying...');
+        }
     } else {
         console.log('[Arbitrage] Sell failed in ' + roomName);
         if (!buyOrder || (Game.market.getOrderById(buyOrder.id) === null)) op.buyOrderId = null;
@@ -1623,9 +2024,13 @@ function adaptScanInterval() {
 function run() {
     if (!ENABLED) return;
 
-    if (!Memory.marketArbitrage) Memory.marketArbitrage = { operations: {}, buffered: [], selfArbPending: {}, accountOp: null };
+    // Clear per-scan caches at the start of every tick.
+    _powerMultiplierCache = {};
+
+    if (!Memory.marketArbitrage) Memory.marketArbitrage = { operations: {}, buffered: [], selfArbPending: {}, accountOp: null, groups: {} };
     if (!Memory.marketArbitrage.selfArbPending) Memory.marketArbitrage.selfArbPending = {};
     if (Memory.marketArbitrage.accountOp === undefined) Memory.marketArbitrage.accountOp = null;
+    if (!Memory.marketArbitrage.groups) Memory.marketArbitrage.groups = {};
     var ops = Memory.marketArbitrage.operations;
 
     adaptScanInterval();
@@ -1640,7 +2045,7 @@ function run() {
             var psTermRoom = Game.rooms[psRoom];
             var psTerminal = psTermRoom && psTermRoom.terminal;
             if (!psTerminal || psTerminal.cooldown > 0) continue;
-            processPendingSell(psTerminal, psOp, ops, psRoom, _cachedMyRooms, _cachedEnergyPrice, _cachedOppBuyRequests, _cachedBuysByRes);
+            processPendingSell(psTerminal, psOp, ops, psRoom, _cachedMyRooms, _cachedEnergyPrice, _cachedOppBuyRequests, _cachedBooks);
         }
         return;
     }
@@ -1664,10 +2069,10 @@ function run() {
     var books = buildOrderBooks(myRooms, oppBuyRequests);
 
     // -- Update module-level caches for inter-scan active operation processing --
-    _cachedBuysByRes = books.buysByRes;
     _cachedOppBuyRequests = oppBuyRequests;
     _cachedEnergyPrice = energyPrice;
     _cachedMyRooms = myRooms;
+    _cachedBooks = books;
 
     // -- Build committed buy amounts ONCE (shared by self-arb and all passes) --
     var buffered = Memory.marketArbitrage.buffered || [];
@@ -1677,8 +2082,21 @@ function run() {
         if (!aOp) continue;
         if (aOp.state === 'pending_verify' && aOp.verifyOrderId) {
             committedBuyAmounts[aOp.verifyOrderId] = (committedBuyAmounts[aOp.verifyOrderId] || 0) + aOp.amount;
-        } else if (aOp.buyOrderId) {
+        } else if (aOp.buyOrderId && !aOp.buyDepth) {
+            // Ops without a buyDepth (legacy, floor sweeps, single-buyer) use the
+            // primary buyOrderId. Ops WITH buyDepth are handled by the loop below
+            // which covers the primary buyer and every deeper buyer.
             committedBuyAmounts[aOp.buyOrderId] = (committedBuyAmounts[aOp.buyOrderId] || 0) + aOp.amount;
+        }
+        // Track per-buyer committed amounts across the buyDepth allocation so
+        // buildArbCandidates excludes already-claimed volume from deeper buyers.
+        if (aOp.buyDepth) {
+            for (var dbi = 0; dbi < aOp.buyDepth.length; dbi++) {
+                var dba = aOp.buyDepth[dbi];
+                if (dba && dba.order && dba.order.id) {
+                    committedBuyAmounts[dba.order.id] = (committedBuyAmounts[dba.order.id] || 0) + (dba.amount || 0);
+                }
+            }
         }
     }
     for (var bv = 0; bv < buffered.length; bv++) {
@@ -1716,7 +2134,7 @@ function run() {
             }
             if (op.state === 'pending_buy_verify')  processPendingBuyVerify(terminal, op, ops, roomName);
             else if (op.state === 'pending_verify') processPendingVerify(terminal, op, ops, roomName);
-            else if (op.state === 'pending_sell')   processPendingSell(terminal, op, ops, roomName, myRooms, energyPrice, oppBuyRequests, books.buysByRes);
+            else if (op.state === 'pending_sell')   processPendingSell(terminal, op, ops, roomName, myRooms, energyPrice, oppBuyRequests, books);
         } else if (terminal.cooldown <= 0) {
             idleTerminals.push(terminal);
         }
@@ -1724,6 +2142,9 @@ function run() {
 
     // -- PASS 1a: verify account-level operation --
     processAccountOpVerify();
+
+    // -- Stale group watchdog --
+    checkStaleGroups();
 
     // -- Buffer timeouts --
     buffered = Memory.marketArbitrage.buffered;
@@ -1750,7 +2171,7 @@ function run() {
 
     // -- PASS 1.5: Self-arbitrage on own sell orders --
     var usedTerminals = {};
-    processOwnSellOrders(energyPrice, myRooms, committedBuyAmounts, books.buysByRes, oppBuyRequests, usedTerminals);
+    processOwnSellOrders(books, energyPrice, myRooms, committedBuyAmounts, oppBuyRequests, usedTerminals);
 
     // -- PASS 2: unified scan --
 
@@ -1809,31 +2230,59 @@ function run() {
         }
     }
 
-    var scoredIdle = [];
+    var candidates = buildArbCandidates(
+        books, oppBuyRequests, committedBuyAmounts, committedSellAmounts,
+        resourceExposure, bufferedResources, ownSellResources, activeResourceTypes
+    );
+
+    // Rank terminals once by their best available candidate so high-value
+    // terminals get first pick, same as the old profit-sorted scoredIdle.
+    var rankedTerminals = [];
     for (var si = 0; si < idleTerminals.length; si++) {
         var sTerm = idleTerminals[si];
-        var sOpp = findBestOpportunity(
-            sTerm, books, energyPrice, committedBuyAmounts, committedSellAmounts,
-            idleTerminals.length, resourceExposure, bufferedResources, ownSellResources, activeResourceTypes, oppBuyRequests
-        );
-        scoredIdle.push({ terminal: sTerm, opp: sOpp, profit: sOpp ? sOpp.profit : -1 });
+        var sBest = 0;
+        var sBestOpp = null;
+        var sBestCand = null;
+        for (var sc = 0; sc < candidates.length; sc++) {
+            var sCand = candidates[sc];
+            var sOpp = evaluateCandidate(sCand, sTerm, energyPrice, idleTerminals.length, activeResourceTypes);
+            if (sOpp && sOpp.profit > sBest) {
+                sBest = sOpp.profit;
+                sBestOpp = sOpp;
+                sBestCand = sCand;
+            }
+        }
+        rankedTerminals.push({ terminal: sTerm, profit: sBest, bestOpp: sBestOpp, bestCand: sBestCand });
     }
-    scoredIdle.sort(function (a, b) { return b.profit - a.profit; });
+    rankedTerminals.sort(function (a, b) { return b.profit - a.profit; });
 
-    var remainingIdle = scoredIdle.length;
-    var needsReeval = false;
-    for (var i = 0; i < scoredIdle.length; i++) {
-        var scored = scoredIdle[i];
-        var term   = scored.terminal;
-        var tRoom  = term.room.name;
+    // Accumulates split-buy legs by (sellOrder.id|buyOrder.id) so we can emit
+    // a single "BUY INITIATED" summary line per group after this loop, and
+    // seed Memory.marketArbitrage.groups for downstream aggregate logging.
+    var buyLogGroups = {};
 
-        var opp = needsReeval
-            ? findBestOpportunity(term, books, energyPrice, committedBuyAmounts, committedSellAmounts,
-                  remainingIdle, resourceExposure, bufferedResources, ownSellResources, activeResourceTypes, oppBuyRequests)
-            : scored.opp;
-        needsReeval = false;
+    var remainingIdle = rankedTerminals.length;
+    for (var i = 0; i < rankedTerminals.length; i++) {
+        var term  = rankedTerminals[i].terminal;
+        var tRoom = term.room.name;
 
-        if (!opp) {
+        var bestOpp = rankedTerminals[i].bestOpp;
+        var bestCand = rankedTerminals[i].bestCand;
+        var bestProfit = rankedTerminals[i].profit;
+
+        if (!cachedOpportunityStillValid(bestCand, bestOpp, ghosts, activeResourceTypes)) {
+            bestOpp = null; bestCand = null; bestProfit = 0;
+            for (var ci = 0; ci < candidates.length; ci++) {
+                var cand = candidates[ci];
+                if (ghosts && ghosts[cand.sell.id]) continue;
+                var opp = evaluateCandidate(cand, term, energyPrice, remainingIdle, activeResourceTypes);
+                if (opp && opp.profit > bestProfit) {
+                    bestProfit = opp.profit; bestOpp = opp; bestCand = cand;
+                }
+            }
+        }
+
+        if (!bestOpp) {
             // No profitable arb -- try a floor sweep (buy cheap, buffer, sell later).
             // findFloorSweepOpportunity verifies a realistic exit exists accounting
             // for full cost basis (purchase price + buy-leg energy at ~28 cr/energy).
@@ -1864,10 +2313,10 @@ function run() {
                         buyVerifyTick: Game.time,
                         tick:          Game.time,
                         isFloorSweep:  true
+                        // Note: floor sweeps have no groupKey -- never split, never grouped.
                     };
 
                     activeResourceTypes[sweepOpp.resourceType] = true;
-                    needsReeval = true;
 
                     console.log('[Arbitrage] FLOOR SWEEP ' + sweepOpp.amount + ' ' + sweepOpp.resourceType +
                         ' from ' + sweepOpp.sellOrder.roomName + ' @ ' + sweepOpp.sellOrder.price +
@@ -1881,45 +2330,98 @@ function run() {
             remainingIdle--; continue;
         }
 
-        if (ghosts && ghosts[opp.sellOrder.id]) { remainingIdle--; continue; }
+        if (Game.market.deal(bestOpp.sellOrder.id, bestOpp.amount, tRoom) === OK) {
+            bestCand.sellAvailable -= bestOpp.amount;
+            bestCand.buyAvailable  -= bestOpp.amount;
+            bestCand.exposureRoom  -= bestOpp.amount;
 
-        if (Game.market.deal(opp.sellOrder.id, opp.amount, tRoom) === OK) {
-            committedSellAmounts[opp.sellOrder.id] = (committedSellAmounts[opp.sellOrder.id] || 0) + opp.amount;
-            if (opp.buyOrder) committedBuyAmounts[opp.buyOrder.id] = (committedBuyAmounts[opp.buyOrder.id] || 0) + opp.amount;
-            resourceExposure[opp.resourceType] = (resourceExposure[opp.resourceType] || 0) + opp.amount;
+            committedSellAmounts[bestOpp.sellOrder.id] = (committedSellAmounts[bestOpp.sellOrder.id] || 0) + bestOpp.amount;
+            // Track every buyer in the depth allocation so processPendingSell walks
+            // through them and so we don't double-count committed volume in later
+            // evaluations of the same candidates.
+            if (bestOpp.buyDepthAllocation) {
+                for (var cbi = 0; cbi < bestOpp.buyDepthAllocation.length; cbi++) {
+                    var cbd = bestOpp.buyDepthAllocation[cbi];
+                    committedBuyAmounts[cbd.order.id] = (committedBuyAmounts[cbd.order.id] || 0) + cbd.amount;
+                }
+            } else if (bestOpp.buyOrder) {
+                committedBuyAmounts[bestOpp.buyOrder.id] = (committedBuyAmounts[bestOpp.buyOrder.id] || 0) + bestOpp.amount;
+            }
+            resourceExposure[bestOpp.resourceType] = (resourceExposure[bestOpp.resourceType] || 0) + bestOpp.amount;
+
+            var groupKey = bestOpp.sellOrder.id + '|' + (bestOpp.buyOrder ? bestOpp.buyOrder.id : '');
 
             ops[tRoom] = {
-                state: 'pending_buy_verify', resourceType: opp.resourceType,
-                amount: opp.amount, sellOrderId: opp.sellOrder.id, sellOrderRoom: opp.sellOrder.roomName,
-                sellPrice: opp.sellOrder.price,
+                state: 'pending_buy_verify', resourceType: bestOpp.resourceType,
+                amount: bestOpp.amount, sellOrderId: bestOpp.sellOrder.id, sellOrderRoom: bestOpp.sellOrder.roomName,
+                sellPrice: bestOpp.sellOrder.price,
                 // Full cost basis: purchase price + buy-leg energy per unit
-                costBasis: opp.sellOrder.price + (opp.buyEnergy * energyPrice / opp.amount),
-                buyOrderId: opp.buyOrder ? opp.buyOrder.id : null,
-                buyOrderRoom: opp.buyOrder ? opp.buyOrder.roomName : null,
-                buyPrice: opp.buyOrder ? opp.buyOrder.price : 0,
-                profit: opp.profit, margin: opp.margin,
-                buyEnergy: opp.buyEnergy, sellEnergy: opp.sellEnergy,
-                buyVerifyTick: Game.time, tick: Game.time
+                costBasis: bestOpp.sellOrder.price + (bestOpp.buyEnergy * energyPrice / bestOpp.amount),
+                buyOrderId: bestOpp.buyOrder ? bestOpp.buyOrder.id : null,
+                buyOrderRoom: bestOpp.buyOrder ? bestOpp.buyOrder.roomName : null,
+                buyPrice: bestOpp.buyOrder ? bestOpp.buyOrder.price : 0,
+                buyDepth: bestOpp.buyDepthAllocation || null,
+                buyDepthIndex: 0, // pointer into buyDepth for staged sell execution
+                soldToPrimary: 0, // how much already sold to the top buyer (live tracking)
+                profit: bestOpp.profit, margin: bestOpp.margin,
+                buyEnergy: bestOpp.buyEnergy, sellEnergy: bestOpp.sellEnergy,
+                buyVerifyTick: Game.time, tick: Game.time,
+                groupKey: groupKey
             };
 
-            activeResourceTypes[opp.resourceType] = true;
-            needsReeval = true;
+            activeResourceTypes[bestOpp.resourceType] = true;
 
-            var totalCommitted = committedSellAmounts[opp.sellOrder.id];
-            var splitTag = totalCommitted > opp.amount
-                ? ' | Split: ' + opp.amount + '/' + opp.sellOrder.amount + ' (committed: ' + totalCommitted + ')'
-                : '';
-
-            console.log('[Arbitrage] BUY ' + opp.amount + ' ' + opp.resourceType +
-                ' from ' + opp.sellOrder.roomName + ' @ ' + opp.sellOrder.price +
-                ' -> sell to ' + opp.buyOrder.roomName + ' @ ' + opp.buyOrder.price +
-                ' | Profit: ' + opp.profit.toFixed(2) + ' (' + (opp.margin * 100).toFixed(1) + '%)' +
-                ' | Energy: ' + opp.buyEnergy + '+' + opp.sellEnergy +
-                ' | Room: ' + tRoom + splitTag + ' | Verifying buy...');
+            // Accumulate for the post-loop BUY INITIATED summary + group seed
+            if (!buyLogGroups[groupKey]) {
+                buyLogGroups[groupKey] = {
+                    resource: bestOpp.resourceType,
+                    sellRoom: bestOpp.sellOrder.roomName,
+                    buyRoom: bestOpp.buyOrder ? bestOpp.buyOrder.roomName : '?',
+                    margin: bestOpp.margin,
+                    rooms: [],
+                    totalAmount: 0,
+                    totalProfit: 0
+                };
+            }
+            var lg = buyLogGroups[groupKey];
+            lg.rooms.push(tRoom);
+            lg.totalAmount += bestOpp.amount;
+            lg.totalProfit += bestOpp.profit;
+            // Keep the worst (lowest) margin seen for the group, since margin
+            // shrinks as committedSellAmounts grows across split legs.
+            if (bestOpp.margin < lg.margin) lg.margin = bestOpp.margin;
         } else {
-            console.log('[Arbitrage] Buy deal failed in ' + tRoom + ' for ' + opp.resourceType);
+            console.log('[Arbitrage] Buy deal failed in ' + tRoom + ' for ' + bestOpp.resourceType);
         }
         remainingIdle--;
+    }
+
+    // -- Emit BUY INITIATED summaries and seed group tracking state --
+    for (var gk in buyLogGroups) {
+        var g = buyLogGroups[gk];
+
+        Memory.marketArbitrage.groups[gk] = {
+            resource: g.resource,
+            sellRoom: g.sellRoom,
+            buyRoom: g.buyRoom,
+            margin: g.margin,
+            members: g.rooms,
+            totalAmount: g.totalAmount,
+            totalProfit: g.totalProfit,
+            createdTick: Game.time,
+
+            buyConfirmedRooms: {},
+            sellInitRooms: {},
+            sellConfirmedRooms: {},
+            failedRooms: {},
+            sellGhostCounts: {},
+            sellRoomsActual: {}
+        };
+
+        console.log('[Arbitrage] BUY INITIATED ' + g.resource + ' ' + g.sellRoom + ' -> My Rooms: (' + g.rooms.join(', ') + ') -> ' +
+            g.buyRoom + ' | Margin: ' + (g.margin * 100).toFixed(1) + '%' +
+            ' | Volume: ' + g.totalAmount +
+            ' | Est. Profit: ' + g.totalProfit.toFixed(2));
     }
 }
 
@@ -1933,6 +2435,7 @@ function status() {
     var buffered = Memory.marketArbitrage.buffered || [];
     var selfPending = Memory.marketArbitrage.selfArbPending || {};
     var accountOp = Memory.marketArbitrage.accountOp;
+    var groups = Memory.marketArbitrage.groups || {};
     var out = '[Arbitrage] Status: ' + (ENABLED ? 'ENABLED' : 'DISABLED') + '\nActive operations:\n';
     var count = 0;
 
@@ -1941,6 +2444,11 @@ function status() {
         var age = Game.time - op.tick;
         var st = op.state;
         if (op.isFloorSweep) st += ' [SWEEP]';
+        if (op.groupKey) st += ' [GRP]';
+        if (op.buyDepth && op.buyDepth.length) {
+            var bdi = op.buyDepthIndex || 0;
+            st += ' [DEPTH ' + (bdi + 1) + '/' + op.buyDepth.length + ']';
+        }
         if (op.state === 'pending_verify') st += ' (sell ' + op.verifyAmount + ', ' + (Game.time - op.verifyTick) + 't ago)';
         else if (op.state === 'pending_buy_verify') st += ' (buy ' + op.amount + ', ' + (Game.time - op.buyVerifyTick) + 't ago)';
         var basisStr = (typeof op.costBasis === 'number') ? ' basis@' + op.costBasis.toFixed(3) : '';
@@ -1986,14 +2494,38 @@ function status() {
             ' | ' + spAge + 't ago\n';
         selfCount++; count++;
     }
+    var groupKeys = Object.keys(groups);
+    if (groupKeys.length > 0) {
+        out += '\nActive groups:\n';
+        for (var gi = 0; gi < groupKeys.length; gi++) {
+            var grp = groups[groupKeys[gi]];
+            var gAge = Game.time - grp.createdTick;
+            var buyDone = Object.keys(grp.buyConfirmedRooms).length;
+            var sellInitDone = Object.keys(grp.sellInitRooms).length;
+            var sellDone = Object.keys(grp.sellConfirmedRooms).length;
+            var failedCount = Object.keys(grp.failedRooms).length;
+            var expected = groupExpectedCount(grp);
+            out += '  ' + grp.resource + ' ' + grp.sellRoom + '->' + grp.buyRoom +
+                ' | members: ' + grp.members.length +
+                ' | buyConfirmed: ' + buyDone + '/' + expected +
+                ' | sellInit: ' + sellInitDone + '/' + expected +
+                ' | sellConfirmed: ' + sellDone + '/' + expected +
+                ' | failed: ' + failedCount +
+                ' | age: ' + gAge + 't\n';
+        }
+    }
     if (count === 0) out += '  (none)\n';
     out += '\nConfig: enabled=' + ENABLED + ', margin=' + (MIN_PROFIT_MARGIN * 100) + '%, minBuy=' + MIN_BUY_ORDER_AMOUNT +
+        ', minBuyPrice=' + MIN_BUY_ORDER_PRICE +
+        ', minArbBuyVol=' + MIN_ARB_BUY_VOLUME +
         ', scan=' + SCAN_INTERVAL + ', bufTimeout=' + BUFFER_TIMEOUT + ', verifyTimeout=' + VERIFY_TIMEOUT +
         ', acctVerifyTimeout=' + ACCOUNT_VERIFY_TIMEOUT +
         ', maxExposure=' + MAX_RESOURCE_EXPOSURE + ', minSelfArbProfit=' + MIN_SELF_ARB_PROFIT +
         ', selfFulfillAdvantage=' + (SELF_FULFILL_ADVANTAGE * 100).toFixed(0) + '%' +
         ', floorSweepPrice=' + FLOOR_SWEEP_PRICE +
-        ', floorSweepBanned=[' + Object.keys(FLOOR_SWEEP_BANNED).join(',') + ']';
+        ', floorSweepBanned=[' + Object.keys(FLOOR_SWEEP_BANNED).join(',') + ']' +
+        ', sellGhostFailThreshold=' + SELL_GHOST_FAIL_THRESHOLD +
+        ', groupStaleTicks=' + GROUP_STALE_TICKS;
     console.log(out); return out;
 }
 
@@ -2002,6 +2534,16 @@ function cancel(roomName) {
     if (Memory.marketArbitrage.operations && Memory.marketArbitrage.operations[roomName]) {
         var op = Memory.marketArbitrage.operations[roomName];
         delete Memory.marketArbitrage.operations[roomName];
+
+        // If this was the last active member of its group, clean up the group too.
+        if (op.groupKey && Memory.marketArbitrage.groups && Memory.marketArbitrage.groups[op.groupKey]) {
+            var grp = Memory.marketArbitrage.groups[op.groupKey];
+            grp.failedRooms[roomName] = { stage: op.state, reason: 'cancelled', amount: op.amount, tick: Game.time };
+            grp.totalAmount -= op.amount;
+            var expected = groupExpectedCount(grp);
+            if (expected <= 0) delete Memory.marketArbitrage.groups[op.groupKey];
+        }
+
         var m = '[Arbitrage] Cancelled ' + roomName + ' (' + op.amount + ' ' + op.resourceType + ' ' + op.state + ')';
         console.log(m); return m;
     }
@@ -2049,6 +2591,18 @@ function setMinBuyAmount(v) {
     if (typeof v !== 'number' || v < 1) return '[Arbitrage] Must be >= 1';
     MIN_BUY_ORDER_AMOUNT = v;
     var m = '[Arbitrage] Min buy amount set to ' + v; console.log(m); return m;
+}
+
+function setMinBuyOrderPrice(v) {
+    if (typeof v !== 'number' || v < 0) return '[Arbitrage] Must be >= 0';
+    MIN_BUY_ORDER_PRICE = v;
+    var m = '[Arbitrage] Min buy order price set to ' + v; console.log(m); return m;
+}
+
+function setMinArbBuyVolume(v) {
+    if (typeof v !== 'number' || v < 1) return '[Arbitrage] Must be >= 1';
+    MIN_ARB_BUY_VOLUME = v;
+    var m = '[Arbitrage] Min arbitrage buy volume set to ' + v; console.log(m); return m;
 }
 
 function setBufferTimeout(v) {
@@ -2102,12 +2656,25 @@ function removeFloorSweepBan(resource) {
     console.log(m); return m;
 }
 
+function setSellGhostFailThreshold(v) {
+    if (typeof v !== 'number' || v < 1) return '[Arbitrage] Must be >= 1';
+    SELL_GHOST_FAIL_THRESHOLD = v;
+    var m = '[Arbitrage] Sell ghost fail threshold set to ' + v; console.log(m); return m;
+}
+
+function setGroupStaleTicks(v) {
+    if (typeof v !== 'number' || v < 1) return '[Arbitrage] Must be >= 1';
+    GROUP_STALE_TICKS = v;
+    var m = '[Arbitrage] Group stale ticks set to ' + v; console.log(m); return m;
+}
+
 module.exports = {
     run: run, status: status, cancel: cancel, cancelAccount: cancelAccount,
     setEnabled: setEnabled,
-    setMargin: setMargin, setMinBuyAmount: setMinBuyAmount,
+    setMargin: setMargin, setMinBuyAmount: setMinBuyAmount, setMinBuyOrderPrice: setMinBuyOrderPrice, setMinArbBuyVolume: setMinArbBuyVolume,
     setBufferTimeout: setBufferTimeout, setMaxExposure: setMaxExposure,
     setMinSelfArbProfit: setMinSelfArbProfit, setSelfFulfillAdvantage: setSelfFulfillAdvantage,
     setFloorSweepPrice: setFloorSweepPrice, setFloorSweepDebug: setFloorSweepDebug,
-    addFloorSweepBan: addFloorSweepBan, removeFloorSweepBan: removeFloorSweepBan
+    addFloorSweepBan: addFloorSweepBan, removeFloorSweepBan: removeFloorSweepBan,
+    setSellGhostFailThreshold: setSellGhostFailThreshold, setGroupStaleTicks: setGroupStaleTicks
 };

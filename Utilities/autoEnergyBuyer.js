@@ -33,7 +33,6 @@
  *       Batteries (10e/bat): 0.0350/bat  →  3,500.00 cr  (10,000 batteries)
  *       ✓ Batteries are cheaper by 700.00 cr  (16.7% saving)
  *
- * ────────────────────────────────────────────────────────────
  *
  * runAutoEnergyBuyer()
  *   Runs the auto-buyer immediately for all owned rooms, without waiting

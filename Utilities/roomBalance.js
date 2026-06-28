@@ -9,10 +9,6 @@
 // - Sends an email notification via Game.notify after each successful transfer.
 // - If a room's storage energy exceeds 825,000 and no opportunistic sell order exists for it,
 //   creates an opportunistic sell order to sell the excess down to 825,000.
-// Notes:
-// - No optional chaining used (Screeps-compatible).
-// - All transfers are initiated exclusively via terminalManager.transferStuff(fromRoom, toRoom, 'energy', amount).
-// - Tick interval is controlled from main; this file has no internal gating.
 
 const terminalManager = require('terminalManager');
 const opportunisticSell = require('opportunisticSell');
@@ -108,9 +104,6 @@ const roomBalance = {
       if (from1 !== to1 && !isBusy(to1) && !isBusy(from1)) {
         var res1 = terminalManager.transferStuff(from1, to1, 'energy', TRANSFER_AMOUNT);
         console.log('[RoomBalance] ' + from1 + ' -> ' + to1 + ' x ' + TRANSFER_AMOUNT + ' ENERGY | ' + res1);
-        if (isSuccess(res1)) {
-          //notifyTransfer(from1, to1, TRANSFER_AMOUNT);
-        }
       }
     }
 
@@ -121,9 +114,6 @@ const roomBalance = {
       if (from2 !== to2 && !isBusy(to2) && !isBusy(from2)) {
         var res2 = terminalManager.transferStuff(from2, to2, 'energy', TRANSFER_AMOUNT);
         console.log('[RoomBalance] ' + from2 + ' -> ' + to2 + ' x ' + TRANSFER_AMOUNT + ' ENERGY | ' + res2);
-        if (isSuccess(res2)) {
-          //notifyTransfer(from2, to2, TRANSFER_AMOUNT);
-        }
       }
     }
   }

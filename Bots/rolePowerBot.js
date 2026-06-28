@@ -5,11 +5,20 @@
 // After gathering power, any remaining carry capacity is filled with energy.
 // Delivery order: power first, then energy, then idle.
 
+var getRoomState = require('getRoomState');
+
+function findPowerSpawn(creep) {
+    var rs = getRoomState.get(creep.room.name);
+    var arr = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_POWER_SPAWN]) || [];
+    for (var i = 0; i < arr.length; i++) {
+        if (arr[i].my) return arr[i];
+    }
+    return null;
+}
+
 module.exports = {
     run: function(creep) {
-        var powerSpawn = creep.room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) { return s.structureType === STRUCTURE_POWER_SPAWN; }
-        })[0];
+        var powerSpawn = findPowerSpawn(creep);
 
         if (!powerSpawn) {
             creep.say('? no spawn');
@@ -143,9 +152,7 @@ module.exports = {
             creep.say('🔴 get P');
         } else {
             // Not enough power — try energy instead, or idle
-            var powerSpawn = creep.room.find(FIND_MY_STRUCTURES, {
-                filter: function(s) { return s.structureType === STRUCTURE_POWER_SPAWN; }
-            })[0];
+            var powerSpawn = findPowerSpawn(creep);
             if (powerSpawn && (powerSpawn.store[RESOURCE_ENERGY] || 0) < 2000) {
                 this.startEnergyTask(creep);
             } else {

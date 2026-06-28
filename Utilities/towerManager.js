@@ -34,36 +34,13 @@ var DEFENSE_MAX_BY_RCL = [
 var SUPPLIER_INTERVAL = 50;
 var HEAL_SCAN_INTERVAL = 5;
 var SCAN_COOLDOWN = 20;
-
-// How many hits the queue-repair tower spends on one target before advancing.
 var MAX_HITS_PER_TARGET = 50000;
-
-// Rescan the repair queue periodically even when it isn't exhausted,
-// so newly-damaged structures (container decay, road wear) get picked up.
 var REPAIR_RESCAN_INTERVAL = 150;
-
-// Minimum energy a tower must hold before it will perform any peacetime
-// action (heal, urgent repair, queue repair).  Keeps a combat reserve so
-// towers are never caught empty when hostiles appear.
 var TOWER_ENERGY_RESERVE = 350;
-
-// Structures below this fraction of hitsMax are treated as urgent and
-// repaired outside the normal queue (containers, roads, etc.).
 var URGENT_FRACTION = 0.5;
-
-// Containers specifically get an even more generous urgency check because
-// they decay steadily and are critical infrastructure.
 var CONTAINER_URGENT_FRACTION = 0.20;
-
-// Generic walls/ramparts below this are treated as emergency (pri 4),
-// jumping ahead of critical rampart minimum enforcement.
-var GENERIC_DEFENSE_LOW = 1000000; // 1M
-
-// Ramparts covering critical buildings are maintained to at least this level.
-// They get pri 5 until this minimum is met (or defenseMax, whichever is lower).
-var CRITICAL_RAMPART_MIN = 10500000; // 10.5M
-
-// Structure types considered critical — ramparts on these get boosted priority.
+var GENERIC_DEFENSE_LOW = 1000000;
+var CRITICAL_RAMPART_MIN = 10500000;
 var CRITICAL_STRUCTURE_TYPES = [
   STRUCTURE_SPAWN, STRUCTURE_TERMINAL, STRUCTURE_NUKER, STRUCTURE_STORAGE, 
   STRUCTURE_LAB, STRUCTURE_TOWER, STRUCTURE_FACTORY
@@ -75,7 +52,6 @@ var REPAIR_TYPES = [
   STRUCTURE_TERMINAL, STRUCTURE_RAMPART, STRUCTURE_WALL//, STRUCTURE_ROAD
 ];
 
-// NEW: Small helper to detect border positions
 function isBorderPos(pos) {
   return pos.x === 0 || pos.x === 49 || pos.y === 0 || pos.y === 49;
 }
@@ -92,11 +68,10 @@ var heap = {
   towers: {},
   energy: {},
   heal: {},
-  repair: {},          // roomName -> { queue, idx, hitsRepaired, scanTick }
-  urgent: {},          // roomName -> { tick, targets: [id, ...] }
-  criticalRamparts: {}, // roomName -> { tick, set: { rampartId: true } }
-  towerState: {},      // roomName -> { repairState, nextScanTick, 
-                       // supplierNeeded, lastSupplierCheck }
+  repair: {},          
+  urgent: {},          
+  criticalRamparts: {}, 
+  towerState: {},      
   rooms: null,
   roomsTick: 0
 };
@@ -113,7 +88,7 @@ function isLowThreatCreep(creep) {
   return creep.getActiveBodyparts(HEAL) === 0 &&
          creep.getActiveBodyparts(WORK) === 0 &&
          creep.getActiveBodyparts(ATTACK) === 0 &&
-         creep.getActiveBodyparts(RANGED_ATTACK) === 0;
+         creep.getActiveBodyparts(RANGED_ATTACK) === 0 &&
          creep.getActiveBodyparts(CLAIM) === 0;
 }
 
@@ -460,6 +435,35 @@ function runTowers() {
     if (state === 'scan') {
       if (tmem.nextScanTick && tick < tmem.nextScanTick) continue;
 
+      var managerPlan = Memory.repairPlan && Memory.repairPlan[roomName];
+      var managerTick = managerPlan ? (managerPlan.tick || managerPlan.t || 0) : 0;
+      var compactQueue = managerPlan && (managerPlan.tq || managerPlan.towerQueue);
+      if (managerPlan && compactQueue && tick - managerTick <= 5) {
+        var expandedQueue = [];
+        for (var mq = 0; mq < compactQueue.length; mq++) {
+          var entry = compactQueue[mq];
+          if (Array.isArray(entry)) {
+            expandedQueue.push({ id: entry[0], pri: entry[1], val: entry[2], border: entry[3] });
+          } else {
+            expandedQueue.push(entry);
+          }
+        }
+        var managerPolicy = managerPlan.towerPolicy || null;
+        if (!managerPolicy && managerPlan.tp) {
+          managerPolicy = { repairTowerLimit: managerPlan.tp.l, reservePerTower: managerPlan.tp.r };
+        }
+        rp = heap.repair[roomName] = {
+          queue: expandedQueue,
+          idx: 0,
+          hitsRepaired: 0,
+          scanTick: managerTick,
+          towerPolicy: managerPolicy
+        };
+        tmem.repairState = 'repair';
+        tmem.nextScanTick = null;
+        state = 'repair';
+      } else {
+
       var lsc = tmem.lastSupplierCheck || 0;
       if (tick - lsc >= SUPPLIER_INTERVAL) {
         tmem.supplierNeeded = spawnManager.shouldSpawnSupplier(roomName);
@@ -560,6 +564,7 @@ function runTowers() {
       tmem.repairState = 'repair';
       tmem.nextScanTick = null;
       state = 'repair';
+      }
     }
 
     if (state === 'repair') {
@@ -593,9 +598,13 @@ function runTowers() {
         heap.repair[roomName] = null;
       } else {
         var repCount = 0;
+        var maxRepairTowers = tCount;
+        if (rp.towerPolicy && typeof rp.towerPolicy.repairTowerLimit === 'number') {
+          maxRepairTowers = Math.min(maxRepairTowers, rp.towerPolicy.repairTowerLimit);
+        }
 
         if (unleashed) {
-          for (var rti = 0; rti < tCount; rti++) {
+          for (var rti = 0; rti < tCount && repCount < maxRepairTowers; rti++) {
             var rtw = towers[rti];
             var rtE = (rti === 0) ? primaryE : rtw.store[RESOURCE_ENERGY];
             if (rtE >= TOWER_ENERGY_RESERVE) {
@@ -603,7 +612,7 @@ function runTowers() {
               repCount++;
             }
           }
-        } else {
+        } else if (maxRepairTowers > 0) {
           primary.repair(repT);
           repCount = 1;
         }

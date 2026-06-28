@@ -1,170 +1,414 @@
-# 🎯 Complete System Integration Overview
+# Complete System Integration Overview
 
-## **How Everything Fits Together**
+## How Everything Fits Together
 
-### **Main.js Integration**
-- **Terminal Manager** is imported and runs via ```terminalManager.run()``` in the main loop
-- **Terminal Bots** are handled in the creep management section with ```runTerminalBot(creep)```
-- **Helper functions** like ```getResourceNeeded()``` are defined in main.js to support terminal operations
+This Screeps AI is stored in the repository with `main.js` at the root and modules organized under `Bots/`, `Scanners/`, `Utilities/`, and `Documentation/`. `main.js` is the only tick entry point. It requires all managers, role modules, console-command modules, and side-effect modules, then runs them through a CPU-aware scheduler.
 
-### **Terminal Manager Lifecycle**
-1. **Initialization**: Sets up memory structure on first run
-2. **Operation Processing**: Handles market buy/sell and transfers each tick
-3. **Bot Management**: Spawns and manages terminal bots as needed
-4. **Cleanup**: Removes completed operations and syncs with actual market orders
+The current live build has two major consolidation points:
 
----
+- `scanner.js` owns observer-backed intelligence, room registry, wide scans, player analysis, player monitoring, nuke analysis, nuke threat scans, maintenance scans, and war estimates.
+- `repairManager.js` owns unified repair planning, nuke repair planning, rebuild caches, and repairer spawn requests. `roleRepairer.js` executes those plans.
 
-## **🚀 All Available Console Commands**
+## Main Loop Integration
 
-### **Terminal Management Commands**
-```javascript
-// === MARKET OPERATIONS ===
-marketBuy('roomName', 'resourceType', amount, maxPrice)
-// Example: marketBuy('W7N23', 'energy', 10000, 0.5)
+`main.js` performs these high-level steps each tick:
 
-marketSell('roomName', 'resourceType', amount, minPrice)  
-// Example: marketSell('E15S42', 'O', 5000, 2.0)
+1. Initialize cached room state through `getRoomState.init()`.
+2. Refresh role counts and shared creep lookup tables.
+3. Run critical defense, repair, and tower systems.
+4. Run infrastructure managers: links, terminals, labs, factory, storage, room balance, mineral handling, power, and boost support.
+5. Run market automation: pricing, market buy/sell workflows, auto trader, arbitrage, market lab, local refine, market refine, opportunistic buy/sell, and daily finance.
+6. Run strategic systems: remote supply, claim route checks, tower drains, contested demolishers, nukes, deposit observation, and scanner workflows.
+7. Run creeps by role, with role priority throttling under CPU pressure.
+8. Run cleanup, profiling, memory maintenance, and status reporting.
 
-transferStuff('fromRoom', 'toRoom', 'resourceType', amount)
-// Example: transferStuff('W7N23', 'E15S42', 'energy', 3000)
+## CPU Budget Model
 
-// === STATUS & MANAGEMENT ===
-terminalStatus()                    // Show all operations and bots
-cancelTerminalOperation('opId')     // Cancel specific operation
-checkMarketStatus()                 // Debug market orders vs operations
-cleanupTerminalOps()               // Enhanced cleanup with sync
-forceCleanup()                     // Debug cleanup with detailed logs
-debugTerminalBot('botName')        // Debug specific terminal bot
-```
+The live build is tuned for Shard 3 with a 20 CPU limit.
 
-### **Military Operations**
-```javascript
-// === SQUAD ATTACKS ===
-orderSquad('formRoom', 'attackRoom', numSquads)
-cancelSquadOrder('attackRoom')
+`main.js` defines these budget assumptions:
 
-// === INDIVIDUAL ATTACKERS ===
-orderAttack('targetRoom', count, 'rallyRoom')
-cancelAttackOrder('targetRoom')
-assignAttackTarget('roomName', 'targetId')
+- `HARD_CEILING`: 19.3 CPU, leaving room for Memory serialization.
+- `NORMAL`: 18.0 CPU for normal operation.
+- `CRITICAL`: 14.0 CPU when bucket is low.
 
-// === SPECIALIZED OPERATIONS ===
-orderThieves('homeRoom', 'targetRoom', count)
-cancelThiefOrder('targetRoom')
+Subsystems are assigned section tiers:
 
-orderTowerDrain('homeRoom', 'targetRoom', count)
-cancelTowerDrainOrder('homeRoom', 'targetRoom')
+- `CRITICAL`: must run every tick, including creeps, defense, towers, tower fillers, and room-state initialization.
+- `HIGH`: important infrastructure, including links, terminals, labs, boost manager, repair manager, spawn manager, factory, minerals, room balance, and auto energy buying.
+- `NORMAL`: standard strategic work, including power, tower drains, contested demolishers, deposit observation, nuke launch support, claim range checks, and remote supply.
+- `LOW`: deferrable work, including market scans, market refining, auto trader, daily finance, arbitrage, status reports, creep profiling, and CPU profiling.
 
-orderDemolition('homeRoom', 'targetRoom', teamCount)
-cancelDemolitionOrder('targetRoom')
-```
+Creeps also have role priorities. Important logistics, combat, defense, tower filling, maintainers, and static distributors are protected before low-priority economy or diagnostic roles.
 
-### **Utility Commands**
-```javascript
-orderMineralCollect('roomName')     // Spawn mineral collector
-```
+## Core Data Flow
 
----
+1. Game state enters through `Game.rooms`, `Game.creeps`, `Game.spawns`, `Game.market`, and `Memory`.
+2. `getRoomState.js` builds cached room snapshots for structures, creeps, sources, minerals, and common lookups.
+3. Managers read cached room state where possible instead of repeatedly calling expensive room searches.
+4. Managers write intent state into their own `Memory` namespaces.
+5. `spawnManager.js` reads role counts, room conditions, orders, and manager requests to spawn creeps.
+6. Creep role modules execute per-creep behavior and update lightweight creep memory.
+7. Profilers and status modules summarize runtime behavior for console inspection.
 
-## **🔧 Unused/Redundant Components**
+## Unified Scanner
 
-### **In Main.js**
-- **```roleRemoteHarvester```** - Commented out/disabled
-- **```spawnScavengers()```** - Only triggers on specific tower kill events
-- **Duplicate CPU profiling** - Some sections have redundant profiling calls
-- **```cleanupCompletedOperations()```** - Called twice (once in terminalManager, once standalone)
+`Scanners/scanner.js` replaces the older split scanner/intel modules in the current build. It consolidates these responsibilities:
 
-### **In Terminal Manager**
-- **Duplicate ```cleanupCompletedOperations```** - There are two versions (enhanced and simple)
-- **```checkMarketOrderStatus()```** - Mainly for debugging, could be removed in production
-- **Email notifications** - Setting exists but may not be used
-- **```maxBotsPerRoom``` setting** - Defined but not enforced
+- Maintenance scanner.
+- Room intel and scoring.
+- Cached room efficiency profiles.
+- Observer scheduler.
+- Room ownership registry.
+- Wide scan and player discovery.
+- Player analysis and creep census.
+- Player monitoring and alerting.
+- Nuke strike analysis.
+- Incoming nuke detection.
+- Hostile nuke threat scans.
+- War estimate pipeline.
 
----
-
-## **⚡ Key Integration Points**
-
-### **Creep Role Handling**
-```javascript
-// In main.js runCreeps() function
-case 'terminalBot': runTerminalBot(creep); break;
-```
-
-### **Resource Calculation**
-```javascript
-// Helper function in main.js used by terminal bots
-function getResourceNeeded(roomName, resourceType) {
-    // Calculates exact amount needed for operations
-}
-```
-
-### **Body Generation**
-```javascript
-// Terminal manager uses main.js body generation
-const body = this.getCreepBody('supplier', spawn.room.energyAvailable);
-```
-
----
-
-## **📊 System Status Flow**
-
-1. **Operations Created** → Console commands create operations in memory
-2. **Processing Loop** → Each tick processes pending operations
-3. **Bot Spawning** → Automatically spawns bots when resources needed
-4. **Market Integration** → Handles both deals and order creation
-5. **Cleanup & Sync** → Keeps operations synchronized with actual market state
-
----
-
-## **🎮 Complete Command Reference Card**
+All observer use flows through one scheduler so systems do not fight over observers in the same tick. External modules can request observation through:
 
 ```javascript
-// === TERMINAL OPERATIONS ===
-marketBuy('W12S8', 'energy', 10000, 0.5)        // Buy energy
-marketSell('E31N17', 'O', 5000, 2.0)            // Sell oxygen  
-transferStuff('W12S8', 'E31N17', 'energy', 3000) // Transfer between rooms
-
-// === STATUS COMMANDS ===
-terminalStatus()                                 // Show all operations
-checkMarketStatus()                             // Debug market sync
-forceCleanup()                                  // Force operation cleanup
-
-// === MILITARY COMMANDS ===
-orderSquad('W5N41', 'E22S35', 2)               // Send 2 squads
-orderAttack('E22S35', 5, 'W5N41')              // Send 5 attackers
-orderThieves('W12S8', 'E9N26', 3)              // Send 3 thieves
-orderTowerDrain('E31N17', 'W18S14', 2)         // Send 2 drain bots
-orderDemolition('W5N41', 'E44N3', 1)           // Send 1 demo team
-
-// === CANCEL COMMANDS ===
-cancelTerminalOperation('sell_12345_abc')       // Cancel terminal op
-cancelSquadOrder('E22S35')                      // Cancel squad attack
-cancelAttackOrder('W18S14')                     // Cancel attack order
+require('scanner').observe.request(roomName, 'sourceName', priority)
 ```
 
-The system is **fully integrated** and **production-ready**! The terminal manager seamlessly handles resource trading, transfers, and logistics while the main system manages all other colony operations. 🚀✨
+Observer priority is roughly:
 
-To cancel all market orders:
-const myOrders = Game.market.orders;
-let cancelCount = 0;
-let totalRefund = 0;
-console.log('=== CANCELLING ALL MARKET ORDERS ===');
-for (const orderId in myOrders) {
-    const order = myOrders[orderId];
-    console.log(`Cancelling: ${orderId} - ${order.type} ${order.remainingAmount} ${order.resourceType} @ ${order.price}`);
-    const result = Game.market.cancelOrder(orderId);
-    if (result === OK) {
-        cancelCount++;
-        const orderValue = order.totalAmount * order.price;
-        const estimatedRefund = orderValue * 0.05;
-        totalRefund += estimatedRefund;
-        console.log(`✓ Cancelled ${orderId}`);
-    } else {
-        console.log(`✗ Failed to cancel ${orderId}: ${result}`);
-    }
-}
-console.log(`=== CANCELLATION COMPLETE ===`);
-console.log(`Cancelled: ${cancelCount} orders`);
-console.log(`Estimated refund: ~${Math.floor(totalRefund)} credits`);
+- One-shot console commands first.
+- WAR-status hot polls.
+- Deposit observer route/deposit scans.
+- ENEMY/NEUTRAL/ALLY monitor hot polls.
+- Registry sweep with leftover observer capacity.
 
+Important scanner memory keys include:
+
+- `Memory.maintScan`
+- `Memory.roomEffProfile`
+- `Memory.roomEffCache`
+- `Memory.roomIntelPending`
+- `Memory.nukeAnalyzePending`
+- `Memory.nukeThreatScans`
+- `Memory.playerAnalysis`
+- `Memory.playerScan`
+- `Memory.warEstimate`
+- `Memory.obsSched`
+- `Memory.roomRegistry`
+- `Memory.wideScanReport`
+- `Memory.playerMonitor`
+
+## Unified Repair System
+
+`repairManager.js` is the planning layer. It computes compact per-room plans and emits repairer spawn requests. `roleRepairer.js` is the generic executor that carries out those tasks.
+
+The repair manager handles:
+
+- Road and container repair priorities.
+- Wall and rampart targets.
+- Critical rampart emergency work.
+- Tower repair queue limits.
+- Wartime and peacetime repair tiers.
+- Nuke landing damage plans.
+- Rebuild caches for important structures.
+- Inaccessible target tracking.
+- Repairer body sizing and spawn request generation.
+- Repair memory compaction.
+- Pause/resume controls.
+
+`spawnManager.js` reads `Memory.repairSpawnRequests` and spawns creeps with role `repairer`. Legacy wall repair, repair bot, rampart bot, and defense repair spawning is disabled/replaced by repair manager requests. Existing legacy creeps continue to run until they expire.
+
+## Market And Economy Flow
+
+The economy is split into several cooperating systems:
+
+- `terminalManager.js`: terminal balancing, transfers, and operation processing.
+- `storageManager.js`: resource reservations and storage coordination.
+- `roomBalance.js`: intra-room distribution and balancing.
+- `marketPricing.js`: weighted market pricing helpers.
+- `autoTrader.js`: periodic profit-seeking trade analysis.
+- `marketArbitrage.js`: buy/sell spread exploitation with energy-cost accounting.
+- `marketLab.js`: lab reaction profit workflows.
+- `marketRefine.js`: market-backed factory refining loops.
+- `localRefine.js`: local factory/lab refinement without market dependency.
+- `marketBuy.js` and `marketSell.js`: direct order workflows and reservation integration.
+- `opportunisticBuy.js` and `opportunisticSell.js`: tactical market opportunities.
+- `autoEnergyBuyer.js`: automatic energy or battery purchasing.
+- `dailyFinance.js`: credit and transaction tracking.
+
+Market order views support optional room filtering:
+
+```javascript
+selling()
+selling('compact')
+selling('expanded')
+selling('OH')
+selling('compact', 'E0N0')
+selling('expanded', 'E0N0')
+selling('OH', 'E0N0')
+
+buying()
+buying('compact')
+buying('expanded')
+buying('K')
+buying('compact', 'E0N0')
+buying('expanded', 'E0N0')
+buying('K', 'E0N0')
+```
+
+## Spawn Flow
+
+`spawnManager.js` is the central spawn orchestrator. It spawns core economy roles, special mission roles, repairers, lab bots, remote suppliers, single-source room creeps, military roles, and power-support creeps.
+
+Major spawn inputs include:
+
+- Room state and energy capacity.
+- Per-room role counts from `statusReport` / `main.js`.
+- Mission orders in `Memory`.
+- Repair requests in `Memory.repairSpawnRequests`.
+- Remote supply demand.
+- Lab, market, mineral, claim, combat, and tower-drain requests.
+
+Repair-specific spawn flow:
+
+1. `repairManager.run()` computes repair tasks.
+2. It writes compact requests into `Memory.repairSpawnRequests[roomName]`.
+3. `spawnManager.run()` calls its repairer spawn manager.
+4. A creep is spawned with `role: 'repairer'`, `homeRoom`, `repairKind`, and a task payload.
+5. `roleRepairer.run(creep)` executes the assigned task.
+
+## Creep Role Flow
+
+`main.js` dispatches creeps by `creep.memory.role`. Each role module owns its behavior.
+
+Important role groups:
+
+- Economy: `harvester`, `supplier`, `staticDistributor`, `upgrader`, `builder`, `maintainer`.
+- Repair and construction: `repairer`, `wallRepair`, `repairBot`, `rampartBot`, `remoteBuilder`, `roadBuilder`.
+- Processing: `extractor`, `extractorAssistant`, `mineralCollector`, `labBot`, `powerBot`, `operator`.
+- Remote and expansion: `claimbot`, `remoteSupplier`, `remoteBuilder`, `scout`, `signbot`.
+- Combat: `defender`, `attacker`, `demolition`, `contestedDemolisher`, `towerDrain`, `towerFiller`, `skAttacker`, `controllerAttacker`, `comboBot`, `hd`, `squad`, `thief`, `nukeFill`.
+
+## Console Commands
+
+### Intelligence And Scanner
+
+```javascript
+intel('W1N1')
+intelFast('W1N1')
+listIntel()
+getCachedIntel('W1N1')
+
+maintScan()
+maintScanRoom('W1N1')
+
+registrySweep()
+registryStatus()
+registryList()
+registryPlayer('PlayerName')
+
+wideScan('PlayerName')
+wideScanPlayers()
+wideScanStatus()
+wideScanCancel()
+
+player('PlayerName')
+playerStatus()
+playerCancel()
+playerLast()
+
+playerScan('PlayerName', 'CREEPCOUNT')
+playerScanStatus()
+playerScanCancel()
+
+monitor('PlayerName', 'WAR')
+monitorSetStatus('PlayerName', 'ENEMY')
+monitorAdd('PlayerName', ['W1N1'], 'WAR')
+monitorRemove('PlayerName')
+monitorStatus()
+monitorPause()
+monitorResume()
+
+warEstimate('PlayerName')
+warEstimateStatus()
+warEstimateCancel()
+warEstimateLast()
+```
+
+### Nuke Analysis
+
+```javascript
+nukeAnalyze('W1N1')
+nukeAnalyze('W1N1', 3)
+nukeAnalyzeSelf()
+nukeAnalyzeCost('W1N1', 25, 25)
+nukeIncoming()
+nukeIncoming('W1N1')
+nukeThreat('W1N1')
+nukeThreatStatus('W1N1')
+nukeThreatCancel('W1N1')
+launchNuke('W1N1', 'W3N3', 'spawn')
+nukeFill('W1N1', { maxPrice: 1.5 })
+```
+
+### Repair And Defense
+
+```javascript
+repairPlan('W1N1')
+repairStatus('W1N1')
+repairDispatch('W1N1')
+repairSize({ totalHits: 1000000 })
+repairNukePlan('W1N1')
+repairSetTarget('W1N1', STRUCTURE_RAMPART, 50000000)
+repairResetTargets('W1N1')
+repairSuggestBoost('W1N1')
+repairPause('W1N1')
+repairResume('W1N1')
+repairCleanup()
+repairCompactPlans('W1N1')
+repairCompactMemory()
+
+repairCacheBuildings('W1N1')
+repairCacheStatus('W1N1')
+repairForgetCache('W1N1')
+repairDestroyCached('W1N1', STRUCTURE_EXTENSION, 'CONFIRM')
+repairRebuildMissing('W1N1')
+
+defenseStatus()
+getTowerDrainStatus()
+getContestedDemolisherStatus()
+```
+
+### Market And Economy
+
+```javascript
+prices()
+prices('energy')
+marketAnalysis()
+reverseReactionAnalysis()
+decompressionAnalysis()
+orderBook('ZO')
+rawMarketData('energy')
+
+autoTrader()
+autoTrader('run')
+selling()
+selling('compact', 'E0N0')
+buying()
+buying('expanded', 'E0N0')
+
+marketBuy('W1N1', RESOURCE_ENERGY, 10000, 0.5)
+marketSell('W1N1', RESOURCE_ZYNTHIUM, 5000, 2.0)
+marketSellStatus('W1N1')
+marketSellReconcile()
+marketSellCleanup()
+
+labForward('E3N46', 'ZO')
+labReverse('E3N46', 'ZO')
+orderLabs('W1N1', 'XGH2O', 2000)
+breakdownLabs('W1N1', 'ZO', 1000)
+showLabs('W1N1')
+showAllLabs()
+cancelLabs('W1N1')
+
+orderFactory('W1N1', 'Composite', 'max')
+factoryOrders('W1N1')
+cancelFactoryOrder('W1N1', 'Composite')
+
+marketRefine('W1N1', RESOURCE_COMPOSITE)
+localRefine('W1N1', RESOURCE_COMPOSITE, 1000)
+localRefineStatus()
+cancelLocalRefine()
+
+financeReport()
+fR()
+compareEnergyCost(100000)
+runAutoEnergyBuyer()
+```
+
+### Logistics And Operations
+
+```javascript
+transferStuff('E1S1', 'E3S3', RESOURCE_ZYNTHIUM, 5000)
+remoteSupplyStatus('E1S1')
+roomBalanceNextRun()
+
+orderMineralCollect('W1N1')
+launchClaimbot('E1S1', 'E3S3')
+launchClaimbot('E1S1', 'E3S3', ['E2S3', 'E3S3'])
+listClaimOrders()
+claimbotRangeCheck.run()
+```
+
+### Combat And Missions
+
+```javascript
+orderAttack('E3N44', 5, 'E3N45')
+cancelAttackOrder('E3N44')
+assignAttackTarget('E3N44', 'targetId')
+
+orderSquad('E1S1', 'W1N1', 2)
+cancelSquadOrder('W1N1')
+cancelSquadOrders()
+
+orderTowerDrain('E1S1', 'E2S1', 2)
+orderTowerDrain('E1S1', 'E2S1', 2, 'N')
+cancelTowerDrainOrder('E1S1', 'E2S1')
+
+orderDemolition('E1S1', 'E2S2', 2)
+orderDemolition('E1S1', 'E2S2', 2, 'wall')
+cancelDemolitionOrder('E2S2')
+setDemolitionFocus('E2S2', 'wall')
+showDemolitionOrders()
+
+orderContestedDemolisher('E4N49', 'E4N51')
+cancelContestedDemolisherOrder('E4N51')
+getContestedDemolisherStatus()
+
+orderThieves('W1N1', 'W2N1', 3)
+cancelThiefOrder('W2N1')
+listThiefOrders()
+
+orderSKAttack('E1S1', 'E2S1', 2)
+orderControllerAttack('E1S1', 'E2S1')
+orderTowerFill('E1S1', 'E2S1', 2)
+```
+
+### Power Creeps
+
+```javascript
+createOperator('C1')
+upgradeOperator('C1', PWR_GENERATE_OPS)
+setupOperator('C1', 'E2N46')
+setupOperator('C1', 'E2N46', [PWR_GENERATE_OPS, PWR_OPERATE_FACTORY])
+removeOperator('C1')
+listOperators()
+showOperator('C1')
+listPowers()
+```
+
+### Diagnostics
+
+```javascript
+statusReport()
+creepProfile()
+roomCPU('E1S1')
+memoryQuery('searchTerm')
+memoryQueryKeys('searchTerm')
+memoryQueryValues('searchTerm')
+memoryGet('path.to.value')
+memoryOverview()
+```
+
+## Documentation-Only Context
+
+`Documentation/llmcontext.js` is pure documentation for LLM-assisted code review and generation. It has no runtime purpose and is safe if accidentally required.
+
+## Integration Notes
+
+- Prefer `getRoomState` for repeated room lookups.
+- New observer consumers should use `require('scanner').observe.request(...)` rather than directly calling observers.
+- New repair behavior should flow through `repairManager` and `roleRepairer` instead of re-enabling legacy repair spawns.
+- New high-frequency systems should be added to the `SECTION_TIERS` map in `main.js`.
+- New console globals should live in the module that owns the feature, not in `main.js`.
+- Keep Memory compact. Derived values should usually be recomputed from game state rather than persisted.

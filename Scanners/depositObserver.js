@@ -1,18 +1,4 @@
 //depositObserver.js
-// FIXED: Added cooldown checks to runSafetyScanner. 
-// Prevents the "Scanning Loop" where the bot tries to scan faster than the Observer can work.
-// UPDATED: Now supports multiple harvesters per deposit (MAX_HARVESTERS).
-// OPTIMIZED: Added garbage collection for old jobs and stale pathfinding data.
-// UPDATED: Filter out deposits with lastCooldown >= 100 to save CPU/Travel.
-// UPDATED: Added BANNED_ROOMS to prevent routing through hostile/avoided rooms.
-// UPDATED: Detects accessible edges around deposit to prevent over-spawning (Dynamic Harvester Limit).
-// UPDATED: Added PathFinder-based route validation in planPathForJob. After observer scans
-// each room along the route, validates traversal from entry edge to exit edge using PathFinder
-// (same engine creeps use). Detects both terrain walls and player-built walls. Prevents creep looping.
-// UPDATED: Deposit harvesters are only spawned from rooms directly adjacent to highways.
-// FIXED: Removed random blockedEdges/roomStatus cache wipe that caused repeated edge-blocked loops.
-// FIXED: Added unreachableRooms cache — rooms with no observer in range are not re-queued each tick.
-// FIXED: planPathForJob bails early if the route requires an unobservable room.
 
 //Memory.depositObserver.scanQueue = [];
 //Memory.depositObserver.roomStatus = {};
@@ -32,7 +18,19 @@ var PASSABILITY_CACHE_TICKS = 1500;
 var UNREACHABLE_CACHE_TICKS = 2000;
 var MAX_HARVESTERS = 2;
 var MAX_COOLDOWN = 25;
+// Home selection: how many Manhattan-nearest homes to evaluate by highway route (Stage 2).
+var MAX_HOME_CANDIDATES = 3;
+// Per-room weights used when scoring a highway route. Highways are cheap/safe corridors;
+// interior rooms cost more so a candidate forced through interior loses to one with a clean shot.
+var HIGHWAY_COST = 1;
+var INTERIOR_COST = 2.5;
+// How long to wait for the scheduler to deliver visibility before retrying a scan.
+var SCAN_REQUEST_TIMEOUT = 20;
+// Scheduler priorities (see scanner OBS_PRI: one-shots 100, WAR polls 80, monitor 50, sweep last)
+var PRI_ROUTE_SCAN   = 60;  // route validation scans — operationally urgent
+var PRI_DEPOSIT_WATCH = 55; // periodic deposit re-checks
 var iff = require('iff');
+var scanner = require('scanner');
 
 function initMemory() {
   if (!Memory.depositObserver) {
@@ -62,25 +60,13 @@ function getRoomLinearDistance(r1, r2) {
 }
 
 function findLinearRoute(startRoom, targetRoom) {
-  // Pre-collect all observer room names so we can check coverage during routing.
   // A room is "coverable" if at least one observer is within OBSERVER_RANGE of it,
   // OR if it is one of our own rooms (we always have vision there).
-  var observerRooms = [];
-  for (var orName in Game.rooms) {
-    var orRoom = Game.rooms[orName];
-    if (!orRoom.controller || !orRoom.controller.my) continue;
-    var obs = orRoom.find(FIND_MY_STRUCTURES, { filter: { structureType: STRUCTURE_OBSERVER } });
-    if (obs.length > 0) observerRooms.push(orName);
-  }
-
-  // Returns true if the room is owned by us OR reachable by at least one observer.
+  // Coverage checks go through the scanner's shared helper.
   function isCoverable(roomName) {
     var r = Game.rooms[roomName];
     if (r && r.controller && r.controller.my) return true;
-    for (var oi = 0; oi < observerRooms.length; oi++) {
-      if (Game.map.getRoomLinearDistance(observerRooms[oi], roomName) <= OBSERVER_RANGE) return true;
-    }
-    return false;
+    return scanner.observe.inRange(roomName);
   }
 
   var openSet = [startRoom];
@@ -142,7 +128,17 @@ function findLinearRoute(startRoom, targetRoom) {
 
       if (blockedEdges[current + ':' + neighbor]) continue;
 
-      var tentative_gScore = gScore[current] + 1;
+      // Diagonal moves (both X and Y change) cost 2 because the creep
+      // must physically pass through two room transitions instead of one.
+      var moveCost = 1;
+      var parsedCurrent  = /^[WE](\d+)[NS](\d+)$/.exec(current);
+      var parsedNeighbor = /^[WE](\d+)[NS](\d+)$/.exec(neighbor);
+      if (parsedCurrent && parsedNeighbor) {
+        var dx = Math.abs(parseInt(parsedCurrent[1], 10) - parseInt(parsedNeighbor[1], 10));
+        var dy = Math.abs(parseInt(parsedCurrent[2], 10) - parseInt(parsedNeighbor[2], 10));
+        if (dx > 0 && dy > 0) moveCost = 2;
+      }
+      var tentative_gScore = gScore[current] + moveCost;
 
       if (typeof gScore[neighbor] === 'undefined' || tentative_gScore < gScore[neighbor]) {
         cameFrom[neighbor] = current;
@@ -259,6 +255,30 @@ function validateRouteTraversal(route) {
   return blocked;
 }
 
+// --- ROOM COORDINATE HELPERS ---
+
+// Parse a room name into SIGNED grid coordinates so distance math is correct
+// across the W/E and N/S hemisphere seams. (W and E both start at 0, so the
+// raw numbers alone would make e.g. W1 <-> E1 look like distance 0.)
+function parseRoomXY(roomName) {
+  var m = /^([WE])(\d+)([NS])(\d+)$/.exec(roomName);
+  if (!m) return null;
+  var x = parseInt(m[2], 10);
+  var y = parseInt(m[4], 10);
+  if (m[1] === 'W') x = -x - 1;
+  if (m[3] === 'S') y = -y - 1;
+  return { x: x, y: y };
+}
+
+// Manhattan distance in room-grid units. Rooms only connect via the four cardinal
+// exits, so true travel distance is |dx| + |dy| — a diagonal costs 2, not 1.
+function roomManhattanDistance(a, b) {
+  var pa = parseRoomXY(a);
+  var pb = parseRoomXY(b);
+  if (!pa || !pb) return Infinity;
+  return Math.abs(pa.x - pb.x) + Math.abs(pa.y - pb.y);
+}
+
 // --- HIGHWAY ADJACENCY CHECK ---
 // Returns true if the room is one step away from a highway (coordinate mod 10 === 1 or 9).
 function isRoomAdjacentToHighway(roomName) {
@@ -267,6 +287,37 @@ function isRoomAdjacentToHighway(roomName) {
   var x = parseInt(parsed[1], 10) % 10;
   var y = parseInt(parsed[2], 10) % 10;
   return (x === 1 || x === 9 || y === 1 || y === 9);
+}
+
+// Returns true if the room is a highway (either coordinate divisible by 10).
+function isHighwayRoom(roomName) {
+  var parsed = /^[WE](\d+)[NS](\d+)$/.exec(roomName);
+  if (!parsed) return false;
+  return (parseInt(parsed[1], 10) % 10 === 0) || (parseInt(parsed[2], 10) % 10 === 0);
+}
+
+// Score a route from fromRoom to toRoom that prefers highway rooms.
+// Uses Game.map.findRoute with a routeCallback weighting highways low and interior
+// rooms higher (but NOT banning interior — we still need a few interior hops at each
+// end to get on/off the highway). BANNED_ROOMS are excluded entirely.
+// Returns the summed weighted cost, or Infinity if no route exists.
+function highwayRouteCost(fromRoom, toRoom) {
+  if (fromRoom === toRoom) return 0;
+
+  var route = Game.map.findRoute(fromRoom, toRoom, {
+    routeCallback: function (roomName) {
+      if (BANNED_ROOMS.indexOf(roomName) !== -1) return Infinity;
+      return isHighwayRoom(roomName) ? HIGHWAY_COST : INTERIOR_COST;
+    }
+  });
+
+  if (!Array.isArray(route) || route.length === 0) return Infinity;
+
+  var total = 0;
+  for (var i = 0; i < route.length; i++) {
+    total += isHighwayRoom(route[i].room) ? HIGHWAY_COST : INTERIOR_COST;
+  }
+  return total;
 }
 
 // --- UNREACHABLE ROOM HELPERS ---
@@ -291,8 +342,7 @@ function markRoomUnreachable(roomName) {
 
 function harvestResources(targetRoomName) {
   initMemory();
-  var observer = findObserverForRoom(targetRoomName);
-  if (!observer) return ERR_NOT_FOUND;
+  if (!scanner.observe.inRange(targetRoomName)) return ERR_NOT_FOUND;
 
   if (!Memory.depositObserver.rooms[targetRoomName]) {
     Memory.depositObserver.rooms[targetRoomName] = { nextScanTick: Game.time, lastObserved: 0 };
@@ -325,23 +375,6 @@ function cancelJobsInRoom(targetRoomName) {
   }
   console.log('[DepositObserver] No active jobs found in ' + targetRoomName);
   return ERR_NOT_FOUND;
-}
-
-function findObserverForRoom(targetRoomName) {
-  var bestObserver = null;
-  var bestDistance = Infinity;
-  for (var roomName in Game.rooms) {
-    var room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
-    var observers = room.find(FIND_MY_STRUCTURES, { filter: { structureType: STRUCTURE_OBSERVER } });
-    if (observers.length === 0) continue;
-    var distance = Game.map.getRoomLinearDistance(roomName, targetRoomName);
-    if (distance <= OBSERVER_RANGE && distance < bestDistance) {
-      bestDistance = distance;
-      bestObserver = observers[0];
-    }
-  }
-  return bestObserver;
 }
 
 // --- SAFETY & CONNECTIVITY CHECKS ---
@@ -594,7 +627,8 @@ function planPathForJob(job) {
 function runSafetyScanner() {
   var mem = Memory.depositObserver;
 
-  // 1. PROCESS SCAN RESULT FROM PREVIOUS TICK
+  // 1. PROCESS SCAN RESULT — the scheduler delivers visibility for the
+  //    requested room; we read it whenever it shows up.
   if (mem.scanState.activeRoom) {
     var roomName = mem.scanState.activeRoom;
     var room = Game.rooms[roomName];
@@ -642,27 +676,21 @@ function runSafetyScanner() {
         mem.scanQueue.shift();
       }
 
-    } else {
-      // Room not visible — observer may have missed. Clear active so we retry next tick.
+    } else if (Game.time - (mem.scanState.requestedTick || 0) > SCAN_REQUEST_TIMEOUT) {
+      // The scheduler hasn't delivered visibility — observers are saturated
+      // or the request expired. Clear and re-request next tick.
       mem.scanState.activeRoom = null;
     }
+    // else: still waiting on the scheduler — do nothing this tick.
   }
 
-  // 2. PICK NEXT SCAN
+  // 2. PICK NEXT SCAN — submit to the scanner's observer scheduler.
   if (mem.scanQueue.length > 0 && !mem.scanState.activeRoom) {
     var nextRoom = mem.scanQueue[0];
-    var observer = findObserverForRoom(nextRoom);
 
-    if (observer) {
-      if (observer.cooldown > 0) {
-        // Observer busy — wait.
-        return;
-      }
-
-      var result = observer.observeRoom(nextRoom);
-      if (result === OK) {
-        mem.scanState.activeRoom = nextRoom;
-      }
+    if (scanner.observe.request(nextRoom, 'deposit', PRI_ROUTE_SCAN)) {
+      mem.scanState.activeRoom = nextRoom;
+      mem.scanState.requestedTick = Game.time;
     } else {
       // No observer can reach this room. Cache the fact so planPathForJob stops re-queuing it.
       console.log('[DepositObserver] Skipping unreachable room ' + nextRoom);
@@ -788,23 +816,73 @@ function maintainJobs() {
   }
 }
 
+// Two-stage home selection.
+//   STAGE 1: gather all eligible homes (RCL7+, has storage + spawn, highway-adjacent)
+//            and prune to the MAX_HOME_CANDIDATES nearest by Manhattan distance
+//            (orthogonal-only travel => diagonal counts as 2).
+//   STAGE 2: among the shortlist, pick the one with the cheapest *highway* route
+//            (Game.map.findRoute weighted to prefer highway rooms over interior).
+//   FALLBACKS: if no shortlisted room yields a highway route, widen to the rest of
+//            the candidates; if still none, use the Manhattan-nearest home outright.
 function findNearestRcl7Home(targetRoomName) {
-  var bestRoom = null, bestDist = Infinity;
+  var candidates = [];
   for (var name in Game.rooms) {
     var r = Game.rooms[name];
     if (!r.controller || !r.controller.my) continue;
     if (r.controller.level < 7) continue;
     if (!r.storage || r.find(FIND_MY_SPAWNS).length === 0) continue;
 
-    // Only consider rooms that are directly adjacent to a highway room.
-    // Deposits live in highway rooms; spawning from a highway-adjacent room
-    // minimises travel time and avoids routing through deep interior rooms.
+    // Deposits live in highway rooms; only spawn from highway-adjacent rooms to
+    // minimise travel time and avoid routing through deep interior rooms.
     if (!isRoomAdjacentToHighway(name)) continue;
 
-    var d = Game.map.getRoomLinearDistance(name, targetRoomName);
-    if (d < bestDist) { bestDist = d; bestRoom = r; }
+    candidates.push({
+      room:      r,
+      name:      name,
+      manhattan: roomManhattanDistance(name, targetRoomName)
+    });
   }
-  return bestRoom;
+
+  if (candidates.length === 0) return null;
+
+  // STAGE 1 — prune to the nearest few by Manhattan distance.
+  candidates.sort(function (a, b) { return a.manhattan - b.manhattan; });
+  var shortlist = candidates.slice(0, MAX_HOME_CANDIDATES);
+
+  // STAGE 2 — pick the shortlisted home with the cheapest highway route.
+  var best     = null;
+  var bestCost = Infinity;
+  for (var i = 0; i < shortlist.length; i++) {
+    var cost = highwayRouteCost(shortlist[i].name, targetRoomName);
+    if (cost < bestCost) {
+      bestCost = cost;
+      best     = shortlist[i];
+    }
+  }
+
+  // FALLBACK 1 — no shortlisted room could produce a highway route. Walk the rest
+  // of the (Manhattan-sorted) candidates and take the first that routes.
+  if (!best) {
+    for (var j = MAX_HOME_CANDIDATES; j < candidates.length; j++) {
+      var c = highwayRouteCost(candidates[j].name, targetRoomName);
+      if (c < Infinity) { best = candidates[j]; bestCost = c; break; }
+    }
+  }
+
+  // FALLBACK 2 — nothing routes at all. Use the Manhattan-nearest home.
+  if (!best) {
+    console.log('[DepositObserver] No highway route to ' + targetRoomName + '; using Manhattan-nearest home.');
+    best     = candidates[0];
+    bestCost = Infinity;
+  }
+
+  console.log(
+    '[DepositObserver] Home for ' + targetRoomName + ': ' + best.name +
+    ' (manhattan ' + best.manhattan + ', highwayCost ' +
+    (bestCost === Infinity ? 'n/a' : bestCost.toFixed(1)) + ')'
+  );
+
+  return best.room;
 }
 
 function spawnHarvesterForJob(job) {
@@ -847,15 +925,17 @@ function scanVisibleRoomsForDeposits() {
   var roomsMem    = Memory.depositObserver.rooms;
   var currentTime = Game.time;
 
+  // Submit ONE due watch-room to the scheduler per tick (same pacing as before,
+  // but the scheduler decides which observer fires and when).
   for (var roomName in roomsMem) {
     var data = roomsMem[roomName];
-    if (currentTime >= data.nextScanTick) {
-      var observer = findObserverForRoom(roomName);
-      if (observer && !observer.cooldown) {
-        observer.observeRoom(roomName);
-        data.lastObserved = currentTime;
+    if (currentTime >= data.nextScanTick && !Game.rooms[roomName]) {
+      if (scanner.observe.request(roomName, 'deposit', PRI_DEPOSIT_WATCH)) {
         data.nextScanTick = currentTime + SCAN_INTERVAL;
         break;
+      } else {
+        // No coverage right now (lost an observer?) — back off a full interval.
+        data.nextScanTick = currentTime + SCAN_INTERVAL;
       }
     }
   }
@@ -863,6 +943,8 @@ function scanVisibleRoomsForDeposits() {
   for (var roomName in roomsMem) {
     var room = Game.rooms[roomName];
     if (!room) continue;
+
+    roomsMem[roomName].lastObserved = currentTime;
 
     var currentDeposits = room.find(FIND_DEPOSITS);
     var foundDepositIds = [];
@@ -938,6 +1020,7 @@ function isCreepSpawning(creepName) {
   }
   return false;
 }
+
 
 function run() {
   initMemory();

@@ -1,31 +1,27 @@
 // dailyFinance.js — Daily market transaction tracker
 // Resets at midnight Pacific Time. Console: financeReport()
 
+// ── Toggles ────────────────────────────────────────────────────────
+const INCLUDE_ROOMS_IN_EMAIL = false;  // true = include ROOMS chunk in nightly email
+
 const dailyFinance = {
 
     // ── Called every tick from main ──────────────────────────────────
     run: function () {
         // Re-register console shortcuts after every global reset
         if (!global.fR) {
-            global.fR            = function (mode) { if (!mode || mode === 'compact' || mode === 'c') { dailyFinance._reportCompact(); } else { dailyFinance.report(); } };
+            global.fR            = function (mode) { dailyFinance.report(mode || 'compact'); };
             global.financeReport = function (mode) { dailyFinance.report(mode); };
         }
 
         this._ensureMemory();
 
-        // Midnight reset check (every 100 ticks to save CPU)
+        // Every 100 ticks: midnight check, transaction processing, hourly snapshot
         if (Game.time % 100 === 0) {
-            this._checkMidnightReset();
-        }
-
-        // Process transactions every 100 ticks
-        if (Game.time % 100 === 0) {
-            this._processTransactions();
-        }
-
-        // Hourly time snapshot (~1200 ticks ≈ 1 hour at 3s/tick)
-        if (Game.time % 1200 === 0) {
-            this._recordHourlyCheck();
+            if (!this._checkMidnightReset()) {
+                this._processTransactions();
+            }
+            this._maybeRecordHourlyCheck();
         }
     },
 
@@ -33,6 +29,12 @@ const dailyFinance = {
     report: function (mode) {
         if (mode === 'compact' || mode === 'c') {
             return this._reportCompact();
+        }
+        if (mode === 'vwap') {
+            return this._reportVwap();
+        }
+        if (mode === 'json') {
+            return this._reportJson();
         }
         const fin = Memory.dailyFinance;
         if (!fin) {
@@ -165,30 +167,38 @@ const dailyFinance = {
         L.push('  TOTAL EXPENSES:' + dailyFinance._fmtNum(fin.totalExpenses).padStart(39));
         L.push('');
 
-        // ── Fees (derived from balance delta) ──
+        // ── Credit reconciliation (balance delta) ──
         var currentBalance = Math.round(Game.market.credits);
         var expectedBalance = fin.startingBalance + fin.totalIncome - fin.totalExpenses;
         var delta = expectedBalance - currentBalance;
 
-        L.push('--- MARKET FEES ---');
+        L.push('--- CREDIT RECONCILIATION ---');
         L.push('  Starting Balance:' + dailyFinance._fmtNum(fin.startingBalance).padStart(37));
         L.push('  Current Balance: ' + dailyFinance._fmtNum(currentBalance).padStart(37));
         L.push('  Expected Balance:' + dailyFinance._fmtNum(expectedBalance).padStart(37));
         if (delta >= 0) {
-            L.push('  Fees/Untracked Losses:' + dailyFinance._fmtNum(delta).padStart(32));
+            L.push('  Untracked Credit Loss:' + dailyFinance._fmtNum(delta).padStart(33));
         } else {
-            L.push('  Untracked Gains:' + dailyFinance._fmtNum(Math.abs(delta)).padStart(38));
+            L.push('  Untracked Credit Gain:' + dailyFinance._fmtNum(Math.abs(delta)).padStart(33));
         }
         L.push('');
 
         // ── Net ──
         const net = fin.totalIncome - fin.totalExpenses - delta;
         const sign = net >= 0 ? '+' : '';
-        L.push('  NET PROFIT/LOSS:' + (sign + dailyFinance._fmtNum(net)).padStart(38));
+        L.push('  NET CREDIT CHANGE:' + (sign + dailyFinance._fmtNum(net)).padStart(38));
         L.push('  Transactions today: ' +
             dailyFinance._fmtNum(fin.totalSalesTx) + ' sales, ' +
             dailyFinance._fmtNum(fin.totalPurchasesTx) + ' purchases  ' +
             '(' + dailyFinance._fmtNum(fin.totalSalesTx + fin.totalPurchasesTx) + ' total)');
+
+        // ── Null-order anomalies ──
+        const nullOrder = fin.nullOrderTx;
+        if (nullOrder && (nullOrder.incoming || nullOrder.outgoing)) {
+            L.push('');
+            L.push('  Anomalies: ' + nullOrder.outgoing + ' outgoing, ' +
+                    nullOrder.incoming + ' incoming transactions had no order data');
+        }
 
         // ── Room Trading Summary ──
         L.push('');
@@ -228,7 +238,7 @@ const dailyFinance = {
         // ── Hourly snapshots summary ──
         if (fin.hourlyChecks && fin.hourlyChecks.length > 0) {
             L.push('');
-            L.push('  Hourly snapshots recorded: ' + fin.hourlyChecks.length + '/23');
+            L.push('  Hourly snapshots recorded: ' + fin.hourlyChecks.length + '/24');
             const last = fin.hourlyChecks[fin.hourlyChecks.length - 1];
             L.push('  Last snapshot: tick ' + last.tick +
                    ' (' + dailyFinance._fmt12hr(last.hour, last.minute) + ' PT)');
@@ -303,7 +313,7 @@ const dailyFinance = {
         }
 
         L.push('Expenses: ' + sn(fin.totalExpenses) +
-               '  Fees: ' + sn(fees) +
+               '  Delta: ' + sn(fees) +
                '  NET: ' + (net >= 0 ? '+' : '') + sn(net) +
                '  Tx: ' + fin.totalSalesTx + 's/' + fin.totalPurchasesTx + 'b');
 
@@ -341,11 +351,17 @@ const dailyFinance = {
                 hourlyChecks:     [],
                 income:           {},
                 expenses:         {},
+                incomeUnits:      {},
+                expenseUnits:     {},
                 totalIncome:      0,
                 totalExpenses:    0,
                 totalSalesTx:     0,
                 totalPurchasesTx: 0,
-                rooms:            {}   // { roomName: { sells, buys, resources: { RES: { sells, buys } } } }
+                rooms:            {},
+                nullOrderTx:      { incoming: 0, outgoing: 0 },
+                lastHourlyKey:    null,
+                lastProcessLog:   0,
+                legacyCleanupDone: true
             };
             this._seedTransactionIds();
         }
@@ -370,8 +386,21 @@ const dailyFinance = {
             if (!rooms[rn].resources) rooms[rn].resources = {};
         }
         // Migration: drop legacy buyers/suppliers if still present from old installs
-        delete Memory.dailyFinance.buyers;
-        delete Memory.dailyFinance.suppliers;
+        if (!Memory.dailyFinance.legacyCleanupDone) {
+            delete Memory.dailyFinance.buyers;
+            delete Memory.dailyFinance.suppliers;
+            Memory.dailyFinance.legacyCleanupDone = true;
+        }
+        // Migration: backfill incomeUnits, expenseUnits
+        if (!Memory.dailyFinance.incomeUnits) Memory.dailyFinance.incomeUnits = {};
+        if (!Memory.dailyFinance.expenseUnits) Memory.dailyFinance.expenseUnits = {};
+        // Migration: backfill nullOrderTx counter
+        if (!Memory.dailyFinance.nullOrderTx) {
+            Memory.dailyFinance.nullOrderTx = { incoming: 0, outgoing: 0 };
+        }
+        // Migration: backfill lastHourlyKey & lastProcessLog
+        if (Memory.dailyFinance.lastHourlyKey === undefined) Memory.dailyFinance.lastHourlyKey = null;
+        if (Memory.dailyFinance.lastProcessLog === undefined) Memory.dailyFinance.lastProcessLog = 0;
     },
 
     // Set last-seen IDs to the newest available transactions so the first
@@ -434,33 +463,46 @@ const dailyFinance = {
     },
 
     // ── Midnight reset ──────────────────────────────────────────────
+    // Returns true if a reset occurred (caller should skip _processTransactions this tick)
     _checkMidnightReset: function () {
         var pt = this._getPT();
         var today = this._dateString(pt);
 
         if (Memory.dailyFinance.dateString !== today) {
+            // Catch up any transactions not yet processed
+            this._processTransactions();
+
             console.log('[DailyFinance] ☀️ New day (' + today + '). Printing final report then resetting.');
             this.report();
             this._notifyReport();
 
-            var savedOutId = Memory.dailyFinance.lastOutgoingTxId;
-            var savedInId  = Memory.dailyFinance.lastIncomingTxId;
-
             Memory.dailyFinance = {
                 dateString:       today,
-                lastIncomingTxId: savedInId,
-                lastOutgoingTxId: savedOutId,
+                lastIncomingTxId: null,
+                lastOutgoingTxId: null,
                 startingBalance:  Math.round(Game.market.credits),
                 hourlyChecks:     [],
                 income:           {},
                 expenses:         {},
+                incomeUnits:      {},
+                expenseUnits:     {},
                 totalIncome:      0,
                 totalExpenses:    0,
                 totalSalesTx:     0,
                 totalPurchasesTx: 0,
-                rooms:            {}
+                rooms:            {},
+                nullOrderTx:      { incoming: 0, outgoing: 0 },
+                lastHourlyKey:    null,
+                lastProcessLog:   0,
+                legacyCleanupDone: true
             };
+
+            // Seed transaction cursors so new-day processing starts fresh
+            this._seedTransactionIds();
+
+            return true;
         }
+        return false;
     },
 
     // ── Email notification (compact, ≤400 chars per Game.notify) ───
@@ -515,7 +557,7 @@ const dailyFinance = {
                  'LocalInc:' + localIncPct +
                  ' LocalProfit:' + localProfPct + '\n' +
                  'OUT:' + sn(fin.totalExpenses) +
-                 ' Fees:' + sn(delta) +
+                 ' Delta:' + sn(delta) +
                  ' NET:' + (net >= 0 ? '+' : '') + sn(net) + '\n' +
                  'Tx:' + fin.totalSalesTx + 'sales/' + fin.totalPurchasesTx + 'buys';
         msgs.push(b1);
@@ -552,31 +594,34 @@ const dailyFinance = {
         }
 
         // ── Block 4+: Rooms with resource symbols ──
-        var rooms = fin.rooms || {};
-        var roomNames = Object.keys(rooms).sort(function (a, b) {
-            return (rooms[b].sells + rooms[b].buys) - (rooms[a].sells + rooms[a].buys);
-        });
-        if (roomNames.length > 0) {
-            var b4 = 'ROOMS:\n';
-            for (var ri = 0; ri < roomNames.length; ri++) {
-                var rn = roomNames[ri];
-                var r = rooms[rn];
-                var netR = r.sells - r.buys;
-                var resStr = dailyFinance._roomResStr(r.resources);
-                var line3 = rn + ' S:' + sn(r.sells) + ' B:' + sn(r.buys) +
-                            ' N:' + (netR >= 0 ? '+' : '') + sn(netR) +
-                            ' [' + resStr + ']\n';
-                if ((b4 + line3).length > LIMIT) {
-                    msgs.push(b4);
-                    b4 = '';
+        if (INCLUDE_ROOMS_IN_EMAIL) {
+            var rooms = fin.rooms || {};
+            var roomNames = Object.keys(rooms).sort(function (a, b) {
+                return (rooms[b].sells + rooms[b].buys) - (rooms[a].sells + rooms[a].buys);
+            });
+            if (roomNames.length > 0) {
+                var b4 = 'ROOMS:\n';
+                for (var ri = 0; ri < roomNames.length; ri++) {
+                    var rn = roomNames[ri];
+                    var r = rooms[rn];
+                    var netR = r.sells - r.buys;
+                    var resStr = dailyFinance._roomResStr(r.resources);
+                    var line3 = rn + ' S:' + sn(r.sells) + ' B:' + sn(r.buys) +
+                                ' N:' + (netR >= 0 ? '+' : '') + sn(netR) +
+                                ' [' + resStr + ']\n';
+                    if ((b4 + line3).length > LIMIT) {
+                        msgs.push(b4);
+                        b4 = '';
+                    }
+                    b4 += line3;
                 }
-                b4 += line3;
+                if (b4.length > 0) msgs.push(b4);
             }
-            if (b4.length > 0) msgs.push(b4);
         }
 
-        for (var n = 0; n < msgs.length; n++) {
-            Game.notify(msgs[n], 0);
+        var total = msgs.length;
+        for (var n = 0; n < total; n++) {
+            Game.notify('[' + (n + 1) + '/' + total + '] ' + msgs[n], n * 10);
         }
     },
 
@@ -619,9 +664,18 @@ const dailyFinance = {
             estimatedTicksToMidnight: this._ticksUntilMidnight(pt)
         });
 
-        while (checks.length > 23) {
+        while (checks.length > 24) {
             checks.shift();
         }
+    },
+
+    // ── Wall-clock-hour dedup (once per hour regardless of tick timing) ──
+    _maybeRecordHourlyCheck: function () {
+        var pt = this._getPT();
+        var key = this._dateString(pt) + ' ' + pt.hours;
+        if (Memory.dailyFinance.lastHourlyKey === key) return;
+        Memory.dailyFinance.lastHourlyKey = key;
+        this._recordHourlyCheck();
     },
 
     // ═════════════════════════════════════════════════════════════════
@@ -646,29 +700,35 @@ const dailyFinance = {
             var tx = outgoing[i];
             if (tx.transactionId === fin.lastOutgoingTxId) break;
 
-            if (tx.order && tx.order.price > 0) {
-                var resource = tx.resourceType;
-                var credits = Math.round(tx.amount * tx.order.price);
-
-                if (!fin.income[resource]) fin.income[resource] = 0;
-                fin.income[resource] += credits;
-                fin.totalIncome += credits;
-                fin.totalSalesTx++;
-
-                // Room tracking — use tx.to (counterparty room)
-                // Skip if it's our own sell order being filled by us (pure self-trade, ignore)
-                if (tx.to && (!ownOrderIds[tx.order.id] || tx.order.type === 'buy')) {
-                    var roomName = tx.to;
-                    if (!fin.rooms[roomName]) fin.rooms[roomName] = { sells: 0, buys: 0, resources: {} };
-                    if (!fin.rooms[roomName].resources) fin.rooms[roomName].resources = {};
-                    fin.rooms[roomName].sells += credits;
-                    if (!fin.rooms[roomName].resources[resource])
-                        fin.rooms[roomName].resources[resource] = { sells: 0, buys: 0 };
-                    fin.rooms[roomName].resources[resource].sells += credits;
-                }
-                outProcessed++;
-            }
+            // Advance cursor to newest tx on first iteration (before any continue)
             if (i === 0) newLastOutId = tx.transactionId;
+
+            if (!tx.order || tx.order.price <= 0) {
+                fin.nullOrderTx.outgoing++;
+                continue;
+            }
+            var resource = tx.resourceType;
+            var credits = Math.round(tx.amount * tx.order.price);
+
+            if (!fin.income[resource]) fin.income[resource] = 0;
+            fin.income[resource] += credits;
+            if (!fin.incomeUnits[resource]) fin.incomeUnits[resource] = 0;
+            fin.incomeUnits[resource] += tx.amount;
+            fin.totalIncome += credits;
+            fin.totalSalesTx++;
+
+            // Room tracking — use tx.to (counterparty room)
+            // Skip if it's our own sell order being filled by us (pure self-trade, ignore)
+            if (tx.to && (!ownOrderIds[tx.order.id] || tx.order.type === 'buy')) {
+                var roomName = tx.to;
+                if (!fin.rooms[roomName]) fin.rooms[roomName] = { sells: 0, buys: 0, resources: {} };
+                if (!fin.rooms[roomName].resources) fin.rooms[roomName].resources = {};
+                fin.rooms[roomName].sells += credits;
+                if (!fin.rooms[roomName].resources[resource])
+                    fin.rooms[roomName].resources[resource] = { sells: 0, buys: 0 };
+                fin.rooms[roomName].resources[resource].sells += credits;
+            }
+            outProcessed++;
         }
         fin.lastOutgoingTxId = newLastOutId;
 
@@ -681,33 +741,41 @@ const dailyFinance = {
             var txIn = incoming[j];
             if (txIn.transactionId === fin.lastIncomingTxId) break;
 
-            if (txIn.order && txIn.order.price > 0) {
-                var resIn = txIn.resourceType;
-                var creditsIn = Math.round(txIn.amount * txIn.order.price);
-
-                if (!fin.expenses[resIn]) fin.expenses[resIn] = 0;
-                fin.expenses[resIn] += creditsIn;
-                fin.totalExpenses += creditsIn;
-                fin.totalPurchasesTx++;
-
-                // Room tracking — use txIn.from (counterparty room)
-                // Skip if it's our own buy order being filled by us (pure self-trade, ignore)
-                if (txIn.from && (!ownOrderIds[txIn.order.id] || txIn.order.type === 'sell')) {
-                    var roomNameIn = txIn.from;
-                    if (!fin.rooms[roomNameIn]) fin.rooms[roomNameIn] = { sells: 0, buys: 0, resources: {} };
-                    if (!fin.rooms[roomNameIn].resources) fin.rooms[roomNameIn].resources = {};
-                    fin.rooms[roomNameIn].buys += creditsIn;
-                    if (!fin.rooms[roomNameIn].resources[resIn])
-                        fin.rooms[roomNameIn].resources[resIn] = { sells: 0, buys: 0 };
-                    fin.rooms[roomNameIn].resources[resIn].buys += creditsIn;
-                }
-                inProcessed++;
-            }
+            // Advance cursor to newest tx on first iteration (before any continue)
             if (j === 0) newLastInId = txIn.transactionId;
+
+            if (!txIn.order || txIn.order.price <= 0) {
+                fin.nullOrderTx.incoming++;
+                continue;
+            }
+            var resIn = txIn.resourceType;
+            var creditsIn = Math.round(txIn.amount * txIn.order.price);
+
+            if (!fin.expenses[resIn]) fin.expenses[resIn] = 0;
+            fin.expenses[resIn] += creditsIn;
+            if (!fin.expenseUnits[resIn]) fin.expenseUnits[resIn] = 0;
+            fin.expenseUnits[resIn] += txIn.amount;
+            fin.totalExpenses += creditsIn;
+            fin.totalPurchasesTx++;
+
+            // Room tracking — use txIn.from (counterparty room)
+            // Skip if it's our own buy order being filled by us (pure self-trade, ignore)
+            if (txIn.from && (!ownOrderIds[txIn.order.id] || txIn.order.type === 'sell')) {
+                var roomNameIn = txIn.from;
+                if (!fin.rooms[roomNameIn]) fin.rooms[roomNameIn] = { sells: 0, buys: 0, resources: {} };
+                if (!fin.rooms[roomNameIn].resources) fin.rooms[roomNameIn].resources = {};
+                fin.rooms[roomNameIn].buys += creditsIn;
+                if (!fin.rooms[roomNameIn].resources[resIn])
+                    fin.rooms[roomNameIn].resources[resIn] = { sells: 0, buys: 0 };
+                fin.rooms[roomNameIn].resources[resIn].buys += creditsIn;
+            }
+            inProcessed++;
         }
         fin.lastIncomingTxId = newLastInId;
 
-        if (outProcessed + inProcessed > 0) {
+        if (outProcessed + inProcessed > 0 &&
+            (!fin.lastProcessLog || Game.time - fin.lastProcessLog >= 1000)) {
+            fin.lastProcessLog = Game.time;
             console.log('[DailyFinance] Processed ' + outProcessed + ' sales, ' +
                         inProcessed + ' purchases. Running totals — Income: ' +
                         this._fmtNum(fin.totalIncome) + ' | Expenses: ' +
@@ -743,21 +811,77 @@ const dailyFinance = {
         var h = hours % 12;
         if (h === 0) h = 12;
         return h + ':' + String(minutes).padStart(2, '0') + ' ' + suffix;
+    },
+
+    // ── VWAP helpers ─────────────────────────────────────────────────
+    _vwap: function (credits, units) {
+        if (!units || units <= 0) return null;
+        return credits / units;
+    },
+
+    _fmtPrice: function (n) {
+        if (n === null || n === undefined) return 'N/A';
+        if (n >= 1) return n.toFixed(3);
+        if (n >= 0.01) return n.toFixed(4);
+        return n.toFixed(6);
+    },
+
+    // ── VWAP Report ──────────────────────────────────────────────────
+    _reportVwap: function () {
+        var fin = Memory.dailyFinance;
+        if (!fin) { console.log('[DailyFinance] No data yet.'); return; }
+
+        var L = [];
+        L.push('');
+        L.push('============= DAILY VWAP REPORT (' + fin.dateString + ') ==============');
+        L.push('');
+
+        var resources = {};
+        for (var res in fin.income) resources[res] = true;
+        for (var res in fin.expenses) resources[res] = true;
+        var resList = Object.keys(resources);
+
+        if (resList.length === 0) {
+            L.push('  (no data)');
+        } else {
+            L.push('  ' +
+                'Resource'.padEnd(18) + '| ' +
+                'Sold Units'.padStart(10) + ' | ' +
+                'Sell VWAP'.padStart(10) + ' | ' +
+                'Bought Units'.padStart(12) + ' | ' +
+                'Buy VWAP'.padStart(10) + ' | ' +
+                'Spread');
+            L.push('  ' + '-'.repeat(83));
+            for (var i = 0; i < resList.length; i++) {
+                var res = resList[i];
+                var soldCredits = fin.income[res] || 0;
+                var soldUnits = fin.incomeUnits[res] || 0;
+                var boughtCredits = fin.expenses[res] || 0;
+                var boughtUnits = fin.expenseUnits[res] || 0;
+                var sellVwap = soldUnits > 0 ? soldCredits / soldUnits : null;
+                var buyVwap = boughtUnits > 0 ? boughtCredits / boughtUnits : null;
+                var spread = sellVwap !== null && buyVwap !== null ? sellVwap - buyVwap : null;
+                L.push('  ' +
+                    res.padEnd(18) + '| ' +
+                    this._fmtNum(soldUnits).padStart(10) + ' | ' +
+                    (sellVwap !== null ? this._fmtPrice(sellVwap) : 'N/A').padStart(10) + ' | ' +
+                    this._fmtNum(boughtUnits).padStart(12) + ' | ' +
+                    (buyVwap !== null ? this._fmtPrice(buyVwap) : 'N/A').padStart(10) + ' | ' +
+                    (spread !== null ? this._fmtPrice(spread) : 'N/A'));
+            }
+        }
+
+        L.push('================================================================');
+        L.push('');
+        console.log(L.join('\n'));
+    },
+
+    // ── JSON Export ──────────────────────────────────────────────────
+    _reportJson: function () {
+        var fin = Memory.dailyFinance;
+        if (!fin) { console.log('[DailyFinance] No data yet.'); return; }
+        console.log(JSON.stringify(fin, null, 2));
     }
 };
 
 module.exports = dailyFinance;
-
-// ── Console shortcuts ────────────────────────────────────────────────
-// fR()              → compact report
-// fR('full')        → full report (same as financeReport())
-// financeReport()   → full report
-// financeReport('compact') or financeReport('c') → compact report
-global.fR = function (mode) {
-    if (!mode || mode === 'compact' || mode === 'c') {
-        dailyFinance._reportCompact();
-    } else {
-        dailyFinance.report();
-    }
-};
-global.financeReport = function (mode) { dailyFinance.report(mode); };

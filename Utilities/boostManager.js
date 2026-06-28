@@ -37,6 +37,17 @@
 var storageManager   = require('storageManager');
 var labManager       = require('labManager');
 var opportunisticBuy = require('opportunisticBuy');
+var getRoomState     = require('getRoomState');
+
+function _getLabs(room) {
+    var rs = getRoomState.get(room.name);
+    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_LAB]) {
+        return rs.structuresByType[STRUCTURE_LAB];
+    }
+    return room.find(FIND_STRUCTURES, {
+        filter: function(s) { return s.structureType === STRUCTURE_LAB; }
+    });
+}
 
 // =============================================================================
 // CONSTANTS
@@ -233,6 +244,68 @@ function getLabsCompound(labIds, compound) {
   return total;
 }
 
+function getBoostLabStock(order, compound) {
+  migrateLabIds(order);
+
+  var info = order.boosts[compound];
+  if (!info || !info.labIds || info.labIds.length === 0) {
+    return { compound: 0, energy: 0 };
+  }
+
+  var compoundTotal = 0;
+  var energyTotal = 0;
+
+  for (var i = 0; i < info.labIds.length; i++) {
+    var lab = Game.getObjectById(info.labIds[i]);
+    if (!lab) continue;
+
+    if (lab.mineralType === compound) {
+      compoundTotal += (lab.mineralAmount || 0);
+    }
+    if (lab.store) {
+      energyTotal += (lab.store.getUsedCapacity(RESOURCE_ENERGY) || 0);
+    }
+  }
+
+  return {
+    compound: compoundTotal,
+    energy: energyTotal
+  };
+}
+
+function getReservedAmount(roomName, building, material, program) {
+  if (!Memory.storageReservations) return 0;
+  var roomBuckets = Memory.storageReservations[roomName];
+  if (!roomBuckets || !roomBuckets[building] || !roomBuckets[building][material]) return 0;
+
+  var reservations = roomBuckets[building][material];
+  var total = 0;
+  for (var i = 0; i < reservations.length; i++) {
+    if (reservations[i] && reservations[i].program === program) {
+      total += (reservations[i].amount || 0);
+    }
+  }
+  return total;
+}
+
+function getBoostAccessibleAmount(roomName, material) {
+  var info = storageManager.storageFind(roomName, material);
+  if (!info) return 0;
+
+  var terminalOwn = getReservedAmount(roomName, 'terminal', material, 'boostManager');
+  var storageOwn = getReservedAmount(roomName, 'storage', material, 'boostManager');
+
+  var terminalActual = info.terminal ? (info.terminal.total || 0) : 0;
+  var storageActual = info.storage ? (info.storage.total || 0) : 0;
+  var terminalReserved = info.terminal ? (info.terminal.reserved || 0) : 0;
+  var storageReserved = info.storage ? (info.storage.reserved || 0) : 0;
+
+  var terminalOthers = Math.max(0, terminalReserved - terminalOwn);
+  var storageOthers = Math.max(0, storageReserved - storageOwn);
+
+  return Math.max(0, terminalActual - terminalOthers) + Math.max(0, storageActual - storageOthers);
+}
+
 function getRefPrice(compound) {
   var history = Game.market.getHistory(compound);
   if (history && history.length > 0) {
@@ -258,9 +331,7 @@ function getBoostFillTarget(parts) {
 function selectBoostLab(room, usedLabIds) {
   var layout = labManager.getLayout(room);
 
-  var allLabs = room.find(FIND_STRUCTURES, {
-    filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-  });
+  var allLabs = _getLabs(room);
   if (allLabs.length === 0) return null;
 
   var inputIds = {};
@@ -332,9 +403,7 @@ function getAllAllocatedLabIds(roomName) {
 function ensureLabsAllocated(room, order) {
   migrateLabIds(order);
 
-  var allLabs = room.find(FIND_STRUCTURES, {
-    filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-  });
+  var allLabs = _getLabs(room);
 
   // Per-order budget — each order independently gets up to this many labs
   var perOrderBudget = Math.floor(allLabs.length * (order.maxLabFraction || MAX_BOOST_LAB_FRACTION));
@@ -504,27 +573,91 @@ function handlePurchasing(roomName, order) {
 // RESERVATIONS
 // =============================================================================
 
-function updateReservations(roomName, order) {
+function updateReservations(roomName) {
   var room = Game.rooms[roomName];
   if (!room) return;
 
-  for (var compound in order.boosts) {
-    if (room.terminal && (room.terminal.store[compound] || 0) > 0) {
-      storageManager.reserve(roomName, compound, 'terminal',
-        'boostManager', room.terminal.store[compound]);
+  var roomOrders = (Memory.boostManager && Memory.boostManager.orders && Memory.boostManager.orders[roomName]) || {};
+  var demand = {};
+
+  for (var role in roomOrders) {
+    var order = roomOrders[role];
+    if (!order || !order.active || order.stopping) continue;
+    migrateLabIds(order);
+
+    for (var compound in order.boosts) {
+      var info = order.boosts[compound];
+      var totalCompoundNeed = (order.batchSize || DEFAULT_BATCH_SIZE) * compoundPerBoost(info.parts);
+      var totalEnergyNeed = (order.batchSize || DEFAULT_BATCH_SIZE) * energyPerBoost(info.parts);
+      var labStock = getBoostLabStock(order, compound);
+      var need = Math.max(0, totalCompoundNeed - labStock.compound);
+      var energyNeed = Math.max(0, totalEnergyNeed - labStock.energy);
+
+      demand[compound] = (demand[compound] || 0) + need;
+      demand[RESOURCE_ENERGY] = (demand[RESOURCE_ENERGY] || 0) + energyNeed;
     }
-    if (room.storage && (room.storage.store[compound] || 0) > 0) {
-      storageManager.reserve(roomName, compound, 'storage',
-        'boostManager', room.storage.store[compound]);
+  }
+
+  var active = {};
+  for (var c in demand) active[c] = true;
+
+  if (Memory.storageReservations && Memory.storageReservations[roomName]) {
+    var roomBuckets = Memory.storageReservations[roomName];
+    for (var building in roomBuckets) {
+      var bucket = roomBuckets[building] || {};
+      for (var material in bucket) {
+        var reservations = bucket[material] || [];
+        var hasBoostMgr = false;
+        for (var i = 0; i < reservations.length; i++) {
+          if (reservations[i] && reservations[i].program === 'boostManager') { hasBoostMgr = true; break; }
+        }
+        if (hasBoostMgr && !active[material]) {
+          storageManager.unReserve(roomName, material, building, 'boostManager');
+        }
+      }
+    }
+  }
+
+  for (var compound2 in demand) {
+    var need = demand[compound2];
+    if (need <= 0) {
+      storageManager.unReserve(roomName, compound2, 'terminal', 'boostManager');
+      storageManager.unReserve(roomName, compound2, 'storage', 'boostManager');
+      continue;
+    }
+
+    var info2 = storageManager.storageFind(roomName, compound2);
+    if (!info2 || (!info2.terminal && !info2.storage)) continue;
+
+    var termOwn = getReservedAmount(roomName, 'terminal', compound2, 'boostManager');
+    var storOwn = getReservedAmount(roomName, 'storage', compound2, 'boostManager');
+    var termFree = info2.terminal
+      ? Math.max(0, (info2.terminal.total || 0) - Math.max(0, (info2.terminal.reserved || 0) - termOwn))
+      : 0;
+    var storFree = info2.storage
+      ? Math.max(0, (info2.storage.total || 0) - Math.max(0, (info2.storage.reserved || 0) - storOwn))
+      : 0;
+    var fromTerm = Math.min(need, termFree);
+    var fromStor = Math.min(need - fromTerm, storFree);
+
+    if (fromTerm > 0) {
+      var rv1 = storageManager.reserve(roomName, compound2, 'terminal', 'boostManager', fromTerm);
+      if (!rv1.ok) console.log('[BoostManager] Failed terminal reserve for ' + compound2 + ' in ' + roomName + ': ' + rv1.reason);
+    } else {
+      storageManager.unReserve(roomName, compound2, 'terminal', 'boostManager');
+    }
+
+    if (fromStor > 0) {
+      var rv2 = storageManager.reserve(roomName, compound2, 'storage', 'boostManager', fromStor);
+      if (!rv2.ok) console.log('[BoostManager] Failed storage reserve for ' + compound2 + ' in ' + roomName + ': ' + rv2.reason);
+    } else {
+      storageManager.unReserve(roomName, compound2, 'storage', 'boostManager');
     }
   }
 }
 
 function removeReservations(roomName, order) {
-  for (var compound in order.boosts) {
-    storageManager.unReserve(roomName, compound, 'terminal', 'boostManager');
-    storageManager.unReserve(roomName, compound, 'storage', 'boostManager');
-  }
+  updateReservations(roomName);
 }
 
 function placeCleanupReservations(roomName, order) {
@@ -831,10 +964,15 @@ function needsLabBot(roomName) {
         var compAmt = (lab.mineralType === comp) ? (lab.mineralAmount || 0) : 0;
         var enAmt = lab.store ? (lab.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
 
-        if (compAmt < perBoost || enAmt < perBoostEnergy) {
-          var room = Game.rooms[roomName];
-          var roomHasCompound = room && getRoomCompound(room, comp) >= perBoost;
-          if (roomHasCompound) {
+        if (compAmt < perBoost) {
+          if (getBoostAccessibleAmount(roomName, comp) >= perBoost) {
+            _needsLabBotCache[roomName] = true;
+            return true;
+          }
+        }
+
+        if (enAmt < perBoostEnergy) {
+          if (getBoostAccessibleAmount(roomName, RESOURCE_ENERGY) >= perBoostEnergy) {
             _needsLabBotCache[roomName] = true;
             return true;
           }
@@ -949,7 +1087,6 @@ function handleStopping(roomName, role, order) {
   if (!allEmpty) return;
 
   console.log('[BoostManager] Cleanup complete for ' + role + ' in ' + roomName);
-  removeReservations(roomName, order);
 
   // Clear any boostManager_cleanup reservations for these compounds.
   // placeCleanupReservations() used to re-lock them here, but nothing ever
@@ -974,6 +1111,7 @@ function handleStopping(roomName, role, order) {
   }
 
   deleteOrder(roomName, role);
+  updateReservations(roomName);
   console.log('[BoostManager] Fully stopped ' + role + ' boosting in ' + roomName);
 }
 
@@ -1036,9 +1174,10 @@ function run() {
       ensureLabsAllocated(room, order);
       handlePurchasing(roomName, order);
 
-      if (Game.time % 50 === 0) {
-        updateReservations(roomName, order);
-      }
+    }
+
+    if (Game.time % 50 === 0) {
+      updateReservations(roomName);
     }
 
   }
@@ -1063,9 +1202,7 @@ function installConsole() {
       return '[BoostManager] No owned room: ' + roomName;
     }
 
-    var labs = room.find(FIND_STRUCTURES, {
-      filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-    });
+    var labs = _getLabs(room);
     var numCompounds = Object.keys(compounds).length;
     if (labs.length < numCompounds) {
       return '[BoostManager] Need ' + numCompounds + ' lab(s) but room has ' + labs.length;
@@ -1084,7 +1221,6 @@ function installConsole() {
 
     var existing = getOrder(roomName, role);
     if (existing) {
-      removeReservations(roomName, existing);
       for (var oldComp in existing.boosts) {
         opportunisticBuy.cancelRequest(roomName, oldComp);
       }
@@ -1103,6 +1239,8 @@ function installConsole() {
       boostsCompleted: 0, purchaseSetup: {}, buyOrderIds: {},
       lastPurchaseCheck: 0, _pendingBoosts: {}, created: Game.time
     });
+
+    updateReservations(roomName);
 
     var maxLabs = Math.floor(labs.length * MAX_BOOST_LAB_FRACTION);
     var lines = ['[BoostManager] Enabled ' + role + ' boosting in ' + roomName];
@@ -1180,6 +1318,7 @@ function installConsole() {
     order.stopping = true;
     order.active = false;
     _cacheTick = 0;
+    updateReservations(roomName);
 
     return '[BoostManager] Stopping ' + role + ' boost in ' + roomName +
       '. LabBot will empty boost labs.';

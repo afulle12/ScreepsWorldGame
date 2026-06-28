@@ -30,6 +30,11 @@ function moveOpts(color) {
   return opts;
 }
 
+function safeMoveTo(creep, target, opts) {
+  if (creep.fatigue > 0) return ERR_TIRED;
+  return creep.moveTo(target, opts);
+}
+
 function structureHasEnergy(structure) {
   if (!structure) return false;
   if (structure.store && typeof structure.store.getUsedCapacity === 'function') {
@@ -277,7 +282,7 @@ function withdrawEnergy(creep, target) {
     }
 
   } else {
-    creep.moveTo(target, moveOpts('#ffaa00'));
+    safeMoveTo(creep, target, moveOpts('#ffaa00'));
   }
 }
 
@@ -286,7 +291,7 @@ function harvestFromSource(creep, source) {
   if (creep.pos.isNearTo(source)) {
     creep.harvest(source);
   } else {
-    creep.moveTo(source, moveOpts('#ffaa00'));
+    safeMoveTo(creep, source, moveOpts('#ffaa00'));
   }
 }
 
@@ -295,7 +300,7 @@ function doUpgrade(creep, controller) {
   if (creep.pos.inRangeTo(controller, 3)) {
     creep.upgradeController(controller);
   } else {
-    creep.moveTo(controller, moveOpts('#ffffff'));
+    safeMoveTo(creep, controller, moveOpts('#ffffff'));
   }
 }
 
@@ -382,14 +387,14 @@ var role = {
                 ' (' + compound + '): ' + result);
             }
           } else {
-            creep.moveTo(readyLab, { range: 1, reusePath: 5 });
+            safeMoveTo(creep, readyLab, { range: 1, reusePath: 5 });
             creep.say('🧪');
           }
         } else {
           // No lab ready — wait near the first valid lab
           var waitLab = findFirstValidLab(labIds);
           if (waitLab && !creep.pos.inRangeTo(waitLab, 3)) {
-            creep.moveTo(waitLab, { range: 3, reusePath: 10 });
+            safeMoveTo(creep, waitLab, { range: 3, reusePath: 10 });
           }
           creep.say('⏳');
         }
@@ -436,7 +441,7 @@ var role = {
                 console.log('[BoostManager] unboostCreep failed: ' + ubResult);
               }
             } else {
-              creep.moveTo(unboostLab, { range: 1, reusePath: 3 });
+              safeMoveTo(creep, unboostLab, { range: 1, reusePath: 3 });
               creep.say('♻️');
             }
             return;
@@ -488,7 +493,7 @@ var role = {
             delete creep.memory.linkDryUntil;
           } else {
             if (!creep.pos.isNearTo(dryLink)) {
-              creep.moveTo(dryLink, moveOpts('#ffaa00'));
+              safeMoveTo(creep, dryLink, moveOpts('#ffaa00'));
             }
           }
           return;
@@ -502,6 +507,9 @@ var role = {
     var withdrawTarget = findEnergyWithdrawTarget(creep, state);
     if (withdrawTarget) {
       withdrawEnergy(creep, withdrawTarget);
+      if (creep.store.getFreeCapacity() === 0) {
+        doUpgrade(creep, state.controller);
+      }
       return;
     }
 

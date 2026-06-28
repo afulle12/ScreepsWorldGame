@@ -99,11 +99,21 @@ function resolveById(id, room, hint) {
   var obj = Game.getObjectById(id);
   if (obj) return obj;
 
-  // getObjectById failed — attempt a room.find recovery
+  var rs = getRoomState.get(room.name);
+
+  // getObjectById failed — attempt a recovery using the per-tick room cache
   if (hint === 'dropped') {
-    var drops = room.find(FIND_DROPPED_RESOURCES, {
-      filter: function(r) { return r.resourceType === RESOURCE_ENERGY; }
-    });
+    var drops = [];
+    if (rs && rs.dropped) {
+      var allDrops = rs.dropped;
+      for (var di = 0; di < allDrops.length; di++) {
+        if (allDrops[di].resourceType === RESOURCE_ENERGY) drops.push(allDrops[di]);
+      }
+    } else {
+      drops = room.find(FIND_DROPPED_RESOURCES, {
+        filter: function(r) { return r.resourceType === RESOURCE_ENERGY; }
+      });
+    }
     if (!drops.length) return null;
     var refPos = room.controller ? room.controller.pos : drops[0].pos;
     return closestByRange(refPos, drops);
@@ -111,12 +121,20 @@ function resolveById(id, room, hint) {
 
   if (hint === STRUCTURE_STORAGE || hint === STRUCTURE_TERMINAL ||
       hint === STRUCTURE_CONTAINER) {
-    var structs = room.find(FIND_STRUCTURES, {
-      filter: function(s) {
-        return s.structureType === hint &&
-               s.store && s.store[RESOURCE_ENERGY] > 0;
+    var structs = [];
+    if (rs && rs.structuresByType && rs.structuresByType[hint]) {
+      var arr = rs.structuresByType[hint];
+      for (var si = 0; si < arr.length; si++) {
+        if (arr[si].store && arr[si].store[RESOURCE_ENERGY] > 0) structs.push(arr[si]);
       }
-    });
+    } else {
+      structs = room.find(FIND_STRUCTURES, {
+        filter: function(s) {
+          return s.structureType === hint &&
+                 s.store && s.store[RESOURCE_ENERGY] > 0;
+        }
+      });
+    }
     if (!structs.length) return null;
     var refPos2 = room.controller ? room.controller.pos : structs[0].pos;
     return closestByRange(refPos2, structs);
@@ -363,6 +381,7 @@ function applyEdgePenalty(roomName, costMatrix) {
 
 // == Wrapper: in-room move that avoids edges unless target is on the edge ==
 function moveToWithinRoom(creep, target, opts) {
+  if (creep.fatigue > 0) return ERR_TIRED;
   if (isNearRoomEdge(creep.pos, 1)) {
     if (nudgeOffRoomEdge(creep)) return;
   }
@@ -381,7 +400,7 @@ function moveToWithinRoom(creep, target, opts) {
     }
   };
 
-  creep.moveTo(target, mopts);
+  return creep.moveTo(target, mopts);
 }
 
 // == Helper: count open (non-wall) tiles adjacent to a source ==

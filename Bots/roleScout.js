@@ -36,11 +36,6 @@ const log = (message) => {
     }
 };
 
-// =================================================================
-// HELPER: Parse a room name into its numeric coordinates.
-// Returns { xDir: 'W'|'E', x: number, yDir: 'N'|'S', y: number }
-// or null if the name is invalid.
-// =================================================================
 const parseRoomName = function(roomName) {
     const match = roomName.match(/^([WE])(\d+)([NS])(\d+)$/);
     if (!match) return null;
@@ -52,13 +47,6 @@ const parseRoomName = function(roomName) {
     };
 };
 
-// =================================================================
-// HELPER: Given a room name, return a list of nearby highway
-// intersection room names (coords divisible by 10).
-// These are the rooms most likely to contain inter-shard portals.
-// Searches outward in a small spiral so the scout picks the closest
-// candidate first.
-// =================================================================
 const getNearbyHighwayRooms = function(fromRoomName, searchRadius) {
     searchRadius = searchRadius || 3; // how many highway steps out to look
     const parsed = parseRoomName(fromRoomName);
@@ -189,10 +177,8 @@ const roleScout = {
             const currentShard = Game.shard ? Game.shard.name : 'shard0';
             if (currentShard !== mem.homeShard) {
                 log(`✅ Inter-shard scout [${creep.name}] confirmed jump to ${currentShard}! Switching to autonomous.`);
-                mem.task        = 'autonomous';
-                mem.phase       = null;
-                mem.arrivedFrom = mem.homeShard;
-                mem.homeRoom    = null;
+                mem.task  = 'autonomous';
+                mem.phase = null;
                 return;
             }
 
@@ -710,9 +696,6 @@ const roleScout = {
                 return;
             }
         }
-        if (!Memory.exploration) Memory.exploration = {};
-        if (!Memory.exploration.rooms) Memory.exploration.rooms = {};
-        if (!Memory.ownedRooms) Memory.ownedRooms = [];
         if (!Memory.dangerousRooms) Memory.dangerousRooms = {};
         if (!creep.memory.targetRoom) this.assignTargetRoom(creep);
         if (creep.memory.lastRoom !== creep.room.name) {
@@ -814,46 +797,7 @@ const roleScout = {
         return true;
     },
 
-    clearDangerousRoom: function(roomName) {
-        if (Memory.dangerousRooms && Memory.dangerousRooms[roomName]) {
-            delete Memory.dangerousRooms[roomName];
-            console.log(`🔓 Manually cleared dangerous room: ${roomName}`);
-            return true;
-        }
-        return false;
-    },
-
-    listDangerousRooms: function() {
-        if (!Memory.dangerousRooms || Object.keys(Memory.dangerousRooms).length === 0) {
-            console.log("No dangerous rooms tracked.");
-            return;
-        }
-        console.log("=== DANGEROUS ROOMS ===");
-        for (const roomName in Memory.dangerousRooms) {
-            const data = Memory.dangerousRooms[roomName];
-            const status = data.permanent ? "PERMANENT" : `${data.cooldownUntil - Game.time} ticks remaining`;
-            console.log(`${roomName}: ${data.reason} - ${status}`);
-        }
-    },
-
-    showScoutStatus: function() {
-        console.log("=== SCOUT STATUS ===");
-        for (const creepName in Game.creeps) {
-            const creep = Game.creeps[creepName];
-            if (creep.memory.role === 'scout') {
-                const taskInfo = creep.memory.task ? ` (${creep.memory.task})` : '';
-                const target = creep.memory.task === 'checkRoom' || creep.memory.task === 'pathfinder'
-                    ? creep.memory.destinationRoom
-                    : creep.memory.task === 'interShardAutonomous'
-                        ? `[portal hunting → ${creep.memory.preferredShard || 'any shard'}] phase:${creep.memory.phase}`
-                        : creep.memory.targetRoom;
-                console.log(`${creep.name}${taskInfo}: ${creep.room.name} → ${target} (HP: ${creep.hits}/${creep.hitsMax})`);
-            }
-        }
-    },
-
     assignTargetRoom: function(creep) {
-        delete creep.memory.routeBlacklist;
         delete creep.memory.route;
         const exits = Game.map.describeExits(creep.room.name);
         if (!exits) return;
@@ -900,25 +844,9 @@ const roleScout = {
         if (creep.memory.roomScanned) return;
         const room = creep.room;
         const roomName = room.name;
-        if (!Memory.exploration.rooms[roomName]) Memory.exploration.rooms[roomName] = {};
-        Memory.exploration.rooms[roomName].lastVisit = Game.time;
-        Memory.exploration.rooms[roomName].sources = room.find(FIND_SOURCES).map(s => ({ id: s.id, pos: s.pos }));
-        if (room.controller) Memory.exploration.rooms[roomName].controller = { id: room.controller.id, pos: room.controller.pos, owner: room.controller.owner ? room.controller.owner.username : null, level: room.controller.level };
-        Memory.exploration.rooms[roomName].minerals = room.find(FIND_MINERALS).map(m => ({ id: m.id, pos: m.pos, mineralType: m.mineralType }));
-        Memory.exploration.rooms[roomName].exits = Game.map.describeExits(roomName);
         const hostiles = room.find(FIND_HOSTILE_CREEPS);
-        Memory.exploration.rooms[roomName].hostile = hostiles.length > 0;
         let ownerInfo = (room.controller && room.controller.owner) ? ` (owned by ${room.controller.owner.username})` : '';
         log(`📊 Scout ${creep.name} scanned ${roomName}: ${room.find(FIND_SOURCES).length} sources, ${room.find(FIND_MINERALS).length} minerals, ${hostiles.length} hostiles${ownerInfo}`);
-
-        if (!Memory.scoutIntel) Memory.scoutIntel = {};
-        Memory.scoutIntel[roomName] = {
-            sources:      room.find(FIND_SOURCES).map(s => s.id),
-            owner:        room.controller ? (room.controller.owner ? room.controller.owner.username : null) : null,
-            reservation:  room.controller ? room.controller.reservation : null,
-            lastScouted:  Game.time
-        };
-        log(`[Remote Harvest] Saved intel for ${roomName}.`);
         creep.memory.roomScanned = true;
     }
 };

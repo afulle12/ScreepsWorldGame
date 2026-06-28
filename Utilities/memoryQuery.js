@@ -13,15 +13,6 @@ const MAX_RESULTS = 100;
 const MAX_DEPTH = 20;
 const MAX_VALUE_PREVIEW = 100;
 
-/**
- * Recursively search through an object for a term
- * @param {Object} obj - Object to search through
- * @param {string} searchTerm - Term to search for
- * @param {string} currentPath - Current path in the object
- * @param {Array} results - Array to collect results
- * @param {Object} options - Search options
- * @param {number} depth - Current recursion depth
- */
 function searchObject(obj, searchTerm, currentPath, results, options, depth) {
     if (depth > MAX_DEPTH) return;
     if (results.length >= MAX_RESULTS) return;

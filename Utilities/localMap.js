@@ -4,25 +4,15 @@
  * ═══════════════════════════════════════════════════════════════════
  * CONSOLE COMMANDS:
  * ═══════════════════════════════════════════════════════════════════
- *
  *   localMap()         - Start a full scan of all rooms in observer range.
  *                        Collects owner, RCL, room type, sources, mineral,
  *                        towers, spawns, nuker, storage, terminal,
  *                        and average wall/rampart strength.
- *
  *   localMapStatus()   - Check progress of active scan.
  *                        Shows rooms scanned, rooms found, ETA.
- *
  *   localMapCancel()   - Cancel an active scan immediately.
- *
  *   localMapReport()   - Re-print the results of the last completed scan.
- *
- * ═══════════════════════════════════════════════════════════════════
- * RESULT COLUMNS (player-owned rooms):
- *   Room | Owner | RCL | T:<towers> Sp:<spawns> | Def:<avg hits> | Min:<mineral> | <flags>
- *   Flags: SAFE = safe mode active, NKR = nuker present,
- *          STR = storage present,   TRM = terminal present
- * ═══════════════════════════════════════════════════════════════════
+
  */
 
 'use strict';

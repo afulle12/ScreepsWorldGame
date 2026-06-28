@@ -2,12 +2,6 @@
 //cancelSquadOrder('ROOM');
 /*
  * roleSquad.js
- * PATCHED: Fixed "Snake Mode" triggering on walls
- * PATCHED: Added "Breach Mode" to target blocking walls/ramparts when no path exists
- * PATCHED: Fixed followers trying to form up where buildings block formation
- * PATCHED: Fixed train mode — followers now chain-follow instead of all pathing to leader
- * PATCHED: Fixed room-boundary oscillation — followers go FORWARD not back to leader
- * PATCHED: Added moveAsTrain fallback + findClosestByPath for stuck corners
  */
 
 var iff = require('iff');

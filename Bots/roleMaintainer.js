@@ -5,6 +5,16 @@
 
 var getRoomState = require('getRoomState');
 
+function _flattenStructures(structuresByType) {
+    var out = [];
+    for (var t in structuresByType) {
+        if (!structuresByType.hasOwnProperty(t)) continue;
+        var arr = structuresByType[t];
+        for (var i = 0; i < arr.length; i++) out.push(arr[i]);
+    }
+    return out;
+}
+
 // Cost matrix callback that avoids edge tiles AND structures
 function getRoomCostMatrix(roomName) {
     var room = Game.rooms[roomName];
@@ -20,8 +30,12 @@ function getRoomCostMatrix(roomName) {
 
     if (!room) return costs;
 
+    var rs = getRoomState.get(roomName);
+    var allStructures = (rs && rs.structuresByType) ? _flattenStructures(rs.structuresByType) : room.find(FIND_STRUCTURES);
+
     // Mark structures appropriately
-    room.find(FIND_STRUCTURES).forEach(function(struct) {
+    for (var si = 0; si < allStructures.length; si++) {
+        var struct = allStructures[si];
         if (struct.structureType === STRUCTURE_ROAD) {
             // Prefer roads (lower cost)
             costs.set(struct.pos.x, struct.pos.y, 1);
@@ -30,12 +44,23 @@ function getRoomCostMatrix(roomName) {
             // Non-walkable structures = impassable
             costs.set(struct.pos.x, struct.pos.y, 255);
         }
-    });
+    }
 
-    // Avoid other creeps
-    room.find(FIND_CREEPS).forEach(function(creep) {
-        costs.set(creep.pos.x, creep.pos.y, 255);
-    });
+    // Avoid other creeps (myCreeps + hostiles; missed neutrals are rare in owned rooms)
+    if (rs) {
+        var myCreeps = rs.myCreeps || [];
+        for (var mi = 0; mi < myCreeps.length; mi++) {
+            costs.set(myCreeps[mi].pos.x, myCreeps[mi].pos.y, 255);
+        }
+        var hostiles = rs.hostiles || [];
+        for (var hi = 0; hi < hostiles.length; hi++) {
+            costs.set(hostiles[hi].pos.x, hostiles[hi].pos.y, 255);
+        }
+    } else {
+        room.find(FIND_CREEPS).forEach(function(creep) {
+            costs.set(creep.pos.x, creep.pos.y, 255);
+        });
+    }
 
     return costs;
 }
@@ -68,7 +93,14 @@ module.exports = {
         // Phase A: Fill Storage Link
         // Phase B: Maintain Controller
         if (!creep.memory.phase) {
-            creep.memory.phase = 'fillLink';
+            // If a supplier is already spawned in this room, skip the link
+            // fill phase — the supplier handles storage link fills as part
+            // of its normal duties. Go straight to upgrading the controller.
+            if (isSupplierSpawned(creep.room)) {
+                creep.memory.phase = 'maintain';
+            } else {
+                creep.memory.phase = 'fillLink';
+            }
         }
 
         if (creep.memory.phase === 'fillLink') {
@@ -138,13 +170,32 @@ function runMaintain(creep) {
 
 // --- HELPERS ---
 
+function isSupplierSpawned(room) {
+    if (!room) return false;
+    var rs = getRoomState.get(room.name);
+    if (rs && rs.myCreeps) {
+        for (var i = 0; i < rs.myCreeps.length; i++) {
+            var c = rs.myCreeps[i];
+            if (c.memory && c.memory.role === 'supplier') return true;
+        }
+        return false;
+    }
+    var suppliers = room.find(FIND_MY_CREEPS, {
+        filter: function(c) { return c.memory && c.memory.role === 'supplier'; }
+    });
+    return suppliers.length > 0;
+}
+
 function getStorageLink(creep) {
     // Uses getRoomState for efficiency if available, falls back to find
     var rs = getRoomState.get(creep.room.name);
     var links = [];
 
     if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_LINK]) {
-        links = rs.structuresByType[STRUCTURE_LINK];
+        var allLinks = rs.structuresByType[STRUCTURE_LINK];
+        for (var li = 0; li < allLinks.length; li++) {
+            if (allLinks[li].my) links.push(allLinks[li]);
+        }
     } else {
         links = creep.room.find(FIND_MY_STRUCTURES, {
             filter: function(s) { return s.structureType === STRUCTURE_LINK; }

@@ -18,14 +18,6 @@
 
 const iff = require('iff');
 
-// === ROOM DIRECTION HELPER ===
-/**
- * Returns the name of the room adjacent in the given cardinal direction.
- * Handles the N0↔S1 and W0↔E1 axis transitions.
- * @param {string} roomName  e.g. "W1N1"
- * @param {string} dir       "N" | "S" | "E" | "W"
- * @returns {string|null}
- */
 function getRoomInDirection(roomName, dir) {
     const match = roomName.match(/^([WE])(\d+)([NS])(\d+)$/);
     if (!match) return null;

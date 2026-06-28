@@ -37,6 +37,9 @@ const BANNED_ROOMS = [
 
 const NEAR_EDGE_DIST = 5;
 
+// Ignore dropped energy piles smaller than this (not worth the trip / decays anyway)
+const MIN_ENERGY_DROP = 200;
+
 // ── Edge-avoid CostMatrix cache (Aligned with Wall Repair) ───────────────────
 var CACHE_REFRESH_TICKS = 25;
 if (!global._edgeAvoidCache) global._edgeAvoidCache = {};
@@ -127,6 +130,8 @@ function edgeAvoidMoveOpts(creep, lockRoomName) {
 }
 
 function stayOffEdges(creep) {
+    if (creep.fatigue > 0) return ERR_TIRED;
+
     if (creep.pos.x === 0) creep.move(RIGHT);
     else if (creep.pos.x === 49) creep.move(LEFT);
     if (creep.pos.y === 0) creep.move(BOTTOM);
@@ -167,6 +172,9 @@ const hasResources = (s) => {
 };
 
 const roomHasNonEnergyResources = (room) => {
+    // In a room you don't own, count your own (left-behind) structures too.
+    // Only exclude `my` structures when you actually own the room.
+    const roomIsMine = room.controller && room.controller.my;
     const structures = room.find(FIND_STRUCTURES, {
         filter: (s) =>
             [
@@ -177,7 +185,7 @@ const roomHasNonEnergyResources = (room) => {
                 STRUCTURE_LAB,
                 STRUCTURE_TERMINAL,
                 STRUCTURE_LINK,
-            ].includes(s.structureType) && !s.my
+            ].includes(s.structureType) && (roomIsMine ? !s.my : true)
     });
 
     for (const s of structures) {
@@ -186,7 +194,25 @@ const roomHasNonEnergyResources = (room) => {
             if (resourceType !== RESOURCE_ENERGY && s.store[resourceType] > 0) {
                 const atPos = room.lookForAt(LOOK_STRUCTURES, s.pos);
                 const hasEnemyRampart = atPos.some(
-                    (st) => st.structureType === STRUCTURE_RAMPART && !st.my
+                    (st) => st.structureType === STRUCTURE_RAMPART && st.owner && !st.my
+                );
+                if (!hasEnemyRampart) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Ruins and tombstones count too — a destroyed storage/terminal or a dead
+    // hauler can hold minerals.
+    const lootPiles = room.find(FIND_RUINS).concat(room.find(FIND_TOMBSTONES));
+    for (const r of lootPiles) {
+        if (!r.store) continue;
+        for (const resourceType in r.store) {
+            if (resourceType !== RESOURCE_ENERGY && r.store[resourceType] > 0) {
+                const atPos = room.lookForAt(LOOK_STRUCTURES, r.pos);
+                const hasEnemyRampart = atPos.some(
+                    (st) => st.structureType === STRUCTURE_RAMPART && st.owner && !st.my
                 );
                 if (!hasEnemyRampart) {
                     return true;
@@ -208,7 +234,12 @@ const getBestResourceToWithdraw = (target, room) => {
     }
 
     if (target.store[RESOURCE_ENERGY] > 0) {
-        if (roomHasNonEnergyResources(room)) {
+        // Tombstones and ruins outrank structures in the priority order, so
+        // energy in them is always fair game. The "leave energy until minerals
+        // are gone" rule only applies to structures.
+        const isRuin = (typeof Ruin !== 'undefined') && target instanceof Ruin;
+        const isTombstone = (typeof Tombstone !== 'undefined') && target instanceof Tombstone;
+        if (!isRuin && !isTombstone && roomHasNonEnergyResources(room)) {
             return null;
         }
         return RESOURCE_ENERGY;
@@ -225,6 +256,8 @@ const clearStuckState = (creep) => {
 };
 
 const smartMoveTo = (creep, target, opts) => {
+    if (creep.fatigue > 0) return ERR_TIRED;
+
     var moveOpts = edgeAvoidMoveOpts(creep, creep.room.name);
     if (opts && opts.range) moveOpts.range = opts.range;
 
@@ -240,6 +273,8 @@ const smartMoveTo = (creep, target, opts) => {
 };
 
 function stepInwardOffEdge(creep) {
+    if (creep.fatigue > 0) return ERR_TIRED;
+
     const pos = creep.pos;
 
     if (!isOnEdge(pos)) {
@@ -334,6 +369,7 @@ function travelToRoom(creep, destRoom, routeKey) {
             if (exitTiles.length > 0) {
                 const closest = creep.pos.findClosestByRange(exitTiles);
                 if (closest) {
+                    if (creep.fatigue > 0) return ERR_TIRED;
                     var fallbackOpts = edgeAvoidMoveOpts(creep, creep.room.name);
                     fallbackOpts.maxRooms = 2; // Allow cross-room edge tracking
                     creep.moveTo(closest, fallbackOpts);
@@ -378,6 +414,7 @@ function travelToRoom(creep, destRoom, routeKey) {
             if (exitTiles.length > 0) {
                 const closest = creep.pos.findClosestByRange(exitTiles);
                 if (closest) {
+                    if (creep.fatigue > 0) return ERR_TIRED;
                     var edgeOpts = edgeAvoidMoveOpts(creep, creep.room.name);
                     edgeOpts.maxRooms = 2;
                     const moveToExit = creep.moveTo(closest, edgeOpts);
@@ -391,6 +428,7 @@ function travelToRoom(creep, destRoom, routeKey) {
 
     // Capture current position to evaluate stuck rules before passing to external routing
     updateStuckCounter(creep);
+    if (creep.fatigue > 0) return ERR_TIRED;
     const result = roomNav.followRoomRoute(creep, routeKey, destRoom);
 
     if (result !== OK && result !== ERR_TIRED) {
@@ -570,7 +608,7 @@ const roleThief = {
 
                 const droppedResources = creep.room.find(FIND_DROPPED_RESOURCES);
                 const nonEnergyDrops = droppedResources.filter(r => r.resourceType !== RESOURCE_ENERGY);
-                const energyDrops    = droppedResources.filter(r => r.resourceType === RESOURCE_ENERGY);
+                const energyDrops    = droppedResources.filter(r => r.resourceType === RESOURCE_ENERGY && r.amount >= MIN_ENERGY_DROP);
 
                 const allStructures = creep.room.find(FIND_STRUCTURES, {
                     filter: (s) =>
@@ -582,12 +620,37 @@ const roleThief = {
                 });
 
                 const enemyStructures = allStructures.filter((s) => !s.my);
-                const potentialTargets = enemyStructures.filter((s) => {
+                // In a room you don't own (e.g. one you unclaimed), recover from
+                // your own left-behind structures too. Only restrict to non-owned
+                // (enemy) structures when the creep is in a room you actually own.
+                const roomIsMine = creep.room.controller && creep.room.controller.my;
+                const targetableStructures = roomIsMine ? enemyStructures : allStructures;
+                const potentialTargets = targetableStructures.filter((s) => {
                     const atPos = creep.room.lookForAt(LOOK_STRUCTURES, s.pos);
-                    return !atPos.some((st) => st.structureType === STRUCTURE_RAMPART && !st.my);
+                    return !atPos.some((st) => st.structureType === STRUCTURE_RAMPART && st.owner && !st.my);
                 });
 
                 const split = splitTargetsByNonEnergy(potentialTargets);
+
+                // Tombstones — withdraw works the same as structures. They decay
+                // fast, so they rank just below drops.
+                const tombstones = creep.room.find(FIND_TOMBSTONES, {
+                    filter: (t) => t.store && t.store.getUsedCapacity() > 0,
+                }).filter((t) => {
+                    const atPos = creep.room.lookForAt(LOOK_STRUCTURES, t.pos);
+                    return !atPos.some((st) => st.structureType === STRUCTURE_RAMPART && st.owner && !st.my);
+                });
+                const tombSplit = splitTargetsByNonEnergy(tombstones);
+
+                // Ruins (destroyed structures) — withdraw works the same as structures.
+                const allRuins = creep.room.find(FIND_RUINS, {
+                    filter: (r) => r.store && r.store.getUsedCapacity() > 0,
+                });
+                const reachableRuins = allRuins.filter((r) => {
+                    const atPos = creep.room.lookForAt(LOOK_STRUCTURES, r.pos);
+                    return !atPos.some((st) => st.structureType === STRUCTURE_RAMPART && st.owner && !st.my);
+                });
+                const ruinSplit = splitTargetsByNonEnergy(reachableRuins);
 
                 const closestByPath = (arr) =>
                     arr.length
@@ -597,14 +660,17 @@ const roleThief = {
                           }) || creep.pos.findClosestByRange(arr)
                         : null;
 
-                const noNonEnergyStructures = !split.nonEnergyTargets.length;
-                const roomHasNoNonEnergy    = !roomHasNonEnergyResources(creep.room);
+                const roomHasNoNonEnergy = !roomHasNonEnergyResources(creep.room);
 
                 target =
-                    closestByPath(nonEnergyDrops)                                        // 1. non-energy drops
-                    || closestByPath(split.nonEnergyTargets)                             // 2. non-energy structures
-                    || (noNonEnergyStructures && closestByPath(energyDrops))             // 3. energy drops
-                    || (roomHasNoNonEnergy    && closestByPath(split.energyOnlyTargets)) // 4. energy structures
+                    closestByPath(nonEnergyDrops)                                        // 1. dropped non-energy
+                    || closestByPath(energyDrops)                                        // 2. dropped energy
+                    || closestByPath(tombSplit.nonEnergyTargets)                         // 3. tombstones w/ non-energy
+                    || closestByPath(tombSplit.energyOnlyTargets)                        // 4. tombstones w/ energy only
+                    || closestByPath(ruinSplit.nonEnergyTargets)                         // 5. ruins w/ non-energy
+                    || closestByPath(ruinSplit.energyOnlyTargets)                        // 6. ruins w/ energy only
+                    || closestByPath(split.nonEnergyTargets)                             // 7. structures w/ non-energy
+                    || (roomHasNoNonEnergy && closestByPath(split.energyOnlyTargets))    // 8. structures w/ energy only
                     || null;
 
                 if (target) creep.memory.theftTarget = target.id;

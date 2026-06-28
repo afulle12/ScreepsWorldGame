@@ -7,20 +7,10 @@
 //    setDemolitionFocus('E2S2', 'rampart')
 // Notes:
 // - Adds banned rooms list at top.
-// - Optional focus:
-//   - 'controller' -> prioritize walls/ramparts within range 1 of target room controller.
-//   - 'wall'       -> dismantle ONLY STRUCTURE_WALL in the target room; mission is complete only when the room has zero STRUCTURE_WALL.
-//   - 'rampart'    -> dismantle ONLY STRUCTURE_RAMPART in the target room; mission is complete only when the room has zero STRUCTURE_RAMPART.
-// - No optional chaining used.
-// - In-room navigation avoids room edges; creeps step inward if sitting on an edge.
-// - Navigation system unified with Attacker (uses dynamic tower blacklisting, retreats, and PathFinder).
-// - Demolishers have NO CARRY parts. All carry/withdraw/transfer/pickup/drop logic removed.
-// - Mission completion attempts to delete the matching demolition order from Memory.demolitionOrders.
-// - Console logging reduced (only important one-time events are logged).
-// - IMPORTANT: Completed demolishers idle in place (they do NOT auto-return home).
-// - Boosted demolishers: if creep memory contains needsBoost=true, the creep will seek a
-//   boost lab in homeRoom before travelling. No unboost is performed — creeps die in the
-//   target room and compound is reclaimed via stopBoost / labBot cleanup.
+// - Optional focus (all three are strict — mission ends when no matching targets remain):
+//   - 'controller' -> dismantle ONLY walls/ramparts within range 1 of the target room controller; mission ends when the ring is clear.
+//   - 'wall'       -> dismantle ONLY STRUCTURE_WALL in the target room; mission ends when the room has zero STRUCTURE_WALL.
+//   - 'rampart'    -> dismantle ONLY STRUCTURE_RAMPART in the target room; mission ends when the room has zero STRUCTURE_RAMPART.
 
 const iff = require('iff');
 
@@ -284,6 +274,27 @@ function findAllRamparts(room) {
   return out;
 }
 
+/**
+ * Returns true when `target` is a valid match for the current demolition focus.
+ * Used to invalidate stale cached targets that were picked up under a different
+ * focus (or under no focus) so a wall-focused demolisher cannot keep dismantling
+ * a rampart (or any other structure type) for several ticks.
+ *
+ *   'wall'       -> target must be STRUCTURE_WALL
+ *   'rampart'    -> target must be STRUCTURE_RAMPART
+ *   'controller' -> target must be STRUCTURE_WALL or STRUCTURE_RAMPART
+ *   (none)       -> any target is fine
+ */
+function isFocusTarget(focus, target) {
+  if (!focus) return true;
+  if (focus === 'wall') return target.structureType === STRUCTURE_WALL;
+  if (focus === 'rampart') return target.structureType === STRUCTURE_RAMPART;
+  if (focus === 'controller') {
+    return target.structureType === STRUCTURE_WALL || target.structureType === STRUCTURE_RAMPART;
+  }
+  return true;
+}
+
 const roleDemolition = {
   run: function(creep) {
     this.runDemolisher(creep);
@@ -406,8 +417,15 @@ const roleDemolition = {
     if (creep.memory.targetId && Game.time % 5 !== 0) {
       const cached = Game.getObjectById(creep.memory.targetId);
       if (cached) {
-        this.dismantleTarget(creep, cached);
-        return;
+        // Invalidate cache if the cached target was picked up under a different
+        // focus (or no focus) — prevents a wall-focused demolisher from
+        // continuing to dismantle a rampart (or vice versa) for several ticks.
+        if (!isFocusTarget(focus, cached)) {
+          delete creep.memory.targetId;
+        } else {
+          this.dismantleTarget(creep, cached);
+          return;
+        }
       } else {
         delete creep.memory.targetId;
       }
@@ -465,8 +483,16 @@ const roleDemolition = {
       return;
     }
 
-    // ── Focus: controller ring first, then fall through to default ─────────
-    if (focus === 'controller' && room) {
+    // ── Focus: controller ──────────────────────────────────────────────────
+    // Dismantle ONLY walls/ramparts within range 1 of the controller; mission
+    // ends when the controller ring is clear.
+    if (focus === 'controller') {
+      if (!room) {
+        creep.moveTo(new RoomPosition(25, 25, targetRoom), { maxRooms: 1, range: 20 });
+        creep.say('CTR');
+        return;
+      }
+
       const ringTargets = findControllerRingTargets(room);
       if (ringTargets.length > 0) {
         target = creep.pos.findClosestByPath(ringTargets) || creep.pos.findClosestByRange(ringTargets);
@@ -477,7 +503,10 @@ const roleDemolition = {
           return;
         }
       }
-      // Fall through to default targeting when ring is clear
+
+      completeDemolitionMission(creep, targetRoom, 'controller');
+      creep.say('DONE');
+      return;
     }
 
     // ── Default targeting: ramparts first, then other hostile structures ───

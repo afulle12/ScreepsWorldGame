@@ -4,24 +4,13 @@
 // ============================================================================
 //
 // startPowerUpgrade(roomName)
-//   Begins automatic power purchasing and processing for the specified room.
-//   - Calculates how much Power is needed to reach the next GPL level
-//   - Subtracts any Power already stored in Terminal/Storage/PowerSpawn
-//   - Places a buy order at the 48h weighted average market price
-//   - Enables powerMode so the room will process Power each tick
-//   Example: startPowerUpgrade('W1N1')
 //
 // stopPowerUpgrade(roomName)
-//   Disables power processing mode for the specified room.
-//   - Sets Memory.power[roomName] to false / deletes it
-//   - Does NOT cancel any active market orders (do that manually if needed)
-//   Example: stopPowerUpgrade('W1N1')
 //
 // powerStatus()
 //   Lists all rooms that currently have power processing enabled.
 //   - Shows stored Power (Terminal + Storage + PowerSpawn) per room
 //   - Shows current GPL progress
-//   Example: powerStatus()
 //
 // Enable:  Memory.power['W1N1'] = 1;
 // Disable: delete Memory.power['W1N1'];
@@ -29,6 +18,17 @@
 // ============================================================================
 
 const opportunisticBuy = require('opportunisticBuy');
+const getRoomState = require('getRoomState');
+
+function findPowerSpawns(room) {
+    var rs = getRoomState.get(room.name);
+    var arr = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_POWER_SPAWN]) || [];
+    var out = [];
+    for (var i = 0; i < arr.length; i++) {
+        if (arr[i].my) out.push(arr[i]);
+    }
+    return out;
+}
 
 /**
  * Internal helper to calculate 48h weighted average price
@@ -79,9 +79,7 @@ global.startPowerUpgrade = function(roomName) {
     if (room.storage)  stored += room.storage.store[RESOURCE_POWER] || 0;
 
     // Check PowerSpawn for existing resource
-    const powerSpawns = room.find(FIND_MY_STRUCTURES, {
-        filter: s => s.structureType === STRUCTURE_POWER_SPAWN
-    });
+    const powerSpawns = findPowerSpawns(room);
     if (powerSpawns.length > 0) {
         stored += powerSpawns[0].store[RESOURCE_POWER] || 0;
     }
@@ -149,9 +147,7 @@ global.powerStatus = function() {
         if (room.terminal) terminal = room.terminal.store[RESOURCE_POWER] || 0;
         if (room.storage)  storage  = room.storage.store[RESOURCE_POWER] || 0;
 
-        const powerSpawns = room.find(FIND_MY_STRUCTURES, {
-            filter: s => s.structureType === STRUCTURE_POWER_SPAWN
-        });
+        const powerSpawns = findPowerSpawns(room);
         if (powerSpawns.length > 0) pSpawn = powerSpawns[0].store[RESOURCE_POWER] || 0;
 
         const total = terminal + storage + pSpawn;
@@ -174,9 +170,7 @@ module.exports = {
         if (!Memory.power || !Memory.power[roomName]) return;
 
         // --- 1. Find Power Spawn ---
-        var powerSpawns = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) { return s.structureType === STRUCTURE_POWER_SPAWN; }
-        });
+        var powerSpawns = findPowerSpawns(room);
 
         if (powerSpawns.length === 0) return;
         var powerSpawn = powerSpawns[0];

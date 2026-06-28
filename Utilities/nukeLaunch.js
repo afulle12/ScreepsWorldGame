@@ -23,8 +23,39 @@
 // Memory layout:
 //   Memory.nukeOps = { [opId]: { donor, recipient, targetType, targetX, targetY, state, scheduledAt } }
 
+var getRoomState = require('getRoomState');
+
 function _ensureMemory() {
   if (!Memory.nukeOps) Memory.nukeOps = {};
+}
+
+function _myStructures(roomName, type) {
+  var rs = getRoomState.get(roomName);
+  if (rs && rs.structuresByType && rs.structuresByType[type]) {
+    var out = [];
+    var arr = rs.structuresByType[type];
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i].my) out.push(arr[i]);
+    }
+    return out;
+  }
+  var room = _getRoom(roomName);
+  if (!room) return [];
+  return room.find(FIND_MY_STRUCTURES, {
+    filter: function (s) { return s.structureType === type; }
+  });
+}
+
+function _allStructures(roomName, type) {
+  var rs = getRoomState.get(roomName);
+  if (rs && rs.structuresByType && rs.structuresByType[type]) {
+    return rs.structuresByType[type];
+  }
+  var room = _getRoom(roomName);
+  if (!room) return [];
+  return room.find(FIND_STRUCTURES, {
+    filter: function (s) { return s.structureType === type; }
+  });
 }
 
 function _opId(donor, recipient, targetType) {
@@ -41,25 +72,13 @@ function _getRoom(roomName) {
 }
 
 function _findObserver(roomName) {
-  var room = _getRoom(roomName);
-  if (!room) return null;
-  var observers = room.find(FIND_MY_STRUCTURES, {
-    filter: function (s) {
-      return s.structureType === STRUCTURE_OBSERVER;
-    }
-  });
+  var observers = _myStructures(roomName, STRUCTURE_OBSERVER);
   if (observers && observers.length > 0) return observers[0];
   return null;
 }
 
 function _findNuker(roomName) {
-  var room = _getRoom(roomName);
-  if (!room) return null;
-  var nukers = room.find(FIND_MY_STRUCTURES, {
-    filter: function (s) {
-      return s.structureType === STRUCTURE_NUKER;
-    }
-  });
+  var nukers = _myStructures(roomName, STRUCTURE_NUKER);
   if (nukers && nukers.length > 0) return nukers[0];
   return null;
 }
@@ -70,15 +89,7 @@ function _normalizeTargetType(targetType) {
 }
 
 function _findTargetPosition(recipientRoomName, targetType) {
-  var room = _getRoom(recipientRoomName);
-  if (!room) return null;
-
-  var targets = room.find(FIND_STRUCTURES, {
-    filter: function (s) {
-      return s.structureType === targetType;
-    }
-  });
-
+  var targets = _allStructures(recipientRoomName, targetType);
   if (!targets || targets.length === 0) return null;
 
   // Selection policy: first found. Adjust if you prefer other criteria.
@@ -285,9 +296,7 @@ function nukeStatus() {
     var room = Game.rooms[roomName];
     if (!room || !room.controller || !room.controller.my) continue;
 
-    var nukers = room.find(FIND_MY_STRUCTURES, {
-      filter: function (s) { return s.structureType === STRUCTURE_NUKER; }
-    });
+    var nukers = _myStructures(roomName, STRUCTURE_NUKER);
 
     if (!nukers || nukers.length === 0) continue;
 

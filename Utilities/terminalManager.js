@@ -26,6 +26,11 @@
 
 const getRoomState = require('getRoomState'); // use room state cache instead of room.find
 var singleSourceRoom = require('singleSourceRoom');
+var storageManager = require('storageManager');
+
+// Local terminal moves (storage <-> terminal) under this amount are handed off
+// to the room's supplier instead of spawning a dedicated terminalBot.
+const SUPPLIER_TASK_THRESHOLD = 20000;
 
 const terminalManager = {
 
@@ -37,8 +42,6 @@ const terminalManager = {
                 bots: [],
                 settings: {
                     emailNotifications: true,
-                    botBodyType: 'supplier',
-                    maxBotsPerRoom: 1,
                     // Set true only if you do NOT run terminalBots from your main loop by role
                     runBotsFromManager: false,
                     energyHighThreshold: 100000,
@@ -48,15 +51,133 @@ const terminalManager = {
         } else {
             if (!Memory.terminalManager.settings) Memory.terminalManager.settings = {};
             if (typeof Memory.terminalManager.settings.emailNotifications !== 'boolean') Memory.terminalManager.settings.emailNotifications = true;
-            if (!Memory.terminalManager.settings.botBodyType) Memory.terminalManager.settings.botBodyType = 'supplier';
-            if (typeof Memory.terminalManager.settings.maxBotsPerRoom !== 'number') Memory.terminalManager.settings.maxBotsPerRoom = 1;
             if (typeof Memory.terminalManager.settings.runBotsFromManager !== 'boolean') Memory.terminalManager.settings.runBotsFromManager = false;
             if (typeof Memory.terminalManager.settings.energyHighThreshold !== 'number') Memory.terminalManager.settings.energyHighThreshold = 100000;
             if (typeof Memory.terminalManager.settings.energyTargetLevel !== 'number') Memory.terminalManager.settings.energyTargetLevel = 20000;
+            if (typeof Memory.terminalManager.settings.useSupplierForSmallLocalOps !== 'boolean') Memory.terminalManager.settings.useSupplierForSmallLocalOps = true;
             if (!Array.isArray(Memory.terminalManager.operations)) Memory.terminalManager.operations = [];
             if (!Array.isArray(Memory.terminalManager.bots)) Memory.terminalManager.bots = [];
         }
-        if (this.lastLogTick === undefined) this.lastLogTick = 0;
+    },
+
+    // ===== storageManager v2 HELPERS =====
+    // V2 is enabled for all owned rooms.
+    // `building` is 'terminal' for transfer ops and toStorage ops; 'storage' for
+    // toTerminal ops (the resource lives in storage/containers before being moved).
+    v2Enabled: function(roomName) {
+        var room = Game.rooms[roomName];
+        return !!(room && room.controller && room.controller.my);
+    },
+
+    // Release the v2 reservation associated with an op, if any.
+    releaseOpReservation: function(operation) {
+        if (!operation) return;
+
+        if (Array.isArray(operation.reservationEntries) && operation.reservationEntries.length > 0) {
+            for (var i = 0; i < operation.reservationEntries.length; i++) {
+                var entry = operation.reservationEntries[i];
+                if (!entry || !entry.roomName || !entry.building || !entry.program) continue;
+                storageManager.unReserve(entry.roomName, operation.resourceType, entry.building, entry.program);
+            }
+        } else if (operation.reservationProgram && operation.reservationBuilding) {
+            storageManager.unReserve(
+                operation.reservationRoom,
+                operation.resourceType,
+                operation.reservationBuilding,
+                operation.reservationProgram
+            );
+        }
+
+        // Clear so we don't double-release
+        delete operation.reservationProgram;
+        delete operation.reservationBuilding;
+        delete operation.reservationRoom;
+        delete operation.reservationEntries;
+    },
+
+    ensureReservationEntries: function(operation) {
+        if (!operation.reservationEntries) operation.reservationEntries = [];
+        return operation.reservationEntries;
+    },
+
+    addReservationEntry: function(operation, roomName, building, program) {
+        if (!operation || !roomName || !building || !program) return;
+        var entries = this.ensureReservationEntries(operation);
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i] && entries[i].roomName === roomName && entries[i].building === building && entries[i].program === program) {
+                return;
+            }
+        }
+        entries.push({ roomName: roomName, building: building, program: program });
+    },
+
+    reserveOperationStock: function(operation, roomName, resourceType, building, amount, program) {
+        if (!operation || !roomName || !resourceType || !building || !program || !amount) return { ok: false, reason: 'Missing required parameter' };
+        var rv = storageManager.reserve(roomName, resourceType, building, program, amount);
+        if (rv.ok) {
+            this.addReservationEntry(operation, roomName, building, program);
+            operation.reservationProgram = program;
+            operation.reservationRoom = roomName;
+            if (!operation.reservationBuilding) operation.reservationBuilding = building;
+        }
+        return rv;
+    },
+
+    consumeOperationStock: function(operation, roomName, resourceType, building, amount, program) {
+        if (!operation || !roomName || !resourceType || !building || !program || !amount) return { ok: false, consumed: 0, remaining: 0 };
+        return storageManager.consume(roomName, resourceType, building, program, amount);
+    },
+
+    // ===== SUPPLIER TASK QUEUE (small local moves) =====
+    shouldUseSupplierForOp: function(operation) {
+        if (!operation) return false;
+        if (operation.type !== 'toTerminal' && operation.type !== 'toStorage') return false;
+        if (!Memory.terminalManager.settings || !Memory.terminalManager.settings.useSupplierForSmallLocalOps) return false;
+        // Single-source rooms use ComboBot for terminal duties; keep that path.
+        if (singleSourceRoom && typeof singleSourceRoom.isSingleSourceActive === 'function' &&
+            singleSourceRoom.isSingleSourceActive(operation.roomName)) {
+            return false;
+        }
+        return (operation.amount || 0) <= SUPPLIER_TASK_THRESHOLD;
+    },
+
+    addSupplierTask: function(roomName, operation) {
+        if (!roomName || !operation || !operation.id) return;
+        if (!Memory.terminalManager.supplierTasks) Memory.terminalManager.supplierTasks = {};
+        if (!Memory.terminalManager.supplierTasks[roomName]) Memory.terminalManager.supplierTasks[roomName] = [];
+        var list = Memory.terminalManager.supplierTasks[roomName];
+        for (var i = 0; i < list.length; i++) {
+            if (list[i] && list[i].opId === operation.id) return; // already queued
+        }
+        list.push({
+            opId: operation.id,
+            type: operation.type,
+            resourceType: operation.resourceType,
+            amount: operation.amount,
+            reservationProgram: operation.reservationProgram || null
+        });
+    },
+
+    getSupplierTasks: function(roomName) {
+        return (Memory.terminalManager && Memory.terminalManager.supplierTasks && Memory.terminalManager.supplierTasks[roomName]) || [];
+    },
+
+    cleanupSupplierTasks: function() {
+        if (!Memory.terminalManager || !Memory.terminalManager.supplierTasks) return;
+        var activeIds = {};
+        var ops = Memory.terminalManager.operations || [];
+        for (var i = 0; i < ops.length; i++) {
+            if (ops[i] && ops[i].id) activeIds[ops[i].id] = true;
+        }
+        for (var roomName in Memory.terminalManager.supplierTasks) {
+            var list = Memory.terminalManager.supplierTasks[roomName];
+            if (!Array.isArray(list)) continue;
+            for (var j = list.length - 1; j >= 0; j--) {
+                if (!list[j] || !activeIds[list[j].opId]) {
+                    list.splice(j, 1);
+                }
+            }
+        }
     },
 
     // ===== MAIN LOOP FUNCTION =====
@@ -79,6 +200,7 @@ const terminalManager = {
 
         this.processOperations();
         this.manageBots();
+        this.cleanupSupplierTasks();
         this.cleanupCompletedOperations();
     },
 
@@ -137,6 +259,35 @@ const terminalManager = {
             amountTransferred: 0
         };
 
+        // ── storageManager v2: reserve the source-side terminal stock ──────
+        // TODO(storageManager-v2): when the terminal is short and a bot must bring
+        // the payload from storage, the storage portion is not reserved here.
+        // Reserve the shortfall in storage and hand it off to terminal as the bot
+        // moves it, to prevent other systems from claiming that storage stock.
+        if (this.v2Enabled(fromRoom)) {
+            var info = storageManager.storageFind(fromRoom, resourceType);
+            var termFree = info.terminal.total - info.terminal.reserved;
+            var storFree = info.storage.total - info.storage.reserved;
+            if (termFree < amount) {
+                console.log('[Terminal] v2 reserve warning: only ' + termFree + ' free of ' + amount + ' ' + resourceType + ' in ' + fromRoom + ' terminal. Op will queue and wait.');
+            }
+            var program = 'terminalManager_transfer_' + operation.id;
+            var reserveAmt = Math.min(amount, Math.max(0, termFree));
+            if (reserveAmt > 0) {
+                var rv = this.reserveOperationStock(operation, fromRoom, resourceType, 'terminal', reserveAmt, program);
+                if (rv.ok) {
+                    operation.reservationProgram = program;
+                    operation.reservationBuilding = 'terminal';
+                    operation.reservationRoom = fromRoom;
+                }
+            }
+            var shortfall = Math.max(0, amount - reserveAmt);
+            if (shortfall > 0 && storFree > 0) {
+                var storReserve = Math.min(shortfall, storFree);
+                this.reserveOperationStock(operation, fromRoom, resourceType, 'storage', storReserve, program);
+            }
+        }
+
         Memory.terminalManager.operations.push(operation);
 
         console.log('[Terminal] Transfer order created: ' + amount + ' ' + resourceType + ' from ' + fromRoom + ' to ' + toRoom);
@@ -179,7 +330,33 @@ const terminalManager = {
             created: Game.time
         };
 
+        // ── storageManager v2: reserve the source-side (storage) stock ──────
+        if (this.v2Enabled(roomName)) {
+            var info = storageManager.storageFind(roomName, resourceType);
+            var storFree = info.storage.total - info.storage.reserved;
+            if (storFree < amount) {
+                console.log('[Terminal] v2 reserve warning: only ' + storFree + ' free of ' + amount + ' ' + resourceType + ' in ' + roomName + ' storage. Op will queue and wait.');
+            }
+            var reserveAmt = Math.min(amount, Math.max(0, storFree));
+            if (reserveAmt > 0) {
+                var rv = this.reserveOperationStock(op, roomName, resourceType, 'storage', reserveAmt, 'terminalManager_toTerm_' + op.id);
+                if (rv.ok) {
+                    op.reservationProgram = 'terminalManager_toTerm_' + op.id;
+                    op.reservationBuilding = 'storage';
+                    op.reservationRoom = roomName;
+                }
+            }
+        }
+
         Memory.terminalManager.operations.push(op);
+
+        // Small local moves go to the room supplier; larger moves still use a terminalBot.
+        if (this.shouldUseSupplierForOp(op)) {
+            op.useSupplier = true;
+            this.addSupplierTask(roomName, op);
+            console.log('[Terminal] Local order queued for supplier: move ' + amount + ' ' + resourceType + ' to Terminal in ' + roomName);
+            return '[Terminal] Local order queued for supplier: move ' + amount + ' ' + resourceType + ' to Terminal in ' + roomName;
+        }
 
         // Assign or request a bot to collect the resource into terminal
         this.assignTerminalBot(roomName, 'collect', resourceType, op.id);
@@ -224,7 +401,33 @@ const terminalManager = {
             created: Game.time
         };
 
+        // ── storageManager v2: reserve the source-side (terminal) stock ────
+        if (this.v2Enabled(roomName)) {
+            var info = storageManager.storageFind(roomName, resourceType);
+            var termFree = info.terminal.total - info.terminal.reserved;
+            if (termFree < amount) {
+                console.log('[Terminal] v2 reserve warning: only ' + termFree + ' free of ' + amount + ' ' + resourceType + ' in ' + roomName + ' terminal. Op will queue and wait.');
+            }
+            var reserveAmt = Math.min(amount, Math.max(0, termFree));
+            if (reserveAmt > 0) {
+                var rv = this.reserveOperationStock(op, roomName, resourceType, 'terminal', reserveAmt, 'terminalManager_toStor_' + op.id);
+                if (rv.ok) {
+                    op.reservationProgram = 'terminalManager_toStor_' + op.id;
+                    op.reservationBuilding = 'terminal';
+                    op.reservationRoom = roomName;
+                }
+            }
+        }
+
         Memory.terminalManager.operations.push(op);
+
+        // Small local moves go to the room supplier; larger moves still use a terminalBot.
+        if (this.shouldUseSupplierForOp(op)) {
+            op.useSupplier = true;
+            this.addSupplierTask(roomName, op);
+            console.log('[Terminal] Local order queued for supplier: move ' + amount + ' ' + resourceType + ' from Terminal to Storage in ' + roomName);
+            return '[Terminal] Local order queued for supplier: move ' + amount + ' ' + resourceType + ' from Terminal to Storage in ' + roomName;
+        }
 
         // Assign or request a bot to drain the terminal into storage
         this.assignTerminalBot(roomName, 'drain', resourceType, op.id);
@@ -458,6 +661,22 @@ const terminalManager = {
             }
         }
 
+        // Remove any supplier task linked to this operation
+        if (Memory.terminalManager && Memory.terminalManager.supplierTasks) {
+            for (var stRoom in Memory.terminalManager.supplierTasks) {
+                var stList = Memory.terminalManager.supplierTasks[stRoom];
+                if (!Array.isArray(stList)) continue;
+                for (var k = stList.length - 1; k >= 0; k--) {
+                    if (stList[k] && stList[k].opId === operationId) {
+                        stList.splice(k, 1);
+                    }
+                }
+            }
+        }
+
+        // Release v2 reservation before removing the op from the array
+        this.releaseOpReservation(operations[index]);
+
         operations.splice(index, 1);
         console.log('[Terminal] Cancelled operation: ' + operationId);
         return '[Terminal] Cancelled operation: ' + operationId;
@@ -488,6 +707,7 @@ const terminalManager = {
         if (!sourceRoom) {
             operation.status = 'failed';
             operation.error = 'Source room not accessible';
+            this.releaseOpReservation(operation);
             return;
         }
 
@@ -495,6 +715,7 @@ const terminalManager = {
         if (!sourceTerminal) {
             operation.status = 'failed';
             operation.error = 'No terminal in source room';
+            this.releaseOpReservation(operation);
             return;
         }
 
@@ -507,6 +728,8 @@ const terminalManager = {
                 console.log('[Terminal] Transfer completed: ' + operation.amount + ' ' + operation.resourceType + ' from ' + operation.fromRoom + ' to ' + operation.toRoom);
                 this.sendNotification('Transfer completed: ' + operation.amount + ' ' + operation.resourceType + ' from ' + operation.fromRoom + ' to ' + operation.toRoom);
             }
+            // Release v2 reservation on completion
+            this.releaseOpReservation(operation);
             return;
         }
 
@@ -581,6 +804,9 @@ const terminalManager = {
 
         var result = sourceTerminal.send(operation.resourceType, sendAmount, operation.toRoom);
         if (result === OK) {
+            if (operation.reservationProgram) {
+                this.consumeOperationStock(operation, operation.fromRoom, operation.resourceType, 'terminal', sendAmount, operation.reservationProgram);
+            }
             operation.amountTransferred = (operation.amountTransferred || 0) + sendAmount;
             if (operation.amountTransferred >= operation.amount) {
                 operation.status = 'completed';
@@ -606,12 +832,14 @@ const terminalManager = {
         if (!room || !room.controller || !room.controller.my) {
             operation.status = 'failed';
             operation.error = 'Room not accessible or not owned';
+            this.releaseOpReservation(operation);
             return;
         }
         var terminal = room.terminal;
         if (!terminal) {
             operation.status = 'failed';
             operation.error = 'No terminal in room';
+            this.releaseOpReservation(operation);
             return;
         }
 
@@ -626,7 +854,9 @@ const terminalManager = {
             operation.status = 'waiting';
             operation.error = 'Terminal full';
             if (typeof operation._waitingSince !== 'number') operation._waitingSince = Game.time;
-            this.assignTerminalBot(operation.roomName, 'collect', operation.resourceType, operation.id);
+            if (!operation.useSupplier) {
+                this.assignTerminalBot(operation.roomName, 'collect', operation.resourceType, operation.id);
+            }
             return;
         }
 
@@ -638,6 +868,7 @@ const terminalManager = {
                 console.log('[Terminal] Local toTerminal completed: ' + operation.amount + ' ' + operation.resourceType + ' in ' + operation.roomName);
                 this.sendNotification('Local toTerminal completed: ' + operation.amount + ' ' + operation.resourceType + ' in ' + operation.roomName);
             }
+            this.releaseOpReservation(operation);
             return;
         }
 
@@ -646,13 +877,17 @@ const terminalManager = {
             operation.status = 'waiting';
             operation.error = 'No supply outside terminal';
             if (typeof operation._waitingSince !== 'number') operation._waitingSince = Game.time;
-            // still try to assign bot (will idle)
-            this.assignTerminalBot(operation.roomName, 'collect', operation.resourceType, operation.id);
+            // still try to assign bot (will idle) unless supplier is handling it
+            if (!operation.useSupplier) {
+                this.assignTerminalBot(operation.roomName, 'collect', operation.resourceType, operation.id);
+            }
             return;
         }
 
-        // Assign/retask a bot to collect this resource
-        this.assignTerminalBot(operation.roomName, 'collect', operation.resourceType, operation.id);
+        // Assign/retask a bot to collect this resource, unless a supplier task is queued.
+        if (!operation.useSupplier) {
+            this.assignTerminalBot(operation.roomName, 'collect', operation.resourceType, operation.id);
+        }
         operation.status = 'active';
         if (typeof operation._waitingSince === 'number') delete operation._waitingSince;
     },
@@ -663,12 +898,14 @@ const terminalManager = {
         if (!room || !room.controller || !room.controller.my) {
             operation.status = 'failed';
             operation.error = 'Room not accessible or not owned';
+            this.releaseOpReservation(operation);
             return;
         }
         var terminal = room.terminal;
         if (!terminal) {
             operation.status = 'failed';
             operation.error = 'No terminal in room';
+            this.releaseOpReservation(operation);
             return;
         }
 
@@ -683,6 +920,7 @@ const terminalManager = {
                     operation.status = 'completed';
                     console.log('[Terminal] Auto-balance completed early: terminal energy in ' + operation.roomName + ' is ' + currentEnergy + ' (target: ' + targetLevel + ')');
                 }
+                this.releaseOpReservation(operation);
                 return;
             }
         }
@@ -695,6 +933,7 @@ const terminalManager = {
                 console.log('[Terminal] Local toStorage completed: ' + operation.amount + ' ' + operation.resourceType + ' in ' + operation.roomName);
                 this.sendNotification('Local toStorage completed: ' + operation.amount + ' ' + operation.resourceType + ' in ' + operation.roomName);
             }
+            this.releaseOpReservation(operation);
             return;
         }
 
@@ -703,12 +942,16 @@ const terminalManager = {
             operation.status = 'waiting';
             operation.error = 'No payload in terminal';
             if (typeof operation._waitingSince !== 'number') operation._waitingSince = Game.time;
-            // still try to assign bot (will idle)
-            this.assignTerminalBot(operation.roomName, 'drain', operation.resourceType, operation.id);
+            // still try to assign bot (will idle) unless supplier is handling it
+            if (!operation.useSupplier) {
+                this.assignTerminalBot(operation.roomName, 'drain', operation.resourceType, operation.id);
+            }
             return;
         }
 
-        this.assignTerminalBot(operation.roomName, 'drain', operation.resourceType, operation.id);
+        if (!operation.useSupplier) {
+            this.assignTerminalBot(operation.roomName, 'drain', operation.resourceType, operation.id);
+        }
         operation.status = 'active';
         if (typeof operation._waitingSince === 'number') delete operation._waitingSince;
     },
@@ -732,7 +975,7 @@ const terminalManager = {
 
         if (Memory.terminalManager.settings.runBotsFromManager) {
             var activeBots = this.getAllTerminalBots();
-            for (var b = 0; b < activeBots.length; b++) this.runBot(activeBots[b]);
+            for (var b = 0; b < activeBots.length; b++) this.runTerminalBot(activeBots[b]);
         }
     },
 
@@ -872,18 +1115,7 @@ const terminalManager = {
             return false;
         }
 
-        // 3) If any alive bot exists in the room, skip (it will pick up the job)
-        var existingBot = null;
-        var creeps = Game.creeps;
-        for (var name in creeps) {
-            var c = creeps[name];
-            if (c && c.memory && c.memory.role === 'terminalBot' && c.memory.terminalRoom === roomName) { existingBot = c; break; }
-        }
-        if (existingBot) {
-            return false;
-        }
-
-        // 4) If a request already exists for the room, skip
+        // 3) If a request already exists for the room, skip
         var existingRequest = null;
         var reqs = Memory.terminalManager.bots || [];
         for (var i = 0; i < reqs.length; i++) {
@@ -1179,10 +1411,6 @@ const terminalManager = {
         }
     },
 
-    runBot: function(creep) {
-        this.runTerminalBot(creep);
-    },
-
     // Returns next needed resource for the room based on active transfer operations (non-energy prioritized)
     // Extended to include marketSell gather operations (no energy considered for marketSell).
     findNextNeededResourceForRoom: function(roomName) {
@@ -1410,7 +1638,25 @@ const terminalManager = {
                                     if (opD.type === 'toTerminal' && opD.roomName === roomName && opD.resourceType === depositRes) {
                                         if (typeof opD.amountMoved !== 'number') opD.amountMoved = 0;
                                         opD.amountMoved += depositAmt;
+                                        if (opD.reservationProgram) {
+                                            this.reserveOperationStock(opD, roomName, depositRes, 'terminal', opD.amountMoved, opD.reservationProgram);
+                                        }
+                                        if (Memory.marketSell && Array.isArray(Memory.marketSell.requests)) {
+                                            for (var ms = 0; ms < Memory.marketSell.requests.length; ms++) {
+                                                var req = Memory.marketSell.requests[ms];
+                                                if (!req || req.tmOpId !== opD.id || req.roomName !== roomName || req.resourceType !== depositRes) continue;
+                                                if (opD.reservationProgram) {
+                                                    storageManager.transfer(roomName, depositRes, 'terminal', opD.reservationProgram, 'marketSell', depositAmt);
+                                                }
+                                                break;
+                                            }
+                                        }
                                         credited = true;
+                                    } else if (opD.type === 'transfer' && opD.fromRoom === roomName && opD.resourceType === depositRes && opD.reservationProgram) {
+                                        var remainingToSend = Math.max(0, opD.amount - (opD.amountTransferred || 0));
+                                        if (remainingToSend > 0) {
+                                            this.reserveOperationStock(opD, roomName, depositRes, 'terminal', remainingToSend, opD.reservationProgram);
+                                        }
                                     }
                                     break; // found the linked op either way
                                 }
@@ -1429,6 +1675,19 @@ const terminalManager = {
                                         opF.status !== 'failed') {
                                         if (typeof opF.amountMoved !== 'number') opF.amountMoved = 0;
                                         opF.amountMoved += depositAmt;
+                                        if (opF.reservationProgram) {
+                                            this.reserveOperationStock(opF, roomName, depositRes, 'terminal', opF.amountMoved, opF.reservationProgram);
+                                        }
+                                        if (Memory.marketSell && Array.isArray(Memory.marketSell.requests)) {
+                                            for (var msF = 0; msF < Memory.marketSell.requests.length; msF++) {
+                                                var reqF = Memory.marketSell.requests[msF];
+                                                if (!reqF || reqF.tmOpId !== opF.id || reqF.roomName !== roomName || reqF.resourceType !== depositRes) continue;
+                                                if (opF.reservationProgram) {
+                                                    storageManager.transfer(roomName, depositRes, 'terminal', opF.reservationProgram, 'marketSell', depositAmt);
+                                                }
+                                                break;
+                                            }
+                                        }
                                         break;
                                     }
                                 }
@@ -1489,6 +1748,14 @@ const terminalManager = {
         // Update resourceType in case we just switched
         resourceType = creep.memory.terminalResource || resourceType;
 
+        var opRefCollect = null;
+        if (opId) {
+            var opsLookup = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+            for (var opi = 0; opi < opsLookup.length; opi++) {
+                if (opsLookup[opi] && opsLookup[opi].id === opId) { opRefCollect = opsLookup[opi]; break; }
+            }
+        }
+
         // 3) Use cached source if available
         var source = null;
         if (creep.memory.sourceId) {
@@ -1501,23 +1768,50 @@ const terminalManager = {
         if (shouldCheck) {
             creep.memory.waitingState.lastResourceCheck = Game.time;
 
-            var sources = this.findResourceSources(room, resourceType);
-            if (sources.length > 0) {
-                var best = sources[0];
-                creep.memory.sourceId = best.structure.id;
-                source = best.structure;
+            var reservedSource = null;
+            if (opRefCollect && opRefCollect.reservationProgram) {
+                var reservationInfo = storageManager.storageFind(room.name, resourceType);
+                var reservedBuildings = [
+                    { structure: room.storage, bucket: reservationInfo.storage },
+                    { structure: room.terminal, bucket: reservationInfo.terminal }
+                ];
+                for (var rb = 0; rb < reservedBuildings.length; rb++) {
+                    var slot = reservedBuildings[rb];
+                    if (!slot.structure || !slot.bucket || !Array.isArray(slot.bucket.reservations)) continue;
+                    for (var ri = 0; ri < slot.bucket.reservations.length; ri++) {
+                        var resv = slot.bucket.reservations[ri];
+                        if (resv && resv.program === opRefCollect.reservationProgram && resv.amount > 0) {
+                            reservedSource = slot.structure;
+                            break;
+                        }
+                    }
+                    if (reservedSource) break;
+                }
+            }
+
+            if (reservedSource) {
+                creep.memory.sourceId = reservedSource.id;
+                source = reservedSource;
                 creep.memory.waitingState.isWaiting = false;
             } else {
-                if (!creep.memory.waitingState.isWaiting) {
-                    creep.memory.waitingState.isWaiting = true;
-                    creep.memory.waitingState.waitStartTime = Game.time;
+                var sources = this.findResourceSources(room, resourceType);
+                if (sources.length > 0) {
+                    var best = sources[0];
+                    creep.memory.sourceId = best.structure.id;
+                    source = best.structure;
+                    creep.memory.waitingState.isWaiting = false;
+                } else {
+                    if (!creep.memory.waitingState.isWaiting) {
+                        creep.memory.waitingState.isWaiting = true;
+                        creep.memory.waitingState.waitStartTime = Game.time;
+                    }
                 }
             }
         }
 
         // 5) Act on the source every tick
         if (source) {
-            if (creep.pos.isNearTo(source)) {
+        if (creep.pos.isNearTo(source)) {
                 // Compute op-specific remaining need if available
                 var needNow = 0;
                 var opRemainNow = null;
@@ -1556,6 +1850,21 @@ const terminalManager = {
                     var res = creep.withdraw(source, resourceType, withdrawAmount);
                     if (res !== OK && res !== ERR_FULL && res !== ERR_NOT_ENOUGH_RESOURCES) {
                         delete creep.memory.sourceId;
+                    } else if (res === OK) {
+                        var opRef = null;
+                        if (opId) {
+                            var opsNow2 = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+                            for (var oi2 = 0; oi2 < opsNow2.length; oi2++) {
+                                if (opsNow2[oi2] && opsNow2[oi2].id === opId) { opRef = opsNow2[oi2]; break; }
+                            }
+                        }
+                        if (opRef && opRef.reservationProgram) {
+                            var building = (source.structureType === STRUCTURE_STORAGE) ? 'storage' :
+                                           (source.structureType === STRUCTURE_TERMINAL ? 'terminal' : null);
+                            if (building) {
+                                this.consumeOperationStock(opRef, roomName, resourceType, building, withdrawAmount, opRef.reservationProgram);
+                            }
+                        }
                     }
                 } else {
                     delete creep.memory.sourceId;
@@ -1637,6 +1946,9 @@ const terminalManager = {
                                     if (op.type === 'toStorage' && op.roomName === roomName && op.resourceType === res) {
                                         if (typeof op.amountMoved !== 'number') op.amountMoved = 0;
                                         op.amountMoved += depositAmt;
+                                        if (op.reservationProgram) {
+                                            this.reserveOperationStock(op, roomName, res, 'storage', op.amountMoved, op.reservationProgram);
+                                        }
                                         credited = true;
                                     }
                                     break; // found the linked op either way
@@ -1656,6 +1968,9 @@ const terminalManager = {
                                         opF.status !== 'failed') {
                                         if (typeof opF.amountMoved !== 'number') opF.amountMoved = 0;
                                         opF.amountMoved += depositAmt;
+                                        if (opF.reservationProgram) {
+                                            this.reserveOperationStock(opF, roomName, res, 'storage', opF.amountMoved, opF.reservationProgram);
+                                        }
                                         break;
                                     }
                                 }
@@ -1737,6 +2052,17 @@ const terminalManager = {
             if (resW !== OK && resW !== ERR_FULL && resW !== ERR_NOT_ENOUGH_RESOURCES) {
                 creep.say('w err');
             } else {
+                if (resW === OK && opId) {
+                    var opsW = Memory.terminalManager && Array.isArray(Memory.terminalManager.operations) ? Memory.terminalManager.operations : [];
+                    for (var oiW = 0; oiW < opsW.length; oiW++) {
+                        var opW = opsW[oiW];
+                        if (!opW || opW.id !== opId) continue;
+                        if (opW.reservationProgram) {
+                            this.consumeOperationStock(opW, roomName, resourceType, 'terminal', amtToWithdraw, opW.reservationProgram);
+                        }
+                        break;
+                    }
+                }
                 //creep.say('take');
             }
         } else {
@@ -1983,6 +2309,23 @@ const terminalManager = {
                 created: Game.time,
                 autoBalance: true
             };
+
+            // ── storageManager v2: reserve the terminal energy we're about to drain ──
+            // Prevents auto-balance from draining energy that factory/lab/transfer
+            // ops have reserved in the terminal.
+            if (this.v2Enabled(rn)) {
+                var abInfo = storageManager.storageFind(rn, RESOURCE_ENERGY);
+                var abTermFree = abInfo.terminal.total - abInfo.terminal.reserved;
+                var abReserve = Math.min(excess, Math.max(0, abTermFree));
+                if (abReserve > 0) {
+                    var abRv = this.reserveOperationStock(drainOp, rn, RESOURCE_ENERGY, 'terminal', abReserve, 'terminalManager_toStor_' + drainOp.id);
+                    if (abRv.ok) {
+                        drainOp.reservationProgram = 'terminalManager_toStor_' + drainOp.id;
+                        drainOp.reservationBuilding = 'terminal';
+                        drainOp.reservationRoom = rn;
+                    }
+                }
+            }
 
             Memory.terminalManager.operations.push(drainOp);
             this.assignTerminalBot(rn, 'drain', RESOURCE_ENERGY, drainOp.id);

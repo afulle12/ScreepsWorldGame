@@ -41,11 +41,6 @@ var CONFIRMATION_TIMEOUT_TICKS = 20;
 // Account-level resources that go to your account, not a terminal
 var ACCOUNT_RESOURCES = { pixel: true, cpuUnlock: true, accessKey: true };
 
-/**
- * Check if a resource type is an account-level resource (no terminal needed).
- * @param {string} resourceType
- * @returns {boolean}
- */
 function isAccountResource(resourceType) {
     return !!ACCOUNT_RESOURCES[resourceType];
 }
@@ -425,6 +420,18 @@ function process() {
     for (var key in requests) {
         var req = requests[key];
         if (!req || typeof req.remaining !== 'number' || req.remaining <= 0) continue;
+
+        // Drop terminal-resource requests whose room is no longer owned.
+        // Account-resource requests (pixel, cpuUnlock, accessKey) use the room name
+        // as a key only and are preserved.
+        if (!isAccountResource(req.resourceType) && !myRooms[req.roomName]) {
+            console.log('[OpportunisticSell] Removing orphaned request for ' + req.remaining + '/' + req.totalAmount +
+                ' ' + req.resourceType + ' in ' + req.roomName + ' (room no longer owned); ' +
+                (req.fulfilled || 0) + ' already fulfilled.');
+            delete requests[key];
+            continue;
+        }
+
         entries.push({ key: key, req: req });
     }
     entries.sort(function(a, b) {

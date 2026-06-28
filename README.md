@@ -1,9 +1,9 @@
-# Screeps Colony – README
-Version: 2026-05-28 (Expanded Build)
+# Screeps Colony - README
+Version: 2026-06-27 (Unified Scanner + Repair Manager Build)
 
 ## Overview
 
-This repository runs a comprehensive multi-room Screeps AI that automates economy, logistics, combat, market play, and late-game strategy. The codebase is heavily modular: each subsystem lives in its own module and is orchestrated from the main loop. The latest build significantly expands specialized creep roles (tower fillers, combo bots, SK attackers, rampart bots, and more), adds dedicated profiling and monitoring systems for CPU/energy/creeps, introduces advanced defense and strategic monitoring, and provides distributed remote supply management alongside core systems.
+This repository runs a comprehensive multi-room Screeps AI that automates economy, logistics, combat, market play, and late-game strategy. The repository keeps `main.js` at the root and organizes modules under `Bots/`, `Scanners/`, `Utilities/`, and `Documentation/`. Recent work consolidates several high-traffic systems: `Scanners/scanner.js` now owns observer-backed intelligence, registry, player, nuke, and war-estimate workflows, while `Utilities/repairManager.js` and `Bots/roleRepairer.js` provide unified repair planning and execution.
 
 ## Core Systems
 
@@ -62,9 +62,10 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 
 - **Room state caching**: Centralized, cached views of structures, creeps, and key room metadata.
 - **Room intelligence scoring**: Weighted analysis of rooms across Economic (25%), Military (30%), and Dual Purpose (45%) categories with auto-expiring caches.
-- **Observer scanning**: Scheduled room visibility sweeps with fallback chain (structural observer → Operator with PWR_OPERATE_OBSERVER → manual scouting).
-- **Wide scan**: Full observer-range sweep to find all rooms owned by a target player.
-- **Player analysis**: Multi-phase intelligence pipeline (wideScan → roomIntel → comprehensive report with strength classifications, aggregated scores, and nuke capability comparison).
+- **Unified scanner**: `scanner.js` consolidates maintenance scanning, room intel, nuke analysis, player analysis, wide scan, war estimate, player monitor, observer scheduling, and room registry workflows.
+- **Observer scheduling**: Shared priority queue for one-shot console commands, WAR hot polls, player monitor polls, deposit scans, and registry sweeps.
+- **Registry-backed wide scan**: Room ownership registry supports `wideScan()`, `wideScanPlayers()`, player monitoring, and war analysis.
+- **Player analysis**: Multi-phase intelligence pipeline with registry discovery, room intel, creep census, nuke threat checks, and strength classifications.
 - **Room navigation**: Shared A* room-level pathfinder respecting observer-scanned blocked rooms and custom ban lists.
 - **Managers**:
   - Link routing and energy distribution
@@ -78,7 +79,7 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 ### Profiling & Diagnostics Systems (New)
 
 - **Creep Profiler** (`creepProfiler.js`): Real-time per-creep role statistics, spawn efficiency tracking, and performance analysis.
-- **Energy Profiler** (`energyProfiler.js`): Room-level energy flow analysis, production/consumption metrics, and efficiency reporting.
+- **Energy profiling**: Room energy flow analysis now lives in the consolidated scanner/intel stack.
 - **Room CPU Profiler** (`roomCPUProfiler.js`): CPU cost tracking per room, per subsystem, with performance trending and bottleneck identification.
 - **CPU optimization patterns**:
   - Cached state reads and per-tick caches
@@ -94,9 +95,9 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 ### Defense & War Monitoring (New)
 
 - **Defense Monitor** (`defenseMonitor.js`): Real-time threat assessment, tower status, hostile creep tracking, and automatic escalation alerts.
-- **War Estimate** (`warEstimate.js`): Strategic strength analysis, combat capability prediction, casualty estimation, and battle outcome forecasting.
-- **Player Monitor** (`playerMonitor.js`): Ongoing surveillance of target players, activity tracking, expansion monitoring, and attack pattern analysis.
-- **Nuke Analysis** (`nukeAnalyze.js`): Nuke landing prediction, incoming nuke detection, damage forecasting, and defensive counter-strategy.
+- **War Estimate** (`scanner.js`): Strategic strength analysis, combat capability prediction, casualty estimation, and battle outcome forecasting.
+- **Player Monitor** (`scanner.js`): Ongoing surveillance of target players, activity tracking, expansion monitoring, and attack pattern analysis.
+- **Nuke Analysis** (`scanner.js`): Nuke landing prediction, incoming nuke detection, damage forecasting, and defensive counter-strategy.
 
 ### Resource & Market Automation
 
@@ -148,8 +149,21 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 - **Claimbot Range Check** (`claimbotRangeCheck.js`): Pre-mission verification of claim routes and range validation.
 - **Task Scheduler** (`taskScheduler.js`): Deferred task execution, priority queuing, and task batching.
 
+### Unified Repair System (New)
+
+- **Repair Manager** (`repairManager.js`): Unified room repair planner for roads, containers, walls, ramparts, towers, nuke-defense prep, rebuild cache, and repairer spawn requests.
+- **Repairer Role** (`roleRepairer.js`): Generic repair task executor used by repair manager plans.
+- **Legacy repair migration**: Legacy wall repair, repair bot, rampart bot, and defense repair spawning is replaced by repair manager spawn requests. Existing old-role creeps continue running until they expire.
+- **Repair memory compaction**: Compact plan/request formats reduce serialization cost for repair state.
+
 ## New Highlights (since 2026-01-09)
 
+- **Unified scanner module**: `Scanners/scanner.js` replaces the separate maintenance scanner, room intel, nuke analysis, player analysis, wide scan, war estimate, player monitor, room observer, and registry modules in the current build.
+- **Shared observer scheduler**: Observer use is coordinated through one priority system so modules do not silently collide on the same observer tick.
+- **Unified repair manager**: `repairManager.js` computes repair plans and `roleRepairer.js` executes them, with `spawnManager.js` consuming `Memory.repairSpawnRequests`.
+- **Shard 3 CPU budgeting**: `main.js` defines explicit CPU budget tiers and section priorities for critical, high, normal, and low-priority work.
+- **Room-filtered market views**: `selling(mode, roomName)` and `buying(mode, roomName)` now accept an optional room filter.
+- **LLM context documentation**: `Documentation/llmcontext.js` is documentation-only context for code review/generation and has no runtime purpose.
 - **Expanded creep role ecosystem**: Tower Fillers, Combo Bots, Rampart Bots, SK Attackers, Controller Attackers, Remote Suppliers, Static Distributors, Extractor Assistants, and HD (Heavy Defense) roles for specialized operations.
 - **Profiling & monitoring suite**: Creep Profiler (per-role efficiency), Energy Profiler (flow analysis), Room CPU Profiler (cost tracking), and comprehensive diagnostics.
 - **War & defense systems**: Defense Monitor (real-time threat tracking), War Estimate (battle prediction), Player Monitor (surveillance), and Nuke Analysis (incoming threat detection).
@@ -174,6 +188,7 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 - `getRoomState.js` — Centralized room state caching
 - `spawnManager.js` — Creep and Power Creep spawn management (168K, comprehensive body optimization)
 - `taskScheduler.js` — Deferred task execution and priority queuing
+- `Documentation/llmcontext.js` — Documentation-only context for LLM-assisted code review and generation
 
 ### Managers
 - `towerManager.js` — Tower defense/heal/repair
@@ -181,9 +196,9 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 - `factoryManager.js` — Factory production orders
 - `labManager.js` — Lab reaction workflows (multi-group)
 - `linkManager.js` — Link energy routing
-- `roomObserver.js` — Observer scheduling
+- `scanner.js` — Unified observer scheduling, room intel, registry, nuke analysis, player analysis, player monitoring, and war estimates
 - `powerManager.js` — Power spawn management
-- `maintenanceScanner.js` — Structure maintenance scanning
+- `repairManager.js` — Unified repair, nuke-defense, rebuild-cache, and repairer dispatch planning
 
 ### Storage & Distribution
 - `storageManager.js` — Centralized storage optimization and reservation (24K)
@@ -193,23 +208,28 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 - `localMap.js` — Cached local navigation and structure tracking (20K)
 
 ### Intelligence & Reconnaissance
-- `roomIntel.js` — Room scoring and analysis (100K)
-- `wideScan.js` — Observer-range room scanning
-- `playerAnalysis.js` — Comprehensive player intelligence (68K)
+- `scanner.js` — Consolidated intelligence and scanning system
+- `intel()` / `intelFast()` — Room scoring and analysis
+- `wideScan()` / `wideScanPlayers()` — Registry-backed observer-range room scanning
+- `player()` / `playerScan()` — Comprehensive player intelligence and creep census
 - `roomNavigation.js` — Shared A* room pathfinder
-- `playerMonitor.js` — Ongoing player surveillance (40K, new)
-- `warEstimate.js` — Strategic battle prediction and strength analysis (100K, new)
+- `monitor()` — Ongoing player surveillance
+- `warEstimate()` — Strategic battle prediction and strength analysis
 - `defenseMonitor.js` — Real-time threat assessment and tower tracking (32K, new)
-- `nuke​Analyze.js` — Nuke prediction and defense counter-strategy (72K, new)
+- `nukeAnalyze()` / `nukeThreat()` — Nuke prediction and defense counter-strategy
 
 ### Profiling & Diagnostics
 - `creepProfiler.js` — Per-creep role statistics and efficiency (20K, new)
-- `energyProfiler.js` — Room-level energy flow and production analysis (52K, new)
 - `roomCPUProfiler.js` — Per-room CPU cost and bottleneck tracking (64K, new)
 - `statusReport.js` — Comprehensive system status reporting (20K, new)
 - `memoryProfiler.js` — Memory usage analysis
 - `memoryQuery.js` — Deep Memory search utility
 - `screeps-profiler.js` — CPU profiling
+
+### Repair & Maintenance
+- `repairManager.js` — Unified repair planner, nuke repair planner, rebuild cache, and spawn request dispatcher
+- `roleRepairer.js` — Generic repair task executor for repair manager plans
+- `roadBuilder.js` — Automated road construction (8K, new)
 
 ### Market & Economy
 - `autoTrader.js` — Automated profitable trading (76K)
@@ -257,6 +277,7 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 - `roleRampartBot.js` — Dedicated rampart building and reinforcement (20K, new)
 - `roleWallRepair.js` — Wall/rampart repair (24K)
 - `roleRepairBot.js` — Structure repair (12K)
+- `roleRepairer.js` — Generic repair manager executor (new)
 - `roleMaintainer.js` — Room maintenance
 - `roadBuilder.js` — Automated road construction (8K, new)
 
@@ -310,15 +331,43 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 
 ### Intelligence & Monitoring
     intel('W1N1')                          // Score and analyze a room
+    intelFast('W1N1')                      // Instant room snapshot without profiling
     listIntel()                            // List all cached intel
+    getCachedIntel('W1N1')                 // Return cached room intel
+    registrySweep()                        // Force ownership registry sweep
+    registryStatus()                       // Registry sweep progress and age
+    registryList()                         // List registered players and rooms
+    registryPlayer('PlayerName')           // Rooms owned by one player
     wideScan('PlayerName')                 // Scan all observer-range rooms for a player
+    wideScanPlayers()                      // List all players in observer range
     wideScanStatus()                       // Check scan progress
+    wideScanCancel()                       // Cancel pending wideScan report
     player('PlayerName')                   // Full player analysis pipeline
     playerStatus()                         // Check analysis progress
+    playerCancel()                         // Cancel active analysis
     playerLast()                           // Reprint last analysis report
+    playerScan('PlayerName', 'CREEPCOUNT') // Observer-backed creep census
+    playerScanStatus()                     // Creep census progress
+    playerScanCancel()                     // Cancel active creep census
     warEstimate('PlayerName')              // Battle prediction and strength analysis (new)
+    warEstimateStatus()                    // War estimate phase and progress
+    warEstimateCancel()                    // Cancel active war estimate
+    warEstimateLast()                      // View cached war estimate
     defenseStatus()                        // Current threat level and defense readiness (new)
-    playerMonitor('PlayerName')            // Start/stop ongoing surveillance (new)
+    monitor('PlayerName', 'WAR')           // Assign player monitor status
+    monitorStatus()                        // Player monitor status summary
+    monitorPause() / monitorResume()       // Pause or resume player monitor alerts
+
+### Scanner & Nukes
+    maintScan()                            // Maintenance decay/repair cost report
+    maintScanRoom('W1N1')                  // Maintenance scan for one room
+    nukeAnalyze('W1N1')                    // Best single nuke strike position
+    nukeAnalyze('W1N1', 3)                 // Greedy best-3 strike combination
+    nukeAnalyzeSelf()                      // Analyze owned rooms
+    nukeIncoming()                         // Check owned rooms for incoming nukes
+    nukeThreat('W1N1')                     // Scan 10-room radius for hostile nukers
+    nukeThreatStatus('W1N1')               // Threat scan progress
+    nukeThreatCancel('W1N1')               // Cancel threat scan
 
 ### Market & Economy
     prices()                               // Print all resource prices (WMP)
@@ -327,7 +376,9 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
     autoTrader()                           // Show auto-trader status
     autoTrader('run')                      // Force immediate trading cycle
     selling()                              // Show all active sell orders
+    selling('compact', 'E0N0')             // Show sell orders filtered by room
     buying()                               // Show all active buy orders
+    buying('expanded', 'E0N0')             // Show buy orders filtered by room
     labForward('E3N46', 'ZO')              // Start forward lab operation
     labReverse('E3N46', 'ZO')              // Start reverse lab operation
     console.log(marketAnalysis())          // Profitability tables
@@ -367,6 +418,15 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 
 ### Defense & Nukes
     orderWallRepair('W1N1', 500000)
+    repairPlan('W1N1')                     // Unified repair plan
+    repairStatus('W1N1')                   // Active/idle repairer count
+    repairDispatch('W1N1')                 // Pending repairer spawn requests
+    repairNukePlan('W1N1')                 // Nuke repair tier breakdown
+    repairSetTarget('W1N1', STRUCTURE_RAMPART, 50000000)
+    repairResetTargets('W1N1')             // Clear target overrides
+    repairPause('W1N1') / repairResume('W1N1')
+    repairCacheBuildings('W1N1')           // Snapshot rebuildable structures
+    repairRebuildMissing('W1N1')           // Recreate missing construction sites
     nukeFill('W1N1', { maxPrice: 1.5 })
     launchNuke('W1N1', 'W3N3', 'spawn')
     nukeDefense('W1N1')                    // Plan nuke defense (new)
@@ -389,7 +449,7 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 - Clone/copy into your Screeps `src` directory.
 - Deploy the main loop (`main.js`) to your Screeps environment.
 - Configure per-module constants (thresholds, margins, allowlists/denylists) before upload.
-- Review `IntelWeights.txt` for room scoring tuning and threat classification.
+- Review scanner scoring and monitor constants in `scanner.js` for room scoring, threat classification, observer priorities, and registry cadence.
 - Use console commands to:
   - Gather intelligence on rooms and players with war/defense analysis
   - Schedule factory/lab/market actions
@@ -404,12 +464,15 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 ## Configuration & Tuning
 
 - **Intel Weights** (`IntelWeights.txt`): Adjust room scoring weights (economic/military/dual-purpose ratios)
+- **Scanner** (`scanner.js`): Adjust room scoring, observer priorities, registry sweep cadence, monitor hot-poll cadence, and war-estimate behavior
+- **Repair Manager** (`repairManager.js`): Adjust repair tiers, rampart/wall targets, nuke safety margins, tower repair limits, and repairer spawn sizing
 - **Boost Management** (`boostManager.js`): Configure boost production priorities and schedules
 - **Storage Thresholds** (`storageManager.js`): Set per-resource storage targets and reserve amounts
 - **Remote Supply** (`remoteSupplyManager.js`): Define remote room supply priorities and demand levels
 - **Tower Strategy** (`towerManager.js`): Tune tower target selection (defend/heal/repair balance)
 - **Market Margins** (`marketArbitrage.js`, `autoTrader.js`): Set minimum profit thresholds
 - **CPU Throttling** (`roomCPUProfiler.js`): Configure CPU budget allocation per room
+- **Main CPU Scheduler** (`main.js`): Tune Shard 3 CPU limits and section priority tiers
 
 ## Architecture Highlights
 

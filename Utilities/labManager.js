@@ -10,12 +10,110 @@
 // labsDiagnoseBots()                   Global census of every creep with labbot in its role, its current room, phase, idle ticks, and suicide flag.
 // labsClearBotMemory('LabBot_E2N46_1') Hard-resets a stuck bot's memory so the role script starts fresh without waiting for a respawn.
 // cancelLabs('E9N49') Clears lab orders in a room
-// Paste this block inside your labManager.js installConsole() function, for example right after global.labsStats.
 
 var labManager = (function() {
   var LAYOUT_VALIDATION_INTERVAL = 50;
   var MANAGER_RUN_INTERVAL = 3;
   var LAB_REACTION_AMOUNT = 5;
+  var BROKEN_ORDER_TICKS = 10000; // emergency watchdog: processing this long == broken
+  var LAB_SUPPLIER_STAGE_TARGET = 2500;
+  var LAB_SUPPLIER_STALL_TICKS = 100;
+
+  // ─── storageManager v2 ──────────────────────────────────────────────────
+  // Enabled for every owned room. labManager reserves leaf reagents under a
+  // per-product program and releases them on completion, cancellation, or
+  // broken-order liquidate.
+  var storageManager = require('storageManager');
+  var getRoomState = require('getRoomState');
+
+  function _getLabs(room) {
+    if (!room) return [];
+    var rs = getRoomState.get(room.name);
+    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_LAB]) {
+      return rs.structuresByType[STRUCTURE_LAB];
+    }
+    return room.find(FIND_STRUCTURES, {
+      filter: function(s) { return s.structureType === STRUCTURE_LAB; }
+    });
+  }
+
+  function v2Enabled(roomName) {
+    var room = Game.rooms[roomName];
+    return !!(room && room.controller && room.controller.my);
+  }
+
+  function releaseOrderReservations(order) {
+    if (!order || !order.reservationProgram) return;
+    var leafs = order.leafReagents || [];
+    var roomName = order.room || order.roomName;
+    for (var i = 0; i < leafs.length; i++) {
+      var r = leafs[i].reagent;
+      if (!roomName) continue;
+      storageManager.unReserve(roomName, r, 'terminal', order.reservationProgram);
+      storageManager.unReserve(roomName, r, 'storage',  order.reservationProgram);
+    }
+  }
+
+  // Returns the chain's leaf (base mineral) reagents as [{reagent, amount}],
+  // summing the total demand across all chain steps. Intermediates are
+  // produced in labs and consumed in-place, so they aren't reserved.
+  // Walks the chain recursively; amounts follow REACTIONS stoichiometry.
+  function computeLeafReagents(chain, product, amount) {
+    // Find the chain step that produces `product`; that's the terminal step.
+    // The chain is bottom-up (reversed in buildReactionChain). Walk it
+    // forward from the end and accumulate demand for each unique reagent.
+    var demand = {};
+    function stepDose(stepProduct, stepAmount) {
+      var reagents = findDirectReagents(stepProduct);
+      if (!reagents) return;
+      // If a reagent is itself produced by an earlier step in the chain,
+      // its demand is satisfied by that step's output and doesn't need
+      // reservation from terminal/storage.
+      var producedByChain = false;
+      for (var i = 0; i < chain.length; i++) {
+        if (chain[i].product === reagents.a) { producedByChain = true; break; }
+      }
+      if (!producedByChain) {
+        // This reagent is a leaf. REACTIONS[reag1][reag2] = product with
+        // amount LAB_REACTION_AMOUNT consumed on each side. Stoichiometry is
+        // 1:1 for our purposes (each input amount produces the same in
+        // output). Add stepAmount worth of this reagent.
+        demand[reagents.a] = (demand[reagents.a] || 0) + stepAmount;
+      }
+      var producedByChainB = false;
+      for (var j = 0; j < chain.length; j++) {
+        if (chain[j].product === reagents.b) { producedByChainB = true; break; }
+      }
+      if (!producedByChainB) {
+        demand[reagents.b] = (demand[reagents.b] || 0) + stepAmount;
+      }
+    }
+    // The chain in storage order: startOrder pushes leaves first, then
+    // compounds, then the final product. We need the LEAVES — which are the
+    // compounds with no incoming chain step (i.e. base minerals in REACTIONS).
+    // Simpler approach: just walk the chain and add non-chain-produced reagents.
+    for (var k = 0; k < chain.length; k++) {
+      var step = chain[k];
+      var reagents = findDirectReagents(step.product);
+      if (!reagents) continue;
+      // Determine how much of this step's reagents are needed
+      var stepNeed = (step.product === product) ? amount : Math.ceil(amount * 1.2);
+      // If the reagent is itself a chain product, the demand is satisfied
+      // by that step's output, not from terminal/storage.
+      var aInChain = false, bInChain = false;
+      for (var m = 0; m < chain.length; m++) {
+        if (chain[m].product === reagents.a) aInChain = true;
+        if (chain[m].product === reagents.b) bInChain = true;
+      }
+      if (!aInChain) demand[reagents.a] = (demand[reagents.a] || 0) + stepNeed;
+      if (!bInChain) demand[reagents.b] = (demand[reagents.b] || 0) + stepNeed;
+    }
+    var out = [];
+    for (var key in demand) {
+      out.push({ reagent: key, amount: demand[key] });
+    }
+    return out;
+  }
 
   var layoutCache = {};
   var breakdownLayoutCache = {};
@@ -133,9 +231,7 @@ var labManager = (function() {
   function computeBestLayout(room) {
     var labs = room._labsCache;
     if (!labs || room._labsCacheTime !== Game.time) {
-      labs = room.find(FIND_STRUCTURES, {
-        filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-      });
+      labs = _getLabs(room);
       room._labsCache = labs;
       room._labsCacheTime = Game.time;
     }
@@ -273,9 +369,7 @@ var labManager = (function() {
       }
     }
 
-    var labs = room.find(FIND_STRUCTURES, {
-      filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-    });
+    var labs = _getLabs(room);
 
     if (!labs || labs.length < 3) return null;
 
@@ -325,6 +419,220 @@ var labManager = (function() {
 
   function getBreakdownLayout(room) {
     return computeBreakdownLayout(room);
+  }
+
+  function getUnreservedAmount(roomName, resourceType) {
+    var info = storageManager.storageFind(roomName, resourceType);
+    if (!info) return 0;
+
+    var total = 0;
+    if (info.terminal) total += Math.max(0, (info.terminal.total || 0) - (info.terminal.reserved || 0));
+    if (info.storage) total += Math.max(0, (info.storage.total || 0) - (info.storage.reserved || 0));
+    return total;
+  }
+
+  function getProductionInputTarget(layout, order) {
+    if (!layout || !layout.groups || !order || order.type !== 'production') return 0;
+
+    var remaining = typeof order.remaining === 'number' && order.remaining > 0
+      ? order.remaining
+      : (order.amount || 0);
+    if (remaining <= 0) return 0;
+
+    var outStock = 0;
+    var outputCapacity = 0;
+    for (var g = 0; g < layout.groups.length; g++) {
+      var group = layout.groups[g];
+      for (var i = 0; i < group.outs.length; i++) {
+        var outLab = group.outs[i];
+        if (!outLab || !outLab.store) continue;
+        outputCapacity += outLab.store.getFreeCapacity(order.product) || 0;
+        outStock += outLab.store[order.product] || 0;
+      }
+    }
+
+    var stillToProduce = Math.max(0, remaining - outStock);
+    if (stillToProduce <= 0) return 0;
+
+    var maxProducible = Math.min(stillToProduce, outputCapacity);
+    var perGroupTarget = Math.ceil(maxProducible / Math.max(1, layout.groups.length));
+    var perInputTarget = Math.min(perGroupTarget, LAB_SUPPLIER_STAGE_TARGET);
+    var mod = perInputTarget % LAB_REACTION_AMOUNT;
+    if (mod !== 0) {
+      perInputTarget += (LAB_REACTION_AMOUNT - mod);
+    }
+
+    return Math.min(perInputTarget, LAB_SUPPLIER_STAGE_TARGET);
+  }
+
+  function getProductionInputLoadState(room, layout, order) {
+    var state = {
+      target: 0,
+      totalLoaded: 0,
+      reag1Available: 0,
+      reag2Available: 0,
+      suppressLoads: false
+    };
+
+    if (!room || !layout || !layout.groups || !order || order.type !== 'production') return state;
+
+    state.target = getProductionInputTarget(layout, order);
+    if (state.target <= 0) return state;
+
+    var totalLoaded = 0;
+    for (var g = 0; g < layout.groups.length; g++) {
+      var group = layout.groups[g];
+      var have1 = (group.in1 && group.in1.mineralType === order.reag1) ? (group.in1.mineralAmount || 0) : 0;
+      var have2 = (group.in2 && group.in2.mineralType === order.reag2) ? (group.in2.mineralAmount || 0) : 0;
+      totalLoaded += have1 + have2;
+    }
+    state.totalLoaded = totalLoaded;
+    state.reag1Available = getUnreservedAmount(room.name, order.reag1);
+    state.reag2Available = getUnreservedAmount(room.name, order.reag2);
+
+    var hasInputsNeeded = false;
+    for (var gg = 0; gg < layout.groups.length; gg++) {
+      var grp = layout.groups[gg];
+      var gHave1 = (grp.in1 && grp.in1.mineralType === order.reag1) ? (grp.in1.mineralAmount || 0) : 0;
+      var gHave2 = (grp.in2 && grp.in2.mineralType === order.reag2) ? (grp.in2.mineralAmount || 0) : 0;
+      if (gHave1 < state.target || gHave2 < state.target) {
+        hasInputsNeeded = true;
+        break;
+      }
+    }
+
+    var hasAnyUnreserved = state.reag1Available > 0 || state.reag2Available > 0;
+    if (!hasInputsNeeded || hasAnyUnreserved) {
+      delete order.inputLoadStalledSince;
+      return state;
+    }
+
+    if (!order.inputLoadStalledSince) order.inputLoadStalledSince = Game.time;
+    if ((Game.time - order.inputLoadStalledSince) >= LAB_SUPPLIER_STALL_TICKS && totalLoaded >= LAB_SUPPLIER_STAGE_TARGET) {
+      state.suppressLoads = true;
+    }
+    return state;
+  }
+
+  function isMarketLabOrder(order) {
+    return !!(order && (order.origin === 'marketLab' || order.marketOpId));
+  }
+
+  function productionInputsReady(layout, order) {
+    var target = getProductionInputTarget(layout, order);
+    if (target <= 0) return false;
+
+    for (var g = 0; g < layout.groups.length; g++) {
+      var group = layout.groups[g];
+      var have1 = (group.in1 && group.in1.mineralType === order.reag1) ? (group.in1.mineralAmount || 0) : 0;
+      var have2 = (group.in2 && group.in2.mineralType === order.reag2) ? (group.in2.mineralAmount || 0) : 0;
+      if (have1 < target || have2 < target) return false;
+    }
+
+    return true;
+  }
+
+  function getSupplierLabTasks(roomName) {
+    var rm = Memory.labOrders && Memory.labOrders[roomName];
+    if (!rm || !rm.active || rm.active.origin !== 'marketLab') return [];
+    if (rm.active.type !== 'production' &&
+        !(rm.active.type === 'breakdown' && rm.active.evacuating)) return [];
+
+    var room = Game.rooms[roomName];
+    if (!room || !room.terminal) return [];
+
+    var order = rm.active;
+    var isBreakdown = order.type === 'breakdown';
+    var layout = isBreakdown ? getBreakdownLayout(room) : getLayout(room);
+    if (!layout || !layout.groups || layout.groups.length === 0) return [];
+
+    var tasks = [];
+
+    function emitLabUnload(lab, reason) {
+      if (!lab || !lab.mineralType || (lab.mineralAmount || 0) <= 0) return;
+      var amt = Math.min(lab.mineralAmount || 0, room.terminal.store.getFreeCapacity(lab.mineralType) || 0);
+      if (amt <= 0) return;
+      tasks.push({
+        type: 'lab_unload',
+        taskId: 'lab_unload:' + lab.id + ':' + lab.mineralType,
+        targetId: room.terminal.id,
+        amount: amt,
+        priority: 55,
+        extra: 'res=' + lab.mineralType + ',lab=' + lab.id + ',reason=' + reason
+      });
+    }
+
+    if (order.evacuating) {
+      for (var eg = 0; eg < layout.groups.length; eg++) {
+        var egrp = layout.groups[eg];
+        if (!egrp) continue;
+
+        emitLabUnload(egrp.in1, 'evacuate');
+        emitLabUnload(egrp.in2, 'evacuate');
+
+        for (var eo = 0; eo < egrp.outs.length; eo++) {
+          emitLabUnload(egrp.outs[eo], 'evacuate');
+        }
+      }
+
+      return tasks;
+    }
+
+    var state = getProductionInputLoadState(room, layout, order);
+
+    for (var g = 0; g < layout.groups.length; g++) {
+      var group = layout.groups[g];
+      if (!group) continue;
+
+      if (group.in1 && group.in1.mineralType && group.in1.mineralType !== order.reag1) {
+        emitLabUnload(group.in1, 'wrong');
+      }
+      if (group.in2 && group.in2.mineralType && group.in2.mineralType !== order.reag2) {
+        emitLabUnload(group.in2, 'wrong');
+      }
+      for (var o = 0; o < group.outs.length; o++) {
+        var outLab = group.outs[o];
+        if (outLab && outLab.mineralType && outLab.mineralType !== order.product) {
+          emitLabUnload(outLab, 'wrong');
+        }
+      }
+    }
+
+    if (state.suppressLoads) return tasks;
+
+    var loadCandidates = [];
+    for (var gi = 0; gi < layout.groups.length; gi++) {
+      var grp = layout.groups[gi];
+      var in1Free = grp.in1 && grp.in1.store ? (grp.in1.store.getFreeCapacity(order.reag1) || 0) : 0;
+      var in2Free = grp.in2 && grp.in2.store ? (grp.in2.store.getFreeCapacity(order.reag2) || 0) : 0;
+      var have1 = (grp.in1 && grp.in1.mineralType === order.reag1) ? (grp.in1.mineralAmount || 0) : 0;
+      var have2 = (grp.in2 && grp.in2.mineralType === order.reag2) ? (grp.in2.mineralAmount || 0) : 0;
+
+      if (grp.in1 && have1 < state.target && state.reag1Available > 0 && in1Free > 0) {
+        loadCandidates.push({ lab: grp.in1, reagent: order.reag1, deficit: state.target - have1, free: in1Free });
+      }
+
+      if (grp.in2 && have2 < state.target && state.reag2Available > 0 && in2Free > 0) {
+        loadCandidates.push({ lab: grp.in2, reagent: order.reag2, deficit: state.target - have2, free: in2Free });
+      }
+    }
+
+    loadCandidates.sort(function(a, b) { return b.deficit - a.deficit; });
+
+    for (var lc = 0; lc < loadCandidates.length; lc++) {
+      var cand = loadCandidates[lc];
+      var loadPriority = 56 - (Math.min(cand.deficit, LAB_SUPPLIER_STAGE_TARGET) / 100000);
+      tasks.push({
+        type: 'lab_load',
+        taskId: 'lab_load:' + order.created + ':' + cand.lab.id + ':' + cand.reagent,
+        targetId: cand.lab.id,
+        amount: Math.min(cand.deficit, cand.free),
+        priority: loadPriority,
+        extra: 'res=' + cand.reagent + ',lab=' + cand.lab.id + ',target=' + state.target + ',need=' + cand.deficit + (order.reservationProgram ? ',program=' + order.reservationProgram : '')
+      });
+    }
+
+    return tasks;
   }
 
   // ===========================================================================
@@ -385,10 +693,98 @@ var labManager = (function() {
   }
 
   // ===========================================================================
+  // BROKEN-ORDER DETECTION + EVACUATE/SELL
+  // ===========================================================================
+
+  // Flag an order as unrecoverable: stop reacting, drain the labs, sell on done.
+  function markBroken(roomName, order, reason) {
+    order.broken             = true;
+    order.evacuating         = true;
+    order.needsPreEvacuation = false;
+    console.log('[Labs] Order BROKEN in ' + roomName + ' (' + reason +
+                ') — evacuating labs and selling associated resources.');
+  }
+
+  function resourceNeededByQueue(rm, resource, exceptOrder) {
+    if (!rm.queue) return false;
+    for (var i = 0; i < rm.queue.length; i++) {
+      var o = rm.queue[i];
+      if (o === exceptOrder) continue;
+      if (o.reag1 === resource || o.reag2 === resource ||
+          o.product === resource || o.compound === resource) return true;
+    }
+    return false;
+  }
+
+  // Is a marketLab forward/reverse op tracking this resource? If so, let
+  // marketLab's salvage path sell it (avoids duplicate sell orders).
+  function resourceOwnedByMarketOp(roomName, resource) {
+    function scan(mem) {
+      if (!mem || !mem.rooms || !mem.rooms[roomName]) return false;
+      var q = mem.rooms[roomName];
+      for (var i = 0; i < q.length; i++) {
+        var op = q[i]; if (!op) continue;
+        if (op.targetCompound === resource) return true;
+        if (op.reagents && (op.reagents[0] === resource || op.reagents[1] === resource)) return true;
+      }
+      return false;
+    }
+    return scan(Memory.marketLabForward) || scan(Memory.marketLabReverse);
+  }
+
+  function hasRecentMarketSellRequest(roomName, resource, amount) {
+    if (!Memory.marketSell || !Array.isArray(Memory.marketSell.requests)) return false;
+    for (var i = Memory.marketSell.requests.length - 1; i >= 0; i--) {
+      var req = Memory.marketSell.requests[i];
+      if (!req) continue;
+      if (req.roomName !== roomName) continue;
+      if (req.resourceType !== resource) continue;
+      if (req.amount !== amount) continue;
+      if (req.created !== Game.time) continue;
+      return true;
+    }
+    return false;
+  }
+
+  // Called once, at the moment a broken order completes (labs already drained
+  // into the terminal). Sells the order's compound/reagents that no other lab
+  // order needs and that no marketLab op already owns.
+  function sellBrokenOrderResources(rm, roomName, order) {
+    if (typeof global.marketSell !== 'function') return;
+    var room = Game.rooms[roomName];
+    if (!room || !room.terminal) return;
+
+    var list = (order.type === 'breakdown')
+      ? [order.compound, order.reag1, order.reag2]
+      : [order.product,  order.reag1, order.reag2];
+
+    var seen = {};
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      if (!r || r === RESOURCE_ENERGY || seen[r]) continue;
+      seen[r] = true;
+      if (resourceNeededByQueue(rm, r, order)) continue;   // a queued order needs it
+      if (resourceOwnedByMarketOp(roomName, r)) continue;  // marketLab will sell it
+      var amt = room.terminal.store[r] || 0;
+      if (amt > 0) {
+        console.log('[Labs] Broken order — selling ' + amt + ' ' + r + ' in ' + roomName);
+        global.marketSell(roomName, r, amt);
+
+        // Release only after marketSell has created its own request record.
+        if (v2Enabled(roomName) && order.reservationProgram && hasRecentMarketSellRequest(roomName, r, amt)) {
+          storageManager.unReserve(roomName, r, 'terminal', order.reservationProgram);
+          storageManager.unReserve(roomName, r, 'storage', order.reservationProgram);
+        }
+      }
+    }
+  }
+
+  // ===========================================================================
   // ORDER MANAGEMENT - PRODUCTION
   // ===========================================================================
 
-  function startOrder(roomName, product, amount) {
+  function startOrder(roomName, product, amount, opts) {
+    opts = opts || {};
     var rm = ensureRoomOrders(roomName);
     var room = Game.rooms[roomName];
 
@@ -401,13 +797,59 @@ var labManager = (function() {
       return { ok: false, msg: "[Labs] Cannot produce " + product + " - no reaction found" };
     }
 
+    // ── storageManager v2: reserve leaf reagents for the chain ──────────────
+    // Each order gets a unique program name (including order created tick).
+    // This prevents a queued reaction chain from replacing an active chain's
+    // reservation, and guarantees promoted chains still hold their reservations.
+    var leafReagents = null;
+    var chainProgram = null;
+    if (v2Enabled(roomName)) {
+      leafReagents = computeLeafReagents(chain, product, amount);
+      chainProgram = 'labManager_' + product + '_' + Game.time + '_' + Math.random().toString(36).substr(2, 6);
+      var reservedOk = true;
+      var reservedKeys = [];
+      for (var li = 0; li < leafReagents.length; li++) {
+        var r = leafReagents[li].reagent;
+        var need = leafReagents[li].amount;
+        var info = storageManager.storageFind(roomName, r);
+        var termFree = info.terminal.total - info.terminal.reserved;
+        var storFree = info.storage.total  - info.storage.reserved;
+        if (termFree + storFree < need) {
+          reservedOk = false;
+          break;
+        }
+        var fromTerm = Math.min(need, termFree);
+        var fromStor = need - fromTerm;
+        if (fromTerm > 0) {
+          var rv1 = storageManager.reserve(roomName, r, 'terminal', chainProgram, fromTerm);
+          reservedKeys.push({ r: r, b: 'terminal' });
+          if (!rv1.ok) { reservedOk = false; break; }
+        }
+        if (fromStor > 0) {
+          var rv2 = storageManager.reserve(roomName, r, 'storage', chainProgram, fromStor);
+          reservedKeys.push({ r: r, b: 'storage' });
+          if (!rv2.ok) { reservedOk = false; break; }
+        }
+      }
+      if (!reservedOk) {
+        for (var rk = 0; rk < reservedKeys.length; rk++) {
+          storageManager.unReserve(roomName, reservedKeys[rk].r, reservedKeys[rk].b, chainProgram);
+        }
+        return { ok: false, msg: "[Labs] Insufficient unreserved leaf reagents in " + roomName + " for " + product };
+      }
+    }
+
     var orders = [];
-    for (var i = 0; i < chain.length; i++) {
+      for (var i = 0; i < chain.length; i++) {
       var step = chain[i];
       var stepAmount = (step.product === product) ? amount : Math.ceil(amount * 1.2);
 
-      orders.push({
+      var stepOrder = {
+        room: roomName,
         type: 'production',
+        origin: opts.origin || null,
+        sink: opts.sink || 'storage',
+        marketOpId: opts.marketOpId || null,
         product: step.product,
         amount: stepAmount,
         remaining: stepAmount,
@@ -416,7 +858,16 @@ var labManager = (function() {
         created: Game.time,
         priority: step.priority,
         needsPreEvacuation: (i === 0)
-      });
+      };
+      // Tag every step in the chain with the same reservation program + leafs
+      // so that when any step is active and gets cleared, releaseOrderReservations
+      // can find and release the chain-wide reservation. (Only one active per
+      // room at a time, so multiple steps in the chain won't double-release.)
+      if (chainProgram) {
+        stepOrder.reservationProgram = chainProgram;
+        stepOrder.leafReagents = leafReagents;
+      }
+      orders.push(stepOrder);
     }
 
     clearRoomCache(roomName);
@@ -424,6 +875,7 @@ var labManager = (function() {
     if (!rm.active) {
       rm.active = orders.shift();
       rm.active.needsPreEvacuation = true;
+      rm.active.processingSince = Game.time;
       rm.queue = orders;
       return { ok: true, msg: "[Labs] Started reaction chain for " + product + " x" + amount + " (" + (orders.length + 1) + " steps)" };
     } else {
@@ -436,7 +888,8 @@ var labManager = (function() {
   // ORDER MANAGEMENT - BREAKDOWN
   // ===========================================================================
 
-  function startBreakdownOrder(roomName, compound, amount) {
+  function startBreakdownOrder(roomName, compound, amount, opts) {
+    opts = opts || {};
     var rm = ensureRoomOrders(roomName);
     var room = Game.rooms[roomName];
 
@@ -451,15 +904,51 @@ var labManager = (function() {
 
     var storage = room.storage;
     var terminal = room.terminal;
-    var available = ((storage && storage.store[compound]) || 0) + 
+    var available = ((storage && storage.store[compound]) || 0) +
                     ((terminal && terminal.store[compound]) || 0);
 
     if (available < amount) {
       debugLog("[Labs] Warning: Only " + available + " " + compound + " available, requested " + amount);
     }
 
+    // ── storageManager v2: reserve the compound to be broken down ──────────
+    // The product reagents (reag1/reag2) are produced in-lab and don't need
+    // pre-reservation. Only the input compound (in terminal/storage) reserves.
+    // Use a unique program name per order so queued breakdown orders don't
+    // collide with an active breakdown order's reservation.
+    var breakdownProgram = null;
+    if (v2Enabled(roomName)) {
+      breakdownProgram = 'labManager_' + compound + '_' + Game.time + '_' + Math.random().toString(36).substr(2, 6);
+      var info = storageManager.storageFind(roomName, compound);
+      var termFree = info.terminal.total - info.terminal.reserved;
+      var storFree = info.storage.total  - info.storage.reserved;
+      if (termFree + storFree < amount) {
+        return { ok: false, msg: "[Labs] Insufficient unreserved " + compound + " in " + roomName + " for breakdown" };
+      }
+      var fromTerm = Math.min(amount, termFree);
+      var fromStor = amount - fromTerm;
+      var rolled = false;
+      if (fromTerm > 0) {
+        var rv = storageManager.reserve(roomName, compound, 'terminal', breakdownProgram, fromTerm);
+        if (!rv.ok) rolled = true;
+      }
+      if (fromStor > 0 && !rolled) {
+        var rv2 = storageManager.reserve(roomName, compound, 'storage', breakdownProgram, fromStor);
+        if (!rv2.ok) rolled = true;
+      }
+      if (rolled) {
+        storageManager.unReserve(roomName, compound, 'terminal', breakdownProgram);
+        storageManager.unReserve(roomName, compound, 'storage',  breakdownProgram);
+        return { ok: false, msg: "[Labs] Reserve failed for " + compound + " in " + roomName };
+      }
+    }
+
     var order = {
+      room: roomName,
       type: 'breakdown',
+      origin: opts.origin || null,
+      sink: opts.sink || 'storage',
+      marketOpId: opts.marketOpId || null,
       compound: compound,
       amount: amount,
       remaining: amount,           // Tracks compound remaining to deliver to output labs
@@ -470,10 +959,15 @@ var labManager = (function() {
       evacuating: false,
       needsPreEvacuation: true
     };
+    if (breakdownProgram) {
+      order.reservationProgram = breakdownProgram;
+      order.leafReagents = [{ reagent: compound, amount: amount }];
+    }
 
     clearRoomCache(roomName);
 
     if (!rm.active) {
+      order.processingSince = Game.time;
       rm.active = order;
       return { ok: true, msg: "[Labs] Started breakdown of " + compound + " x" + amount + " -> " + reagents.a + " + " + reagents.b };
     } else {
@@ -518,9 +1012,7 @@ var labManager = (function() {
 
     var layout = isBreakdown ? computeBreakdownLayout(room) : resolveLayout(room);
 
-    var allLabs = room.find(FIND_STRUCTURES, {
-      filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-    });
+    var allLabs = _getLabs(room);
 
     // =====================================================================
     // CHECK IF ALL LABS ARE EMPTY (shared helper for both types)
@@ -569,11 +1061,13 @@ var labManager = (function() {
       // even if compound still exists in terminal/storage (unprocessed)
       // -----------------------------------------------------------------
       if (rm.active.evacuating && labsEmpty) {
+        if (rm.active.broken) sellBrokenOrderResources(rm, roomName, rm.active);
         // Check if compound was never actually processed
         if (compoundInTerminalStorage >= LAB_REACTION_AMOUNT && compoundInLabs === 0 && totalReagentsInInputs === 0) {
           // Compound was never loaded into labs - this order failed
-          debugLog("[Labs] Breakdown aborted: compound never processed, " + 
+          debugLog("[Labs] Breakdown aborted: compound never processed, " +
                    compoundInTerminalStorage + " still in terminal/storage");
+          releaseOrderReservations(rm.active);
           rm.active = null;
           clearRoomCache(roomName);
           if (rm.queue.length > 0) {
@@ -586,6 +1080,7 @@ var labManager = (function() {
         // Evacuation is truly complete
         debugLog("[Labs] Breakdown fully complete: " + rm.active.compound + " in " + roomName +
                  " (reagents: " + totalReagentsInInputs + ")");
+        releaseOrderReservations(rm.active);
         rm.active = null;
         clearRoomCache(roomName);
 
@@ -615,6 +1110,7 @@ var labManager = (function() {
         // Fast path: absolutely nothing left anywhere
         if (totalCompoundAnywhere === 0 && totalReagentsInInputs < LAB_REACTION_AMOUNT) {
           debugLog("[Labs] Breakdown order complete - no compound or reagents remain anywhere.");
+          releaseOrderReservations(rm.active);
           rm.active = null;
           clearRoomCache(roomName);
 
@@ -637,6 +1133,7 @@ var labManager = (function() {
         if (deliveryComplete && reactionsComplete && evacuationComplete) {
           debugLog("[Labs] Breakdown fully complete: " + rm.active.compound + " in " + roomName +
                    " (compound remaining: " + totalCompoundAnywhere + ", reagents: " + totalReagentsInInputs + ")");
+          releaseOrderReservations(rm.active);
           rm.active = null;
           clearRoomCache(roomName);
 
@@ -671,8 +1168,10 @@ var labManager = (function() {
       // of remaining (product may already be in terminal/storage)
       // -----------------------------------------------------------------
       if (rm.active.evacuating && labsEmpty) {
+        if (rm.active.broken) sellBrokenOrderResources(rm, roomName, rm.active);
         var orderDesc = rm.active.product;
         debugLog("[Labs] Evacuation complete, labs empty — completing " + orderDesc + " in " + roomName);
+        releaseOrderReservations(rm.active);
         rm.active = null;
         clearRoomCache(roomName);
 
@@ -689,9 +1188,9 @@ var labManager = (function() {
 
       // -----------------------------------------------------------------
       // FIX: If one reagent is loaded into an input lab but the other
-      // reagent is completely absent from terminal + storage, reactions
-      // cannot proceed.  Force evacuation so the stranded mineral is
-      // returned to storage rather than sitting idle forever.
+      // reagent is completely absent from terminal + storage AND the
+      // partner input lab doesn't already hold enough to react, then
+      // reactions cannot proceed. Only then force evacuation.
       // -----------------------------------------------------------------
       if (!rm.active.evacuating && !deliveryComplete) {
         var st = room.storage;
@@ -704,13 +1203,18 @@ var labManager = (function() {
         if (layout && layout.groups) {
           for (var g = 0; g < layout.groups.length; g++) {
             var grp = layout.groups[g];
-            if ((grp.in1.mineralAmount || 0) > 0 && r2Avail === 0) {
+            var in1Amt = grp.in1.mineralAmount || 0;
+            var in2Amt = grp.in2.mineralAmount || 0;
+
+            // in1 loaded, but its partner can't react and can't be refilled
+            if (in1Amt > 0 && in2Amt < LAB_REACTION_AMOUNT && r2Avail === 0) {
               rm.active.evacuating = true;
               debugLog("[Labs] Production stuck: " + rm.active.reag1 +
                        " loaded but no " + rm.active.reag2 + " available — evacuating");
               break;
             }
-            if ((grp.in2.mineralAmount || 0) > 0 && r1Avail === 0) {
+            // in2 loaded, but its partner can't react and can't be refilled
+            if (in2Amt > 0 && in1Amt < LAB_REACTION_AMOUNT && r1Avail === 0) {
               rm.active.evacuating = true;
               debugLog("[Labs] Production stuck: " + rm.active.reag2 +
                        " loaded but no " + rm.active.reag1 + " available — evacuating");
@@ -740,6 +1244,7 @@ var labManager = (function() {
       if (deliveryComplete && labsEmpty) {
         var orderDesc = rm.active.product;
         debugLog("[Labs] Completed " + orderDesc + " in " + roomName);
+        releaseOrderReservations(rm.active);
         rm.active = null;
         clearRoomCache(roomName);
 
@@ -824,9 +1329,7 @@ var labManager = (function() {
   // ===========================================================================
 
   function checkLabsClear(room, layout, order) {
-    var allLabs = room.find(FIND_STRUCTURES, {
-      filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-    });
+    var allLabs = _getLabs(room);
 
     for (var i = 0; i < allLabs.length; i++) {
       var lab = allLabs[i];
@@ -851,9 +1354,7 @@ var labManager = (function() {
     var room = Game.rooms[roomName];
     if (!room) return false;
 
-    var labs = room.find(FIND_STRUCTURES, {
-      filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-    });
+    var labs = _getLabs(room);
 
     var hasMineral = false;
     for (var i = 0; i < labs.length; i++) {
@@ -908,6 +1409,11 @@ var labManager = (function() {
       debugLog("[Labs] Preemptive evacuate: outputs hold " + outStock + " " + order.product + " >= remaining " + remaining);
     }
 
+    if (!order.evacuating && isMarketLabOrder(order) && !productionInputsReady(layout, order)) {
+      debugLog("[Labs] Waiting for marketLab staging before running " + order.product);
+      return;
+    }
+
     if (!order.evacuating) {
       for (var gi = 0; gi < layout.groups.length; gi++) {
         var grp = layout.groups[gi];
@@ -930,11 +1436,7 @@ var labManager = (function() {
   // ===========================================================================
 
   function runBreakdown(room, layout, order) {
-    if (order.evacuating) return;
-
-    var allLabs = room.find(FIND_STRUCTURES, {
-      filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-    });
+    var allLabs = _getLabs(room);
 
     // Preemptive evacuate: if reagent destinations (in1/in2) can't accept any
     // more reagent, OR there is no processable compound anywhere, flip the order
@@ -1023,13 +1525,11 @@ var labManager = (function() {
  
     // Pre-evacuation always needs a labBot
     if (active.needsPreEvacuation) return true;
- 
+
     // During evacuation, only need a labBot if labs still have minerals to move out
     if (active.evacuating) {
-      var allLabs = room.find(FIND_STRUCTURES, {
-        filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-      });
- 
+      var allLabs = _getLabs(room);
+
       for (var li = 0; li < allLabs.length; li++) {
         if ((allLabs[li].mineralAmount || 0) > 0) {
           return true;
@@ -1042,11 +1542,9 @@ var labManager = (function() {
     var terminal = room.terminal;
     var storage = room.storage;
     var LAB_CAPACITY = 3000;
- 
-    var allLabs = room.find(FIND_STRUCTURES, {
-      filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-    });
- 
+
+    var allLabs = _getLabs(room);
+
     // Contamination: wrong mineral type in a lab always needs a labBot
     for (var i = 0; i < allLabs.length; i++) {
       var lab = allLabs[i];
@@ -1089,7 +1587,8 @@ var labManager = (function() {
           var group = layout.groups[g];
           var have1 = (group.in1.mineralType === active.reag1) ? (group.in1.mineralAmount || 0) : 0;
           var have2 = (group.in2.mineralType === active.reag2) ? (group.in2.mineralAmount || 0) : 0;
-          // Only spawn if deficit and supply are both actionable (>= one reaction's worth)
+          
+          // FIXED: Only need a bot if this group can't react and we need to fill it
           if ((LAB_CAPACITY - have1) >= LAB_REACTION_AMOUNT && reag1Available >= LAB_REACTION_AMOUNT) return true;
           if ((LAB_CAPACITY - have2) >= LAB_REACTION_AMOUNT && reag2Available >= LAB_REACTION_AMOUNT) return true;
         }
@@ -1105,11 +1604,15 @@ var labManager = (function() {
           }
         }
  
-        // A reagent is loaded in an input lab but its partner is gone — needs evacuation
+        // A reagent is loaded in an input lab but its partner can't react and
+        // can't be refilled — needs evacuation to prevent stalling
         for (var g = 0; g < layout.groups.length; g++) {
           var group = layout.groups[g];
-          if ((group.in1.mineralAmount || 0) > 0 && reag2Available === 0) return true;
-          if ((group.in2.mineralAmount || 0) > 0 && reag1Available === 0) return true;
+          var in1Amt = group.in1.mineralAmount || 0;
+          var in2Amt = group.in2.mineralAmount || 0;
+          
+          if (in1Amt > 0 && in2Amt < LAB_REACTION_AMOUNT && reag2Available === 0) return true;
+          if (in2Amt > 0 && in1Amt < LAB_REACTION_AMOUNT && reag1Available === 0) return true;
         }
       }
     }
@@ -1146,6 +1649,20 @@ var labManager = (function() {
     }
 
     repairActiveOrderIfNeeded(room.name);
+
+    // -----------------------------------------------------------------------
+    // BROKEN-ORDER WATCHDOG: if an order has been the active (reacting) order
+    // for 10k+ ticks, it's stuck — cancel it. markBroken flips it to evacuating
+    // so the existing evac path drains the labs, and sellBrokenOrderResources
+    // liquidates on completion. The processingSince backfill also covers orders
+    // promoted from the queue (they arrive with no timestamp).
+    // -----------------------------------------------------------------------
+    if (rm.active.type !== 'cleanup' && !rm.active.broken) {
+      if (!rm.active.processingSince) rm.active.processingSince = Game.time;
+      if ((Game.time - rm.active.processingSince) > BROKEN_ORDER_TICKS) {
+        markBroken(room.name, rm.active, 'reacting > ' + BROKEN_ORDER_TICKS + ' ticks');
+      }
+    }
 
     var stored = Memory.labLayout ? Memory.labLayout[room.name] : null;
     if (stored && stored.validated && (Game.time - stored.validated) > LAYOUT_VALIDATION_INTERVAL) {
@@ -1227,7 +1744,7 @@ var labManager = (function() {
       lines.push("Queue: " + ((rm.queue && rm.queue.length) || 0));
       lines.push("labsNeedWork: " + labsNeedWork(roomName));
 
-      var allCreeps = room.find(FIND_MY_CREEPS);
+      var allCreeps = (getRoomState.get(roomName) && getRoomState.get(roomName).myCreeps) || room.find(FIND_MY_CREEPS);
       var bots = [];
       for (var i = 0; i < allCreeps.length; i++) {
         if (/labbot/i.test(allCreeps[i].memory.role || "")) bots.push(allCreeps[i]);
@@ -1257,6 +1774,13 @@ var labManager = (function() {
 
       if (rm.active && rm.active.needsPreEvacuation) lines.push("WARNING: stuck in needsPreEvacuation");
       if (rm.active && rm.active.evacuating)       lines.push("Note: evacuating flag is set");
+      if (rm.active && rm.active.broken)           lines.push("BROKEN: flagged for evacuate + sell");
+      if (rm.active) {
+        var diagSince = rm.active.processingSince || rm.active.created;
+        if (diagSince) {
+          lines.push("Processing age: " + (Game.time - diagSince) + " / " + BROKEN_ORDER_TICKS + " ticks");
+        }
+      }
 
       return "[Labs] " + roomName + "\n" + lines.join("\n");
     };
@@ -1291,7 +1815,7 @@ var labManager = (function() {
       return "[Labs] Reset sticky memory on " + creepName + " — manager should reclaim it next tick";
     };
 
-    global.orderLabs = function(roomName, product, amount) {
+    global.orderLabs = function(roomName, product, amount, opts) {
       if (typeof roomName !== "string" || typeof product !== "string") {
         return "[Labs] Usage: orderLabs(roomName, product, amount)";
       }
@@ -1311,11 +1835,11 @@ var labManager = (function() {
         }
       }
 
-      var result = startOrder(roomName, product, n);
+      var result = startOrder(roomName, product, n, opts);
       return result.msg;
     };
 
-    global.breakdownLabs = function(roomName, compound, amount) {
+    global.breakdownLabs = function(roomName, compound, amount, opts) {
       if (typeof roomName !== "string" || typeof compound !== "string") {
         return "[Labs] Usage: breakdownLabs(roomName, compound, amount)";
       }
@@ -1330,7 +1854,7 @@ var labManager = (function() {
         }
       }
 
-      var result = startBreakdownOrder(roomName, compound, n);
+      var result = startBreakdownOrder(roomName, compound, n, opts);
       return result.msg;
     };
 
@@ -1346,6 +1870,15 @@ var labManager = (function() {
     global.cancelLabs = function(roomName) {
       if (typeof roomName !== "string") return "[Labs] Usage: cancelLabs(roomName)";
       var rm = ensureRoomOrders(roomName);
+      // Release v2 reservations on the active order before clearing
+      if (rm.active && rm.active.reservationProgram) {
+        releaseOrderReservations(rm.active);
+      }
+      for (var i = 0; i < rm.queue.length; i++) {
+        if (rm.queue[i] && rm.queue[i].reservationProgram) {
+          releaseOrderReservations(rm.queue[i]);
+        }
+      }
       rm.active = null;
       rm.queue = [];
       return "[Labs] Cleared labs orders in " + roomName;
@@ -1403,6 +1936,7 @@ var labManager = (function() {
 
         var status = act.evacuating ? " (evacuating)" : "";
         if (act.needsPreEvacuation) status += " (pre-evac)";
+        if (act.broken) status += " (BROKEN)";
         var typeLabel = act.type === 'breakdown' ? "BREAKDOWN" : "PRODUCTION";
 
         var line = "Active: " + typeLabel + " " + compound +
@@ -1411,6 +1945,11 @@ var labManager = (function() {
 
         if (act.type === 'breakdown' && typeof act.compoundDelivered === 'number') {
           line += " (delivered: " + act.compoundDelivered + ")";
+        }
+
+        var showSince = act.processingSince || act.created;
+        if (showSince) {
+          line += " | age " + (Game.time - showSince) + "/" + BROKEN_ORDER_TICKS;
         }
 
         lines.push(line);
@@ -1507,6 +2046,8 @@ var labManager = (function() {
         recordDelivery:    recordDelivery,
         getLayout:         getLayout,
         getBreakdownLayout:getBreakdownLayout,
+        getSupplierLabTasks:getSupplierLabTasks,
+        getProductionInputTarget:getProductionInputTarget,
         clearRoomCache:    clearRoomCache,
         labsNeedWork:      labsNeedWork,
         queueCleanup:      queueCleanup

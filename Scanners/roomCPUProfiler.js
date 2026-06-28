@@ -25,7 +25,22 @@
 
 'use strict';
 
-const wideScan = require('wideScan');
+// wideScan.js was merged into scanner.js. The new wideScan is async
+// (registry-backed sweep), which doesn't fit this file's synchronous
+// profile flow. Stub the old interface so this file can still load;
+// foreign player / neighbor modes will degrade to own-rooms-only
+// (or abort with a clear message). Use scanner's wideScan() global
+// directly when you need a full player report.
+const wideScan = {
+  start: function(target) {
+    console.log('[RoomCPUProfiler] Foreign player scan for "' + target +
+      '" is no longer supported in this file (wideScan was merged into scanner.js).');
+  },
+  startPlayers: function() {
+    console.log('[RoomCPUProfiler] Neighbor scan is no longer supported in this file (wideScan was merged into scanner.js).');
+  },
+  cancel: function() {},
+};
 
 const PROFILE_TICKS  = 100;
 const MAX_OBSERVERS  = 2;

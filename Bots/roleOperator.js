@@ -99,6 +99,33 @@
 //   opsCost                 -> ops consumed per use (0 if none)
 //   label                   -> friendly name for logging
 
+const getRoomState = require('getRoomState');
+
+function _myStructuresByType(room, type) {
+    var rs = getRoomState.get(room.name);
+    var arr = (rs && rs.structuresByType && rs.structuresByType[type]) || [];
+    var out = [];
+    for (var i = 0; i < arr.length; i++) {
+        if (arr[i].my) out.push(arr[i]);
+    }
+    return out;
+}
+
+function _structuresOfTypeWith(room, type, extraFilter) {
+    var rs = getRoomState.get(room.name);
+    if (rs && rs.structuresByType && rs.structuresByType[type]) {
+        var arr = rs.structuresByType[type];
+        var out = [];
+        for (var i = 0; i < arr.length; i++) {
+            if (arr[i].my && extraFilter(arr[i])) out.push(arr[i]);
+        }
+        return out;
+    }
+    return room.find(FIND_MY_STRUCTURES, {
+        filter: function(s) { return s.structureType === type && extraFilter(s); }
+    });
+}
+
 const POWER_HANDLERS = {};
 
 // ---------------------------------------------------------------------------
@@ -145,21 +172,16 @@ POWER_HANDLERS[PWR_OPERATE_FACTORY] = {
         }
         if (!neededLevel) return null; // no leveled order — don't operate
 
-        var factories = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) {
-                if (s.structureType !== STRUCTURE_FACTORY) return false;
-
-                if (s.effects && s.effects.length) {
-                    for (var i = 0; i < s.effects.length; i++) {
-                        if (s.effects[i].effect === PWR_OPERATE_FACTORY) {
-                            // Effect is live — re-target only if the level is wrong
-                            return s.effects[i].level !== neededLevel;
-                        }
+        var factories = _structuresOfTypeWith(room, STRUCTURE_FACTORY, function(s) {
+            if (s.effects && s.effects.length) {
+                for (var i = 0; i < s.effects.length; i++) {
+                    if (s.effects[i].effect === PWR_OPERATE_FACTORY) {
+                        // Effect is live — re-target only if the level is wrong
+                        return s.effects[i].level !== neededLevel;
                     }
                 }
-
-                return true; // no active effect — needs operating
             }
+            return true; // no active effect — needs operating
         });
         return factories[0] || null;
     },
@@ -192,17 +214,14 @@ POWER_HANDLERS[PWR_OPERATE_SPAWN] = {
     range: 3,
     opsCost: 100,
     getTarget: function(creep, room) {
-        var spawns = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) {
-                if (s.structureType !== STRUCTURE_SPAWN) return false;
-                if (!s.spawning) return false;
-                if (s.effects && s.effects.length) {
-                    for (var i = 0; i < s.effects.length; i++) {
-                        if (s.effects[i].effect === PWR_OPERATE_SPAWN) return false;
-                    }
+        var spawns = _structuresOfTypeWith(room, STRUCTURE_SPAWN, function(s) {
+            if (!s.spawning) return false;
+            if (s.effects && s.effects.length) {
+                for (var i = 0; i < s.effects.length; i++) {
+                    if (s.effects[i].effect === PWR_OPERATE_SPAWN) return false;
                 }
-                return true;
             }
+            return true;
         });
         return spawns[0] || null;
     },
@@ -242,17 +261,21 @@ POWER_HANDLERS[PWR_REGEN_SOURCE] = {
     range: 3,
     opsCost: 0,
     getTarget: function(creep, room) {
-        var sources = room.find(FIND_SOURCES, {
-            filter: function(s) {
-                if (s.effects && s.effects.length) {
-                    for (var i = 0; i < s.effects.length; i++) {
-                        if (s.effects[i].effect === PWR_REGEN_SOURCE) return false;
-                    }
+        var rs = getRoomState.get(room.name);
+        var sources = (rs && rs.sources) || room.find(FIND_SOURCES);
+        var out = [];
+        for (var i = 0; i < sources.length; i++) {
+            var s = sources[i];
+            if (s.effects && s.effects.length) {
+                var hasEffect = false;
+                for (var j = 0; j < s.effects.length; j++) {
+                    if (s.effects[j].effect === PWR_REGEN_SOURCE) { hasEffect = true; break; }
                 }
-                return true;
+                if (hasEffect) continue;
             }
-        });
-        return sources[0] || null;
+            out.push(s);
+        }
+        return out[0] || null;
     },
     shouldUse: function() { return true; }
 };
@@ -267,19 +290,23 @@ POWER_HANDLERS[PWR_REGEN_MINERAL] = {
     range: 3,
     opsCost: 0,
     getTarget: function(creep, room) {
-        var minerals = room.find(FIND_MINERALS, {
-            filter: function(s) {
-                if (s.mineralAmount === 0) return false;
-                if (s.ticksToRegeneration > 0) return false;
-                if (s.effects && s.effects.length) {
-                    for (var i = 0; i < s.effects.length; i++) {
-                        if (s.effects[i].effect === PWR_REGEN_MINERAL) return false;
-                    }
+        var rs = getRoomState.get(room.name);
+        var minerals = (rs && rs.minerals) || room.find(FIND_MINERALS);
+        var out = [];
+        for (var i = 0; i < minerals.length; i++) {
+            var s = minerals[i];
+            if (s.mineralAmount === 0) continue;
+            if (s.ticksToRegeneration > 0) continue;
+            if (s.effects && s.effects.length) {
+                var hasEffect = false;
+                for (var j = 0; j < s.effects.length; j++) {
+                    if (s.effects[j].effect === PWR_REGEN_MINERAL) { hasEffect = true; break; }
                 }
-                return true;
+                if (hasEffect) continue;
             }
-        });
-        return minerals[0] || null;
+            out.push(s);
+        }
+        return out[0] || null;
     },
     shouldUse: function() { return true; }
 };
@@ -312,17 +339,14 @@ POWER_HANDLERS[PWR_OPERATE_LAB] = {
     range: 3,
     opsCost: 10,
     getTarget: function(creep, room) {
-        var labs = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) {
-                if (s.structureType !== STRUCTURE_LAB) return false;
-                if (!s.mineralType) return false;
-                if (s.effects && s.effects.length) {
-                    for (var i = 0; i < s.effects.length; i++) {
-                        if (s.effects[i].effect === PWR_OPERATE_LAB) return false;
-                    }
+        var labs = _structuresOfTypeWith(room, STRUCTURE_LAB, function(s) {
+            if (!s.mineralType) return false;
+            if (s.effects && s.effects.length) {
+                for (var i = 0; i < s.effects.length; i++) {
+                    if (s.effects[i].effect === PWR_OPERATE_LAB) return false;
                 }
-                return true;
             }
+            return true;
         });
         return labs[0] || null;
     },
@@ -358,11 +382,7 @@ POWER_HANDLERS[PWR_OPERATE_OBSERVER] = {
     range: 3,
     opsCost: 10,
     getTarget: function(creep, room) {
-        var observers = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) {
-                return s.structureType === STRUCTURE_OBSERVER;
-            }
-        });
+        var observers = _myStructuresByType(room, STRUCTURE_OBSERVER);
         return observers[0] || null;
     },
     shouldUse: function() {
@@ -586,9 +606,7 @@ module.exports = {
         var room = Game.rooms[roomName];
         if (!room) return;
 
-        var powerSpawns = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) { return s.structureType === STRUCTURE_POWER_SPAWN; }
-        });
+        var powerSpawns = _myStructuresByType(room, STRUCTURE_POWER_SPAWN);
         if (powerSpawns.length === 0) return;
 
         var result = pc.spawn(powerSpawns[0]);
@@ -600,6 +618,8 @@ module.exports = {
     // ====================================================================
     // Main tick entry point — two-layer architecture
     //
+    //   Layer 0 (Unconditional): PWR_GENERATE_OPS fires here. Self-cast,
+    //                            range 0, fires even during travel phases.
     //   Layer 1 (Power):    Fire all ready, in-range powers. Free action —
     //                       usePower does NOT consume the movement slot.
     //   Layer 2 (Movement): Mutually exclusive — first match wins.
@@ -607,6 +627,19 @@ module.exports = {
     // ====================================================================
 
     runCreep: function(pc, config) {
+        // =============================================================
+        // LAYER 0: Try PWR_GENERATE_OPS first.
+        // Self-cast, range 0, no room/position dependency. Fires even
+        // while traveling, enabling power, or doing anything else.
+        // Only one power can actually be used per tick, so if GenerateOps
+        // fires we skip the rest of the power schedule this tick.
+        // =============================================================
+        var powerUsedThisTick = false;
+        if (pc.powers && pc.powers[PWR_GENERATE_OPS] &&
+            pc.powers[PWR_GENERATE_OPS].cooldown === 0) {
+            powerUsedThisTick = this.tryPowerInRange(pc, null, PWR_GENERATE_OPS);
+        }
+
         var room = Game.rooms[config.homeRoom];
         if (!room) {
             pc.moveTo(new RoomPosition(25, 25, config.homeRoom));
@@ -632,11 +665,19 @@ module.exports = {
         }
 
         // =============================================================
-        // LAYER 1: Fire all ready powers that are in range (free action)
-        // Self-cast powers (PWR_GENERATE_OPS) always fire here.
-        // This runs unconditionally — movement tasks can never starve it.
+        // LAYER 1: Fire exactly one ready power by priority.
+        // GenerateOps already had first chance in Layer 0; the rest run
+        // in config.powers order. Screeps only allows one successful
+        // usePower per tick, so we stop after the first valid candidate.
         // =============================================================
-        this.fireAllReadyPowers(pc, room, config);
+        if (!powerUsedThisTick) {
+            powerUsedThisTick = this.executeScheduledPower(pc, room, config);
+        }
+
+        // Remember whether we used a power this tick so later stages
+        // (e.g. on-demand intel observation) don't overwrite the intent.
+        if (!pc.memory) pc.memory = {};
+        pc.memory._powerUsedTick = powerUsedThisTick ? Game.time : 0;
 
         // =============================================================
         // LAYER 2: Movement — mutually exclusive, first match wins
@@ -661,41 +702,22 @@ module.exports = {
     },
 
     // ====================================================================
-    // Layer 1: Fire all ready, in-range powers
+    // Layer 1: Execute exactly one ready, in-range power by priority.
     //
-    // PWR_GENERATE_OPS is always fired first, unconditionally, before the
-    // priority loop. This guarantees ops generation is never skipped or
-    // starved regardless of config order or other power states.
-    //
-    // Operate Terminal is checked next (outside the config list) because
-    // it is time-sensitive: the terminal cooldown window is short.
-    //
-    // All other configured powers are then iterated in priority order.
+    // PWR_GENERATE_OPS had first chance in Layer 0, so it is skipped here.
+    // We walk config.powers in order and stop at the first candidate that
+    // successfully calls usePower. Screeps only allows one power action per
+    // tick; calling usePower multiple times overrides the previous intent.
     // ====================================================================
 
-    fireAllReadyPowers: function(pc, room, config) {
-
-        // Always generate ops first — self-cast, free, never skipped
-        if (pc.powers && pc.powers[PWR_GENERATE_OPS] &&
-            pc.powers[PWR_GENERATE_OPS].cooldown === 0) {
-            this.tryPowerInRange(pc, room, PWR_GENERATE_OPS);
-        }
-
-        // High-priority: Operate Terminal (time-sensitive, terminal cooldown window)
-        if (pc.powers && pc.powers[PWR_OPERATE_TERMINAL] && pc.powers[PWR_OPERATE_TERMINAL].cooldown === 0) {
-            var ops = pc.store[RESOURCE_OPS] || 0;
-            if (ops >= POWER_HANDLERS[PWR_OPERATE_TERMINAL].opsCost) {
-                this.tryPowerInRange(pc, room, PWR_OPERATE_TERMINAL);
-            }
-        }
-
-        // Walk the configured power list in priority order.
-        // Skip PWR_GENERATE_OPS — already fired unconditionally above.
+    executeScheduledPower: function(pc, room, config) {
+        var ops = pc.store[RESOURCE_OPS] || 0;
         var powers = config.powers || [];
+
         for (var i = 0; i < powers.length; i++) {
             var powerId = powers[i];
 
-            // Already fired above
+            // PWR_GENERATE_OPS already had first chance in Layer 0
             if (powerId === PWR_GENERATE_OPS) continue;
 
             if (!pc.powers || !pc.powers[powerId]) continue;
@@ -704,11 +726,14 @@ module.exports = {
             var handler = POWER_HANDLERS[powerId];
             if (!handler) continue;
 
-            var ops = pc.store[RESOURCE_OPS] || 0;
             if (handler.opsCost > 0 && ops < handler.opsCost) continue;
 
-            this.tryPowerInRange(pc, room, powerId);
+            if (this.tryPowerInRange(pc, room, powerId)) {
+                return true;
+            }
         }
+
+        return false;
     },
 
     // ====================================================================
@@ -803,11 +828,14 @@ module.exports = {
         var handler = POWER_HANDLERS[powerId];
         if (!handler) return false;
 
-        // Self-cast (range 0) — always in range
+        // Self-cast (range 0) — always in range, room can be null
         if (handler.range === 0) {
-            if (!handler.shouldUse(pc, room, null)) return false;
+            if (!handler.shouldUse(pc, null, null)) return false;
             return pc.usePower(powerId) === OK;
         }
+
+        // For targeted powers, room is required
+        if (!room) return false;
 
         var target = handler.getTarget(pc, room);
         if (!target) return false;
@@ -943,6 +971,8 @@ module.exports = {
     // ====================================================================
 
     handleIntelObserve: function(pc, room) {
+        if (pc.memory && pc.memory._powerUsedTick === Game.time) return false;
+
         if (!Memory.intelPowerObserve) return false;
 
         if (!pc.powers || !pc.powers[PWR_OPERATE_OBSERVER]) return false;
@@ -1077,9 +1107,7 @@ module.exports = {
             var room = Game.rooms[cfg.homeRoom];
             if (!room) continue;
 
-            var observers = room.find(FIND_MY_STRUCTURES, {
-                filter: function(s) { return s.structureType === STRUCTURE_OBSERVER; }
-            });
+            var observers = _myStructuresByType(room, STRUCTURE_OBSERVER);
             if (observers.length === 0) continue;
 
             var ops = pc.store[RESOURCE_OPS] || 0;
@@ -1100,7 +1128,7 @@ module.exports = {
 
     /**
      * Legacy helper — attempts a power with movement fallback.
-     * No longer called from the main loop (Layer 1 handles in-range,
+     * No longer called from the main loop (Layer 0/1 handles in-range,
      * Layer 2 handles movement separately), but kept as a utility.
      */
     tryPower: function(pc, room, powerId) {
@@ -1130,9 +1158,7 @@ module.exports = {
     },
 
     doRenew: function(pc, room) {
-        var powerSpawns = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) { return s.structureType === STRUCTURE_POWER_SPAWN; }
-        });
+        var powerSpawns = _myStructuresByType(room, STRUCTURE_POWER_SPAWN);
         if (powerSpawns.length === 0) return false;
 
         var spawn = powerSpawns[0];
@@ -1149,9 +1175,7 @@ module.exports = {
     },
 
     idleNearSpawn: function(pc, room) {
-        var powerSpawns = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) { return s.structureType === STRUCTURE_POWER_SPAWN; }
-        });
+        var powerSpawns = _myStructuresByType(room, STRUCTURE_POWER_SPAWN);
         if (powerSpawns.length === 0) return;
 
         var spawn = powerSpawns[0];

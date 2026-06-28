@@ -1,19 +1,17 @@
 // === PROFILER INTEGRATION ===
+// test
 const profiler = require('screeps-profiler');
 const creepProfiler = require('creepProfiler');
 const taskScheduler = require('taskScheduler');
 
 profiler.enable();
 
-// === LAB SYSTEM TOGGLE ===
-const LAB_LOGGING_ENABLED = false;
-global.LAB_LOGGING_ENABLED = LAB_LOGGING_ENABLED;
-
 // === CPU USAGE LOGGING TOGGLE VARIABLES ===
 const ENABLE_CPU_LOGGING = false;
 const DISABLE_CPU_CONSOLE = true;
 const CPU_HUD_REFRESH_TICKS = 1;
 const roadBuilder = require('roadBuilder');
+const scanner = require('scanner');
 
 // === CPU SCHEDULER CONFIGURATION (Shard3: 20 CPU limit) ===
 // Serialization eats 0.3-0.7 CPU, so our effective ceiling is ~19.3-19.7.
@@ -46,18 +44,15 @@ const SECTION_TIERS = {
   'terminalManager':          SECTION_TIER.HIGH,
   'labManager':               SECTION_TIER.HIGH,
   'boostManager.run':         SECTION_TIER.HIGH,
+  'repairManager.run':        SECTION_TIER.HIGH,
   'spawnManager.run':         SECTION_TIER.HIGH,
   'factoryManager':           SECTION_TIER.HIGH,
   'mineralManager':           SECTION_TIER.HIGH,
   'powerManager':             SECTION_TIER.NORMAL,
   'roleTowerDrain':           SECTION_TIER.NORMAL,
-  'playerAnalysis.run':       SECTION_TIER.NORMAL,
   'roleContestedDemolisher':  SECTION_TIER.NORMAL,
-  'warEstimate.run':          SECTION_TIER.NORMAL,
-  'playerMonitor.run':        SECTION_TIER.NORMAL,
   'depositObserver.run':      SECTION_TIER.NORMAL,
   'nukeLaunch.run':           SECTION_TIER.NORMAL,
-  'roomObserverRun':          SECTION_TIER.NORMAL,
   'scanRoomsStep':            SECTION_TIER.NORMAL,
   'claimbotRangeCheck.run':   SECTION_TIER.NORMAL,
   'remoteSupplyManager.run':  SECTION_TIER.NORMAL,
@@ -66,9 +61,8 @@ const SECTION_TIERS = {
   'marketUpdater':            SECTION_TIER.LOW,
   'marketRefine.run':         SECTION_TIER.LOW,
   'localRefine.run':          SECTION_TIER.LOW,
-  //'marketLabReverse.run':     SECTION_TIER.LOW,
-  //'marketLabForward.run':     SECTION_TIER.LOW,
   'marketLab.run':            SECTION_TIER.LOW,
+
   'marketSeller.run':         SECTION_TIER.LOW,
   'opportunisticBuy':         SECTION_TIER.LOW,
   'opportunisticSell':        SECTION_TIER.LOW,
@@ -76,7 +70,6 @@ const SECTION_TIERS = {
   'dailyFinance':             SECTION_TIER.LOW,
   'marketArbitrage':          SECTION_TIER.LOW,
   'trackCPUUsage':            SECTION_TIER.LOW,
-  'wideScan.run':             SECTION_TIER.LOW,
   'localMap.run':             SECTION_TIER.LOW,
   'statusReport':             SECTION_TIER.LOW,
   'creepProfiler.run':        SECTION_TIER.LOW,
@@ -97,6 +90,7 @@ const CREEP_PRIORITY = {
   'staticDistributor':    5,
   'supplier':             1,
   'wallRepair':           20,
+  'repairer':             20,
   'attacker':             1,
   'claimbot':             1,
   'mineralCollector':    10,
@@ -107,7 +101,6 @@ const CREEP_PRIORITY = {
   'repairBot':           20,
   'rampartBot':          20,
   'labBot':              17,
-  'factoryBot':          15,
   'remoteBuilder':       14,
   'hd':                  3,
   'comboBot':            3,
@@ -118,7 +111,6 @@ const CREEP_PRIORITY = {
   'towerDrain':          1,
   'scout':               27,
   'thief':               28,
-  'scavenger':           29,
   'default':             99,
   'remoteSupplier': 5,
   'controllerAttacker':   2,
@@ -136,7 +128,7 @@ const CREEP_THROTTLE_BANDS = [
   { maxPriority: 10, maxInterval: 2 },  // Combat + logistics: every other tick worst-case
   { maxPriority: 15, maxInterval: 3 },  // Infrastructure support
   { maxPriority: 25, maxInterval: 4 },  // Utility roles
-  { maxPriority: 99, maxInterval: 5 },  // Nice-to-haves (scouts, thieves, scavengers)
+  { maxPriority: 99, maxInterval: 5 },  // Nice-to-haves (scouts, thieves)
 ];
 
 // Section throttle: max tick-interval each tier can be stretched to under pressure
@@ -153,8 +145,6 @@ if (!Memory.errors) Memory.errors = [];
 // --- ROLE & UTILITY IMPORTS ---
 require('marketQuery');
 require('marketAnalysis');
-require('roomObserver');
-require('maintenanceScanner');
 const roleHarvester = require('roleHarvester');
 const roleUpgrader = require('roleUpgrader');
 const roleBuilder = require('roleBuilder');
@@ -165,7 +155,6 @@ const roleClaimbot = require('roleClaimbot');
 const roleAttacker = require('roleAttacker');
 const roleExtractor = require('roleExtractor');
 const iff = require('iff');
-const roleScavenger = require('roleScavenger');
 const roleThief = require('roleThief');
 const roleSquad = require('roleSquad');
 const roleTowerDrain = require('roleTowerDrain');
@@ -174,8 +163,6 @@ const roleMineralCollector = require('roleMineralCollector');
 const terminalManager = require('terminalManager');
 const roleSignbot = require('roleSignbot');
 const factoryManager = require('factoryManager');
-const roleFactoryBot = require('roleFactoryBot');
-const roleWallRepair = require('roleWallRepair');
 const labManager = require('labManager');
 const roleLabBot = require('roleLabBot');
 const roomBalance = require('roomBalance');
@@ -190,11 +177,8 @@ const marketUpdater = require('marketUpdate');
 const opportunisticBuy = require('opportunisticBuy');
 const marketRefine = require('marketRefine');
 const localRefine = require('localRefine');
-//const marketLabReverse = require('marketLabReverse');
-//const marketLabForward = require('marketLabForward');
 const marketLab = require('marketLab');
 const roleNukeFill = require('roleNukeFill');
-const nukeUtils = require('nukeUtils');
 const nukeLaunch = require('nukeLaunch');
 const marketRoomOrders = require('marketRoomOrders');
 const roleRemoteBuilder = require('roleRemoteBuilder');
@@ -205,45 +189,36 @@ const rolePowerBot = require('rolePowerBot');
 const powerManager = require('powerManager');
 const roleOperator = require('roleOperator');
 const marketReport = require('marketReport');
-const roomIntel = require('roomIntel');
 const roleMaintainer = require('roleMaintainer');
 const roleContestedDemolisher = require('roleContestedDemolisher');
 const autoEnergyBuyer = require('autoEnergyBuyer');
-const wideScan = require('wideScan');
-const playerAnalysis = require('playerAnalysis');
 const autoTrader = require('autoTrader');
 const roomNavigation = require('roomNavigation');
 const memoryQuery = require('memoryQuery');
 const dailyFinance = require('dailyFinance');
 const marketPricing = require('marketPricing');
 const marketArbitrage = require('marketArbitrage');
-const warEstimate = require('warEstimate');
-const nukeAnalyzeModule = require('nukeAnalyze');
 const roleSKAttacker = require('roleSKAttacker');
 const defenseMonitor = require('defenseMonitor');
-const roleDefenseRepair = require('roleDefenseRepair');
-const playerMonitor = require('playerMonitor');
 const singleSourceRoom = require('singleSourceRoom');
 const roleHD = require('roleHD');
 const roleStaticDistributor = require('roleStaticDistributor');
 const roleComboBot = require('roleComboBot');
 const opportunisticSell = require('opportunisticSell');
-const roleRepairBot = require('roleRepairBot');
 const statusReport = require('statusReport');
 const storageManager = require('storageManager');
-const roleRampartBot = require('roleRampartBot');
 const boostManager = require('boostManager');
 const roomCPUProfiler = require('roomCPUProfiler');
 const localMap = require('localMap');
 const spawnManager = require('spawnManager');
-const maint = require('maintenanceScanner');
 const remoteSupplyManager = require('remoteSupplyManager');
 const roleRemoteSupplier  = require('roleRemoteSupplier');
 const roleControllerAttacker = require('roleControllerAttacker');
 const roleExtractorAssistant = require('roleExtractorAssistant');
 const claimbotRangeCheck     = require('claimbotRangeCheck');
-const energyProfiler = require('energyProfiler');
 const roleTowerFiller = require('roleTowerFiller');
+const repairManager = require('repairManager');
+const roleRepairer = require('roleRepairer');
 
 require("marketMap");
 
@@ -252,57 +227,45 @@ statusReport.init(ENABLE_CPU_LOGGING, DISABLE_CPU_CONSOLE);
 
 // === GLOBAL MODULE EXPOSURE FOR CONSOLE ACCESS ===
 global.opportunisticBuy = opportunisticBuy;
-global.intel = roomIntel.intel;
-global.listIntel = roomIntel.listIntel;
-global.getCachedIntel = roomIntel.getCachedIntel;
 global.nukeFill = roleNukeFill.order;
-global.nukeInRange = nukeUtils.nukeInRange;
 global.launchNuke = nukeLaunch.launchNuke;
 global.listRoomMarketOrders = marketRoomOrders.listRoomMarketOrders;
 global.memoryProfile = memoryProfiler.profile;
 global.harvestResources = depositObserver.harvestResources;
 global.launchClaimbot = require('roleClaimbot').spawn;
-global.orderClaim = require('roleClaimbot').orderClaim;
-global.cancelClaimOrder = require('roleClaimbot').cancelClaimOrder;
-global.listClaimOrders = require('roleClaimbot').listClaimOrders;
 global.orderThieves = require('roleThief').orderThieves;
 global.cancelThiefOrder = require('roleThief').cancelThiefOrder;
 global.listThiefOrders = require('roleThief').listThiefOrders;
-global.financeReport = dailyFinance.report;
+global.financeReport = function (mode) { dailyFinance.report(mode); };
 global.prices = marketPricing.printPrices;
 global.marketArbitrage = marketArbitrage;
-global.nukeAnalyze = nukeAnalyzeModule.nukeAnalyze;
-global.nukeAnalyzeSelf = nukeAnalyzeModule.nukeAnalyzeSelf;
 global.creepProfile = creepProfiler;
 global.opportunisticSell = opportunisticSell;
 global.storageFind = function(room, material) {
     storageManager.printFind(room, material);
 };
+global.getUnreserved = function(roomName) {
+    storageManager.printUnreserved(roomName);
+};
 global.reserve = storageManager.reserve.bind(storageManager);
 global.unReserve = storageManager.unReserve.bind(storageManager);
+global.transfer = storageManager.transfer.bind(storageManager);
 global.listReservations = storageManager.listReservations.bind(storageManager);
-global.setNavDebug = require('roomNavigation').setDebug;
+global.validateReservations = storageManager.validateReservations.bind(storageManager);
 global.profileRoom       = roomCPUProfiler.start;
 global.cancelRoomProfile = roomCPUProfiler.cancel;
 global.roomProfileStatus  = roomCPUProfiler.status;
 global.status = function() { statusReport.run(statusReport.getPerRoomRoleCounts()); };
-global.nukeAnalyzeCost = nukeAnalyzeModule.nukeAnalyzeCost;
-global.nukeIncoming = nukeAnalyzeModule.nukeIncoming;
 global.buildRoad = roadBuilder.buildRoad;
 global.removeRoad = roadBuilder.removeRoad;
+global.removeAllRoads = roadBuilder.removeAllRoads;
 global.schedule      = taskScheduler.schedule.bind(taskScheduler);
 global.unschedule    = taskScheduler.unschedule.bind(taskScheduler);
 global.listScheduled = taskScheduler.list.bind(taskScheduler);
 global.runScheduled  = taskScheduler.forceRun.bind(taskScheduler);
 global.nukeStatus   = nukeLaunch.nukeStatus;
 global.checkClaimbotRange = function(s, t, r) { return claimbotRangeCheck.start(s, t, r); };
-global.nukeThreat      = nukeAnalyzeModule.nukeThreat;
-global.nukeThreatStatus = nukeAnalyzeModule.nukeThreatStatus;
-global.nukeThreatCancel = nukeAnalyzeModule.nukeThreatCancel;
 global.updateScheduled = (id, updates) => taskScheduler.update(id, updates);
-global.profileEnergy        = energyProfiler.start;
-global.cancelEnergyProfile  = energyProfiler.cancel;
-global.energyProfileStatus  = energyProfiler.status;
 global.marketMap = require("marketMap");
 
 // Optional: keep your help list updated
@@ -311,7 +274,6 @@ global.help = function() {
         "Console commands:",
         "  marketMap()        Print room liquidity snapshot",
         "  marketUpdater.run()",
-        "  wideScan.run()",
         "  ..."
     ].join("\n"));
 };
@@ -427,6 +389,7 @@ global.cpuJSON = function() {
 };
 
 // === PROFILER REGISTRATION ===
+profiler.registerObject(scanner, 'scanner');
 profiler.registerObject(roleHarvester, 'roleHarvester');
 profiler.registerObject(roleUpgrader, 'roleUpgrader');
 profiler.registerObject(roleTowerFiller, 'roleTowerFiller');
@@ -438,7 +401,6 @@ profiler.registerObject(roleClaimbot, 'roleClaimbot');
 profiler.registerObject(roleAttacker, 'roleAttacker');
 profiler.registerObject(roleExtractor, 'roleExtractor');
 profiler.registerObject(iff, 'iff');
-profiler.registerObject(roleScavenger, 'roleScavenger');
 profiler.registerObject(roleThief, 'roleThief');
 profiler.registerObject(roleSquad, 'roleSquad');
 profiler.registerObject(roleTowerDrain, 'roleTowerDrain');
@@ -446,8 +408,6 @@ profiler.registerObject(roleDemolition, 'roleDemolition');
 profiler.registerObject(roleMineralCollector, 'roleMineralCollector');
 profiler.registerObject(roleSignbot, 'roleSignbot');
 profiler.registerObject(factoryManager, 'factoryManager');
-profiler.registerObject(roleFactoryBot, 'roleFactoryBot');
-profiler.registerObject(roleWallRepair, 'roleWallRepair');
 profiler.registerObject(labManager, 'labManager');
 profiler.registerObject(roleLabBot, 'roleLabBot');
 profiler.registerObject(roomBalance, 'roomBalance');
@@ -460,11 +420,8 @@ profiler.registerObject(marketUpdater, 'marketUpdater');
 profiler.registerObject(opportunisticBuy, 'opportunisticBuy');
 profiler.registerObject(marketRefine, 'marketRefine');
 profiler.registerObject(localRefine, 'localRefine');
-//profiler.registerObject(marketLabReverse, 'marketLabReverse');
-//profiler.registerObject(marketLabForward, 'marketLabForward'); // FIX #1: Was incorrectly marketLabReverse
 profiler.registerObject(marketLab, 'marketLab');
 profiler.registerObject(roleNukeFill, 'roleNukeFill');
-profiler.registerObject(nukeUtils, 'nukeUtils');
 profiler.registerObject(nukeLaunch, 'nukeLaunch');
 profiler.registerObject(marketRoomOrders, 'marketRoomOrders');
 profiler.registerObject(roleRemoteBuilder, 'roleRemoteBuilder');
@@ -475,39 +432,31 @@ profiler.registerObject(powerManager, 'powerManager');
 profiler.registerObject(roleOperator, 'roleOperator');
 profiler.registerObject(roleMaintainer, 'roleMaintainer');
 profiler.registerObject(roleContestedDemolisher, 'roleContestedDemolisher');
-profiler.registerObject(roomIntel, 'roomIntel');
 profiler.registerObject(autoEnergyBuyer, 'autoEnergyBuyer');
-profiler.registerObject(wideScan, 'wideScan');
-profiler.registerObject(playerAnalysis, 'playerAnalysis');
 profiler.registerObject(autoTrader, 'autoTrader');
 profiler.registerObject(roomNavigation, 'roomNavigation');
 profiler.registerObject(dailyFinance, 'dailyFinance');
 profiler.registerObject(marketPricing, 'marketPricing');
 profiler.registerObject(marketArbitrage, 'marketArbitrage');
-profiler.registerObject(warEstimate, 'warEstimate');
-profiler.registerObject(nukeAnalyzeModule, 'nukeAnalyze');
 profiler.registerObject(roleSKAttacker, 'roleSKAttacker');
 profiler.registerObject(defenseMonitor, 'defenseMonitor');
-profiler.registerObject(roleDefenseRepair, 'roleDefenseRepair');
-profiler.registerObject(playerMonitor, 'playerMonitor');
 profiler.registerObject(singleSourceRoom, 'singleSourceRoom');
 profiler.registerObject(roleHD, 'roleHD');
 profiler.registerObject(roleStaticDistributor, 'roleStaticDistributor');
 profiler.registerObject(roleComboBot, 'roleComboBot');
 profiler.registerObject(creepProfiler, 'creepProfiler');
 profiler.registerObject(opportunisticSell, 'opportunisticSell');
-profiler.registerObject(roleRepairBot, 'roleRepairBot');
 profiler.registerObject(statusReport, 'statusReport');
 profiler.registerObject(storageManager, 'storageManager');
-profiler.registerObject(roleRampartBot, 'roleRampartBot');
 profiler.registerObject(boostManager, 'boostManager');
 profiler.registerObject(roomCPUProfiler, 'roomCPUProfiler');
-profiler.registerObject(maint, 'maintenanceScanner');
 profiler.registerObject(remoteSupplyManager, 'remoteSupplyManager');
 profiler.registerObject(roleRemoteSupplier,  'roleRemoteSupplier');
 profiler.registerObject(roleControllerAttacker, 'roleControllerAttacker');
 profiler.registerObject(roleExtractorAssistant, 'roleExtractorAssistant');
 profiler.registerObject(claimbotRangeCheck,     'claimbotRangeCheck');
+profiler.registerObject(repairManager, 'repairManager');
+profiler.registerObject(roleRepairer, 'roleRepairer');
 
 
 // =================================================================
@@ -635,7 +584,7 @@ function handleError(sectionName, error) {
     error: error.toString(),
     timestamp: Date.now()
   });
-  if (Memory.errors.length > 20) Memory.errors.shift();
+  if (Memory.errors.length > 10) Memory.errors.shift();
 }
 
 /**
@@ -645,7 +594,9 @@ function cleanMemory() {
   // FIX #7: Initialize order arrays if they don't exist
   if (!Memory.thiefOrders) Memory.thiefOrders = [];
   if (!Memory.demolitionOrders) Memory.demolitionOrders = [];
-  if (!Memory.towerDrainOrders) Memory.towerDrainOrders = [];
+
+  if (Memory.remoteMaintainerOrders) delete Memory.remoteMaintainerOrders;
+  if (Memory.remoteMaintainerView)    delete Memory.remoteMaintainerView;
 
   for (const name in Memory.creeps) {
     if (!Game.creeps[name]) {
@@ -671,15 +622,6 @@ function cleanMemory() {
         }
       }
 
-      if (creepMemory.role === 'towerDrain' && Array.isArray(Memory.towerDrainOrders)) {
-        const orderIndex = Memory.towerDrainOrders.findIndex(function(o) {
-          return o.targetRoom === creepMemory.targetRoom && o.homeRoom === creepMemory.homeRoom;
-        });
-        if (orderIndex > -1) {
-          console.log('[TowerDrain] A tower drain bot for ' + creepMemory.targetRoom + ' has died. Keeping operation active.');
-        }
-      }
-
       delete Memory.creeps[name];
     }
   }
@@ -691,7 +633,7 @@ function trackCPUUsage() {
   }
   const cpuUsed = Game.cpu.getUsed();
   Memory.cpuStats.history.push(cpuUsed);
-  if (Memory.cpuStats.history.length > 100) Memory.cpuStats.history.shift();
+  if (Memory.cpuStats.history.length > 50) Memory.cpuStats.history.shift();
   Memory.cpuStats.average = Memory.cpuStats.history.reduce(function(sum, cpu) { return sum + cpu; }, 0) / Memory.cpuStats.history.length;
 
   Memory.cpuStats.lastBudgetTier = tickBudgetTier;
@@ -713,7 +655,7 @@ function trackCPUUsage() {
       tSec: sectionsThrottled,
       tCrp: creepsThrottled,
     });
-    if (Memory.cpuStats.snapshots.length > 200) Memory.cpuStats.snapshots.shift();
+    if (Memory.cpuStats.snapshots.length > 50) Memory.cpuStats.snapshots.shift();
   }
 }
 
@@ -924,6 +866,22 @@ function cleanCpuProfileMemory(maxAge) {
   }
 }
 
+function cleanRepairBotCooldowns() {
+  if (!Memory.repairBotCooldown) {
+    for (const k in Memory) {
+      if (k.indexOf('repairBotCooldown_') === 0) delete Memory[k];
+    }
+    return;
+  }
+  const now = Game.time;
+  for (const k in Memory.repairBotCooldown) {
+    if (now >= Memory.repairBotCooldown[k]) delete Memory.repairBotCooldown[k];
+  }
+  for (const k in Memory) {
+    if (k.indexOf('repairBotCooldown_') === 0) delete Memory[k];
+  }
+}
+
 // =================================================================
 /* === CREEP MANAGEMENT ============================================ */
 // =================================================================
@@ -987,7 +945,6 @@ function runCreeps() {
         case 'claimbot':            roleClaimbot.run(creep);                break;
         case 'attacker':            roleAttacker.run(creep);                break;
         case 'extractor':           roleExtractor.run(creep);               break;
-        case 'scavenger':           roleScavenger.run(creep);               break;
         case 'thief':               roleThief.run(creep);                   break;
         case 'towerDrain':          roleTowerDrain.run(creep);              break;
         case 'demolition':          roleDemolition.run(creep);              break;
@@ -995,8 +952,7 @@ function runCreeps() {
         case 'mineralCollector':    roleMineralCollector.run(creep);        break;
         case 'terminalBot':         terminalManager.runTerminalBot(creep);  break;
         case 'signbot':             roleSignbot.run(creep);                 break;
-        case 'factoryBot':          roleFactoryBot.run(creep);              break;
-        case 'wallRepair':          roleWallRepair.run(creep);              break;
+        case 'wallRepair':          roleRepairer.run(creep);                break;
         case 'labBot':              roleLabBot.run(creep);                  break;
         case 'nukeFill':            roleNukeFill.run(creep);                break;
         case 'remoteBuilder':       roleRemoteBuilder.run(creep);           break;
@@ -1005,16 +961,17 @@ function runCreeps() {
         case 'maintainer':          roleMaintainer.run(creep);              break;
         case 'contestedDemolisher': roleContestedDemolisher.run(creep);     break;
         case 'skAttacker':          roleSKAttacker.run(creep);              break;
-        case 'defenseRepair':       roleDefenseRepair.run(creep);           break;
+        case 'defenseRepair':       roleRepairer.run(creep);                break;
         case 'hd':                  roleHD.run(creep);                      break;
         case 'staticDistributor':   roleStaticDistributor.run(creep);       break;
         case 'comboBot':            roleComboBot.run(creep);                break;
-        case 'repairBot':           roleRepairBot.run(creep);               break;
-        case 'rampartBot':          roleRampartBot.run(creep);              break;
+        case 'repairBot':           roleRepairer.run(creep);                break;
+        case 'rampartBot':          roleRepairer.run(creep);                break;
         case 'remoteSupplier': roleRemoteSupplier.run(creep);               break;
         case 'controllerAttacker':  roleControllerAttacker.run(creep);      break;
         case 'towerFiller':         roleTowerFiller.run(creep);             break;
         case 'extractorAssistant': roleExtractorAssistant.run(creep); break;
+        case 'repairer':            roleRepairer.run(creep);                break;
         default:
           creep.memory.role = 'harvester';
           roleHarvester.run(creep);
@@ -1137,25 +1094,17 @@ module.exports.loop = function() {
       if (Game.time % 30 === 0) roleScout.handleDeadCreeps();
       if (Game.time % 1000 === 0) cleanMemory();
       if (Game.time % 1000 === 0) cleanCpuProfileMemory();
+      if (Game.time % 1000 === 0) cleanRepairBotCooldowns();
 
       profileSection('getRoomState.init', function() { getRoomState.init(); });
       profileSection('roomCPUProfiler', function() { roomCPUProfiler.run(); });
 
       const perRoomRoleCounts = statusReport.getPerRoomRoleCounts();
-
-      if (Memory.roomObserverState && Memory.roomObserverState.active === true) {
-        if (typeof roomObserverRun === 'function') {
-          profileSection('roomObserverRun', function() { roomObserverRun(); });
-        } else if (typeof scanRoomsStep === 'function') {
-          profileSection('scanRoomsStep', function() { scanRoomsStep(); });
-        } else if (Game.time % 50 === 0) {
-          console.log('roomObserver: scan active but runner not found.');
-        }
-      }
       profileSection('claimbotRangeCheck.run', function() { claimbotRangeCheck.run(); });
 
       // --- STRUCTURES (CRITICAL tier - always runs) ---
       profileSection('defenseMonitor.run', function() { defenseMonitor.run(); });
+      profileSection('repairManager.run', function() { repairManager.run(); });
       profileSection('towerManager.run', function() { towerManager.run(); });
       if (Game.time % 3 === 0) profileSection('linkManager.run', function() { linkManager.run(); });
 
@@ -1168,31 +1117,20 @@ module.exports.loop = function() {
       profileSection('marketUpdater', function() { marketUpdater.run(); });
       profileSection('marketRefine.run', function() { marketRefine.run(); });
       profileSection('localRefine.run', function() { localRefine.run(); });
-      //profileSection('marketLabReverse.run', function() { marketLabReverse.run(); });
-      //profileSection('marketLabForward.run', function() { marketLabForward.run(); });
       profileSection('marketLab.run', function() { marketLab.run(); });
-      profileSection('playerAnalysis.run', function() { playerAnalysis.run(); });
+      if (Game.time % 100 === 0) marketBuyer.run();
       profileSection('autoTrader.run', function() { autoTrader.run(); });
       profileSection('roleContestedDemolisher', function() { roleContestedDemolisher.run(); });
       profileSection('dailyFinance', function() { dailyFinance.run(); });
       profileSection('marketArbitrage', function() { marketArbitrage.run(); });
-      profileSection('warEstimate.run', function() { warEstimate.run(); });
-      profileSection('playerMonitor.run', function() { playerMonitor.run(); });
-      profileSection('energyProfiler', function() { energyProfiler.run(); });
       if (Game.time % 10 === 0) profileSection('opportunisticBuy', function() { opportunisticBuy.process(); });
-      if (Game.time % 100 === 0) roomIntel.cleanExpiredIntel();
       profileSection('remoteSupplyManager.run', function() {
         remoteSupplyManager.run();
       });
-
-      // FIX #7: Removed redundant Game.time % 1 === 0 checks (always true)
-      roomIntel.processEfficiencyProfiles();
-      roomIntel.processPendingIntel();
-      nukeAnalyzeModule.processPendingNukeAnalyze();
-      maint.processPendingMaintScan();
+      scanner.run();
 
       if (Game.time % 10 === 0) profileSection('opportunisticSell', function() { opportunisticSell.process(); });
-      if (Game.time % 1000 === 0) storageManager.cleanStale(5000);
+      if (Game.time % 1000 === 0) storageManager.cleanStale(20000);
       if (Game.time % 50 === 0) profileSection('marketSeller.run', function() { marketSeller.run(); });
 
       profileSection('powerManager', function() {
@@ -1227,7 +1165,6 @@ module.exports.loop = function() {
       profileSection('creepProfiler.run', function() { creepProfiler.run(); });
       profileSection('creepProfiler.report', function() { creepProfiler.report(); });
       profileSection('trackCPUUsage', trackCPUUsage);
-      profileSection('wideScan.run', function() { wideScan.run(); });
       profileSection('localMap.run', function() { localMap.run(); });
 
       if (Game.time % 1050 === 0) {
@@ -1247,7 +1184,7 @@ module.exports.loop = function() {
 
       drawCpuHud();
 
-      if (sectionsThrottled > 0 || creepsThrottled > 0) {
+      if ((Game.time % 10 === 0) && (sectionsThrottled > 0 || creepsThrottled > 0)) {
         console.log('[CPU] Throttled: ' + sectionsThrottled + ' sections, '
           + creepsThrottled + ' creeps | Pressure: '
           + Math.round(getLivePressureCached() * 100) + '% (base '
