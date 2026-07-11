@@ -283,3 +283,11 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 - Include CPU impact notes for large loops and high-frequency logic.
 - Prefer clear, explicit logging that can be toggled or throttled.
 - Use shared infrastructure (roomNavigation, marketPricing, getRoomState) where possible rather than duplicating logic.
+
+## Synchronization Update (2026-07-10)
+
+The repository now mirrors the active Screeps script directory. Every deployed JavaScript module has one canonical repository copy: creep roles are in `Bots/`, scanning, intelligence, monitoring, and profiling modules are in `Scanners/`, and managers, market systems, console tools, and shared helpers are in `Utilities/`. Repository-only JavaScript modules were removed so this tree contains no stale deployable code.
+
+Newly synchronized systems include the unified `scanner` intelligence suite, room CPU and creep profiling, automated defense monitoring, room suspension, remote supply, repair management, local mapping, storage management, boost management, market mapping, detailed status reporting, and the expanded role set for controller attack, drain demolition, extractor assistance, remote supply, tower filling, and SK operations.
+
+See `Documentation/ConsoleCommands.md` for the current console command and order reference. It is generated from the synchronized modules and should be updated whenever a console global is added or changed.

@@ -1,4 +1,8 @@
+// LLM: Read llmcontext.js before reviewing or changing this file.
 //orderSign('W1N1', 'W2N2', 'Hello from my colony!')
+
+const getRoomState = require('getRoomState');
+const spawnManager = require('spawnManager');
 
 const roleSignbot = {
     run: function(creep) {
@@ -53,3 +57,40 @@ const roleSignbot = {
 };
 
 module.exports = roleSignbot;
+
+global.orderSign = function(spawnRoom, targetRoom, message) {
+  if (!spawnRoom || !targetRoom || !message) {
+    return "[Signbot] Invalid command. Use: orderSign('spawnRoomName', 'targetRoomName', 'message')";
+  }
+  if (!Game.rooms[spawnRoom] || !Game.rooms[spawnRoom].controller || !Game.rooms[spawnRoom].controller.my) {
+    return "[Signbot] Invalid spawn room: " + spawnRoom + ". Must be a room you own.";
+  }
+
+  var rs = getRoomState.get(spawnRoom);
+  var freeSpawns = [];
+  if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
+    freeSpawns = rs.structuresByType[STRUCTURE_SPAWN].filter(function(s){ return s.my && !s.spawning; });
+  } else {
+    freeSpawns = Game.rooms[spawnRoom].find(FIND_MY_SPAWNS, { filter: function(s){ return !s.spawning; } });
+  }
+  if (freeSpawns.length === 0) {
+    return "[Signbot] No available spawn in " + spawnRoom;
+  }
+
+  var body = [MOVE];
+  var cost = spawnManager.bodyCost(body);
+  if (cost > freeSpawns[0].room.energyAvailable) {
+    return "[Signbot] Not enough energy in " + spawnRoom + ". Need: " + cost + ", Have: " + freeSpawns[0].room.energyAvailable;
+  }
+
+  var name = "Signbot_" + targetRoom + "_" + Game.time;
+  var memory = { role: 'signbot', targetRoom: targetRoom, signMessage: message };
+
+  var result = spawnManager.spawnCustomCreep(freeSpawns[0], body, name, memory);
+  if (result === OK) {
+    console.log("[Signbot] Spawning '" + name + "' from " + spawnRoom + " to sign " + targetRoom + " with: \"" + message + "\"");
+    return "[Signbot] Successfully ordered signbot from " + spawnRoom + " to " + targetRoom;
+  } else {
+    return "[Signbot] Failed to spawn signbot: " + result;
+  }
+};

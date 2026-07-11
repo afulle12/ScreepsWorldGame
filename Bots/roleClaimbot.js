@@ -1,13 +1,18 @@
+// LLM: Read llmcontext.js before reviewing or changing this file.
 // roleClaimbot.js
 // Bot that travels to a target room, avoids edges, then attacks or claims the controller.
 // To launch: launchClaimbot('SpawnRoomName', 'TargetRoomName')
 // With hardcoded route: launchClaimbot('SpawnRoomName', 'TargetRoomName', ['Room1', 'Room2', 'Room3'])
 
 const enableLogging = true;  // Set false to silence logs
+const spawnManager = require('spawnManager');
+const util = require('util');
+
+var roleClaimbot;
 
 // == BANNED ROOMS (keep in sync with demolition) ==
 const BANNED_ROOMS = [
-  'E8N49', 'E3N47'
+  'E8N49', 'W8N49'
 ];
 
 // == Helper: is a room banned? ==
@@ -19,36 +24,10 @@ function isRoomBanned(roomName) {
 }
 
 // == Edge helpers ==
-function isOnRoomEdge(pos) {
-  return pos.x === 0 || pos.x === 49 || pos.y === 0 || pos.y === 49;
-}
+const isOnRoomEdge = util.isOnRoomEdge;
+const nudgeOffRoomEdge = util.nudgeOffRoomEdge;
 
-function nudgeOffRoomEdge(creep) {
-  if (creep.pos.y === 0) {
-    var mv = creep.move(BOTTOM);
-    if (mv === OK) return true;
-    if (creep.pos.x > 0 && creep.move(BOTTOM_LEFT) === OK) return true;
-    if (creep.pos.x < 49 && creep.move(BOTTOM_RIGHT) === OK) return true;
-  } else if (creep.pos.y === 49) {
-    var mv2 = creep.move(TOP);
-    if (mv2 === OK) return true;
-    if (creep.pos.x > 0 && creep.move(TOP_LEFT) === OK) return true;
-    if (creep.pos.x < 49 && creep.move(TOP_RIGHT) === OK) return true;
-  } else if (creep.pos.x === 0) {
-    var mv3 = creep.move(RIGHT);
-    if (mv3 === OK) return true;
-    if (creep.pos.y > 0 && creep.move(BOTTOM_RIGHT) === OK) return true;
-    if (creep.pos.y < 49 && creep.move(TOP_RIGHT) === OK) return true;
-  } else if (creep.pos.x === 49) {
-    var mv4 = creep.move(LEFT);
-    if (mv4 === OK) return true;
-    if (creep.pos.y > 0 && creep.move(BOTTOM_LEFT) === OK) return true;
-    if (creep.pos.y < 49 && creep.move(TOP_LEFT) === OK) return true;
-  }
-  return false;
-}
-
-module.exports = {
+roleClaimbot = {
   // == SPAWN COMMAND LOGIC ==
   // Call this via console: launchClaimbot('SpawnRoom', 'TargetRoom')
   // With hardcoded route: launchClaimbot('SpawnRoom', 'TargetRoom', ['Room1', 'Room2', ...])
@@ -118,7 +97,7 @@ module.exports = {
       memory.routeIndex = 0;  // Track progress through the route
     }
     
-    var result = spawn.spawnCreep(body, creepName, { memory: memory });
+    var result = spawnManager.spawnCustomCreep(spawn, body, creepName, memory);
 
     if (result === OK) {
       var msg = '✅ Spawning ' + creepName + ' in ' + spawnRoomName + ' targeting ' + targetRoomName;
@@ -569,3 +548,7 @@ module.exports = {
     }
   }
 };
+
+global.launchClaimbot = roleClaimbot.spawn;
+
+module.exports = roleClaimbot;

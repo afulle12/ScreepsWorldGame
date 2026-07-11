@@ -1,3 +1,4 @@
+// LLM: Read llmcontext.js before reviewing or changing this file.
 /**
  * =============================================================================
  * MODULE: Market Report Generator with Reverse Reaction Calculator
@@ -23,6 +24,9 @@
  * =============================================================================
  */
 
+var util = require('util');
+var pricing = require('marketPricing');
+
 var TICKS_PER_DAY = 28800; // ~3 seconds per tick
 
 // Max safe integer in JavaScript (2^53 - 1)
@@ -39,11 +43,9 @@ var MAX_SAFE_INT = 9007199254740991;
  * @returns {number|null} Best buy price or null if no orders
  */
 function getBestBuyPrice(resourceType) {
-    var orders = Game.market.getAllOrders({
-        type: ORDER_SELL,
-        resourceType: resourceType
-    });
-    
+    // maxAge 0: this is a console-only report command, always show live data.
+    var orders = util.marketOrders(resourceType, ORDER_SELL, 0);
+
     if (!orders || orders.length === 0) return null;
     
     var best = null;
@@ -64,11 +66,9 @@ function getBestBuyPrice(resourceType) {
  * @returns {number|null} Best sell price or null if no orders
  */
 function getBestSellPrice(resourceType) {
-    var orders = Game.market.getAllOrders({
-        type: ORDER_BUY,
-        resourceType: resourceType
-    });
-    
+    // maxAge 0: this is a console-only report command, always show live data.
+    var orders = util.marketOrders(resourceType, ORDER_BUY, 0);
+
     if (!orders || orders.length === 0) return null;
     
     var best = null;
@@ -83,16 +83,13 @@ function getBestSellPrice(resourceType) {
 }
 
 /**
- * Get average price from recent market history
+ * Get average price from recent market history (48h volume-weighted,
+ * via marketPricing)
  * @param {string} resourceType
  * @returns {number|null} Average price or null if no history
  */
 function getAveragePrice(resourceType) {
-    var history = Game.market.getHistory(resourceType);
-    if (!history || history.length === 0) return null;
-    
-    // Use the most recent day's average
-    return history[history.length - 1].avgPrice;
+    return pricing.getAvg48h(resourceType);
 }
 
 /**
@@ -281,7 +278,8 @@ global.marketPrices = function(resourceType) {
     }
     
     // Show all resources with orders
-    var allOrders = Game.market.getAllOrders();
+    // maxAge 0: this is a console-only report command, always show live data.
+    var allOrders = util.marketSnapshot(0).all;
     var resources = {};
     
     for (var i = 0; i < allOrders.length; i++) {

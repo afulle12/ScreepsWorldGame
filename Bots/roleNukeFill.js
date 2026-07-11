@@ -1,32 +1,12 @@
+// LLM: Read llmcontext.js before reviewing or changing this file.
 // roleNukeFill.js
 // Purpose: Spawn a supplier-bodied creep that fills the room's Nuker:
 //          1) Fill 100% energy first
 //          2) Then fill GHODIUM
 // Console: nukeFill('W1N1', { maxPrice: 1.2 })  // maxPrice optional
-// Notes:
-// - Uses getRoomState for scanning (no room.find)
-// - Uses opportunisticBuy to request GHODIUM if the room is short
-// - No optional chaining
-//
-// Screeps API reference for Nuker and resource handling (capacities, transactions)【0】【1】
 
 const getRoomState = require('getRoomState');
 const opportunisticBuy = require('opportunisticBuy');
-
-// Memory bucket:
-// Memory.nukeFillOrders = {
-//   [roomName]: {
-//     roomName,
-//     nukerId,
-//     energyTarget,
-//     ghodiumTarget,
-//     phase: 'energy' | 'ghodium' | 'done',
-//     createdAt,
-//     maxPrice,          // for opportunistic buy
-//     buyRequested,      // true once a buy request is created
-//     completed          // set true when done
-//   }
-// }
 
 if (!Memory.nukeFillOrders) Memory.nukeFillOrders = {};
 
@@ -108,10 +88,20 @@ function pickWithdrawTarget(rs, resourceType) {
   if (!rs) return null;
 
   var term = rs.terminal;
-  if (term && term.store && (term.store[resourceType] || 0) > 0) return term;
-
   var storage = rs.storage;
-  if (storage && storage.store && (storage.store[resourceType] || 0) > 0) return storage;
+  var termAmt = (term && term.store) ? (term.store[resourceType] || 0) : 0;
+  var storageAmt = (storage && storage.store) ? (storage.store[resourceType] || 0) : 0;
+
+  if (resourceType === RESOURCE_ENERGY) {
+    // Prefer storage for energy; only use terminal when it holds more energy than storage
+    if (storageAmt > 0 && storageAmt >= termAmt) return storage;
+    if (termAmt > 0) return term;
+    if (storageAmt > 0) return storage;
+  } else {
+    // Non-energy (e.g. GHODIUM): terminal first, since market buys arrive there
+    if (termAmt > 0) return term;
+    if (storageAmt > 0) return storage;
+  }
 
   var containers = (rs.structuresByType && rs.structuresByType[STRUCTURE_CONTAINER]) ? rs.structuresByType[STRUCTURE_CONTAINER] : [];
   var best = null;
@@ -184,6 +174,13 @@ function order(roomName, opts) {
   var energyNeeded = Math.max(0, caps.energy - cur.energy);
   var ghodiumNeeded = Math.max(0, caps.ghodium - cur.ghodium);
 
+  if (energyNeeded === 0 && ghodiumNeeded === 0) {
+    if (Memory.nukeFillOrders && Memory.nukeFillOrders[roomName]) delete Memory.nukeFillOrders[roomName];
+    var doneMsg = '[NukeFill] ' + roomName + ' nuker is already full.';
+    console.log(doneMsg);
+    return doneMsg;
+  }
+
   // Room stock check (excluding the nuker itself)
   var energyInRoom = sumRoomResource(rs, RESOURCE_ENERGY, nuker.id);
   var ghodiumInRoom = sumRoomResource(rs, RESOURCE_GHODIUM, nuker.id);
@@ -208,7 +205,7 @@ function order(roomName, opts) {
     createdAt: Game.time,
     maxPrice: maxPrice,
     buyRequested: buyAmt > 0 ? true : false,
-    completed: energyNeeded === 0 && ghodiumNeeded === 0
+    completed: false
   };
 
   var msg =
@@ -229,6 +226,7 @@ function run(creep) {
   if (!rs) return;
 
   var order = Memory.nukeFillOrders ? Memory.nukeFillOrders[roomName] : null;
+  if (order && order.completed) delete Memory.nukeFillOrders[roomName];
   if (!order || order.completed) {
     // Idle/park if nothing to do
     var storage = rs.storage;
@@ -260,6 +258,7 @@ function run(creep) {
   if (needEnergy === 0 && needGhodium === 0) {
     order.phase = 'done';
     order.completed = true;
+    delete Memory.nukeFillOrders[roomName];
     console.log('[NukeFill] Completed nuker fill in ' + roomName + '.');
     return;
   }
@@ -320,6 +319,8 @@ function run(creep) {
     depositElsewhere(creep, rs, targetResource);
   }
 }
+
+global.nukeFill = order;
 
 module.exports = {
   run: run,

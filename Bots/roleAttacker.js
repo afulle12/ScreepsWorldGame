@@ -1,15 +1,109 @@
-// Attack with auto-selected rally room (closest to target)
-//global.orderAttack('E3N44', 5)
-
-// Attack with specific rally room
-//global.orderAttack('E3N44', 5, 'E3N45')
+// LLM: Read llmcontext.js before reviewing or changing this file.
+// Spawn and rally attackers in spawnRoom, then send them to targetRoom
+//
+// Console commands:
+//
+//   orderAttack(spawnRoom, targetRoom, count, ...flags)
+//     Spawn `count` attackers in spawnRoom, rally them there, then attack targetRoom.
+//     Flags (optional, any order):
+//       'sustain' — keep `count` attackers alive indefinitely: replacements spawn as
+//                   creeps die and travel straight to the target (no group rally).
+//                   Runs until cancelAttackOrder() — there is no automatic stop.
+//       'fast'    — use the fastAttacker body instead of the standard attacker body.
+//     orderAttack('E3N45', 'E3N44', 5)                     // one-shot wave of 5
+//     orderAttack('E3N45', 'E3N44', 3, 'sustain')          // maintain 3 until cancelled
+//     orderAttack('E3N45', 'E3N44', 5, 'sustain', 'fast')  // sustained, fast bodies
+//
+//   cancelAttackOrder(targetRoom)
+//     Remove the attack order for targetRoom. For sustained orders this stops
+//     respawning; living attackers keep fighting until they die.
+//     cancelAttackOrder('E3N44')
+//
+//   setAttackCount(targetRoom, count)
+//     Update the maintained attacker count for an existing sustained attack.
+//     Living attackers above the new count keep fighting; replacements pause
+//     until the live count drops below the new count.
+//     setAttackCount('E3N44', 5)
+//
+//   assignAttackTarget(roomName, targetId)
+//     Point every attacker whose targetRoom is roomName at a specific structure/creep id.
+//     assignAttackTarget('E3N44', '5f4e...')
+//
+// Orders live in Memory.attackOrders; spawning is handled by manageAttackerSpawns()
+// in spawnManager.js (runs every 5 ticks).
 const iff = require('iff');
+const getRoomState = require('getRoomState');
+const navigationCache = {
+  tick: -1,
+  restrictedTiles: {},
+  restrictedCoordinates: {},
+  structureMatrices: {},
+  hostileTowers: {},
+  avoidancePaths: {}
+};
+
+// ============================================================================
+// Console Command
+// ============================================================================
+
+global.orderAttack = function(spawnRoom, targetRoom, count) {
+  if (!spawnRoom || !targetRoom || !count || count <= 0) {
+    return "[Attack] Usage: global.orderAttack('spawnRoom', 'targetRoom', count, 'sustain'?, 'fast'?)";
+  }
+
+  var flags = Array.prototype.slice.call(arguments, 3);
+  var validFlags = ['sustain', 'fast'];
+  var badFlags = flags.filter(function(f){ return validFlags.indexOf(f) === -1; });
+  if (badFlags.length > 0) {
+    return "[Attack] Unknown flag(s): " + badFlags.join(', ') + ". Valid flags: 'sustain', 'fast'.";
+  }
+  var sustain = flags.indexOf('sustain') !== -1;
+  var fast = flags.indexOf('fast') !== -1;
+
+  if (!Game.rooms[spawnRoom] || !Game.rooms[spawnRoom].controller || !Game.rooms[spawnRoom].controller.my) {
+    return "[Attack] Invalid spawn room: " + spawnRoom + ". Must be a room you control.";
+  }
+
+  if (!Memory.attackOrders) Memory.attackOrders = [];
+
+  var existingOrder = Memory.attackOrders.find(function(o){
+  return o.targetRoom === targetRoom &&
+         (o.rallyPhase === 'spawning' || o.rallyPhase === 'rallying');
+  });
+  if (existingOrder) {
+    return "[Attack] Attack order for " + targetRoom + " already exists and is still forming (phase: " + existingOrder.rallyPhase + "). Wait until it reaches the attacking phase.";
+  }
+
+  Memory.attackOrders.push({
+    targetRoom: targetRoom,
+    spawnRoom: spawnRoom,
+    rallyRoom: spawnRoom,
+    count: count,
+    spawned: 0,
+    startTime: Game.time,
+    rallyPoint: { x: 25, y: 25 },
+    rallyPhase: 'spawning',
+    sustain: sustain,
+    fast: fast
+  });
+
+  var desc = "[Attack] Order created: " + count + " attackers spawning in " + spawnRoom + " -> " + targetRoom +
+    (sustain ? " [sustained]" : "") + (fast ? " [fast]" : "");
+  console.log(desc);
+  return desc;
+};
 
 const roleAttacker = {
   /** @param {Creep} creep **/
-  run: function(creep) {
+run: function(creep) {
     const targetRoom = creep.memory.targetRoom;
     const rallyRoom = creep.memory.rallyRoom;
+
+    if (creep.memory._path || creep.memory.pathToTarget || creep.memory.destination) {
+      delete creep.memory._path;
+      delete creep.memory.pathToTarget;
+      delete creep.memory.destination;
+    }
 
     // Force new pathfinding if flag is set
     if (creep.memory.forceNewPath) {
@@ -30,8 +124,6 @@ const roleAttacker = {
     // Check for hostile towers in current room (unless it's the target room)
     const shouldAvoidRoom = this.checkForHostileTowers(creep);
     if (shouldAvoidRoom) {
-      creep.say('🚨 RETREAT!');
-
       // Enter retreat mode
       creep.memory.retreating = true;
       creep.memory.retreatTarget = creep.memory.previousRoom || rallyRoom;
@@ -49,11 +141,10 @@ const roleAttacker = {
 
     // Phase 1: Move to rally room if not there yet
     if (!creep.memory.rallyComplete && creep.room.name !== rallyRoom) {
-      this.moveToAvoidingBlacklist(creep, new RoomPosition(25, 25, rallyRoom), {
+      this.moveSafely(creep, new RoomPosition(25, 25, rallyRoom), {
         visualizePathStyle: { stroke: '#00ff00', lineStyle: 'dotted' },
         range: 23
       });
-      creep.say(`🛡️ ${rallyRoom}`);
       return;
     }
 
@@ -63,43 +154,52 @@ const roleAttacker = {
       if (!rallyResult) return; // Still rallying
     }
 
-    // Phase 3: Move to target room - FIXED: Now uses custom avoidance movement
+    // Phase 3: Move to target room
     if (creep.room.name !== targetRoom) {
-      this.moveToAvoidingBlacklist(creep, new RoomPosition(25, 25, targetRoom), {
+      this.moveSafely(creep, new RoomPosition(25, 25, targetRoom), {
         visualizePathStyle: { stroke: '#ff0000', lineStyle: 'dashed' },
         range: 23
       });
-      creep.say(`⚔️ ${targetRoom}`);
       return;
     }
 
     // Phase 4: Combat logic
     const hasHealParts = creep.body.some(part => part.type === HEAL && part.hits > 0);
     if (hasHealParts && creep.hits < creep.hitsMax) {
-      const healResult = creep.heal(creep);
-      if (healResult === OK) {
-        creep.say('🩹 HEAL');
-      }
+      creep.heal(creep);
     }
 
     let target = null;
-    if (creep.memory.targetId && Game.time % 5 !== 0) {
+    if (creep.memory.assignedTargetId) {
+      target = Game.getObjectById(creep.memory.assignedTargetId);
+      if (target && target.structureType === STRUCTURE_POWER_BANK) target = null;
+      if (!target) delete creep.memory.assignedTargetId;
+      if (target) {
+        creep.memory.targetId = target.id;
+        creep.say('💥 ATTACK!');
+        if (creep.attack(target) === ERR_NOT_IN_RANGE) {
+          this.moveSafely(creep, target, { visualizePathStyle: { stroke: '#ff0000' } });
+        }
+        return;
+      }
+    }
+
+    if (!target && creep.memory.targetId) {
       target = Game.getObjectById(creep.memory.targetId);
+      if (target && target.structureType === STRUCTURE_POWER_BANK) {
+        target = null;
+        delete creep.memory.targetId;
+      }
       if (target) {
         creep.say('💥 ATTACK!');
         const err = creep.attack(target);
         if (err === ERR_NOT_IN_RANGE) {
-          creep.moveTo(target, { visualizePathStyle: { stroke: '#ff0000' } });
+          this.moveSafely(creep, target, { visualizePathStyle: { stroke: '#ff0000' } });
         }
         return;
       } else {
         delete creep.memory.targetId;
       }
-    }
-
-    if (creep.memory.assignedTargetId) {
-      target = Game.getObjectById(creep.memory.assignedTargetId);
-      if (!target) delete creep.memory.assignedTargetId;
     }
 
     if (!target) {
@@ -113,7 +213,8 @@ const roleAttacker = {
         filter: s => {
           if (
             s.structureType === STRUCTURE_CONTROLLER ||
-            s.structureType === STRUCTURE_KEEPER_LAIR
+            s.structureType === STRUCTURE_KEEPER_LAIR ||
+            s.structureType === STRUCTURE_POWER_BANK
           ) return false;
           if (s.owner && iff.IFF_WHITELIST.includes(s.owner.username)) {
             return false;
@@ -127,57 +228,53 @@ const roleAttacker = {
       target = creep.pos.findClosestByPath(FIND_HOSTILE_CONSTRUCTION_SITES);
     }
 
-    if (target) {
-      const standardRoomCallback = () => {
-        const matrix = new PathFinder.CostMatrix();
-        const room = Game.rooms[creep.room.name];
-        if (room) {
-          room.find(FIND_STRUCTURES).forEach(s => {
-            if (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) {
-              matrix.set(s.pos.x, s.pos.y, 255);
-            }
+    if (!target && hasHealParts) {
+      const healTarget = this.findDamagedFriendly(creep);
+      if (healTarget) {
+        delete creep.memory.targetId;
+        const range = creep.pos.getRangeTo(healTarget);
+        if (creep.hits === creep.hitsMax && range <= 3) {
+          if (range <= 1) creep.heal(healTarget);
+          else creep.rangedHeal(healTarget);
+        }
+        if (range > 3 || this.isRestrictedTile(creep, creep.pos.x, creep.pos.y, creep.room.name)) {
+          this.moveSafely(creep, healTarget, {
+            range: 3,
+            visualizePathStyle: { stroke: '#00ff88' }
           });
         }
-        return matrix;
-      };
+        return;
+      }
+    }
 
+    if (target && !creep.pos.inRangeTo(target, 1)) {
       const standardPathRes = PathFinder.search(
         creep.pos, { pos: target.pos, range: 1 },
         {
           maxOps: 1000,
+          maxRooms: 1,
           plainCost: 1,
           swampCost: 5,
-          roomCallback: standardRoomCallback
+          roomCallback: roomName => this.getStructureMatrix(roomName, 255)
         }
       );
 
-      if (standardPathRes.path.length === 0) {
-        const wallRoomCallback = () => {
-          const matrix = new PathFinder.CostMatrix();
-          const room = Game.rooms[creep.room.name];
-          if (room) {
-            room.find(FIND_STRUCTURES).forEach(s => {
-              if (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) {
-                matrix.set(s.pos.x, s.pos.y, 1);
-              }
-            });
-          }
-          return matrix;
-        };
-
+      if (standardPathRes.incomplete) {
         const wallPathRes = PathFinder.search(
           creep.pos, { pos: target.pos, range: 1 },
           {
             maxOps: 1000,
+            maxRooms: 1,
             plainCost: 1,
             swampCost: 5,
-            roomCallback: wallRoomCallback
+            roomCallback: roomName => this.getStructureMatrix(roomName, 1)
           }
         );
 
         const blockers = [];
         for (const step of wallPathRes.path) {
-          const structs = creep.room.lookForAt(LOOK_STRUCTURES, step.x, step.y);
+          const room = Game.rooms[step.roomName];
+          const structs = room ? room.lookForAt(LOOK_STRUCTURES, step.x, step.y) : [];
           for (const s of structs) {
             if (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) {
               blockers.push(s);
@@ -185,7 +282,13 @@ const roleAttacker = {
           }
         }
 
-        if (blockers.length) {
+        // Do not bust walls/ramparts in owned or friendly rooms
+        const isOwnedOrFriendly = creep.room.controller && (
+          creep.room.controller.my ||
+          (creep.room.controller.owner && iff.IFF_WHITELIST.includes(creep.room.controller.owner.username))
+        );
+
+        if (blockers.length && !isOwnedOrFriendly) {
           target = blockers.reduce((weakest, s) => s.hits < weakest.hits ? s : weakest, blockers[0]);
         }
       }
@@ -199,10 +302,16 @@ const roleAttacker = {
       creep.say('💥 ATTACK!');
       const err = creep.attack(target);
       if (err === ERR_NOT_IN_RANGE) {
-        creep.moveTo(target, { visualizePathStyle: { stroke: '#ff0000' } });
+        this.moveSafely(creep, target, { visualizePathStyle: { stroke: '#ff0000' } });
       }
       return;
     }
+
+    // Do not bust walls/ramparts in owned or friendly rooms
+    const isFriendlyOrOwnedRoom = creep.room.controller && (
+      creep.room.controller.my ||
+      (creep.room.controller.owner && iff.IFF_WHITELIST.includes(creep.room.controller.owner.username))
+    );
 
     const allBarriers = creep.room.find(FIND_STRUCTURES, {
       filter: s =>
@@ -210,7 +319,7 @@ const roleAttacker = {
         s.structureType === STRUCTURE_RAMPART
     });
 
-    if (allBarriers.length) {
+    if (allBarriers.length && !isFriendlyOrOwnedRoom) {
       const edgeBarriers = allBarriers.filter(s =>
         s.pos.x === 0 ||
         s.pos.x === 49 ||
@@ -225,7 +334,7 @@ const roleAttacker = {
         creep.memory.targetId = wallTarget.id;
         creep.say('🪨 BUST');
         if (creep.attack(wallTarget) === ERR_NOT_IN_RANGE) {
-          creep.moveTo(wallTarget, {
+          this.moveSafely(creep, wallTarget, {
             visualizePathStyle: { stroke: '#ffaa00' }
           });
         }
@@ -233,62 +342,267 @@ const roleAttacker = {
       }
     }
 
+    if (!creep.room.controller || !creep.room.controller.my) {
+      const friendlyBot = creep.pos.findClosestByRange(FIND_MY_CREEPS, {
+        filter: c => c.name !== creep.name
+      });
+      const lastIdlePos = creep.memory.lastIdlePos;
+      const isNotMoving = lastIdlePos &&
+        lastIdlePos.x === creep.pos.x &&
+        lastIdlePos.y === creep.pos.y &&
+        lastIdlePos.roomName === creep.room.name;
+
+      creep.memory.lastIdlePos = {
+        x: creep.pos.x,
+        y: creep.pos.y,
+        roomName: creep.room.name
+      };
+
+      if (friendlyBot && isNotMoving && !creep.pos.inRangeTo(friendlyBot, 5)) {
+        this.moveSafely(creep, friendlyBot, {
+          range: 5,
+          visualizePathStyle: { stroke: '#00ffff' }
+        });
+        return;
+      }
+    } else {
+      delete creep.memory.lastIdlePos;
+    }
+
     delete creep.memory.targetId;
-    creep.moveTo(new RoomPosition(25, 25, targetRoom), {
-      visualizePathStyle: { stroke: '#cccccc' }
-    });
-    creep.say('⚔️ IDLE');
   },
 
   /**
-   * Custom moveTo that respects blacklisted rooms
-   * @param {Creep} creep 
-   * @param {RoomPosition} target 
-   * @param {Object} opts 
+   * Finds the closest damaged friendly creep (own or IFF-whitelisted)
+   * @param {Creep} creep
+   * @returns {Creep|null}
    */
-  moveToAvoidingBlacklist: function(creep, target, opts = {}) {
-    // If no blacklisted rooms, use normal moveTo for efficiency
-    if (!creep.memory.blacklistedRooms || creep.memory.blacklistedRooms.length === 0) {
-      return creep.moveTo(target, opts);
+  findDamagedFriendly: function(creep) {
+    const state = getRoomState.get(creep.room.name);
+    if (!state) return null;
+    const damaged = state.myCreeps.filter(c => c.id !== creep.id && c.hits < c.hitsMax);
+    for (const c of state.hostiles) {
+      if (c.hits < c.hitsMax && iff.isWhitelistedCreep(c)) damaged.push(c);
+    }
+    if (damaged.length === 0) return null;
+    return creep.pos.findClosestByRange(damaged);
+  },
+
+  /**
+   * Collects tiles reserved by tower-drain lanes in a room, keyed "x,y"
+   * @param {string} roomName
+   * @returns {Object}
+   */
+  getTowerDrainReservedTiles: function(roomName) {
+    const cache = this.getNavigationCache();
+    const cacheKey = 'base:' + roomName;
+    if (cache.restrictedTiles[cacheKey]) return cache.restrictedTiles[cacheKey];
+
+    const reserved = {};
+    if (Memory.towerDrainOps && Memory.towerDrainOps.operations) {
+      const ops = Memory.towerDrainOps.operations;
+      for (const opKey in ops) {
+        const lanes = ops[opKey].lanes;
+        if (!lanes) continue;
+        for (const laneKey in lanes) {
+          const lane = lanes[laneKey];
+          const positions = [lane.attackEdgePos, lane.attackRestPos, lane.healEdgePos, lane.healRestPos];
+          for (const p of positions) {
+            if (p && p.roomName === roomName) reserved[p.x + ',' + p.y] = true;
+          }
+        }
+      }
     }
 
-    // Use PathFinder.search directly to ensure our room callback is respected
-    const goals = [{ pos: target, range: opts.range || 1 }];
+    const allCreeps = getRoomState.creepIndex().all;
+    for (const c of allCreeps) {
+      if (!c.memory || c.memory.role !== 'drainDemolisher' || !c.memory.healerParkPos) continue;
+      const p = c.memory.healerParkPos;
+      if (p.roomName === roomName) reserved[p.x + ',' + p.y] = true;
+    }
 
+    cache.restrictedTiles[cacheKey] = reserved;
+    return reserved;
+  },
+
+  /**
+   * @param {Creep} creep
+   * @param {string} roomName
+   * @returns {Object}
+   */
+  getRestrictedTiles: function(creep, roomName) {
+    const cache = this.getNavigationCache();
+    const isTargetRoom = roomName === creep.memory.targetRoom;
+    const cacheKey = roomName + ':' + isTargetRoom;
+    if (cache.restrictedTiles[cacheKey]) return cache.restrictedTiles[cacheKey];
+
+    const restricted = Object.assign({}, this.getTowerDrainReservedTiles(roomName));
+
+    if (isTargetRoom) {
+      for (let i = 0; i <= 49; i++) {
+        restricted[i + ',0'] = true;
+        restricted[i + ',49'] = true;
+        restricted['0,' + i] = true;
+        restricted['49,' + i] = true;
+      }
+    }
+
+    cache.restrictedTiles[cacheKey] = restricted;
+    return restricted;
+  },
+
+  getRestrictedTileCoordinates: function(creep, roomName) {
+    const cache = this.getNavigationCache();
+    const cacheKey = roomName + ':' + (roomName === creep.memory.targetRoom);
+    if (!cache.restrictedCoordinates[cacheKey]) {
+      cache.restrictedCoordinates[cacheKey] = Object.keys(this.getRestrictedTiles(creep, roomName)).map(key => {
+        const xy = key.split(',');
+        return { x: Number(xy[0]), y: Number(xy[1]) };
+      });
+    }
+    return cache.restrictedCoordinates[cacheKey];
+  },
+
+  getNavigationCache: function() {
+    if (navigationCache.tick !== Game.time) {
+      navigationCache.tick = Game.time;
+      navigationCache.restrictedTiles = {};
+      navigationCache.restrictedCoordinates = {};
+      navigationCache.structureMatrices = {};
+      navigationCache.hostileTowers = {};
+    }
+    return navigationCache;
+  },
+
+  getStructureMatrix: function(roomName, wallCost) {
+    const cache = this.getNavigationCache();
+    const cacheKey = roomName + ':' + wallCost;
+    if (!cache.structureMatrices[cacheKey]) {
+      const matrix = new PathFinder.CostMatrix();
+      const room = Game.rooms[roomName];
+      if (room) {
+        room.find(FIND_STRUCTURES).forEach(s => {
+          if (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) {
+            matrix.set(s.pos.x, s.pos.y, wallCost);
+          }
+        });
+      }
+      cache.structureMatrices[cacheKey] = matrix;
+    }
+    return cache.structureMatrices[cacheKey].clone();
+  },
+
+  applyRestrictedTiles: function(matrix, creep, roomName) {
+    for (const pos of this.getRestrictedTileCoordinates(creep, roomName)) {
+      matrix.set(pos.x, pos.y, 255);
+    }
+    return matrix;
+  },
+
+  /**
+   * @param {Creep} creep
+   * @param {number} x
+   * @param {number} y
+   * @param {string} roomName
+   * @returns {boolean}
+   */
+  isRestrictedTile: function(creep, x, y, roomName) {
+    return !!this.getRestrictedTiles(creep, roomName)[x + ',' + y];
+  },
+
+  /**
+   * Central movement entry point for attackers. This is the only attacker helper
+   * that may call Creep.move or Creep.moveTo.
+   * @param {Creep} creep
+   * @param {RoomObject|RoomPosition} target
+   * @param {Object} opts
+   */
+  moveSafely: function(creep, target, opts = {}) {
+    const currentRestricted = this.getRestrictedTiles(creep, creep.room.name);
+    if (currentRestricted[creep.pos.x + ',' + creep.pos.y]) {
+      const terrain = creep.room.getTerrain();
+      let best = null;
+
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = creep.pos.x + dx;
+          const ny = creep.pos.y + dy;
+          if (nx < 1 || nx > 48 || ny < 1 || ny > 48) continue;
+          if (currentRestricted[nx + ',' + ny]) continue;
+          if (terrain.get(nx, ny) === TERRAIN_MASK_WALL) continue;
+          if (creep.room.lookForAt(LOOK_CREEPS, nx, ny).length > 0) continue;
+          best = { x: nx, y: ny };
+          break;
+        }
+        if (best) break;
+      }
+
+      if (best) {
+        return creep.move(creep.pos.getDirectionTo(best.x, best.y));
+      }
+    }
+
+    const baseCostCallback = opts.costCallback;
+    const moveOpts = Object.assign({}, opts);
+    const targetPos = target.pos || target;
+    if (moveOpts.reusePath === undefined) moveOpts.reusePath = 10;
+    moveOpts.costCallback = (roomName, matrix) => {
+      if (baseCostCallback) baseCostCallback(roomName, matrix);
+      this.applyRestrictedTiles(matrix, creep, roomName);
+    };
+
+    if (!creep.memory.blacklistedRooms || creep.memory.blacklistedRooms.length === 0) {
+      return creep.moveTo(target, moveOpts);
+    }
+
+    const cache = this.getNavigationCache();
+    const blacklist = creep.memory.blacklistedRooms.join(',');
+    const pathKey = targetPos.roomName + ':' + targetPos.x + ':' + targetPos.y + ':' + (moveOpts.range || 1) + ':' + blacklist;
+    let cachedPath = cache.avoidancePaths[creep.name];
+    if (!cachedPath || cachedPath.key !== pathKey) {
+      cachedPath = null;
+    } else if (cachedPath.path.length && creep.pos.isEqualTo(cachedPath.path[0])) {
+      cachedPath.path.shift();
+    }
+
+    if (cachedPath && cachedPath.path.length) {
+      const nextStep = cachedPath.path[0];
+      if (!creep.memory.blacklistedRooms.includes(nextStep.roomName)) {
+        return creep.move(creep.pos.getDirectionTo(nextStep));
+      }
+      delete cache.avoidancePaths[creep.name];
+    }
+
+    const goals = [{ pos: targetPos, range: moveOpts.range || 1 }];
     const result = PathFinder.search(creep.pos, goals, {
-      maxOps: opts.maxOps || 4000,
-      maxRooms: opts.maxRooms || 16,
-      plainCost: opts.plainCost || 1,
-      swampCost: opts.swampCost || 5,
+      maxOps: moveOpts.maxOps || 4000,
+      maxRooms: moveOpts.maxRooms || 16,
+      plainCost: moveOpts.plainCost || 1,
+      swampCost: moveOpts.swampCost || 5,
       roomCallback: this.getAvoidanceRoomCallback(creep)
     });
 
-    // Debug logging
-    if (result.incomplete) {
-      console.log(`[Attack] ${creep.name}: PathFinder incomplete, blacklisted: ${JSON.stringify(creep.memory.blacklistedRooms)}`);
-    }
-
     if (result.path && result.path.length > 0) {
-      // Move along the calculated path
+      cache.avoidancePaths[creep.name] = { key: pathKey, path: result.path };
       const nextStep = result.path[0];
       const direction = creep.pos.getDirectionTo(nextStep);
 
-      // Visualize the path if requested
-      if (opts.visualizePathStyle) {
-        creep.room.visual.poly(result.path, opts.visualizePathStyle);
+      if (moveOpts.visualizePathStyle) {
+        creep.room.visual.poly(result.path, moveOpts.visualizePathStyle);
       }
 
-      // Additional debug: check if next step would go to blacklisted room
       if (creep.memory.blacklistedRooms.includes(nextStep.roomName)) {
         console.log(`[Attack] ${creep.name}: ERROR - PathFinder trying to go to blacklisted room ${nextStep.roomName}!`);
         return ERR_NO_PATH;
       }
 
-      console.log(`[Attack] ${creep.name}: Moving to ${nextStep}, avoiding ${JSON.stringify(creep.memory.blacklistedRooms)}`);
       return creep.move(direction);
     }
 
-    console.log(`[Attack] ${creep.name}: No path found to ${target}, blacklisted: ${JSON.stringify(creep.memory.blacklistedRooms)}`);
+    if (result.incomplete && Game.time % 25 === 0) {
+      console.log(`[Attack] ${creep.name}: No complete path while avoiding ${blacklist}`);
+    }
     return ERR_NO_PATH;
   },
 
@@ -302,6 +616,7 @@ const roleAttacker = {
     delete creep.memory._path;
     delete creep.memory.pathToTarget;
     delete creep.memory.destination;
+    delete navigationCache.avoidancePaths[creep.name];
 
     // Force immediate recalculation flag
     creep.memory.forceNewPath = true;
@@ -329,10 +644,9 @@ const roleAttacker = {
       if (exitDir !== ERR_NO_PATH && exitDir !== ERR_INVALID_ARGS) {
         const exit = creep.pos.findClosestByPath(exitDir);
         if (exit) {
-          creep.moveTo(exit, {
+          this.moveSafely(creep, exit, {
             visualizePathStyle: { stroke: '#ff0000', lineStyle: 'solid' }
           });
-          creep.say('🏃 FLEE!');
           return;
         }
       }
@@ -349,10 +663,9 @@ const roleAttacker = {
         const exitDir = parseInt(direction);
         const exit = creep.pos.findClosestByPath(exitDir);
         if (exit) {
-          creep.moveTo(exit, {
+          this.moveSafely(creep, exit, {
             visualizePathStyle: { stroke: '#ff0000', lineStyle: 'solid' }
           });
-          creep.say('🏃 FLEE!');
           return;
         }
       }
@@ -367,13 +680,11 @@ const roleAttacker = {
       49 - creep.pos.y
     );
 
-    if (distanceFromEdge < 5) {
-      // Move toward center of room
+    if (distanceFromEdge < 2) {
       const centerPos = new RoomPosition(25, 25, creep.room.name);
-      creep.moveTo(centerPos, {
+      this.moveSafely(creep, centerPos, {
         visualizePathStyle: { stroke: '#ffaa00', lineStyle: 'dotted' }
       });
-      creep.say('🛡️ SAFE');
       return;
     }
 
@@ -381,7 +692,6 @@ const roleAttacker = {
     const hasHealParts = creep.body.some(part => part.type === HEAL && part.hits > 0);
     if (hasHealParts && creep.hits < creep.hitsMax) {
       creep.heal(creep);
-      creep.say('🩹 HEAL');
       return;
     }
 
@@ -399,10 +709,7 @@ const roleAttacker = {
       // CRITICAL FIX: Thoroughly clear all movement cache
       this.clearAllMovementCache(creep);
 
-      creep.say('✅ READY');
       console.log(`[Attack] Creep ${creep.name} finished retreating, blacklisted rooms: ${JSON.stringify(creep.memory.blacklistedRooms)}`);
-    } else {
-      creep.say(`⏳ ${3 - (Game.time - creep.memory.retreatTimer)}`);
     }
   },
 
@@ -417,16 +724,17 @@ const roleAttacker = {
       return false;
     }
 
-    const towers = creep.room.find(FIND_HOSTILE_STRUCTURES, {
-      filter: s => {
-        if (s.structureType !== STRUCTURE_TOWER) return false;
-        // Check if tower owner is on whitelist
-        if (s.owner && iff.IFF_WHITELIST.includes(s.owner.username)) {
-          return false;
+    const cache = this.getNavigationCache();
+    let towers = cache.hostileTowers[creep.room.name];
+    if (!towers) {
+      towers = creep.room.find(FIND_HOSTILE_STRUCTURES, {
+        filter: s => {
+          if (s.structureType !== STRUCTURE_TOWER) return false;
+          return !s.owner || !iff.IFF_WHITELIST.includes(s.owner.username);
         }
-        return true;
-      }
-    });
+      });
+      cache.hostileTowers[creep.room.name] = towers;
+    }
 
     if (towers.length > 0) {
       // Initialize blacklist if it doesn't exist
@@ -456,26 +764,16 @@ const roleAttacker = {
    * @returns {function} PathFinder room callback
    */
   getAvoidanceRoomCallback: function(creep) {
+    const self = this;
     return function(roomName) {
       // Block blacklisted rooms (except target room)
       if (creep.memory.blacklistedRooms && 
           creep.memory.blacklistedRooms.includes(roomName) && 
           roomName !== creep.memory.targetRoom) {
-        console.log(`[Attack] ${creep.name}: BLOCKING pathfinding through blacklisted room ${roomName}`);
-        return false; // This should completely block the room
+        return false;
       }
 
-      // Allow pathfinding through other rooms with normal cost matrix
-      const matrix = new PathFinder.CostMatrix();
-      const room = Game.rooms[roomName];
-      if (room) {
-        room.find(FIND_STRUCTURES).forEach(s => {
-          if (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) {
-            matrix.set(s.pos.x, s.pos.y, 255);
-          }
-        });
-      }
-      return matrix;
+      return self.applyRestrictedTiles(self.getStructureMatrix(roomName, 255), creep, roomName);
     };
   },
 
@@ -505,26 +803,69 @@ const roleAttacker = {
     // Move to rally point using custom avoidance movement
     const range = creep.pos.getRangeTo(rallyPoint);
     if (range > 3) {
-      this.moveToAvoidingBlacklist(creep, rallyPoint, {
+      this.moveSafely(creep, rallyPoint, {
         visualizePathStyle: { stroke: '#00ff00', lineStyle: 'dotted' },
         range: 3
       });
-      creep.say(`🛡️ RALLY`);
-    } else {
-      // At rally point, show status
-      const attackersAtRally = _.filter(Game.creeps, c => 
-        c.memory.role === 'attacker' && 
-        c.memory.targetRoom === order.targetRoom &&
-        c.room.name === order.rallyRoom
-      );
-
-      const rallyTimeElapsed = order.rallyStartTime ? Game.time - order.rallyStartTime : 0;
-      const remaining = Math.max(0, 50 - rallyTimeElapsed);
-
-      creep.say(`⏳ ${attackersAtRally.length}/${order.spawned} (${remaining})`);
     }
 
     return false; // Still rallying
   }
 };
 module.exports = roleAttacker;
+
+global.assignAttackTarget = function(roomName, targetId) {
+  if (!roomName || !targetId) {
+    return "[Attack] Invalid command. Use global.assignAttackTarget('roomName', 'targetId').";
+  }
+  var attackersInRoom = _.filter(getRoomState.creepIndex().all, function(c){
+    return c.memory.role === 'attacker' && c.memory.targetRoom === roomName;
+  });
+  if (attackersInRoom.length === 0) {
+    return "[Attack] No attackers found for room " + roomName + ".";
+  }
+  var assignedCount = 0;
+  for (var i = 0; i < attackersInRoom.length; i++) {
+    var creep = attackersInRoom[i];
+    creep.memory.assignedTargetId = targetId;
+    assignedCount++;
+  }
+  return "[Attack] Assigned target " + targetId + " to " + assignedCount + " attackers in room " + roomName + ".";
+};
+
+global.cancelAttackOrder = function (targetRoom) {
+  if (!Memory.attackOrders || Memory.attackOrders.length === 0) return '[Attack] No active attack orders.';
+  var i = Memory.attackOrders.findIndex(function(o){ return o.targetRoom === targetRoom; });
+  if (i === -1) return "[Attack] No attack order found for " + targetRoom + ".";
+  var wasSustained = Memory.attackOrders[i].sustain === true;
+  Memory.attackOrders.splice(i, 1);
+  return "[Attack] Attack on " + targetRoom + " has been cancelled." +
+    (wasSustained ? " Respawning stopped; living attackers will fight until they die." : "");
+};
+
+global.setAttackCount = function(targetRoom, count) {
+  count = parseInt(count, 10);
+  if (!targetRoom || !count || count < 1) {
+    return "[Attack] Invalid command. Use global.setAttackCount('targetRoom', count).";
+  }
+  if (!Memory.attackOrders || Memory.attackOrders.length === 0) return '[Attack] No active attack orders.';
+
+  var i = Memory.attackOrders.findIndex(function(o){ return o.targetRoom === targetRoom; });
+  if (i === -1) return "[Attack] No attack order found for " + targetRoom + ".";
+
+  var order = Memory.attackOrders[i];
+  if (order.sustain !== true) {
+    return "[Attack] Attack order for " + targetRoom + " is not sustained; count updates only apply to sustained attacks.";
+  }
+
+  var oldCount = order.count || 0;
+  order.count = count;
+
+  var alive = _.filter(getRoomState.creepIndex().all, function(c){
+    return c.memory.role === 'attacker' && c.memory.targetRoom === targetRoom;
+  }).length;
+
+  return "[Attack] Updated sustained attack on " + targetRoom + " count " + oldCount + " -> " + count +
+    ". Currently alive: " + alive + "/" + count + "." +
+    (alive > count ? " Extra attackers will keep fighting; replacements are paused until losses occur." : "");
+};

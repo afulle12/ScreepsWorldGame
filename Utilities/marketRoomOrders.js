@@ -1,3 +1,4 @@
+// LLM: Read llmcontext.js before reviewing or changing this file.
 // marketRoomOrders.js
 // Purpose: Console command(s) to list your active market orders per owned room.
 // Usage:
@@ -81,6 +82,8 @@ function listRoomMarketOrders(targetRoomName) {
 
   return results;
 }
+
+global.listRoomMarketOrders = listRoomMarketOrders;
 
 module.exports = {
   listRoomMarketOrders: listRoomMarketOrders

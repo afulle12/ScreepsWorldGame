@@ -1,4 +1,18 @@
+// LLM: Read llmcontext.js before reviewing or changing this file.
 //roleDepositHarvester.js
+// UPDATED: Added PathFinder-based route validation to detect rooms that are impassable between
+// entry/exit edges (terrain walls or player-built walls). Uses same engine as creep movement.
+// Routes are validated after loading/computing and recomputed (up to 5 attempts) avoiding blocked rooms.
+// OPTIMIZED: CPU efficiency while traveling. Per-room navigation is now corridor-constrained:
+// each hop targets a concrete exit tile toward the next route room with maxRooms:1, so the engine
+// can never detour into an off-route room. reusePath raised to 20 for highway rooms.
+// Skips redundant validation if observer already validated the job route (job.routeValidated).
+//
+// MOVEMENT FIXES (border-bounce hardening):
+//   FIX 1: corridor-constrained movement (maxRooms:1 toward a concrete exit tile).
+//   FIX 2: forward-biased off-route recovery (no backward snap on linear-distance ties).
+//   FIX 4: peel off wrong-edge exit tiles before the engine's start-of-tick auto-transfer.
+//
 // Behavior:
 //   Spawned for a single highway Deposit job.
 //   Loop:
@@ -6,8 +20,9 @@
 //     2) harvesting       - harvest until full or deposit gone/exhausted
 //     3) returning        - follow the same room sequence in reverse back to homeRoom
 //     4) delivering       - transfer resources to storage
-//   Repeat until the Deposit object disappears or is considered exhausted,
-//   then mark job completed and let the creep finish its last trip home.
+//   After delivering, the creep suicides so a fresh creep can be spawned for the next trip.
+
+var util = require('util');
 
 function getJob(creep) {
   if (!creep.memory.depositId) return null;
@@ -38,6 +53,19 @@ function clearRouteData(creep) {
   delete creep.memory.depositRouteBack;
   delete creep.memory.depositRouteIndex;
   delete creep.memory.depositRouteBackIndex;
+  delete creep.memory.depositRouteValidated;
+  delete creep.memory._exitTarget;
+  delete creep.memory._lastRoom;
+}
+
+function getRoute(creep, forward) {
+  var job = getJob(creep);
+  if (job) {
+    var jobRoute = forward ? job.route : (Array.isArray(job.route) ? job.route.slice().reverse() : null);
+    if (Array.isArray(jobRoute) && jobRoute.length >= 2) return jobRoute;
+  }
+  var legacyRoute = forward ? creep.memory.depositRoute : creep.memory.depositRouteBack;
+  return Array.isArray(legacyRoute) && legacyRoute.length >= 2 ? legacyRoute : null;
 }
 
 function markJobCompleted(creep, keepRoute) {
@@ -52,19 +80,131 @@ function markJobCompleted(creep, keepRoute) {
   }
 }
 
-// Ensure the creep has depositRoute (home -> deposit) and depositRouteBack (deposit -> home)
-// in its memory, loading from the job.route if available. If the job has no route yet,
-// we fall back to Game.map.findRoute to build one, then store it back into the job.
-// The observer’s route is authoritative; the local fallback is a safety net only.
+// ---------------------------------------------------------------------------
+// ROUTE VALIDATION — PathFinder traversal check
+// Uses the same pathfinding engine as creep movement to verify each intermediate
+// room can be crossed from the entry edge to the exit edge. When the room is
+// visible, player-built walls/ramparts are included via CostMatrix.
+// ---------------------------------------------------------------------------
+
+// Edge helpers shared via util.js.
+var getEdgeCoords = util.getEdgeCoords;
+var getEntryDirection = util.getEntryDirection;
+var pickRandomEdgeTile = util.pickRandomEdgeTile;
+var getEdgeGoals = util.getEdgeGoals;
+
+// Build a CostMatrix including structures when the room is visible.
+function buildRoomCostMatrix(roomName) {
+  if (!global.__depositHarvesterCostMatrices || global.__depositHarvesterCostMatrices.tick !== Game.time) {
+    global.__depositHarvesterCostMatrices = { tick: Game.time, rooms: {} };
+  }
+  var cached = global.__depositHarvesterCostMatrices.rooms[roomName];
+  if (cached) return cached.clone();
+
+  var room = Game.rooms[roomName];
+  var matrix = new PathFinder.CostMatrix();
+  if (!room) {
+    global.__depositHarvesterCostMatrices.rooms[roomName] = matrix;
+    return matrix.clone();
+  }
+
+  var structures = room.find(FIND_STRUCTURES);
+  for (var i = 0; i < structures.length; i++) {
+    var s = structures[i];
+    if (s.structureType === STRUCTURE_WALL) {
+      matrix.set(s.pos.x, s.pos.y, 0xff);
+    } else if (s.structureType === STRUCTURE_RAMPART) {
+      if (!s.my && !s.isPublic) matrix.set(s.pos.x, s.pos.y, 0xff);
+    }
+  }
+  global.__depositHarvesterCostMatrices.rooms[roomName] = matrix;
+  return matrix.clone();
+}
+
+// Check if a creep entering roomName from prevRoom can reach the exit toward nextRoom.
+// Uses PathFinder.search constrained to 1 room, with structure-aware CostMatrix when visible.
+function checkRoomTraversal(roomName, prevRoom, nextRoom) {
+  var entryDir = getEntryDirection(prevRoom, roomName);
+  var exitDir  = Game.map.findExit(roomName, nextRoom);
+  if (entryDir < 0 || exitDir < 0) return false;
+
+  var startPos = pickRandomEdgeTile(roomName, entryDir);
+  if (!startPos) return false;
+
+  var goals = getEdgeGoals(roomName, exitDir);
+  if (goals.length === 0) return false;
+
+  var result = PathFinder.search(startPos, goals, {
+    plainCost: 2,
+    swampCost: 2,
+    maxOps: 4000,
+    maxRooms: 1,
+    roomCallback: function (rName) {
+      if (rName !== roomName) return false;
+      return buildRoomCostMatrix(rName);
+    }
+  });
+
+  return !result.incomplete;
+}
+
+// Validate every intermediate room in the route. Returns an array of room names
+// that fail the PathFinder traversal check (empty array === route is good).
+function validateRoute(route) {
+  var blocked = [];
+  if (!Array.isArray(route) || route.length < 3) return blocked;
+
+  for (var i = 1; i < route.length - 1; i++) {
+    if (!checkRoomTraversal(route[i], route[i - 1], route[i + 1])) {
+      blocked.push(route[i]);
+    }
+  }
+
+  return blocked;
+}
+
+// Recompute a route that avoids the given set of blocked rooms.
+function computeRouteAvoiding(fromRoom, toRoom, blockedRooms) {
+  var blockedSet = {};
+  for (var b = 0; b < blockedRooms.length; b++) {
+    blockedSet[blockedRooms[b]] = true;
+  }
+
+  var routeResult = Game.map.findRoute(fromRoom, toRoom, {
+    routeCallback: function (roomName) {
+      if (blockedSet[roomName]) return Infinity;
+      return 1; // default cost
+    }
+  });
+
+  return routeResult;
+}
+
+// ---------------------------------------------------------------------------
+
+// Ensure the creep has depositRoute (home -> deposit) and depositRouteBack
+// (deposit -> home) in its memory, loading from the job.route if available.
+// If the observer already validated the route (job.routeValidated), trust it
+// to avoid redundant PathFinder calls. Only validate locally-computed fallback routes.
 function ensureRouteOnCreep(creep) {
-  if (Array.isArray(creep.memory.depositRoute) &&
-      creep.memory.depositRoute.length >= 2 &&
-      Array.isArray(creep.memory.depositRouteBack) &&
-      creep.memory.depositRouteBack.length >= 2) {
+  var existingJob = getJob(creep);
+  if (existingJob &&
+      Array.isArray(existingJob.route) && existingJob.route.length >= 2 &&
+      existingJob.routeValidated) {
+    clearRouteData(creep);
     return;
   }
 
-  var job = getJob(creep);
+  if (!existingJob &&
+      Array.isArray(creep.memory.depositRoute) &&
+      creep.memory.depositRoute.length >= 2 &&
+      Array.isArray(creep.memory.depositRouteBack) &&
+      creep.memory.depositRouteBack.length >= 2 &&
+      creep.memory.depositRouteValidated) {
+    return;
+  }
+
+  var job = existingJob;
   var homeRoom = getHomeRoom(creep);
   var targetRoomName = creep.memory.targetRoom;
 
@@ -72,6 +212,9 @@ function ensureRouteOnCreep(creep) {
     console.log('[DepositHarvesterRoute] ' + creep.name + ' cannot ensure route - missing homeRoom or targetRoom.');
     return;
   }
+
+  var route = null;
+  var alreadyValidated = false;
 
   // 1) Preferred: load the authoritative route from the job.
   if (job && Array.isArray(job.route) && job.route.length >= 2) {
@@ -84,181 +227,347 @@ function ensureRouteOnCreep(creep) {
         job.route.length +
         ' rooms).'
     );
+    route = job.route;
+    // If the observer already validated this route, skip redundant PathFinder checks.
+    if (job.routeValidated) {
+      alreadyValidated = true;
+    }
+  }
 
-    creep.memory.depositRoute = job.route;
+  // 2) Fallback: compute a room corridor locally using Game.map.findRoute.
+  if (!route) {
+    route = buildRouteFromFindRoute(homeRoom.name, targetRoomName);
+    if (!route) {
+      console.log(
+        '[DepositHarvesterRoute] ' +
+          creep.name +
+          ' Game.map.findRoute could not find route from ' +
+          homeRoom.name +
+          ' to ' +
+          targetRoomName +
+          '.'
+      );
+      return;
+    }
+  }
 
-    if (Array.isArray(job.routeBack) && job.routeBack.length === job.route.length) {
-      creep.memory.depositRouteBack = job.routeBack;
-    } else {
-      var back = [];
-      for (var i = job.route.length - 1; i >= 0; i--) {
-        back.push(job.route[i]);
+  // 3) VALIDATE: PathFinder traversal check on every intermediate room.
+  // Skip if the observer already validated this route to save CPU.
+  if (!alreadyValidated) {
+    var blocked = validateRoute(route);
+    var recomputeAttempts = 0;
+    var allBlocked = []; // accumulate blocked rooms across retries
+
+    while (blocked.length > 0 && recomputeAttempts < 5) {
+      recomputeAttempts++;
+      for (var b = 0; b < blocked.length; b++) {
+        if (allBlocked.indexOf(blocked[b]) === -1) {
+          allBlocked.push(blocked[b]);
+        }
       }
-      creep.memory.depositRouteBack = back;
+      console.log(
+        '[DepositHarvesterRoute] ' +
+          creep.name +
+          ' route validation FAILED — impassable rooms: ' +
+          blocked.join(', ') +
+          '. Recomputing (attempt ' +
+          recomputeAttempts +
+          ')…'
+      );
+
+      var altResult = computeRouteAvoiding(homeRoom.name, targetRoomName, allBlocked);
+      if (!altResult || altResult === ERR_NO_PATH || altResult.length === 0) {
+        console.log(
+          '[DepositHarvesterRoute] ' +
+            creep.name +
+            ' could not find alternative route avoiding ' +
+            allBlocked.join(', ') +
+            '. Giving up.'
+        );
+        return;
+      }
+
+      route = [homeRoom.name];
+      for (var j = 0; j < altResult.length; j++) {
+        if (altResult[j] && altResult[j].room) {
+          route.push(altResult[j].room);
+        }
+      }
+
+      blocked = validateRoute(route);
     }
-    return;
-  }
 
-  // 2) Fallback: compute a room corridor locally using Game.map.findRoute, then store it.
-  var routeResult = Game.map.findRoute(homeRoom.name, targetRoomName);
-  if (!routeResult || routeResult === ERR_NO_PATH || routeResult.length === 0) {
-    console.log(
-      '[DepositHarvesterRoute] ' +
-        creep.name +
-        ' Game.map.findRoute could not find route from ' +
-        homeRoom.name +
-        ' to ' +
-        targetRoomName +
-        '.'
-    );
-    return;
-  }
-
-  var route = [homeRoom.name];
-  for (var j = 0; j < routeResult.length; j++) {
-    var step = routeResult[j];
-    if (step && step.room) {
-      route.push(step.room);
+    if (blocked.length > 0) {
+      console.log(
+        '[DepositHarvesterRoute] ' +
+          creep.name +
+          ' exhausted recompute attempts. Route still has blocked rooms: ' +
+          blocked.join(', ')
+      );
+      return;
     }
   }
-
-  creep.memory.depositRoute = route;
-
-  var backRoute = [];
-  for (var k = route.length - 1; k >= 0; k--) {
-    backRoute.push(route[k]);
-  }
-  creep.memory.depositRouteBack = backRoute;
 
   if (job) {
     job.route = route;
-    job.routeBack = backRoute;
     job.routePlanned = true;
+    job.routeValidated = true;
+    clearRouteData(creep);
     console.log(
       '[DepositHarvesterRoute] ' +
         creep.name +
-        ' stored locally computed room route into job ' +
+        ' stored VALIDATED room route into job ' +
         job.id +
         ' (' +
         route.length +
-        ' rooms).'
+        ' rooms): ' +
+        route.join(' → ') +
+        '.'
     );
   } else {
+    var backRoute = [];
+    for (var k = route.length - 1; k >= 0; k--) backRoute.push(route[k]);
     console.log(
       '[DepositHarvesterRoute] ' +
         creep.name +
-        ' computed room route of ' +
+        ' validated room route of ' +
         route.length +
-        ' rooms (no job to store it to).'
+        ' rooms: ' +
+        route.join(' → ') +
+        ' (no job to store it to).'
     );
+
+    // No shared job exists, so keep the route on the creep as a compatibility fallback.
+    creep.memory.depositRoute = route;
+    creep.memory.depositRouteBack = backRoute;
+    creep.memory.depositRouteValidated = true;
   }
 }
 
-// Follow the room route one room at a time using local moveTo to the correct exit.
-// - forward === true:  storage/home -> deposit  (depositRoute, depositRouteIndex)
-// - forward === false: deposit -> storage/home (depositRouteBack, depositRouteBackIndex)
+// Helper: build a route array from Game.map.findRoute result.
+function buildRouteFromFindRoute(fromRoom, toRoom) {
+  var routeResult = Game.map.findRoute(fromRoom, toRoom);
+  if (!routeResult || routeResult === ERR_NO_PATH || routeResult.length === 0) {
+    return null;
+  }
+  var route = [fromRoom];
+  for (var j = 0; j < routeResult.length; j++) {
+    if (routeResult[j] && routeResult[j].room) {
+      route.push(routeResult[j].room);
+    }
+  }
+  return route;
+}
+
+// ---------------------------------------------------------------------------
+// MOVEMENT HELPERS (route-following)
+// ---------------------------------------------------------------------------
+
+// Parse a room name into signed grid coordinates so we can test true
+// orthogonal (edge-sharing) adjacency rather than Chebyshev distance.
+function parseRoomXY(roomName) {
+  var m = /^([WE])(\d+)([NS])(\d+)$/.exec(roomName);
+  if (!m) return null;
+  var x = parseInt(m[2], 10);
+  var y = parseInt(m[4], 10);
+  if (m[1] === 'W') x = -x - 1;
+  if (m[3] === 'S') y = -y - 1;
+  return { x: x, y: y };
+}
+
+// True only when the two rooms share an edge (i.e. can be crossed directly).
+function roomsOrthogonallyAdjacent(a, b) {
+  var pa = parseRoomXY(a);
+  var pb = parseRoomXY(b);
+  if (!pa || !pb) return false;
+  return (Math.abs(pa.x - pb.x) + Math.abs(pa.y - pb.y)) === 1;
+}
+
+// FIX 2: forward-biased off-route recovery. Among route rooms that share an
+// edge with the (off-route) current room, return the one furthest along the
+// route (highest index). This pulls the creep back onto the corridor heading
+// forward instead of snapping it backward on a linear-distance tie.
+function pickRecoveryRoom(currentRoomName, route) {
+  var best = null;
+  var bestIdx = -1;
+  for (var i = 0; i < route.length; i++) {
+    if (roomsOrthogonallyAdjacent(currentRoomName, route[i]) && i > bestIdx) {
+      bestIdx = i;
+      best = route[i];
+    }
+  }
+  return best;
+}
+
+// Deep off-route fallback: nearest route room by linear distance, ties broken
+// toward the higher index (forward bias).
+function pickNearestRouteRoom(currentRoomName, route) {
+  var best = null;
+  var bestDist = Infinity;
+  var bestIdx = -1;
+  for (var i = 0; i < route.length; i++) {
+    var d = Game.map.getRoomLinearDistance(currentRoomName, route[i]);
+    if (typeof d !== 'number') continue;
+    if (d < bestDist || (d === bestDist && i > bestIdx)) {
+      bestDist = d;
+      bestIdx = i;
+      best = route[i];
+    }
+  }
+  return best;
+}
+
+// FIX 4 helpers: detect exit tiles and whether the creep sits on the edge that
+// actually leads toward its intended next room.
+function isOnExitTile(pos) {
+  return pos.x === 0 || pos.x === 49 || pos.y === 0 || pos.y === 49;
+}
+
+function isOnIntendedExitEdge(pos, exitDir) {
+  switch (exitDir) {
+    case FIND_EXIT_TOP:    return pos.y === 0;
+    case FIND_EXIT_BOTTOM: return pos.y === 49;
+    case FIND_EXIT_LEFT:   return pos.x === 0;
+    case FIND_EXIT_RIGHT:  return pos.x === 49;
+  }
+  return false;
+}
+
+// FIX 1: find (and cache) a concrete exit tile on the edge toward nextRoom so
+// movement can be constrained to the current room (maxRooms: 1). Returns null
+// if no walkable exit on that edge is reachable from the creep's position.
+function getCachedExitTarget(creep, exitDir) {
+  var cached = creep.memory._exitTarget;
+  if (cached && typeof cached.x === 'number' && typeof cached.y === 'number') {
+    return new RoomPosition(cached.x, cached.y, creep.room.name);
+  }
+  var exitPos = creep.pos.findClosestByPath(exitDir, { ignoreCreeps: true });
+  if (!exitPos) return null;
+  creep.memory._exitTarget = { x: exitPos.x, y: exitPos.y };
+  return exitPos;
+}
+
+// Rebuild a room route from the creep's current room toward the goal when the
+// job (the primary route holder) no longer exists — e.g. it was deleted while
+// this creep was mid-trip. Stored in the legacy creep-memory slot that
+// getRoute already falls back to, so it persists across rooms without spamming
+// findRoute every tick.
+function rebuildRoute(creep, forward) {
+  var goalRoomName = forward ? creep.memory.targetRoom : creep.memory.homeRoom;
+  if (!goalRoomName || creep.room.name === goalRoomName) return null;
+
+  var result = Game.map.findRoute(creep.room.name, goalRoomName);
+  if (!Array.isArray(result) || result.length === 0) return null;
+
+  var route = [creep.room.name];
+  for (var i = 0; i < result.length; i++) {
+    route.push(result[i].room);
+  }
+
+  if (forward) {
+    creep.memory.depositRoute = route;
+  } else {
+    creep.memory.depositRouteBack = route;
+  }
+
+  console.log(
+    '[DepositHarvester] ' +
+      creep.name +
+      ' job route missing; rebuilt ' +
+      (forward ? 'forward' : 'back') +
+      ' route (' +
+      route.length +
+      ' rooms) from ' +
+      creep.room.name +
+      '.'
+  );
+  return route;
+}
+
+// Follow the room route one room at a time, constrained to the validated
+// corridor. Replaces the old moveTo(25,25,nextRoom) approach, which ran its own
+// multi-room planner and could detour through off-route rooms — producing the
+// two-room border-bounce.
 //
-// This function only cares about **which room** we are in; within the room it uses
-// standard pathfinding to the proper exit tile.
+// - forward === true:  storage/home -> deposit  (depositRoute)
+// - forward === false: deposit -> storage/home  (depositRouteBack)
+//
+// FIX 1: each hop targets a concrete exit tile toward the next route room with
+//        maxRooms:1, so the engine can never wander into an off-route room.
+// FIX 2: when off-route, recover toward the furthest-forward edge-adjacent route
+//        room instead of snapping backward on a linear-distance tie.
+// FIX 4: if parked on an exit tile that is NOT the intended exit edge, peel
+//        inward first so the engine's start-of-tick exit-tile auto-transfer
+//        cannot ping-pong the creep back across the border.
+//
+// CPU notes:
+//   - reusePath: 20 for highway rooms (no dynamic obstacles).
+//   - maxOps: 2000 (allow pathing across the current room to the far exit).
+//   - The chosen exit tile is cached in memory._exitTarget and invalidated on
+//     room change, so findClosestByPath runs at most once per room.
 function followRoomRoute(creep, forward) {
-  var homeRoom = getHomeRoom(creep);
-  var targetRoomName = creep.memory.targetRoom;
-
-  // --- FIX: EXIT BOUNCE PREVENTION ---
-  // If we are on an exit tile (x=0, x=49, y=0, y=49), we MUST move into the room immediately.
-  // This overrides route logic to prevent being bounced back to the previous room by the engine.
-  if (creep.pos.x === 0 || creep.pos.x === 49 || creep.pos.y === 0 || creep.pos.y === 49) {
-    creep.moveTo(new RoomPosition(25, 25, creep.room.name), { reusePath: 0, maxOps: 500 });
-    return OK;
-  }
-  // -----------------------------------
-
-  var route = forward ? creep.memory.depositRoute : creep.memory.depositRouteBack;
-  if (!Array.isArray(route) || route.length === 0) {
-    return ERR_NOT_FOUND;
-  }
-
-  var indexKey = forward ? 'depositRouteIndex' : 'depositRouteBackIndex';
   var currentRoomName = creep.room.name;
-  var goalRoomName = forward
-    ? targetRoomName
-    : (homeRoom ? homeRoom.name : null);
+  var route = getRoute(creep, forward);
+  if (!Array.isArray(route) || route.length === 0) {
+    route = rebuildRoute(creep, forward);
+    if (!route) {
+      return ERR_NOT_FOUND;
+    }
+  }
 
-  // If we are already in the goal room for this leg, let the caller handle local movement.
+  var goalRoomName = forward ? creep.memory.targetRoom : creep.memory.homeRoom;
+
+  // Invalidate the cached exit tile whenever the room changes.
+  if (creep.memory._lastRoom !== currentRoomName) {
+    creep.memory._lastRoom = currentRoomName;
+    delete creep.memory._exitTarget;
+  }
+
+  // Arrived at the goal room.
   if (goalRoomName && currentRoomName === goalRoomName) {
     return OK;
   }
 
-  var idx = creep.memory[indexKey];
+  // Decide which room to head toward next.
+  var currentIdx = route.indexOf(currentRoomName);
+  var nextRoomName;
 
-  // Sync index with current room if needed.
-  if (typeof idx !== 'number' ||
-      idx < 0 ||
-      idx >= route.length ||
-      route[idx] !== currentRoomName) {
-
-    var foundIdx = -1;
-    for (var i = 0; i < route.length; i++) {
-      if (route[i] === currentRoomName) {
-        foundIdx = i;
-        break;
-      }
+  if (currentIdx !== -1) {
+    // On route: aim at the next room in sequence.
+    var nextIdx = currentIdx + 1;
+    if (nextIdx >= route.length) {
+      return ERR_NOT_FOUND;
     }
-
-    if (foundIdx !== -1) {
-      idx = foundIdx;
-    } else {
-      // If we somehow appear off-route, snap to the nearest route room by linear distance.
-      var nearestIdx = 0;
-      var nearestDist = Infinity;
-      for (var j = 0; j < route.length; j++) {
-        var dist = Game.map.getRoomLinearDistance(currentRoomName, route[j]);
-        if (typeof dist === 'number' && dist < nearestDist) {
-          nearestDist = dist;
-          nearestIdx = j;
-        }
-      }
-      idx = nearestIdx;
-    }
-
-    creep.memory[indexKey] = idx;
-  }
-
-  // Determine the next room along this route.
-  var nextIdx = idx + 1;
-  if (nextIdx >= route.length) {
-    // No further rooms in this direction. If we are not in the goal, signal failure.
-    if (!goalRoomName || currentRoomName === goalRoomName) {
+    nextRoomName = route[nextIdx];
+  } else {
+    // FIX 2: off route — recover forward toward an edge-adjacent route room.
+    nextRoomName = pickRecoveryRoom(currentRoomName, route);
+    if (!nextRoomName) {
+      // Drifted 2+ rooms off the corridor: fall back to a normal multi-room
+      // move toward the nearest route room (forward-biased on ties).
+      var fallbackRoom = pickNearestRouteRoom(currentRoomName, route);
+      if (!fallbackRoom) return ERR_NOT_FOUND;
+      console.log(
+        '[DepositHarvesterRoute] ' +
+          creep.name +
+          ' deep off-route in ' +
+          currentRoomName +
+          '; recovering toward ' +
+          fallbackRoom +
+          '.'
+      );
+      creep.moveTo(new RoomPosition(25, 25, fallbackRoom), { reusePath: 20 });
       return OK;
     }
-    console.log(
-      '[DepositHarvesterRoute] ' +
-        creep.name +
-        ' has no further rooms in route (forward=' +
-        forward +
-        ') but is still not in goal room (current=' +
-        currentRoomName +
-        ', goal=' +
-        goalRoomName +
-        ').'
-    );
-    return ERR_NOT_FOUND;
   }
 
-  var nextRoomName = route[nextIdx];
-
-  // If we already crossed into the next room (border case), advance the index.
-  if (currentRoomName === nextRoomName) {
-    creep.memory[indexKey] = nextIdx;
-    return OK;
-  }
-
-  var exitDir = Game.map.findExit(currentRoomName, nextRoomName);
+  // Direction of the shared edge toward nextRoom (within the current room).
+  var exitDir = creep.room.findExitTo(nextRoomName);
   if (exitDir < 0) {
     console.log(
       '[DepositHarvesterRoute] ' +
         creep.name +
-        ' Game.map.findExit from ' +
+        ' findExitTo from ' +
         currentRoomName +
         ' to ' +
         nextRoomName +
@@ -269,29 +578,32 @@ function followRoomRoute(creep, forward) {
     return ERR_NO_PATH;
   }
 
-  var exitPos = creep.pos.findClosestByRange(exitDir);
-  if (!exitPos) {
+  // FIX 4: parked on the wrong exit edge — pull inward before the engine yanks
+  // the creep back across the border at the start of next tick.
+  if (isOnExitTile(creep.pos) && !isOnIntendedExitEdge(creep.pos, exitDir)) {
+    creep.moveTo(new RoomPosition(25, 25, currentRoomName), { maxRooms: 1, reusePath: 0 });
+    return OK;
+  }
+
+  // FIX 1: move toward a concrete exit tile, constrained to this room only.
+  var exitTarget = getCachedExitTarget(creep, exitDir);
+  if (!exitTarget) {
+    // No reachable exit tile (rare: disconnected pocket). Let the engine plan
+    // multi-room toward the next room center as a last resort.
     console.log(
       '[DepositHarvesterRoute] ' +
         creep.name +
-        ' could not find exit ' +
-        exitDir +
-        ' in room ' +
-        currentRoomName +
-        ' toward ' +
+        ' no reachable exit tile toward ' +
         nextRoomName +
-        '.'
+        ' from ' +
+        currentRoomName +
+        '; falling back to multi-room moveTo.'
     );
-    return ERR_NO_PATH;
+    creep.moveTo(new RoomPosition(25, 25, nextRoomName), { reusePath: 20, maxOps: 2000 });
+    return OK;
   }
 
-  // Local navigation inside this room to reach the correct exit tile.
-  // Screeps pathfinding handles dynamic obstacles here.
-  creep.moveTo(exitPos, {
-    reusePath: 5,
-    maxOps: 2000
-  });
-
+  creep.moveTo(exitTarget, { reusePath: 20, maxOps: 2000, maxRooms: 1 });
   return OK;
 }
 
@@ -312,7 +624,6 @@ function run(creep) {
     if (creep.memory.state !== 'returning' &&
         creep.memory.state !== 'delivering') {
       creep.memory.state = 'returning';
-      creep.memory.depositRouteBackIndex = 0;
     }
   }
 
@@ -384,7 +695,6 @@ function stateTravelToDeposit(creep) {
 function stateHarvesting(creep) {
   if (creep.store.getFreeCapacity() === 0) {
     // Start return leg; routeBack will be used.
-    creep.memory.depositRouteBackIndex = 0;
     creep.memory.state = 'returning';
     return;
   }
@@ -394,7 +704,6 @@ function stateHarvesting(creep) {
     console.log('[DepositHarvester] ' + creep.name + ' deposit gone while harvesting. Returning with cargo.');
     // Job done, but keep route for final trip home.
     markJobCompleted(creep, true);
-    creep.memory.depositRouteBackIndex = 0;
     creep.memory.state = 'returning';
     return;
   }
@@ -403,7 +712,6 @@ function stateHarvesting(creep) {
     console.log('[DepositHarvester] ' + creep.name + ' deposit cooldown >= 100; treating as exhausted and completing job.');
     // Job done, but keep route for final trip home.
     markJobCompleted(creep, true);
-    creep.memory.depositRouteBackIndex = 0;
     creep.memory.state = 'returning';
     return;
   }
@@ -436,7 +744,6 @@ function stateHarvesting(creep) {
   console.log('[DepositHarvester] ' + creep.name + ' harvest error ' + result + '. Completing job.');
   // Treat as job done; keep route for final trip home.
   markJobCompleted(creep, true);
-  creep.memory.depositRouteBackIndex = 0;
   creep.memory.state = 'returning';
 }
 
@@ -450,21 +757,9 @@ function stateReturning(creep) {
   }
 
   if (creep.store.getUsedCapacity() === 0) {
-    // --- FIX: LOGICAL BOUNCE PREVENTION ---
-    // If empty, only return to work if we are NOT dying AND we are ALREADY HOME.
-    // Fixed threshold to 500 so it matches run() logic.
-    if (typeof creep.ticksToLive === 'number' && creep.ticksToLive <= 500) {
-      creep.suicide();
-      return;
-    }
-
-    if (creep.room.name === homeRoom.name) {
-      // Next trip: reset forward index, go outbound again.
-      creep.memory.depositRouteIndex = 0;
-      creep.memory.state = 'travelToDeposit';
-      return;
-    }
-    // If not home, fall through to movement logic to continue walking home.
+    // Nothing to deliver — suicide immediately rather than wasting TTL on another trip.
+    creep.suicide();
+    return;
   }
 
   var storage = homeRoom.storage;
@@ -525,15 +820,11 @@ function stateDelivering(creep) {
     }
   }
 
+  // Once done delivering (or nothing left to transfer), always suicide.
+  // A fresh creep will be spawned for the next trip rather than risking
+  // this one dying en route with a full cargo.
   if (!transferredSomething || creep.store.getUsedCapacity() === 0) {
-    // Increased threshold to 500 to match run() logic
-    if (typeof creep.ticksToLive === 'number' && creep.ticksToLive <= 500) {
-      creep.suicide();
-      return;
-    }
-    // New outbound trip.
-    creep.memory.depositRouteIndex = 0;
-    creep.memory.state = 'travelToDeposit';
+    creep.suicide();
   }
 }
 

@@ -1,387 +1,910 @@
+// LLM: Read llmcontext.js before reviewing or changing this file.
 // factoryManager.js
+// ============================================================================
 // FIFO per room factory order manager. Refuses orders unless full resources
-// are present in the room. Spawns a hauler to feed the Factory and keeps
-// production going. Orders in different rooms run concurrently.
+// are present in the room (storage + terminal only). Orders in different
+// rooms run concurrently.
 //
-// Added: common higher commodities recipes (Composite, Crystal, Liquid)
-// with factory level requirements. Recipes support multi-input via `inputs`
-// map. Energy is expressed as RESOURCE_ENERGY. `out` is the product units
-// per batch. Optional `level` and `cooldown` fields are informational, with
-// `level` enforced at order time.
+// The supplier handles logistics (loading inputs, evacuating outputs).
+// This manager handles production calls (factory.produce) and order lifecycle.
+//
+// getRecipe() falls back to the game's COMMODITIES constant for any product
+// not in the hardcoded RECIPES table.
+//
+// Supports both compression (minerals -> bars) and decompression (bars -> minerals).
+// ============================================================================
+//
+// CONSOLE COMMANDS
+// ============================================================================
+//
+// orderFactory(roomName, product, amount)
+//   Place a factory production order.
+//   Orders are FIFO per room — a new order for the same room queues
+//   behind any in-progress order. Refuses immediately if the room
+//   lacks sufficient resources for the full order amount.
+//   Examples:
+//     orderFactory('W1N1', 'Oxidant', 1000)
+//     orderFactory('W1N1', 'Zynthium bar', 500)   // queues after Oxidant
+//     orderFactory('W2N3', RESOURCE_WIRE, 'max')   // concurrent in W2N3
+//     orderFactory('W1N1', RESOURCE_ENERGY, 5000)  // batteries → energy
+//     orderFactory('W1N1', 'Utrium', 1000)         // utrium bars → utrium
+//     orderFactory('W1N1', RESOURCE_UTRIUM, 'max') // decompress max utrium bars
+//
+// ────────────────────────────────────────────────────────────
+//
+// cancelFactoryOrder(idOrRoom, product?)
+//   Cancel one or more orders.
+//
+//   Examples:
+//     cancelFactoryOrder('W1N1_XO_1234567')        // cancel by exact ID
+//     cancelFactoryOrder('W1N1')                   // cancel all W1N1 orders
+//     cancelFactoryOrder('W1N1', 'Oxidant')        // cancel W1N1 Oxidant only
+//
+// listFactoryOrders(roomName?)
+//   Examples:
+//     listFactoryOrders()          // all rooms
+//     listFactoryOrders('W1N1')    // W1N1 only
+//     factoryOrders('W1N1')        // backward-compatible alias
+//
+// ────────────────────────────────────────────────────────────
+//
+// showFactories(roomName)
+//   One-line per-room diagnostic: factory presence, active order
+//   (product / phase / progress / age), queue length, factory stock
+//   (total + top 3 resources), and a needs-supplier flag.
+//
+// showAllFactories()
+//   Runs showFactories() across every owned room and joins the lines.
+//
+// ============================================================================
 
-//orderFactory('W1N1', 'Oxidant', 1000);
-//orderFactory('W1N1', 'Zynthium bar', 500); // will wait until Oxidant order finishes (FIFO)
-//orderFactory('W2N3', 'RESOURCE_UTRIUM_BAR', 200); // runs concurrently in another room
-//orderFactory('W1N1', 'Oxidant', 'max'); // computes the maximum producible amount from room resources
-//    Show all factory orders: listFactoryOrders()
-//    Show orders for a specific room: listFactoryOrders('W1N1')
-//cancelFactoryOrder('W1N1_Oxidant_1234567');
+var storageManager = require('storageManager');
+var getRoomState = require('getRoomState');
+var roomSuspender = require('roomSuspender');
+var memoryManager = require('memoryManager');
 
-const getRoomState = require('getRoomState');
+// ─── storageManager v2 feature flag ──────────────────────────────────────────
+// Enabled for every owned room.
+function v2Enabled(roomName) {
+    var room = Game.rooms[roomName];
+    return !!(room && room.controller && room.controller.my);
+}
 
-const ROLE_NAME = 'factoryBot';
+var FACTORY_BROKEN_ORDER_TICKS = 20000;
 
-// Recipes (includes any-level and higher-tier with level requirements)
+// Returns the amount of `resourceType` in room that is unreserved and
+// physically present. When v2 is disabled for the room, returns raw countInRoom.
+function effectiveAvailable(room, resourceType) {
+    var raw = countInRoom(room, resourceType);
+    if (!v2Enabled(room.name)) return raw;
+    var info = storageManager.storageFind(room.name, resourceType);
+    var factory = findFactory(room);
+    if (factory && factory.store && (factory.store[resourceType] || 0) > 0) {
+        raw = Math.max(0, raw - (factory.store[resourceType] || 0));
+    }
+    if (info && info.combined && typeof info.combined.reserved === 'number') {
+        return Math.max(0, raw - info.combined.reserved);
+    }
+    return raw;
+}
+
+// Releases all v2 reservations associated with a given order's inputs.
+function releaseOrderReservations(order) {
+    if (!order || !order.reservationProgram) return;
+    var recipe = getRecipe(order.product);
+    if (!recipe) return;
+    for (var r in recipe.inputs) {
+        storageManager.unReserve(order.room, r, 'terminal', order.reservationProgram);
+        storageManager.unReserve(order.room, r, 'storage',  order.reservationProgram);
+    }
+}
+
+// ─── Recipes (cooldown included for bot sleep calculation) ───────────────────
+
 const RECIPES = Object.freeze({
-  // Compressing commodities (20 ticks)
-  [RESOURCE_OXIDANT]:       { inputs: { [RESOURCE_OXYGEN]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
-  [RESOURCE_REDUCTANT]:     { inputs: { [RESOURCE_HYDROGEN]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
-  [RESOURCE_ZYNTHIUM_BAR]:  { inputs: { [RESOURCE_ZYNTHIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
-  [RESOURCE_LEMERGIUM_BAR]: { inputs: { [RESOURCE_LEMERGIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
-  [RESOURCE_UTRIUM_BAR]:    { inputs: { [RESOURCE_UTRIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
-  [RESOURCE_KEANIUM_BAR]:   { inputs: { [RESOURCE_KEANIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
-  [RESOURCE_GHODIUM_MELT]:  { inputs: { [RESOURCE_GHODIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
-  [RESOURCE_PURIFIER]:      { inputs: { [RESOURCE_CATALYST]: 500, [RESOURCE_ENERGY]: 200 }, out: 100 },
-  [RESOURCE_BATTERY]:       { inputs: { [RESOURCE_ENERGY]: 600 }, out: 50 }, // 10 ticks
+    // ── Compression (minerals → bars, any level factory) ────────────────────
+    [RESOURCE_OXIDANT]:       { inputs: { [RESOURCE_OXYGEN]: 500,   [RESOURCE_ENERGY]: 200 }, out: 100, cooldown: 20 },
+    [RESOURCE_REDUCTANT]:     { inputs: { [RESOURCE_HYDROGEN]: 500, [RESOURCE_ENERGY]: 200 }, out: 100, cooldown: 20 },
+    [RESOURCE_ZYNTHIUM_BAR]:  { inputs: { [RESOURCE_ZYNTHIUM]: 500, [RESOURCE_ENERGY]: 200 }, out: 100, cooldown: 20 },
+    [RESOURCE_LEMERGIUM_BAR]: { inputs: { [RESOURCE_LEMERGIUM]: 500,[RESOURCE_ENERGY]: 200 }, out: 100, cooldown: 20 },
+    [RESOURCE_UTRIUM_BAR]:    { inputs: { [RESOURCE_UTRIUM]: 500,   [RESOURCE_ENERGY]: 200 }, out: 100, cooldown: 20 },
+    [RESOURCE_KEANIUM_BAR]:   { inputs: { [RESOURCE_KEANIUM]: 500,  [RESOURCE_ENERGY]: 200 }, out: 100, cooldown: 20 },
+    [RESOURCE_GHODIUM_MELT]:  { inputs: { [RESOURCE_GHODIUM]: 500,  [RESOURCE_ENERGY]: 200 }, out: 100, cooldown: 20 },
+    [RESOURCE_PURIFIER]:      { inputs: { [RESOURCE_CATALYST]: 500, [RESOURCE_ENERGY]: 200 }, out: 100, cooldown: 20 },
+    [RESOURCE_BATTERY]:       { inputs: { [RESOURCE_ENERGY]: 600  }, out: 50,  cooldown: 10 },
 
-  // Basic regional commodities (8 ticks)
-  [RESOURCE_WIRE]:         { inputs: { [RESOURCE_UTRIUM_BAR]: 20,  [RESOURCE_SILICON]: 100, [RESOURCE_ENERGY]: 40 }, out: 20 },
-  [RESOURCE_CELL]:         { inputs: { [RESOURCE_LEMERGIUM_BAR]: 20, [RESOURCE_BIOMASS]: 100, [RESOURCE_ENERGY]: 40 }, out: 20 },
-  [RESOURCE_ALLOY]:        { inputs: { [RESOURCE_ZYNTHIUM_BAR]: 20, [RESOURCE_METAL]: 100,   [RESOURCE_ENERGY]: 40 }, out: 20 },
-  [RESOURCE_CONDENSATE]:   { inputs: { [RESOURCE_KEANIUM_BAR]: 20,  [RESOURCE_MIST]: 100,    [RESOURCE_ENERGY]: 40 }, out: 20 },
+    // ── Decompression (bars → minerals, any level factory) ──────────────────
+    [RESOURCE_UTRIUM]:        { inputs: { [RESOURCE_UTRIUM_BAR]: 100,    [RESOURCE_ENERGY]: 200 }, out: 500, cooldown: 20 },
+    [RESOURCE_LEMERGIUM]:     { inputs: { [RESOURCE_LEMERGIUM_BAR]: 100, [RESOURCE_ENERGY]: 200 }, out: 500, cooldown: 20 },
+    [RESOURCE_ZYNTHIUM]:      { inputs: { [RESOURCE_ZYNTHIUM_BAR]: 100,  [RESOURCE_ENERGY]: 200 }, out: 500, cooldown: 20 },
+    [RESOURCE_KEANIUM]:       { inputs: { [RESOURCE_KEANIUM_BAR]: 100,   [RESOURCE_ENERGY]: 200 }, out: 500, cooldown: 20 },
+    [RESOURCE_GHODIUM]:       { inputs: { [RESOURCE_GHODIUM_MELT]: 100,  [RESOURCE_ENERGY]: 200 }, out: 500, cooldown: 20 },
+    [RESOURCE_OXYGEN]:        { inputs: { [RESOURCE_OXIDANT]: 100,       [RESOURCE_ENERGY]: 200 }, out: 500, cooldown: 20 },
+    [RESOURCE_HYDROGEN]:      { inputs: { [RESOURCE_REDUCTANT]: 100,     [RESOURCE_ENERGY]: 200 }, out: 500, cooldown: 20 },
+    [RESOURCE_CATALYST]:      { inputs: { [RESOURCE_PURIFIER]: 100,      [RESOURCE_ENERGY]: 200 }, out: 500, cooldown: 20 },
+    // battery → energy (no energy cost, cooldown 10)
+    [RESOURCE_ENERGY]:        { inputs: { [RESOURCE_BATTERY]: 50 },                                out: 500, cooldown: 10 },
 
-  // Common higher commodities
-  // Factory Lvl 1: Composite × 20 (50 ticks)
-  [RESOURCE_COMPOSITE]: { level: 1, inputs: { [RESOURCE_UTRIUM_BAR]: 20, [RESOURCE_ZYNTHIUM_BAR]: 20, [RESOURCE_ENERGY]: 20 }, out: 20, cooldown: 50 },
-  // Factory Lvl 2: Crystal × 6 (21 ticks)
-  [RESOURCE_CRYSTAL]:   { level: 2, inputs: { [RESOURCE_LEMERGIUM_BAR]: 6, [RESOURCE_KEANIUM_BAR]: 6, [RESOURCE_PURIFIER]: 6, [RESOURCE_ENERGY]: 45 }, out: 6, cooldown: 21 },
-  // Factory Lvl 3: Liquid × 12 (60 ticks)
-  [RESOURCE_LIQUID]:    { level: 3, inputs: { [RESOURCE_OXIDANT]: 12, [RESOURCE_REDUCTANT]: 12, [RESOURCE_GHODIUM_MELT]: 12, [RESOURCE_ENERGY]: 90 }, out: 12, cooldown: 60 }
+    // ── Basic regional commodities (cooldown 8) ──────────────────────────────
+    [RESOURCE_WIRE]:         { inputs: { [RESOURCE_UTRIUM_BAR]: 20,    [RESOURCE_SILICON]: 100, [RESOURCE_ENERGY]: 40 }, out: 20, cooldown: 8 },
+    [RESOURCE_CELL]:         { inputs: { [RESOURCE_LEMERGIUM_BAR]: 20, [RESOURCE_BIOMASS]: 100, [RESOURCE_ENERGY]: 40 }, out: 20, cooldown: 8 },
+    [RESOURCE_ALLOY]:        { inputs: { [RESOURCE_ZYNTHIUM_BAR]: 20,  [RESOURCE_METAL]: 100,   [RESOURCE_ENERGY]: 40 }, out: 20, cooldown: 8 },
+    [RESOURCE_CONDENSATE]:   { inputs: { [RESOURCE_KEANIUM_BAR]: 20,   [RESOURCE_MIST]: 100,    [RESOURCE_ENERGY]: 40 }, out: 20, cooldown: 8 },
+
+    // ── Common higher commodities ────────────────────────────────────────────
+    [RESOURCE_COMPOSITE]: { level: 1, inputs: { [RESOURCE_UTRIUM_BAR]: 20, [RESOURCE_ZYNTHIUM_BAR]: 20, [RESOURCE_ENERGY]: 20 }, out: 20, cooldown: 50 },
+    [RESOURCE_CRYSTAL]:   { level: 2, inputs: { [RESOURCE_LEMERGIUM_BAR]: 6, [RESOURCE_KEANIUM_BAR]: 6, [RESOURCE_PURIFIER]: 6, [RESOURCE_ENERGY]: 45 }, out: 6, cooldown: 21 },
+    [RESOURCE_LIQUID]:    { level: 3, inputs: { [RESOURCE_OXIDANT]: 12, [RESOURCE_REDUCTANT]: 12, [RESOURCE_GHODIUM_MELT]: 12, [RESOURCE_ENERGY]: 90 }, out: 12, cooldown: 60 }
 });
 
+/**
+ * Get the recipe for a product. Checks the hardcoded RECIPES first, then
+ * falls back to the game's COMMODITIES constant.
+ */
+function getRecipe(product) {
+    if (RECIPES[product]) return RECIPES[product];
+    if (typeof COMMODITIES !== 'undefined' && COMMODITIES[product]) {
+        var c = COMMODITIES[product];
+        return {
+            inputs: c.components || {},
+            out: c.amount || 1,
+            level: typeof c.level === 'number' ? c.level : undefined,
+            cooldown: c.cooldown || 20
+        };
+    }
+    return null;
+}
+
 function ensureMemory() {
-  if (!Memory.factoryOrders) Memory.factoryOrders = [];
+    if (!Memory.factoryOrders) Memory.factoryOrders = [];
+    if (!Array.isArray(Memory.factoryOrderHistory)) Memory.factoryOrderHistory = [];
+}
+
+function recordCompletedOrder(order) {
+    ensureMemory();
+    if (!order) return;
+    Memory.factoryOrderHistory.push({
+        id: order.id,
+        room: order.room,
+        product: order.product,
+        requested: order.requested,
+        progressOut: order.progressOut || 0,
+        status: order.status,
+        reason: order.brokenReason || null,
+        completedTick: Game.time
+    });
+    if (Memory.factoryOrderHistory.length > 50) {
+        Memory.factoryOrderHistory = Memory.factoryOrderHistory.slice(-50);
+    }
+    memoryManager.requestSave();
 }
 
 function findFactory(room) {
-  var state = getRoomState.get(room.name);
-  if (!state) return undefined;
-  var list = (state.structuresByType && state.structuresByType[STRUCTURE_FACTORY]) || [];
-  return list.length ? list[0] : undefined;
+    if (!room) return null;
+    var rs = getRoomState.get(room.name);
+    var arr = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_FACTORY]) || [];
+    for (var i = 0; i < arr.length; i++) {
+        if (arr[i].my) return arr[i];
+    }
+    return null;
 }
 
 function roomOwned(room) {
-  var state = getRoomState.get(room.name);
-  return !!(state && state.controller && state.controller.my);
+    return !!(room && room.controller && room.controller.my);
 }
 
+/**
+ * Count a resource in storage + terminal + factory only.
+ * Containers are excluded — factory orders only interact with these three.
+ */
 function countInRoom(room, resourceType) {
-  var state = getRoomState.get(room.name);
-  if (!state) return 0;
+    var total = 0;
+    function add(s) { if (s && s.store) total += s.store[resourceType] || 0; }
 
-  var total = 0;
-  function add(s) { if (s && s.store) total += s.store[resourceType] || 0; }
+    add(room.storage);
+    add(room.terminal);
+    add(findFactory(room));
 
-  add(state.storage);
-  add(state.terminal);
-
-  var factory = findFactory(room);
-  add(factory);
-
-  var containers = (state.structuresByType && state.structuresByType[STRUCTURE_CONTAINER]) || [];
-  for (var i = 0; i < containers.length; i++) add(containers[i]);
-
-  return total;
+    return total;
 }
 
 function normalizeProduct(p) {
-  if (p && RECIPES[p]) return p;
-  if (typeof p === 'string') {
-    var s = p.trim().toUpperCase();
-    var map = {
-      OXIDANT: RESOURCE_OXIDANT,
-      REDUCTANT: RESOURCE_REDUCTANT,
-      'ZYNTHIUM BAR': RESOURCE_ZYNTHIUM_BAR, ZYNTHIUM_BAR: RESOURCE_ZYNTHIUM_BAR,
-      'LEMERGIUM BAR': RESOURCE_LEMERGIUM_BAR, LEMERGIUM_BAR: RESOURCE_LEMERGIUM_BAR,
-      'UTRIUM BAR': RESOURCE_UTRIUM_BAR, UTRIUM_BAR: RESOURCE_UTRIUM_BAR,
-      'KEANIUM BAR': RESOURCE_KEANIUM_BAR, KEANIUM_BAR: RESOURCE_KEANIUM_BAR,
-      'GHODIUM MELT': RESOURCE_GHODIUM_MELT, GHODIUM_MELT: RESOURCE_GHODIUM_MELT,
-      PURIFIER: RESOURCE_PURIFIER,
-      BATTERY: RESOURCE_BATTERY,
-      WIRE: RESOURCE_WIRE,
-      CELL: RESOURCE_CELL,
-      ALLOY: RESOURCE_ALLOY,
-      CONDENSATE: RESOURCE_CONDENSATE,
-      COMPOSITE: RESOURCE_COMPOSITE,
-      CRYSTAL: RESOURCE_CRYSTAL,
-      LIQUID: RESOURCE_LIQUID
-    };
-    if (map[s]) return map[s];
-    if (global[s]) return global[s];
-  }
-  return null;
+    if (p && (RECIPES[p] || (typeof COMMODITIES !== 'undefined' && COMMODITIES[p]))) return p;
+    if (typeof p === 'string') {
+        var s = p.trim().toUpperCase();
+        var map = {
+            // Energy
+            ENERGY:             RESOURCE_ENERGY,
+            RESOURCE_ENERGY:    RESOURCE_ENERGY,
+
+            // Compression outputs (bars)
+            OXIDANT:            RESOURCE_OXIDANT,
+            REDUCTANT:          RESOURCE_REDUCTANT,
+            'ZYNTHIUM BAR':     RESOURCE_ZYNTHIUM_BAR,  ZYNTHIUM_BAR:     RESOURCE_ZYNTHIUM_BAR,
+            'LEMERGIUM BAR':    RESOURCE_LEMERGIUM_BAR, LEMERGIUM_BAR:    RESOURCE_LEMERGIUM_BAR,
+            'UTRIUM BAR':       RESOURCE_UTRIUM_BAR,    UTRIUM_BAR:       RESOURCE_UTRIUM_BAR,
+            'KEANIUM BAR':      RESOURCE_KEANIUM_BAR,   KEANIUM_BAR:      RESOURCE_KEANIUM_BAR,
+            'GHODIUM MELT':     RESOURCE_GHODIUM_MELT,  GHODIUM_MELT:     RESOURCE_GHODIUM_MELT,
+            PURIFIER:           RESOURCE_PURIFIER,
+            BATTERY:            RESOURCE_BATTERY,
+
+            // Decompression outputs (raw minerals)
+            UTRIUM:             RESOURCE_UTRIUM,
+            LEMERGIUM:          RESOURCE_LEMERGIUM,
+            ZYNTHIUM:           RESOURCE_ZYNTHIUM,
+            KEANIUM:            RESOURCE_KEANIUM,
+            GHODIUM:            RESOURCE_GHODIUM,
+            OXYGEN:             RESOURCE_OXYGEN,
+            HYDROGEN:           RESOURCE_HYDROGEN,
+            CATALYST:           RESOURCE_CATALYST,
+
+            // Basic regional commodities
+            WIRE:               RESOURCE_WIRE,
+            CELL:               RESOURCE_CELL,
+            ALLOY:              RESOURCE_ALLOY,
+            CONDENSATE:         RESOURCE_CONDENSATE,
+
+            // Common higher commodities
+            COMPOSITE:          RESOURCE_COMPOSITE,
+            CRYSTAL:            RESOURCE_CRYSTAL,
+            LIQUID:             RESOURCE_LIQUID
+        };
+        if (map[s]) return map[s];
+        if (global[s]) return global[s];
+    }
+    return null;
 }
 
 function batchesFor(amount, recipe) { return Math.ceil(amount / recipe.out); }
 
-function haulerBody(energyAvail) {
-  var pairCost = 100; // CARRY+MOVE
-  var pairs = Math.max(3, Math.min(10, Math.floor(energyAvail / pairCost)));
-  var body = [];
-  for (var i = 0; i < pairs; i++) body.push(CARRY);
-  for (var j = 0; j < pairs; j++) body.push(MOVE);
-  return body;
-}
-
-function spawnFactoryBot(room, orderId) {
-  var state = getRoomState.get(room.name);
-  var spawns = (state && state.structuresByType && state.structuresByType[STRUCTURE_SPAWN]) || [];
-  var spawn;
-  for (var i = 0; i < spawns.length; i++) {
-    var s = spawns[i];
-    if (s.my && !s.spawning) { spawn = s; break; }
-  }
-  if (!spawn) return ERR_BUSY;
-
-  var body = haulerBody(spawn.room.energyAvailable);
-  var name = 'FactoryBot_' + room.name + '_' + Game.time;
-  var order = (Memory.factoryOrders || []).find(function(o){ return o.id === orderId; });
-  var memory = {
-    role: ROLE_NAME,
-    orderId: orderId,
-    homeRoom: room.name,
-    product: order ? order.product : undefined
-  };
-  return spawn.spawnCreep(body, name, { memory: memory });
+function hasMatchingFactoryEffect(factory, level) {
+    if (!factory || !factory.effects) return false;
+    for (var i = 0; i < factory.effects.length; i++) {
+        var effect = factory.effects[i];
+        if (effect.effect === PWR_OPERATE_FACTORY && effect.level === level
+                && (effect.ticksRemaining === undefined || effect.ticksRemaining > 0)) return true;
+    }
+    return false;
 }
 
 function enoughForOneBatchInFactory(factory, product) {
-  var rec = RECIPES[product];
-  if (!rec) return false;
-  if (rec.level && (factory.level || 0) < rec.level) return false;
-  for (var res in rec.inputs) {
-    var need = rec.inputs[res] || 0;
-    var have = (factory.store && factory.store[res]) || 0;
-    if (have < need) return false;
-  }
-  return true;
+    var rec = getRecipe(product);
+    if (!rec) return false;
+
+    if (rec.level) {
+        if ((factory.level || 0) !== rec.level || !hasMatchingFactoryEffect(factory, rec.level)) return false;
+    }
+
+    for (var res in rec.inputs) {
+        var need = rec.inputs[res] || 0;
+        var have = (factory.store && factory.store[res]) || 0;
+        if (have < need) return false;
+    }
+    return true;
+}
+
+function recipeInputTotal(recipe) {
+    var total = 0;
+    if (!recipe || !recipe.inputs) return total;
+    for (var res in recipe.inputs) total += recipe.inputs[res] || 0;
+    return total;
+}
+
+function factoryCapacity(factory) {
+    if (!factory || !factory.store || typeof factory.store.getCapacity !== 'function') return 0;
+    return factory.store.getCapacity() || 0;
+}
+
+function remainingBatchesForOrder(order, recipe) {
+    if (!order || !recipe) return 0;
+    return Math.ceil(Math.max(0, (order.requested || 0) - (order.progressOut || 0)) / Math.max(1, recipe.out || 1));
+}
+
+function maxBatchesPerCycle(factory, recipe, remainingBatches) {
+    var cap = factoryCapacity(factory);
+    var perBatchIn = recipeInputTotal(recipe);
+    var perBatchOut = recipe ? (recipe.out || 0) : 0;
+    if (cap <= 0 || perBatchIn <= 0 || perBatchOut <= 0) return 0;
+
+    // Inputs are loaded before the first produce call, so reserve enough free
+    // capacity for one output batch or a full input load can deadlock ERR_FULL.
+    if (perBatchIn + perBatchOut > cap) return 0;
+    // Stock before producing batch k is (B-k+1)*in + (k-1)*out, so the peak is
+    // at the start for in >= out but at the LAST batch for out > in
+    // (decompression: 300 in -> 500 out). Bound by both ends or late batches
+    // hit ERR_FULL and the cycle bounces to 'loading' with no way to resume.
+    var batches = Math.min(
+        Math.floor((cap - perBatchOut) / perBatchIn),
+        Math.floor((cap - perBatchIn) / perBatchOut)
+    );
+    if (remainingBatches != null) batches = Math.min(batches, remainingBatches);
+    return batches;
+}
+
+function factoryHasNonInputStock(factory, recipe, product) {
+    if (!factory || !factory.store) return false;
+    var inputs = (recipe && recipe.inputs) ? recipe.inputs : {};
+    for (var res in factory.store) {
+        if ((factory.store[res] || 0) <= 0) continue;
+        if (res === product) continue;
+        if (inputs[res] !== undefined && inputs[res] > 0) continue;
+        return true;
+    }
+    return false;
+}
+
+function factoryHasAnyStock(factory) {
+    if (!factory || !factory.store) return false;
+    for (var res in factory.store) {
+        if ((factory.store[res] || 0) > 0) return true;
+    }
+    return false;
+}
+
+function factoryStockTotal(factory) {
+    if (!factory || !factory.store) return 0;
+    var total = 0;
+    for (var res in factory.store) total += factory.store[res] || 0;
+    return total;
+}
+
+function prepareCycle(order, factory, recipe) {
+    var remaining = remainingBatchesForOrder(order, recipe);
+    if (remaining <= 0) return false;
+
+    var cycleBatches = maxBatchesPerCycle(factory, recipe, remaining);
+    if (cycleBatches <= 0) return false;
+
+    order.phase = 'loading';
+    order.cycleBatches = cycleBatches;
+    order.cycleBatchesQueued = 0;
+    order.cycleOutputTarget = cycleBatches * (recipe.out || 1);
+    order.cycleStartedTick = Game.time;
+    order.lastProgressTick = Game.time;
+    return true;
+}
+
+function resizeCycleToFit(order, factory, recipe) {
+    if (!order || !order.cycleBatches) return;
+    var remaining = remainingBatchesForOrder(order, recipe);
+    var cycleBatches = maxBatchesPerCycle(factory, recipe, remaining);
+    if (cycleBatches <= 0 || cycleBatches >= order.cycleBatches) return;
+
+    order.cycleBatches = cycleBatches;
+    order.cycleOutputTarget = cycleBatches * (recipe.out || 1);
+    if ((order.cycleBatchesQueued || 0) > cycleBatches) {
+        order.cycleBatchesQueued = cycleBatches;
+    }
+}
+
+// A cycle that bounced back to 'loading' mid-production (ERR_FULL relief) has
+// already consumed inputs for the queued batches, so gate re-entry on the
+// REMAINING batches only — comparing against the full cycle target can never
+// pass again and froze the order until the 20k broken-order breaker.
+function cycleRemainingBatches(order) {
+    return Math.max(0, (order.cycleBatches || 0) - (order.cycleBatchesQueued || 0));
+}
+
+function cycleInputsLoaded(factory, order, recipe) {
+    if (!factory || !factory.store || !order || !recipe) return false;
+    if (!order.cycleBatches) return false;
+    if (factoryHasNonInputStock(factory, recipe, order.product)) return false;
+    var remaining = cycleRemainingBatches(order);
+    if (remaining <= 0) return false;
+    for (var res in recipe.inputs) {
+        var need = (recipe.inputs[res] || 0) * remaining;
+        var have = factory.store[res] || 0;
+        if (have < need) return false;
+    }
+    if (factory.store.getFreeCapacity && (factory.store.getFreeCapacity() || 0) < (recipe.out || 0)) return false;
+    return true;
 }
 
 function tryProduce(factory, order) {
-  if (!factory || factory.cooldown) return false;
-  if (!enoughForOneBatchInFactory(factory, order.product)) return false;
-  var res = factory.produce(order.product);
-  if (res === OK) {
-    order.batchesQueued = (order.batchesQueued || 0) + 1;
-    order.progressOut = (order.batchesQueued * RECIPES[order.product].out);
-    order.lastProduceTick = Game.time;
-    return true;
-  }
-  return false;
+    if (!factory || factory.cooldown) return false;
+    if (!enoughForOneBatchInFactory(factory, order.product)) return false;
+    var res = factory.produce(order.product);
+    if (res === OK) {
+        var recipe = getRecipe(order.product);
+        order.cycleBatchesQueued = (order.cycleBatchesQueued || 0) + 1;
+        order.progressOut = (order.progressOut || 0) + (recipe ? recipe.out : 1);
+        order.lastProduceTick = Game.time;
+        order.lastProgressTick = Game.time;
+        memoryManager.requestSave();
+        return true;
+    }
+    // Log unexpected failures — enoughForOneBatch passed but produce failed
+    if (Game.time % 10 === 0) {
+        console.log('[Factory] produce() failed for ' + order.product
+            + ' in ' + order.room + ': ' + res
+            + ' (cooldown=' + factory.cooldown + ', level=' + (factory.level || 0) + ')');
+    }
+    return false;
+}
+
+function markBrokenOrder(order, reason) {
+    if (!order) return;
+    order.broken = true;
+    order.brokenReason = reason || 'stuck';
+    order.phase = 'unloading';
+    order.lastProgressTick = Game.time;
+    releaseOrderReservations(order);
+    memoryManager.requestSave();
+    console.log('[Factory] BROKEN order ' + order.id + ' in ' + order.room + ': ' + order.brokenReason);
 }
 
 function markActivePerRoom() {
-  // For each room, ensure the earliest non-done order is 'active', others 'queued'
-  var byRoom = _.groupBy(Memory.factoryOrders, function(o){ return o.room; });
-  for (var roomName in byRoom) {
-    var activated = false;
-    var list = byRoom[roomName];
-    for (var i = 0; i < list.length; i++) {
-      var order = list[i];
-      if (order.status === 'done' || order.status === 'cancelled') continue;
-      if (!activated) {
-        if (order.status !== 'active') order.status = 'active';
-        activated = true;
-      } else {
-        if (order.status !== 'queued') order.status = 'queued';
-      }
+    var byRoom = _.groupBy(Memory.factoryOrders, function(o) { return o.room; });
+    for (var roomName in byRoom) {
+        var activated = false;
+        var list = byRoom[roomName];
+        for (var i = 0; i < list.length; i++) {
+            var order = list[i];
+            if (order.status === 'done' || order.status === 'cancelled') continue;
+            if (!activated) {
+                if (order.status !== 'active') order.status = 'active';
+                activated = true;
+            } else {
+                if (order.status !== 'queued') order.status = 'queued';
+            }
+        }
     }
-  }
 }
 
-function needBotForRoom(roomName) {
-  // One hauler per room (since only one active order runs per room)
-  var existing = _.filter(Game.creeps, function(c){ return c.memory.role === ROLE_NAME && (c.memory.homeRoom === roomName); });
-  return existing.length === 0;
+/**
+ * Returns true if a supplier is actively working on a factory task for this
+ * room. Used to prevent the auto-complete race condition where inputs in the
+ * supplier's carry are invisible to countInRoom.
+ */
+function supplierActiveForRoom(roomName) {
+    return _.some(getRoomState.creepIndex().all, function(c) {
+        if (!c.memory || c.memory.role !== 'supplier') return false;
+        if (c.memory.homeRoom !== roomName) return false;
+        if (!c.memory.a) return false;
+        return c.memory.a.indexOf('factory_input|') === 0
+            || c.memory.a.indexOf('factory_output|') === 0
+            || c.memory.a.indexOf('factory_drain|') === 0;
+    });
+}
+
+// Returns true if the active factory order in `roomName` is waiting on
+// supplier logistics (loading inputs / not yet ready to process) and no
+// supplier is currently working on it. Mirrors labsNeedWork semantics.
+function factoryNeedsWork(roomName) {
+    ensureMemory();
+    var order = _.find(Memory.factoryOrders, function(o) {
+        return o.room === roomName && o.status === 'active';
+    });
+    if (!order) return false;
+    var room = Game.rooms[roomName];
+    if (!room) return false;
+    var factory = findFactory(room);
+    if (!factory) return false;
+    var recipe = getRecipe(order.product);
+    if (!recipe) return false;
+
+    // Done / broken / unloading orders don't need logistics help to advance.
+    if (order.status !== 'active') return false;
+    if (order.broken) return false;
+
+    // If remaining batches haven't all been processed and we're either
+    // still loading inputs into the factory or haven't yet prepared a
+    // cycle, the supplier has work to do — unless one is already active.
+    var remaining = remainingBatchesForOrder(order, recipe);
+    if (remaining <= 0) return false;
+
+    if (order.phase === 'processing' && cycleInputsLoaded(factory, order, recipe)) {
+        return false;
+    }
+    return !supplierActiveForRoom(roomName);
 }
 
 function orderSummary(order) {
-  return '[#' + order.id + '] ' + order.room + ' -> ' + order.product + ' | requested: ' + order.requested + ', queuedOut: ' + (order.progressOut || 0) + ', status: ' + order.status;
+    return '[#' + order.id + '] ' + order.room + ' -> ' + order.product
+        + ' | requested: ' + order.requested
+        + ', producedOut: ' + (order.progressOut || 0)
+        + ', phase: ' + (order.phase || 'unknown')
+        + ', status: ' + order.status;
 }
 
-// Compute the maximum number of batches possible in a room for a given recipe
 function maxBatchesForRoom(room, recipe) {
-  var minBatches = Infinity;
-  for (var res in recipe.inputs) {
-    var perBatch = recipe.inputs[res] || 0;
-    if (perBatch <= 0) continue;
-    var have = countInRoom(room, res);
-    var possible = Math.floor(have / perBatch);
-    if (possible < minBatches) minBatches = possible;
-  }
-  if (minBatches === Infinity) return 0;
-  return minBatches;
+    var minBatches = Infinity;
+    for (var res in recipe.inputs) {
+        var perBatch = recipe.inputs[res] || 0;
+        if (perBatch <= 0) continue;
+        var have = effectiveAvailable(room, res);
+        var possible = Math.floor(have / perBatch);
+        if (possible < minBatches) minBatches = possible;
+    }
+    if (minBatches === Infinity) return 0;
+    return minBatches;
+}
+
+function rawBatchesForRoom(room, recipe) {
+    var minBatches = Infinity;
+    for (var res in recipe.inputs) {
+        var perBatch = recipe.inputs[res] || 0;
+        if (perBatch <= 0) continue;
+        minBatches = Math.min(minBatches, Math.floor(countInRoom(room, res) / perBatch));
+    }
+    return minBatches === Infinity ? 0 : minBatches;
 }
 
 function maxAmountForRoom(room, recipe) {
-  var batches = maxBatchesForRoom(room, recipe);
-  return batches * recipe.out;
+    var batches = maxBatchesForRoom(room, recipe);
+    return batches * recipe.out;
 }
 
-// Console: place an order (REFUSES unless full resources are present)
-// Supports amount = 'max' to compute the maximum producible amount from room resources.
+// ─── Console commands ────────────────────────────────────────────────────────
+
 global.orderFactory = function(roomName, productLike, amount) {
-  ensureMemory();
-  if (amount === undefined) amount = 100;
+    ensureMemory();
+    if (amount === undefined) amount = 100;
 
-  var room = Game.rooms[roomName];
-  if (!room || !roomOwned(room)) return '[Factory] Invalid or not-owned room: ' + roomName;
+    var room = Game.rooms[roomName];
+    if (!room || !roomOwned(room)) return '[Factory] Invalid or not-owned room: ' + roomName;
 
-  var factory = findFactory(room);
-  if (!factory) return '[Factory] No Factory in ' + roomName + '. Build one at RCL7.';
-  var product = normalizeProduct(productLike);
-  if (!product || !RECIPES[product]) return '[Factory] Unknown or unsupported product: ' + productLike;
+    var product = normalizeProduct(productLike);
+    var recipe  = product ? getRecipe(product) : null;
+    if (!recipe) return '[Factory] Unknown or unsupported product: ' + productLike;
 
-  var recipe = RECIPES[product];
+    var factory = findFactory(room);
+    if (!factory) return '[Factory] No Factory in ' + roomName + '. Build one at RCL7.';
 
-  // Enforce factory level requirement (if any)
-  if (recipe.level && (factory.level || 0) < recipe.level) {
-    return '[Factory] REFUSED: Factory level ' + (factory.level || 0) + ' in ' + roomName + ' is insufficient for ' + product + ' (requires level ' + recipe.level + ').';
-  }
-
-  // Determine batches and amount
-  var batches;
-  var isMax = (typeof amount === 'string') && (amount.trim().toLowerCase() === 'max');
-  if (isMax) {
-    // Only full batches count for 'max'
-    batches = maxBatchesForRoom(room, recipe);
-    if (batches <= 0) {
-      return '[Factory] REFUSED: Not enough inputs in ' + roomName + ' for one batch of ' + product;
+    if (recipe.level && ((factory.level || 0) !== recipe.level || !hasMatchingFactoryEffect(factory, recipe.level))) {
+        return '[Factory] REFUSED: Factory in ' + roomName + ' requires exact level ' + recipe.level
+            + ' with a live matching PWR_OPERATE_FACTORY effect for ' + product
+            + ' (current level ' + (factory.level || 0) + ').';
     }
-    amount = batches * recipe.out; // derive amount from full batches
-  } else {
-    batches = batchesFor(amount, recipe); // ceil for user-specified amount is correct
-  }
 
-  // Build need map per resource based on batches
-  var needMap = {};
-  for (var res in recipe.inputs) {
-    needMap[res] = (recipe.inputs[res] || 0) * batches;
-  }
-
-  // Verify we have everything in-room
-  var missing = [];
-  for (var r in needMap) {
-    var have = countInRoom(room, r);
-    var need = needMap[r];
-    if (have < need) {
-      missing.push(r + ' ' + have + '/' + need);
+    var oneBatchCapacity = recipeInputTotal(recipe) + (recipe.out || 0);
+    if (factoryCapacity(factory) < oneBatchCapacity) {
+        return '[Factory] REFUSED: Factory capacity in ' + roomName + ' is too small for one batch of ' + product;
     }
-  }
 
-  if (missing.length > 0) {
-    return '[Factory] REFUSED: Missing inputs in ' + roomName + ' -> ' + missing.join(', ');
-  }
+    var batches;
+    var isMax = (typeof amount === 'string') && (amount.trim().toLowerCase() === 'max');
+    if (isMax) {
+        batches = maxBatchesForRoom(room, recipe);
+        if (batches <= 0) {
+            return '[Factory] REFUSED: Not enough inputs in ' + roomName
+                + ' for one batch of ' + product;
+        }
+        amount = batches * recipe.out;
+    } else {
+        batches = batchesFor(amount, recipe);
+    }
 
-  var id = roomName + '_' + product + '_' + Game.time;
-  var order = {
-    id: id, room: roomName, product: product, requested: amount,
-    status: 'queued', created: Game.time,
-    batchesQueued: 0, progressOut: 0, lastProduceTick: 0
-  };
-  Memory.factoryOrders.push(order);
+    var needMap = {};
+    for (var res in recipe.inputs) needMap[res] = (recipe.inputs[res] || 0) * batches;
 
-  // Set active if first in queue for this room
-  markActivePerRoom();
+    var missing = [];
+    for (var r in needMap) {
+        var have = countInRoom(room, r);
+        var need = needMap[r];
+        if (have < need) missing.push(r + ' ' + have + '/' + need);
+    }
+    if (missing.length > 0) {
+        return '[Factory] REFUSED: Missing inputs in ' + roomName + ' -> ' + missing.join(', ');
+    }
 
-  // Spawn a hauler immediately if this room's order is active and no bot exists
-  var isActive = Memory.factoryOrders.find(function(o){ return o.room === roomName && o.status === 'active' && o.id === id; });
-  if (isActive && needBotForRoom(roomName)) spawnFactoryBot(room, id);
+    var id = roomName + '_' + product + '_' + Game.time;
+    var order = {
+        id: id, room: roomName, product: product, requested: amount,
+        status: 'queued', created: Game.time,
+        phase: 'loading',
+        cycleBatches: 0, cycleBatchesQueued: 0, cycleOutputTarget: 0,
+        progressOut: 0, lastProduceTick: 0, lastProgressTick: 0
+    };
 
-  return '[Factory] Order accepted. ' + orderSummary(order);
+    // ── storageManager v2: reserve inputs against this order ───────────────
+    // Each order gets a unique program name (including order id). This prevents
+    // a queued order from replacing an active order's reservation and vice versa.
+    // The memory cost is small (~60 bytes per reservation) and guarantees that
+    // queued orders that eventually become active still hold their reservations.
+    if (v2Enabled(roomName)) {
+        order.reservationProgram = 'factoryManager_' + product + '_' + id + '_' + Math.random().toString(36).substr(2, 6);
+        var reservedKeys = [];
+        var reservedOk = true;
+        for (var resR in needMap) {
+            var info = storageManager.storageFind(roomName, resR);
+            var termFree = info.terminal.total - info.terminal.reserved;
+            var storFree = info.storage.total  - info.storage.reserved;
+            var need = needMap[resR];
+            if (termFree + storFree < need) {
+                reservedOk = false;
+                break;
+            }
+            var fromTerm = Math.min(need, termFree);
+            var fromStor = need - fromTerm;
+            if (fromTerm > 0) {
+                var r1 = storageManager.reserve(roomName, resR, 'terminal', order.reservationProgram, fromTerm);
+                reservedKeys.push({ r: resR, b: 'terminal' });
+                if (!r1.ok) { reservedOk = false; break; }
+            }
+            if (fromStor > 0) {
+                var r2 = storageManager.reserve(roomName, resR, 'storage', order.reservationProgram, fromStor);
+                reservedKeys.push({ r: resR, b: 'storage' });
+                if (!r2.ok) { reservedOk = false; break; }
+            }
+        }
+        if (!reservedOk) {
+            // Roll back partial reservations before refusing
+            for (var k = 0; k < reservedKeys.length; k++) {
+                storageManager.unReserve(roomName, reservedKeys[k].r, reservedKeys[k].b, order.reservationProgram);
+            }
+            delete order.reservationProgram;
+            return '[Factory] REFUSED: Insufficient unreserved inputs in ' + roomName + ' for ' + product;
+        }
+    }
+
+    Memory.factoryOrders.push(order);
+    memoryManager.requestSave();
+
+    markActivePerRoom();
+
+    return '[Factory] Order accepted. ' + orderSummary(order);
 };
 
 global.cancelFactoryOrder = function(idOrRoom, productLike) {
-  ensureMemory();
-  if (!Memory.factoryOrders.length) return '[Factory] No orders.';
-  var removed = 0;
+    ensureMemory();
+    if (!Memory.factoryOrders.length) return '[Factory] No orders.';
+    var removed = 0;
 
-  if (productLike) {
-    var product = normalizeProduct(productLike);
-    Memory.factoryOrders = Memory.factoryOrders.filter(function(o){
-      var match = (o.id === idOrRoom || o.room === idOrRoom) && o.product === product;
-      if (match) removed++;
-      return !match;
-    });
-  } else {
-    Memory.factoryOrders = Memory.factoryOrders.filter(function(o){
-      var match = (o.id === idOrRoom || o.room === idOrRoom);
-      if (match) removed++;
-      return !match;
-    });
-  }
+    function cancelOne(o) {
+        if (o.reservationProgram) releaseOrderReservations(o);
+        removed++;
+    }
 
-  markActivePerRoom();
-  return removed ? '[Factory] Cancelled ' + removed + ' order(s).' : '[Factory] No matching orders.';
+    if (productLike) {
+        var product = normalizeProduct(productLike);
+        Memory.factoryOrders = Memory.factoryOrders.filter(function(o) {
+            var match = (o.id === idOrRoom || o.room === idOrRoom) && o.product === product;
+            if (match) cancelOne(o);
+            return !match;
+        });
+    } else {
+        Memory.factoryOrders = Memory.factoryOrders.filter(function(o) {
+            var match = (o.id === idOrRoom || o.room === idOrRoom);
+            if (match) cancelOne(o);
+            return !match;
+        });
+    }
+
+    markActivePerRoom();
+    if (removed) memoryManager.requestSave();
+    return removed ? '[Factory] Cancelled ' + removed + ' order(s).' : '[Factory] No matching orders.';
 };
 
-// Backward-compatible listing; now supports optional roomName and delegates to listFactoryOrders
 global.factoryOrders = function(roomName) {
-  return global.listFactoryOrders(roomName);
+    return global.listFactoryOrders(roomName);
 };
 
-// Console helper: list orders globally or for a specific room (matches documented usage)
 global.listFactoryOrders = function(roomName) {
-  ensureMemory();
-  var list = Memory.factoryOrders;
-  if (!list.length) return '[Factory] No active orders.';
-  if (roomName) {
-    list = list.filter(function(o){ return o.room === roomName; });
-    if (!list.length) return '[Factory] No active orders in ' + roomName + '.';
-  }
-  return list.map(orderSummary).join('\n');
+    ensureMemory();
+    var list = Memory.factoryOrders;
+    if (!list.length) return '[Factory] No active orders.';
+    if (roomName) {
+        list = list.filter(function(o) { return o.room === roomName; });
+        if (!list.length) return '[Factory] No active orders in ' + roomName + '.';
+    }
+    return list.map(orderSummary).join('\n');
 };
 
-// Tick
-function run() {
-  ensureMemory();
-  getRoomState.init();
-  markActivePerRoom();
+global.showFactories = function(roomName) {
+    if (typeof roomName !== 'string') return '[Factory] Usage: showFactories(roomName)';
+    ensureMemory();
 
-  // Process per-room active orders
-  var activeByRoom = _.groupBy(Memory.factoryOrders.filter(function(o){ return o.status === 'active'; }), function(o){ return o.room; });
-
-  for (var roomName in activeByRoom) {
     var room = Game.rooms[roomName];
-    if (!room || !roomOwned(room)) continue;
+    if (!room || !roomOwned(room)) return '[Factory] ' + roomName + ' — no vision or not owned';
 
     var factory = findFactory(room);
-    if (!factory) continue;
+    var lines = [];
 
-    var order = activeByRoom[roomName][0]; // FIFO: first active for this room
-    // Maintain one hauler
-    if (needBotForRoom(roomName)) spawnFactoryBot(room, order.id);
+    if (!factory) {
+        lines.push('factory: none');
+    } else {
+        var stockTotal = factoryStockTotal(factory);
 
-    // Try to start batches as soon as possible
-    tryProduce(factory, order);
-
-    // Finish when queued output meets request (we count batches started)
-    if ((order.progressOut || 0) >= order.requested) {
-      order.status = 'done';
+        // Top 3 stored resources by amount.
+        var entries = [];
+        if (factory.store) {
+            for (var res in factory.store) {
+                var amt = factory.store[res] || 0;
+                if (amt > 0) entries.push([res, amt]);
+            }
+        }
+        entries.sort(function(a, b) { return b[1] - a[1]; });
+        var top = entries.slice(0, 3)
+            .map(function(e) { return e[0] + ':' + e[1]; })
+            .join(', ') || '—';
+        lines.push('factory stock: ' + stockTotal + ' (top: ' + top + ')');
     }
 
-    // Auto-complete if the room no longer has enough inputs for even one more
-    // batch AND the factory itself doesn't have enough loaded either.
-    // This prevents the bot from spawning forever when an over-ordered run
-    // exhausts a resource mid-way through (e.g. 44 L remaining but 500 needed).
-    if (order.status === 'active') {
-      var recipe = RECIPES[order.product];
-      if (recipe && !enoughForOneBatchInFactory(factory, order.product)
-          && maxBatchesForRoom(room, recipe) <= 0) {
-        console.log('[Factory] Auto-completing order ' + order.id
-          + ': not enough inputs remain for another batch ('
-          + (order.progressOut || 0) + '/' + order.requested + ' produced).');
-        order.status = 'done';
-      }
-    }
-  }
+    // Orders for this room.
+    var roomOrders = Memory.factoryOrders.filter(function(o) { return o.room === roomName; });
+    var active = _.find(roomOrders, function(o) { return o.status === 'active'; });
+    var queuedCount = _.filter(roomOrders, function(o) { return o.status === 'queued'; }).length;
 
-  // Cleanup done orders and let next queued become active
-  var before = Memory.factoryOrders.length;
-  Memory.factoryOrders = Memory.factoryOrders.filter(function(o){ return o.status !== 'done' && o.status !== 'cancelled'; });
-  if (Memory.factoryOrders.length !== before) {
+    if (active) {
+        var phase = active.phase || 'unknown';
+        var produced = active.progressOut || 0;
+        var requested = active.requested || 0;
+        var status = active.broken ? ' (BROKEN)' : '';
+        var line = 'Active: ' + active.product + ' [' + phase + ']' + status
+            + ' | progress ' + produced + '/' + requested;
+        var showSince = active.cycleStartedTick || active.created;
+        if (showSince) {
+            line += ' | age ' + (Game.time - showSince) + '/' + FACTORY_BROKEN_ORDER_TICKS;
+        }
+        lines.push(line);
+    } else {
+        lines.push('Active: none');
+    }
+    lines.push('Queue: ' + queuedCount);
+
+    var needsWork = factoryNeedsWork(roomName);
+    lines.push('Needs supplier: ' + (needsWork ? 'YES' : 'NO'));
+
+    return '[Factory] ' + roomName + ' — ' + lines.join(' | ');
+};
+
+global.showAllFactories = function() {
+    ensureMemory();
+    var ownedNames = getRoomState.ownedNames();
+    var results = [];
+    for (var i = 0; i < ownedNames.length; i++) {
+        results.push(global.showFactories(ownedNames[i]));
+    }
+    return results.length ? results.join('\n') : '[Factory] No owned rooms';
+};
+
+// ─── Main tick ───────────────────────────────────────────────────────────────
+
+function run() {
+    ensureMemory();
     markActivePerRoom();
-  }
+
+    var activeByRoom = _.groupBy(
+        Memory.factoryOrders.filter(function(o) { return o.status === 'active'; }),
+        function(o) { return o.room; }
+    );
+
+    for (var roomName in activeByRoom) {
+        var room = Game.rooms[roomName];
+        if (!room || !roomOwned(room)) continue;
+        if (roomSuspender.shouldAvoidRoomWork(roomName)) continue;
+
+        var order   = activeByRoom[roomName][0];
+        var recipe  = getRecipe(order.product);
+        var factory = findFactory(room);
+        if (!factory) continue;
+
+        if (!order.phase) order.phase = 'loading';
+        if (!order.lastProgressTick) order.lastProgressTick = Game.time;
+
+        if (!order.broken) {
+            var stuckTicks = Game.time - (order.lastProgressTick || order.created || Game.time);
+            if (stuckTicks > FACTORY_BROKEN_ORDER_TICKS) {
+                markBrokenOrder(order, 'no progress for ' + stuckTicks + ' ticks');
+            } else if (stuckTicks > 1000 && Game.time % 100 === 0) {
+                console.log('[Factory] Order ' + order.id + ' (' + order.room + ' -> ' + order.product
+                    + ') stalled in phase ' + (order.phase || 'loading') + ' for ' + stuckTicks + ' ticks');
+            }
+        }
+
+        if (order.broken) {
+            order.phase = 'unloading';
+            if (!factoryHasAnyStock(factory)) {
+                order.status = 'cancelled';
+            }
+            continue;
+        }
+
+        var remainingBatches = remainingBatchesForOrder(order, recipe);
+        if (remainingBatches <= 0) {
+            if (!factoryHasAnyStock(factory)) {
+                order.status = 'done';
+            } else {
+                order.phase = 'unloading';
+            }
+            continue;
+        }
+
+        if (order.phase === 'loading') {
+            if (!supplierActiveForRoom(roomName) && !factoryHasAnyStock(factory)
+                    && rawBatchesForRoom(room, recipe) <= 0) {
+                markBrokenOrder(order, 'insufficient accessible inputs for remaining production');
+                order.status = 'cancelled';
+                memoryManager.requestSave();
+                continue;
+            }
+            if (!order.cycleBatches && !prepareCycle(order, factory, recipe)) {
+                if (factoryHasAnyStock(factory)) {
+                    order.phase = 'unloading';
+                }
+                continue;
+            }
+
+            resizeCycleToFit(order, factory, recipe);
+
+            if (order.cycleBatches && cycleRemainingBatches(order) <= 0) {
+                order.phase = 'unloading';
+            } else if (cycleInputsLoaded(factory, order, recipe)) {
+                order.phase = 'processing';
+            } else if (!supplierActiveForRoom(roomName) && rawBatchesForRoom(room, recipe) <= 0) {
+                markBrokenOrder(order, 'insufficient accessible inputs for remaining production');
+            }
+        }
+
+        if (order.phase === 'processing') {
+            if (cycleRemainingBatches(order) <= 0) {
+                order.phase = 'unloading';
+            } else if (factory.store.getFreeCapacity && (factory.store.getFreeCapacity() || 0) < (recipe.out || 0)) {
+                order.phase = 'loading';
+                continue;
+            } else {
+                tryProduce(factory, order);
+
+                if (!supplierActiveForRoom(roomName) && rawBatchesForRoom(room, recipe) <= 0
+                        && !enoughForOneBatchInFactory(factory, order.product)) {
+                    markBrokenOrder(order, 'insufficient accessible inputs for remaining production');
+                }
+
+                if (cycleRemainingBatches(order) <= 0) {
+                    order.phase = 'unloading';
+                }
+
+                if (recipe && !supplierActiveForRoom(roomName)
+                        && maxBatchesForRoom(room, recipe) <= 0
+                        && !factoryHasAnyStock(factory)
+                        && (order.progressOut || 0) > 0) {
+                    order.phase = 'unloading';
+                }
+            }
+        }
+
+        if (order.phase === 'unloading') {
+            // Supplier hauling counts as progress — without this a completed
+            // order's broken-timer keeps running from the last produce call.
+            var unloadStock = factoryStockTotal(factory);
+            if (order.unloadStock === undefined || unloadStock < order.unloadStock) {
+                order.lastProgressTick = Game.time;
+            }
+            order.unloadStock = unloadStock;
+
+            if (!factoryHasAnyStock(factory)) {
+                delete order.unloadStock;
+                if ((order.progressOut || 0) >= order.requested) {
+                    order.status = 'done';
+                } else if (prepareCycle(order, factory, recipe)) {
+                    if (!supplierActiveForRoom(roomName) && rawBatchesForRoom(room, recipe) <= 0) {
+                        markBrokenOrder(order, 'insufficient accessible inputs for remaining production');
+                        order.status = 'cancelled';
+                        memoryManager.requestSave();
+                    } else {
+                        order.phase = 'loading';
+                    }
+                } else {
+                    order.status = 'done';
+                }
+            }
+        }
+    }
+
+    // Cleanup completed orders — release v2 reservations before dropping
+    var before = Memory.factoryOrders.length;
+    Memory.factoryOrders = Memory.factoryOrders.filter(function(o) {
+        if (o.status === 'done' || o.status === 'cancelled') {
+            recordCompletedOrder(o);
+            releaseOrderReservations(o);
+            return false;
+        }
+        return true;
+    });
+    if (Memory.factoryOrders.length !== before) {
+        markActivePerRoom();
+    }
 }
 
-module.exports = { run: run, RECIPES: RECIPES };
+module.exports = { run: run, RECIPES: RECIPES, getRecipe: getRecipe };

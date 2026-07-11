@@ -1,6 +1,7 @@
+// LLM: Read llmcontext.js before reviewing or changing this file.
 // marketQuery.js
 // Provides a global console command to query Screeps market prices.
-// - Default: 48-hour weighted average (approx.) using Game.market.getHistory
+// - Default: 48-hour weighted average (approx.) via marketPricing.getAvg48h
 // - 'buy'  : Top 5 buy orders (highest price first)
 // - 'sell' : Top 5 sell orders (lowest price first)
 //
@@ -19,6 +20,9 @@
 //   value (e.g. RESOURCE_ENERGY), that works too.
 
 (function registerMarketPriceGlobal() {
+  var util = require('util');
+  var pricing = require('marketPricing');
+
   function resolveResource(input) {
     // If the user passed the actual constant value (e.g. RESOURCE_ENERGY -> 'energy'), accept it.
     if (typeof input === 'string' && typeof RESOURCES_ALL !== 'undefined') {
@@ -66,46 +70,29 @@
   }
 
   function getAvg48hString(resource) {
-    // Game.market.getHistory(resource) returns daily entries for ~last 14 days:
-    // { resourceType, date, transactions, volume, avgPrice, stddevPrice }
-    var hist = Game.market.getHistory(resource) || [];
-    if (!hist || hist.length === 0) {
+    // Computation lives in marketPricing.getAvg48h (volume-weighted over the
+    // last two daily history entries); this just formats the console string.
+    var hist = pricing.getHistDays(resource) || [];
+    if (hist.length === 0) {
       return '[Market] No history for ' + resource;
     }
 
-    // Take last two days (approx. 48h window).
-    var last = hist[hist.length - 1];
-    var prev = hist.length >= 2 ? hist[hist.length - 2] : null;
-
-    var sumPV = 0;
-    var sumV = 0;
-
-    if (last && typeof last.avgPrice === 'number' && typeof last.volume === 'number') {
-      sumPV += last.avgPrice * last.volume;
-      sumV += last.volume;
-    }
-    if (prev && typeof prev.avgPrice === 'number' && typeof prev.volume === 'number') {
-      sumPV += prev.avgPrice * prev.volume;
-      sumV += prev.volume;
-    }
-
-    if (sumV <= 0) {
-      // Fallback to last day avg if no volume or incomplete data
-      if (last && typeof last.avgPrice === 'number') {
-        return '[Market] ' + resource + ' 48h avg (approx): ' + formatPrice(last.avgPrice) +
-               ' (volume: ' + (last.volume || 0) + ', days=1)';
-      }
+    var avg = pricing.getAvg48h(resource);
+    if (avg === null) {
       return '[Market] No usable history for ' + resource;
     }
 
-    var avg = sumPV / sumV;
+    var last = hist[hist.length - 1];
+    var prev = hist.length >= 2 ? hist[hist.length - 2] : null;
+    var vol = ((last && last.volume) || 0) + ((prev && prev.volume) || 0);
     return '[Market] ' + resource + ' 48h avg (approx): ' + formatPrice(avg) +
-           ' (volume: ' + sumV + ', days=' + (prev ? 2 : 1) + ')';
+           ' (volume: ' + vol + ', days=' + (prev ? 2 : 1) + ')';
   }
 
   function getTopOrdersString(resource, mode) {
     var type = mode === 'buy' ? ORDER_BUY : ORDER_SELL;
-    var all = Game.market.getAllOrders({ resourceType: resource, type: type }) || [];
+    // maxAge 0: this is a console-only command, always show live data.
+    var all = util.marketOrders(resource, type, 0);
     // Keep only orders with remaining amount
     var valid = [];
     for (var i = 0; i < all.length; i++) {

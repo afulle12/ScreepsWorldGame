@@ -1,3 +1,4 @@
+// LLM: Read llmcontext.js before reviewing or changing this file.
 // roleRemoteBuilder.js
 // Purpose: Remote builder wrapper that forces travel to a target room, avoids hard-coded rooms,
 //          and reuses roleBuilder logic inside the target room.
@@ -12,7 +13,7 @@
 //   - UPDATED: If sources in target room are inaccessible while filling, return home for energy.
 //   - UPDATED: If target room is owned by a friendly player (IFF whitelist), return home for energy.
 //
-//    remoteBuilder('SpawningRoom', 'WorkingRoom', Number) to create/update an order.
+//    remoteBuilder('SpawningRoom', 'WorkingRoom', Number) to CREATE or UPDATE an order.
 //    cancelRemoteBuilder('SpawningRoom', 'WorkingRoom') to cancel an order.
 //    listRemoteBuilders() to list active orders.
 
@@ -22,10 +23,12 @@
 
 var roleBuilder = require('roleBuilder');
 var iff = require('iff');
+var getRoomState = require('getRoomState');
 
 // Hard-coded rooms to avoid (edit to your needs)
 var REMOTE_AVOID_ROOMS = {
    'E8N49': true,
+   'W8N49': true,
   // 'W2N3': true
 };
 
@@ -196,3 +199,71 @@ var roleRemoteBuilder = {
 };
 
 module.exports = roleRemoteBuilder;
+
+global.remoteBuilder = function(homeRoom, targetRoom, count) {
+  if (!homeRoom || !targetRoom || !count || parseInt(count, 10) <= 0) {
+    return "[RemoteBuilder] Invalid command. Use: remoteBuilder('homeRoom', 'targetRoom', count)";
+  }
+
+  var home = Game.rooms[homeRoom];
+  if (!home || !home.controller || !home.controller.my) {
+    return "[RemoteBuilder] Invalid home room: " + homeRoom + ". Must be a room you own.";
+  }
+
+  if (!Memory.remoteBuilderOrders) Memory.remoteBuilderOrders = {};
+  var key = homeRoom + '->' + targetRoom;
+
+  var existing = Memory.remoteBuilderOrders[key];
+  if (existing) {
+    existing.count = parseInt(count, 10);
+    existing.updatedAt = Game.time;
+    return "[RemoteBuilder] Updated order " + key + " to count=" + existing.count;
+  } else {
+    Memory.remoteBuilderOrders[key] = {
+      homeRoom: homeRoom,
+      targetRoom: targetRoom,
+      count: parseInt(count, 10),
+      createdAt: Game.time,
+      updatedAt: Game.time
+    };
+    return "[RemoteBuilder] Order created: " + key + " with count=" + count;
+  }
+};
+
+global.cancelRemoteBuilder = function(homeRoom, targetRoom) {
+  if (!homeRoom || !targetRoom) {
+    return "[RemoteBuilder] Invalid command. Use: cancelRemoteBuilder('homeRoom', 'targetRoom')";
+  }
+  if (!Memory.remoteBuilderOrders) return "[RemoteBuilder] No remote builder orders exist.";
+
+  var key = homeRoom + '->' + targetRoom;
+  if (!Memory.remoteBuilderOrders[key]) {
+    return "[RemoteBuilder] No order found for " + key + ".";
+  }
+
+  delete Memory.remoteBuilderOrders[key];
+  return "[RemoteBuilder] Cancelled order for " + key + ". Existing creeps will not be replaced.";
+};
+
+global.listRemoteBuilders = function() {
+  if (!Memory.remoteBuilderOrders || Object.keys(Memory.remoteBuilderOrders).length === 0) {
+    return "[RemoteBuilder] No active remote builder orders.";
+  }
+
+  var lines = [];
+  for (var key in Memory.remoteBuilderOrders) {
+    var o = Memory.remoteBuilderOrders[key];
+    var living = _.filter(getRoomState.creepIndex().all, function(c) {
+      return c.memory &&
+             c.memory.role === 'remoteBuilder' &&
+             c.memory.homeRoom === o.homeRoom &&
+             c.memory.targetRoom === o.targetRoom;
+    }).length;
+
+    lines.push(o.homeRoom + " -> " + o.targetRoom +
+               " | desired=" + o.count +
+               " | living=" + living +
+               " | key=" + key);
+  }
+  return lines.join(" || ");
+};
