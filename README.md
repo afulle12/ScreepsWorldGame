@@ -1,329 +1,290 @@
-# Screeps Colony – README
-Version: 2026-02-18
+# Screeps Colony
+
+Last synchronized: 2026-07-10
 
 ## Overview
 
-This repository runs a multi-room Screeps AI that automates economy, logistics, combat, market play, and late-game strategy. The codebase is modular: each subsystem lives in its own module and is orchestrated from the main loop. The latest release massively expands automated market trading (arbitrage, forward/reverse lab pipelines, auto-trading), adds a full intelligence and reconnaissance suite, introduces Power Creep support, and brings new combat roles for contested room operations.
+This repository contains a multi-room Screeps World AI for colony economy, logistics, defense, combat, reconnaissance, production, market trading, Power Creeps, and CPU management. `main.js` is the loop entry point and coordinates the modules under `Bots/`, `Scanners/`, and `Utilities/`.
 
-## Core Systems
+The current tree was synchronized from the active Screeps script branch on 2026-07-10. Related workflows are deliberately consolidated where they share state or scarce resources. For example, `Scanners/scanner.js` owns observer scheduling and intelligence workflows, `Utilities/marketLab.js` owns both forward and reverse market-lab pipelines, and `Bots/roleRepairer.js` executes several repair role aliases.
 
-### Creep & Squad Roles
+## Runtime Architecture
 
-- Harvesters
-- Upgraders
-- Builders
-- Suppliers / Haulers
-- Scouts
-- Defenders
-- Attackers
-- Thieves (with order system and observer-scanned routing)
-- Tower Drainers (full 4-position bounce mechanic with route scanning)
-- Demolition teams
-- Contested Demolishers (paired demolisher system for hostile rooms)
-- Claimbots (with hardcoded route support)
-- Mineral Collectors
-- Extractors
-- Factory Bots
-- Lab Bots (forward and reverse reaction support)
-- Power Bots (with low-TTL resource recovery)
-- Operators (Power Creep controller with modular power priorities)
-- Remote Builders
-- Deposit Harvesters
-- Signers
-- Wall Repair
-- Terminal Bots
-- Squad members and multi-creep mission roles
+### Main Loop
 
-Each role owns its behavior module, with spawn bodies tuned for distance, TTL, or mission needs. Specialized teams (tower drainers, demolition, contested demolishers, thieves) use observer-scanned routing and staged/rally logic for multi-room operations.
+`main.js` loads the complete CommonJS module set and exports the Screeps loop. A tick broadly performs the following work:
 
-### Infrastructure & Room Intelligence
+1. Restore the retained heap-backed Memory object.
+2. Calculate the CPU budget and scheduler pressure.
+3. Refresh profiling caches, statistics, and room-state data.
+4. Plan room suspension and claim-range checks.
+5. Run critical defense, tower, repair, and link work.
+6. Run infrastructure, production, logistics, market, and scanner state machines.
+7. Spawn and execute normal creeps and configured Power Creeps.
+8. Run profiling, scheduled tasks, reports, mapping, and CPU telemetry.
 
-- Room state caching: centralized, cached views of structures, creeps, and key room metadata.
-- Room intelligence scoring: weighted analysis of rooms across Economic (25%), Military (30%), and Dual Purpose (45%) categories with auto-expiring caches.
-- Observer scanning: scheduled room visibility sweeps with fallback chain (structural observer → Operator with PWR_OPERATE_OBSERVER → manual scouting).
-- Wide scan: full observer-range sweep to find all rooms owned by a target player.
-- Player analysis: multi-phase intelligence pipeline (wideScan → roomIntel → comprehensive report with strength classifications, aggregated scores, and nuke capability comparison).
-- Room navigation: shared A* room-level pathfinder respecting observer-scanned blocked rooms and custom ban lists.
-- Managers:
-  - Link routing and energy distribution
-  - Terminal balancing and transfers
-  - Towers (streamlined cached-target defense/heal/repair)
-  - Factory production order handling (with COMMODITIES fallback for advanced recipes)
-  - Lab reaction workflows (multi-group edition with order queuing)
-  - Power spawn support
-  - Power Creep (Operator) lifecycle management
+Errors from loop sections and creep execution are logged with stack traces, sent through `Game.notify`, and retained in a bounded `Memory.errors` history.
 
-### Resource & Market Automation
+### Memory And Shared State
 
-- Automated trading: periodic analysis and execution of profitable reverse reactions and factory compression jobs with configurable margin thresholds.
-- Market arbitrage: buy-sell spread exploitation with per-terminal state machines and full energy cost accounting on both transaction legs.
-- Lab pipelines: dedicated forward (buy reagents → combine → sell compound) and reverse (buy compound → break down → sell reagents) operation managers supporting concurrent operations per room.
-- Centralized pricing: Weighted Mid-Price calculation across all resources for consistent valuation.
-- Daily finance tracking: transaction monitoring with midnight resets, hourly snapshots, and report generation.
-- Market analysis: comprehensive profitability tables for factory production, factory decompression, lab production, and reverse reactions with price source tracking (LIVE/HIST/MBUY), actionable indicators, and order depth warnings.
-- Auto energy buying: automatic energy purchases when room storage falls below configurable thresholds.
-- Buyer/Seller workflows for routine trading and opportunistic market actions.
-- Refining pipelines (buy → refine/convert → sell) for commodity/profit loops, now supporting multi-input COMMODITIES recipes.
-- Deposit and mineral management:
-  - Remote deposit harvesting
-  - Mineral extraction and hauling
-  - Automatic bar selling from storage (excluding factory-reserved stock)
-  - Periodic highway deposit selling (mist, biomass, metal, silicon)
-  - Stockpile processing through factory/lab workflows
+`Utilities/memoryManager.js` retains the parsed Memory object on the JavaScript heap and serializes it every 10 ticks or after an explicit save request. This reduces routine parse/stringify cost, but a global reset can lose changes made since the last serialized save. External edits made directly through the Memory editor are not automatically reloaded into the retained object.
 
-### Strategic & Safety Operations
+`Utilities/getRoomState.js` is the shared live-state service. It builds per-tick indexes for owned rooms and visible rooms containing the player's creeps or Power Creeps. Structures, sources, minerals, ruins, tombstones, dropped resources, construction sites, creeps, and hostiles use category-specific cache lifetimes. Callers must use ownership helpers rather than assuming every cached room is owned.
 
-- Friend-or-Foe detection (IFF) and threat scanning to classify rooms and actors.
-- Attack/defense tooling:
-  - Squad orchestration
-  - Tower draining missions (4-position bounce with observer-verified lane assignment and cross-sector routing)
-  - Demolition missions (with wall-only focus mode)
-  - Contested demolisher pairs for hostile room operations
-  - Nuker loading and launching support
-  - Remote claim/defense workflows (with hardcoded route support)
-- Player intelligence gathering (scan → analyze → report pipeline)
-- Mission-style automation designed to be callable from the console.
+`Utilities/storageManager.js` is the shared resource-reservation ledger. Labs, factories, terminals, and market systems use reservations to avoid committing the same inventory to multiple operations.
 
-### CPU & Diagnostics
+### Adaptive CPU Control
 
-- CPU optimization patterns:
-  - Cached state reads and per-tick caches
-  - Throttled/staged execution
-  - Reduced per-tick recalculation where possible
-  - Lookup tables and assignment caching in hot-path roles
-  - Memory path cleanup on idle creeps
-- Memory query utility for deep recursive search through Memory.
-- Console API for live control, debugging, and scheduling without redeploying code.
-- Wall/rampart progress tracking with ETA calculations.
-- Daily financial reporting.
+The loop is tuned around a 20-CPU environment and adjusts its target budget from the CPU bucket:
 
-## New Highlights (since 2026-01-09)
+| Bucket | Scheduler tier | Target budget |
+| --- | --- | --- |
+| Below 1,000 | Critical | 14 CPU |
+| 1,000-2,999 | Low | Interpolated from 14 to 18 CPU |
+| 3,000-7,999 | Normal | 18 CPU |
+| 8,000 or higher | Flush | 19.3 CPU |
 
-- **Full market automation suite**: autoTrader (periodic profit-seeking), marketArbitrage (buy-sell spread exploitation), marketLabForward/Reverse (lab pipeline management), marketPricing (centralized WMP), dailyFinance (transaction tracking), and autoEnergyBuyer.
-- **Intelligence and reconnaissance**: roomIntel (weighted room scoring), wideScan (observer-range sweeps), playerAnalysis (comprehensive player reports), roomNavigation (shared A* pathfinder).
-- **Power Creep support**: roleOperator with modular power priorities, auto-spawning, and full console management lifecycle.
-- **Contested demolisher role**: paired demolisher system with cross-sector BFS routing and observer-verified route scanning.
-- **Tower drain overhaul**: rewritten with 4-position bounce mechanic, observer-based lane scanning, cross-sector highway routing, and per-tick caching.
-- **Lab system expansion**: labManager rewritten as multi-group edition with order queuing; roleLabBot expanded for forward and reverse reaction support.
-- **Builder simplification**: removed job queue overhead in favor of direct closest-job selection with rampart reinforcement targets.
-- **Tower manager streamlining**: replaced intent-budget system with lean cached-target approach.
-- **Supplier optimization**: lookup tables, labeled breaks, assignment caching, and distance pre-computation.
-- **Market analysis v2.3**: price source tracking, actionable indicators, order depth warnings, bid-ask spread detection, volume columns, and factory decompression analysis.
-- **Expanded console commands**: intel, wideScan, player analysis, claim orders, thief orders, financial reports, pricing, arbitrage status, and more.
+Memory-save ticks reserve additional CPU for serialization. Work is divided into critical, high, normal, and low importance bands. Critical work runs every tick; lower bands are deterministically staggered as pressure increases. Creep execution has a separate role-priority throttle, with critical economy and defense roles running more frequently than optional or background roles.
 
-## Module Structure
+`Utilities/roomSuspender.js` provides a second pressure-control layer. When the bucket is low, eligible low-risk rooms can be temporarily suspended while defense, room-state collection, scanning, and market systems remain active. Hostiles, military operations, deposits, Power Creeps, structural risk, and bucket recovery prevent or end suspension.
 
-### Managers
-- `main.js` — Main loop orchestration
-- `getRoomState.js` — Centralized room state caching
-- `spawnManager.js` — Creep and Power Creep spawn management
-- `towerManager.js` — Tower defense/heal/repair
-- `terminalManager.js` — Terminal balancing and transfers
-- `factoryManager.js` — Factory production orders
-- `labManager.js` — Lab reaction workflows (multi-group)
-- `linkManager.js` — Link energy routing
-- `roomObserver.js` — Observer scheduling
-- `powerManager.js` — Power spawn management
-- `maintenanceScanner.js` — Structure maintenance scanning
+CPU tools include per-role telemetry, per-module telemetry, a room CPU profiler, creep profiling, a RoomVisual HUD, and the opt-in `screeps-profiler`. Profiler wrapping is selected at global initialization, so `profilerOn()` and `profilerOff()` require a global reset to take full effect.
 
-### Intelligence & Reconnaissance
-- `roomIntel.js` — Room scoring and analysis
-- `wideScan.js` — Observer-range room scanning
-- `playerAnalysis.js` — Comprehensive player intelligence
-- `roomNavigation.js` — Shared A* room pathfinder
+## Colony Systems
 
-### Market & Economy
-- `autoTrader.js` — Automated profitable trading
-- `marketArbitrage.js` — Buy-sell spread arbitrage
-- `marketLabForward.js` — Buy reagents → combine → sell compound
-- `marketLabReverse.js` — Buy compound → break down → sell reagents
-- `marketPricing.js` — Weighted Mid-Price calculations
-- `marketAnalysis.js` — Profitability tables and order analysis
-- `marketBuy.js` — Buy order workflows
-- `marketSell.js` — Sell order workflows
-- `marketRefine.js` — Factory refining pipelines
-- `marketQuery.js` — Market order queries
-- `marketReport.js` — Market reporting
-- `marketRoomOrders.js` — Per-room order management
-- `marketUpdate.js` — Order price updates
-- `opportunisticBuy.js` — Opportunistic purchase requests
-- `autoEnergyBuyer.js` — Automatic energy purchasing
-- `dailyFinance.js` — Daily transaction tracking
-- `globalOrders.js` — Global order management
-- `roomBalance.js` — Room resource balancing
-- `localRefine.js` — Local refining operations
-- `mineralManager.js` — Mineral and bar management
+### Spawning And Creeps
 
-### Creep Roles
-- `roleHarvester.js` — Energy harvesting
-- `roleUpgrader.js` — Controller upgrading
-- `roleBuilder.js` — Construction and repair
-- `roleSupplier.js` — Logistics and hauling
-- `roleScout.js` — Room scouting
-- `roleDefender.js` — Room defense
-- `roleAttacker.js` — Attack missions
-- `roleThief.js` — Resource theft with order system
-- `roleTowerDrain.js` — Tower draining operations
-- `roleDemolition.js` — Demolition missions
-- `roleContestedDemolisher.js` — Contested room demolition pairs
-- `roleClaimbot.js` — Room claiming
-- `roleMineralCollector.js` — Mineral collection
-- `roleExtractor.js` — Mineral extraction
-- `roleFactoryBot.js` — Factory operations
-- `roleLabBot.js` — Lab operations (forward and reverse)
-- `rolePowerBot.js` — Power processing
-- `roleOperator.js` — Power Creep controller
-- `roleRemoteBuilder.js` — Remote construction
-- `roleRemoteHarvesters.js` — Remote harvesting
-- `roleDepositHarvester.js` — Highway deposit harvesting
-- `roleSignbot.js` — Controller signing
-- `roleWallRepair.js` — Wall/rampart repair
-- `roleRepairBot.js` — Structure repair
-- `roleMaintainer.js` — Room maintenance
-- `roleScavenger.js` — Resource scavenging
-- `roleNukeFill.js` — Nuker loading
-- `roleSquad.js` — Squad coordination
+`Utilities/spawnManager.js` is the central spawn orchestrator and runs on a 10-tick cadence aligned with Memory serialization. It handles normal colony populations, emergency harvesting, operation-specific bodies, boosts, specialized one-source layouts, remote missions, repair requests, and military orders.
 
-### Strategic Operations
-- `nukeLaunch.js` — Nuke targeting and launch
-- `nukeUtils.js` — Nuke utilities
-- `depositObserver.js` — Deposit monitoring
+The active runtime dispatches these role families:
 
-### Utilities & Diagnostics
-- `iff.js` — Friend-or-Foe identification
-- `roadTracker.js` — Road usage tracking
-- `memoryProfiler.js` — Memory usage analysis
-- `memoryQuery.js` — Deep Memory search utility
-- `screeps-profiler.js` — CPU profiling
+- Core economy: harvester, upgrader, builder, supplier, extractor, mineral collector, maintainer, and repairer.
+- Infrastructure: lab bot, power bot, nuker filler, tower filler, terminal bot, static distributor, extractor assistant, and combo bot.
+- Remote operations: scout, remote builder, remote supplier, deposit harvester, claimbot, and signbot.
+- Combat: defender, attacker, thief, demolition, contested demolisher, drain demolisher, tower drainer, bulldozer variants, squad/quad, Source Keeper attacker, and controller attacker.
+- Specialized layouts: HD stationary harvester/distributor and combo-bot workflows for one-source RCL 8 rooms.
+- Power Creeps: Operator lifecycle and configured power priorities are handled separately from normal creeps.
 
-## Console Command Reference
+Most roles have a dedicated module under `Bots/`. Some runtime role names intentionally share implementations:
 
-### Intelligence
-    intel('W1N1')                          // Score and analyze a room
-    listIntel()                            // List all cached intel
-    wideScan('PlayerName')                 // Scan all observer-range rooms for a player
-    wideScanStatus()                       // Check scan progress
-    player('PlayerName')                   // Full player analysis pipeline
-    playerStatus()                         // Check analysis progress
-    playerLast()                           // Reprint last analysis report
+- `wallRepair`, `rampartBot`, `defenseRepair`, and `repairer` execute through `Bots/roleRepairer.js`.
+- `terminalBot` executes through `Utilities/terminalManager.js`.
+- Tower-drain operation units are coordinated by `Bots/roleTowerDrain.js`, with drain-demolisher behavior in `Bots/roleDrainDemolisher.js`.
 
-### Market & Economy
-    prices()                               // Print all resource prices (WMP)
-    prices('energy')                       // Price for specific resource
-    financeReport()                        // Daily transaction summary
-    autoTrader()                           // Show auto-trader status
-    autoTrader('run')                      // Force immediate trading cycle
-    selling()                              // Show all active sell orders
-    buying()                               // Show all active buy orders
-    labForward('E3N46', 'ZO')              // Start forward lab operation
-    labReverse('E3N46', 'ZO')              // Start reverse lab operation
-    console.log(marketAnalysis())          // Profitability tables
-    console.log(reverseReactionAnalysis()) // Reverse reaction profits
-    console.log(decompressionAnalysis())   // Factory decompression profits
-    console.log(orderBook('ZO'))           // Order book for a resource
+### Defense And Repair
 
-### Production & Logistics
-    orderFactory('W1N1', 'Composite', 'max')
-    orderLabs('W1N1', 'XGH2O', 2000)
-    marketRefine('W1N1', RESOURCE_COMPOSITE)
-    transferStuff('E1S1', 'E3S3', RESOURCE_ZYNTHIUM, 5000)
+`Scanners/defenseMonitor.js` runs as critical work and tracks hostile entry, defensive-structure damage, weak wall/rampart clusters, incoming nukes, threatened structures, notifications, and emergency repair demand.
 
-### Power Creeps
-    createOperator('C1')                   // Create a new Operator
-    upgradeOperator('C1', PWR_GENERATE_OPS) // Upgrade a power
-    setupOperator('C1', 'E2N46')           // Assign to room
-    setupOperator('C1', 'E2N46', [PWR_GENERATE_OPS, PWR_OPERATE_FACTORY]) // With priorities
-    removeOperator('C1')                   // Remove room assignment
+`Utilities/towerManager.js` controls tower attacks, healing, and selected repair work using cached targets. `Utilities/repairManager.js` plans peace and war repair priorities, road and container maintenance, defensive targets, reconstruction caches, tower repair queues, max-heal behavior, and nuke damage mitigation. `Bots/roleRepairer.js` consumes those plans for generic, wall, rampart, and emergency-defense repair roles.
 
-### Combat & Missions
-    orderAttack('E3N44', 5, 'E3N45')
-    orderTowerDrain('E1S1', 'E2S1', 2)
-    orderTowerDrain('E1S1', 'E2S1', 2, 'N')  // Specify attack edge
-    orderDemolition('E1S1', 'E2S2', 2)
-    orderDemolition('E1S1', 'E2S2', 2, 'wall') // Wall-only focus
-    orderContestedDemolisher('E4N49', 'E4N51')
-    orderThieves('W1N1', 'W2N1', 3)
-    orderSquad('E1S1', 'W1N1', 2)
-    launchClaimbot('E1S1', 'E3S3')
-    launchClaimbot('E1S1', 'E3S3', ['E2S3', 'E3S3']) // With route
+The repair migration retains compatibility role names and some legacy constants, but repair planning and execution are centered on `repairManager` and `roleRepairer`.
 
-### Defense & Nukes
-    orderWallRepair('W1N1', 500000)
-    nukeFill('W1N1', { maxPrice: 1.5 })
-    launchNuke('W1N1', 'W3N3', 'spawn')
+### Logistics And Infrastructure
 
-### Status & Diagnostics
-    getTowerDrainStatus()
-    getContestedDemolisherStatus()
-    listClaimOrders()
-    listThiefOrders()
-    memoryQuery('searchTerm')              // Search Memory keys and values
-    memoryQueryKeys('searchTerm')          // Search only keys
-    memoryQueryValues('searchTerm')        // Search only values
+- `terminalManager.js` owns persistent transfers, local storage-to-terminal moves, terminal cooldown handling, busy-state decisions, terminal bots, and resource reservations.
+- `linkManager.js` routes link energy on a three-tick base cadence.
+- `roomBalance.js` periodically balances selected resources between rooms.
+- `remoteSupplyManager.js` creates and tracks remote extension-filling and storage-seeding missions.
+- `storageManager.js` owns reservations and reports unreserved stock.
+- `roadBuilder.js` provides console-driven road construction and removal.
+- `singleSourceRoom.js` manages anchors and specialized one-source layouts.
+- `localMap.js` performs persistent local mapping work.
 
-## Installation & Usage
+### Factories, Labs, Boosts, And Power
 
-- Clone/copy into your Screeps `src` directory.
-- Deploy the main loop (`main.js`) to your Screeps environment.
-- Configure per-module constants (thresholds, margins, allowlists/denylists) before upload.
-- Use console commands to:
-  - gather intelligence on rooms and players
-  - schedule factory/lab/market actions
-  - configure automated trading parameters
-  - manage Power Creep assignments
-  - trigger missions (attack/demolition/tower drain/contested demolish)
-  - run scans and diagnostics
-  - manage cross-room transfers
-  - view financial reports and market pricing
+`Utilities/factoryManager.js` is a per-room FIFO production manager. Rooms can process orders concurrently. Factory operations validate recipes and available inputs, while suppliers and specialized stationary bots move inputs and outputs. Commodity recipes, mineral compression, and decompression workflows are supported.
+
+`Utilities/labManager.js` owns multi-group lab layouts, queued reactions, reagent calculation, reservations, reaction execution, cancellation, watchdog behavior, and lab-bot staging. `Bots/roleLabBot.js` performs physical lab logistics and supports normal reactions and reverse reactions.
+
+`Utilities/boostManager.js` separately owns boost orders, lab preparation, creep boost state, cancellation, and status reporting. Boost and production lab state are coordinated but remain distinct systems.
+
+`Utilities/powerManager.js` handles Power Spawn processing for owned rooms. `Bots/roleOperator.js` manages Operator creation, assignment, spawning, renewal, and configurable power priorities, including powered observer support.
+
+## Intelligence And Reconnaissance
+
+### Unified Scanner
+
+`Scanners/scanner.js` consolidates observer scheduling, maintenance scans, room intelligence, player analysis, wide scans, nuke analysis, war estimates, player monitoring, room registry management, and energy profiling.
+
+Full room intelligence currently scores four categories:
+
+- Economic: 20%
+- Military: 25%
+- Infrastructure: 30%
+- Operational efficiency: 25%
+
+Fast intelligence uses a reduced three-category model. The scanner source is authoritative for individual weights and classification thresholds; `Documentation/IntelWeights.txt` is retained as a historical design reference and may describe the previous scoring model.
+
+The observer scheduler centrally books observer use so multiple systems do not issue competing intents in the same tick. Console requests receive the highest priority, followed by war monitoring, deposit route validation, other player monitoring, and background registry sweeps. Powered observers can extend supported scanning workflows when an assigned Operator has the required power.
+
+Wide scans cover matching rooms within available observer sweep range; they are not a guaranteed shard-wide census. `Utilities/roomNavigation.js` is an observer-aware room routing helper built around `Game.map.findRoute`, banned-room rules, and cached hostile or blocked-room data. It is not a custom room-level A* implementation.
+
+### Deposits And IFF
+
+`Scanners/depositObserver.js` watches configured highway rooms, creates deposit jobs, assigns eligible home rooms, validates routes through the unified observer scheduler, and tracks blocked or temporarily unreachable rooms. Deposit harvesters follow an authoritative route, harvest until full or finished, return home, deliver, and retire.
+
+`Scanners/iff.js` is the shared whitelist-aware friend-or-foe authority. Combat and scanning code should use it instead of performing independent username checks.
+
+## Market And Economy
+
+### Pricing And Orders
+
+`Utilities/marketPricing.js` is the shared valuation service for weighted prices, bid/ask depth, spread, history, effective transaction prices, input ceilings, and buy-method selection. It uses a shared per-tick market snapshot, excludes the player's own orders from public valuation, and filters very small orders.
+
+Routine market operations are separated by responsibility:
+
+- `marketBuy.js` manages posted buy workflows and reconciliation.
+- `marketSell.js` manages dynamic and fixed sell orders, compatible-order extension, bulk selling, and duplicate cleanup.
+- `marketUpdate.js` reprices managed orders.
+- `marketRoomOrders.js`, `marketQuery.js`, and `marketReport.js` provide order and transaction reporting.
+- `opportunisticBuy.js` and `opportunisticSell.js` evaluate immediate deals every 10 ticks.
+- `creditLedger.js` tracks credit reservations used by concurrent market operations.
+
+Screeps does not synchronously return a new order ID from `Game.market.createOrder()`. Market managers therefore retain pending state and reconcile against `Game.market.orders` on later ticks.
+
+### Automated Trading
+
+`Utilities/autoTrader.js` evaluates forward and reverse lab opportunities plus factory compression workflows on a 100-tick base cadence. It uses a configurable gross-margin threshold and room eligibility checks. Its opportunity model deliberately relies on margin buffers rather than applying the arbitrage engine's full transaction-energy calculation to every estimate. Factory decompression analysis and workflow support exist, but automatic decompression scheduling is disabled by default.
+
+`Utilities/marketArbitrage.js` is a direct-deal spread engine with per-terminal state, transaction-energy accounting on both legs, adaptive scans, exposure limits, order-depth filters, ghost-order cooldowns, buffered inventory, grouped terminal operations, and credit-ledger integration.
+
+`Utilities/marketLab.js` consolidates both market-lab directions:
+
+- Forward: buy reagents, stage labs, combine, and sell the compound.
+- Reverse: buy a compound, stage labs, break it down, and sell the reagents.
+
+`marketRefine.js` manages market-assisted factory conversions, while `localRefine.js` uses local inventory. `mineralManager.js` manages extraction, hauling, compressed bars, periodic highway-resource disposition, and reservation-aware selling. `autoEnergyBuyer.js` checks eligible rooms every 1,050 ticks rather than continuously.
+
+`dailyFinance.js` tracks incoming and outgoing transactions, hourly snapshots, and daily reports with a midnight Pacific Time reset.
+
+## Combat And Strategic Operations
+
+- Attackers use persistent orders with spawn room, target room, count, and optional mission controls.
+- Standard demolition supports unrestricted targeting plus strict `wall`, `rampart`, and `controller` focus modes.
+- Contested demolishers use paired units, target modes, cross-sector highway routing, observer verification, and persistent operation states.
+- Tower drains support route and edge scans, standard four-position bounce lanes, custom bodies, bulldozers, and paired drain-demolisher operations. A drain-demolisher pair adds a dedicated healer position beyond the standard drain lane.
+- Thieves use persistent remote-looting orders and shared route intelligence.
+- Squads create quad missions; their console order accepts formation and attack rooms rather than a unit count.
+- Controller attackers, Source Keeper attackers, claimbots, remote builders, signbots, and remote suppliers have dedicated order workflows.
+- Nuker operations include filling, target analysis through the scanner, launching, status tracking, and cancellation.
+
+Route behavior is mission-specific. Claimbots can receive an explicit room-route array. Deposit, tower-drain, contested-demolisher, thief, and scanner workflows use their own route planners, cached route data, or observer validation.
+
+## Diagnostics And Console Operations
+
+The runtime installs console globals for:
+
+- Combat, demolition, tower drains, thieves, squads, claiming, signing, SK attacks, and remote missions.
+- Factory, lab, boost, terminal, storage, transfer, repair, and Power Creep operations.
+- Market orders, pricing, analysis, arbitrage, refining, finance, and automated trading.
+- Room intelligence, player scans, monitoring, registry sweeps, war estimates, nuke analysis, and deposit operations.
+- Memory queries, CPU reports, profiling, room suspension, scheduled commands, anchors, roads, and local maps.
+
+Selected valid examples:
+
+```js
+orderAttack('E3N44', 'E3N45', 5)
+orderDemolition('E1S1', 'E2S2', 2, 'wall')
+orderContestedDemolisher('E4N49', 'E4N51', 'military')
+orderTowerDrain('E1S1', 'E2S1', 2, 'N')
+orderSquad('E1S1', 'W1N1')
+launchClaimbot('E1S1', 'E3S3', ['E2S1', 'E3S1', 'E3S2', 'E3S3'])
+
+orderFactory('W1N1', RESOURCE_COMPOSITE, 'max')
+orderLabs('W1N1', 'XGH2O', 2000)
+labForward('W1N1', 'ZO')
+labReverse('W1N1', 'ZO')
+transferStuff('E1S1', 'E3S3', RESOURCE_ZYNTHIUM, 5000)
+
+prices('energy')
+console.log(marketAnalysis())
+console.log(orderBook('ZO'))
+financeReport('compact')
+
+intel('W1N1')
+wideScan('PlayerName')
+player('PlayerName')
+warEstimate('PlayerName')
+roomState('W1N1', true)
+memoryOverview()
+cpu()
+```
+
+See `Documentation/ConsoleCommands.md` for the categorized command guide. Module source remains authoritative for optional arguments, advanced controls, and newly added globals.
+
+## Repository Layout
+
+### Root
+
+- `main.js`: loop entry point, scheduler, creep dispatcher, profiling, and subsystem orchestration.
+- `README.md`: current architecture and operation overview.
+
+### Bots
+
+`Bots/` contains 33 active role modules:
+
+- Economy and infrastructure: `roleHarvester`, `roleUpgrader`, `roleBuilder`, `roleSupplier`, `roleExtractor`, `roleExtractorAssistant`, `roleMineralCollector`, `roleMaintainer`, `roleRepairer`, `roleLabBot`, `rolePowerBot`, `roleNukeFill`, `roleTowerFiller`, `roleStaticDistributor`, `roleHD`, and `roleComboBot`.
+- Remote and support: `roleScout`, `roleClaimbot`, `roleRemoteBuilder`, `roleRemoteSupplier`, `roleDepositHarvester`, and `roleSignbot`.
+- Combat and strategy: `roleDefender`, `roleAttacker`, `roleThief`, `roleDemolition`, `roleContestedDemolisher`, `roleDrainDemolisher`, `roleTowerDrain`, `roleSquad`, `roleSKAttacker`, and `roleControllerAttacker`.
+- Power Creeps: `roleOperator`.
+
+### Scanners
+
+- `scanner.js`: unified observers, intelligence, registry, monitoring, nuke analysis, war estimates, and energy profiling.
+- `depositObserver.js`: highway deposit discovery and job planning.
+- `defenseMonitor.js`: hostile, defensive-structure, and nuke threat monitoring.
+- `iff.js`: shared friend-or-foe checks.
+- `creepProfiler.js`: creep execution profiling and reports.
+- `roomCPUProfiler.js`: room-oriented CPU profiling and HUD support.
+
+### Utilities
+
+`Utilities/` contains the managers and shared services. Major groups include:
+
+- Runtime and CPU: `memoryManager`, `getRoomState`, `roomSuspender`, `taskScheduler`, `cpuQuery`, `consoleQuery`, `screeps-profiler`, and `statusReport`.
+- Colony infrastructure: `spawnManager`, `towerManager`, `repairManager`, `linkManager`, `terminalManager`, `storageManager`, `roomBalance`, `remoteSupplyManager`, `roadBuilder`, `roomNavigation`, `singleSourceRoom`, and `localMap`.
+- Production: `factoryManager`, `labManager`, `boostManager`, `powerManager`, and `mineralManager`.
+- Market and finance: `marketPricing`, `marketAnalysis`, `marketBuy`, `marketSell`, `marketUpdate`, `marketRoomOrders`, `marketQuery`, `marketReport`, `marketMap`, `marketArbitrage`, `marketLab`, `marketRefine`, `localRefine`, `autoTrader`, `autoEnergyBuyer`, `opportunisticBuy`, `opportunisticSell`, `dailyFinance`, and `creditLedger`.
+- Strategy and support: `nukeLaunch`, `claimbotRangeCheck`, `memoryQuery`, `util`, and `llmcontext`.
+
+## Removed Or Consolidated Modules
+
+The 2026-07-10 synchronization removed repository-only JavaScript that was absent from the active Screeps branch. Important consolidations include:
+
+| Previous standalone modules or responsibilities | Active implementation |
+| --- | --- |
+| Room observer, room intel, player analysis, wide scan, nuke analysis, war estimate, player monitoring, and maintenance scans | `Scanners/scanner.js` |
+| `marketLabForward.js` and `marketLabReverse.js` | `Utilities/marketLab.js` |
+| Separate wall, rampart, defense, and generic repair executors | `Utilities/repairManager.js` and `Bots/roleRepairer.js` |
+| Memory-size profiling and queries | `Utilities/memoryQuery.js`, CPU tools, and runtime telemetry |
+| Road tracking/build helpers | `Utilities/roadBuilder.js` |
+
+Legacy repository files such as `roleFactoryBot.js`, `roleRemoteHarvesters.js`, `roleRepairBot.js`, `roleScavenger.js`, `roleWallRepair.js`, `squadModule.js`, `globalOrders.js`, `nukeUtils.js`, and standalone scanner components were deleted because no matching deployed source file remained. The active `Bots/roleSquad.js` was retained and is the current squad implementation.
+
+## Deployment And Configuration
+
+Deploy the complete JavaScript module set to one Screeps branch; deploying only `main.js` will fail because it immediately requires the other modules. The runtime uses flat Screeps module names such as `require('roleHarvester')` and `require('scanner')`, so the uploader or synchronization method must map files from the repository folders to those branch module names.
+
+Configuration is split across:
+
+- Source constants for thresholds and system defaults.
+- `Memory.settings` for runtime switches such as profiler state.
+- Persistent operation state in Memory for operators, orders, scans, transfers, reservations, and scheduled tasks.
+- Console commands for creating, inspecting, modifying, and cancelling operations.
+
+Advanced systems require their corresponding in-game infrastructure and controller level, including terminals, factories, labs, observers, nukers, Power Spawns, and Power Creeps. Review room names, allowlists, banned-room rules, price thresholds, reserves, and mission routes before deploying to another account or shard.
+
+## Documentation
+
+- `Documentation/ConsoleCommands.md`: categorized console command guide.
+- `Documentation/IntelWeights.txt`: historical intelligence-weight design notes; current weights live in `Scanners/scanner.js`.
+- Other files under `Documentation/`: historical notes and design references; they are not deployed JavaScript modules.
 
 ## Contributing
 
-- Keep new functionality modular (one concern per file/module).
-- Document configuration knobs and any console commands added.
-- Include CPU impact notes for large loops and high-frequency logic.
-- Prefer clear, explicit logging that can be toggled or throttled.
-- Use shared infrastructure (roomNavigation, marketPricing, getRoomState) where possible rather than duplicating logic.
-
-## Synchronization Update (2026-07-10)
-
-This release synchronizes the repository to the active Screeps script directory. All 89 deployed JavaScript modules have one canonical repository copy. Creep roles are in `Bots/`, scanning, intelligence, monitoring, and profiling modules are in `Scanners/`, and managers, market systems, console tools, and shared helpers are in `Utilities/`. Repository-only JavaScript files were removed so the repository contains no stale deployable modules.
-
-### Module Organization
-
-- All `role*.js` modules were consolidated under `Bots/`, including the newly synchronized controller attacker, drain demolisher, extractor assistant, HD, remote supplier, repairer, SK attacker, static distributor, and tower filler roles.
-- The new `Scanners/scanner.js` is the unified intelligence and reconnaissance system. It provides room intel, player analysis, wide scans, registry management, threat monitoring, nuke analysis, energy profiling, and war estimates.
-- Creep profiling, room CPU profiling, deposit observation, IFF, and defense monitoring are now grouped in `Scanners/`.
-- Infrastructure, production, terminal, market, maintenance, console, and shared-helper modules are grouped in `Utilities/`.
-
-### Intelligence, Defense, And Diagnostics
-
-- Added the unified scanner workflow for cached room intelligence, player scans, wide scans, registry operations, threat tracking, nuke threat analysis, and war estimates.
-- Added per-creep and per-room CPU profiling, energy profiling, automated defense monitoring, detailed colony status reporting, and CPU console tools.
-- Added room suspension planning and status controls for managing CPU pressure without losing room-state visibility.
-- Added local map utilities, single-source-room anchors, claimbot range checks, and shared room navigation support.
-
-### Economy, Production, And Logistics
-
-- Added boost management, storage management, remote supply management, repair management, task scheduling, credit tracking, and shared utility helpers.
-- Consolidated lab-market workflows into `marketLab.js`, covering forward and reverse lab operations alongside existing lab management and lab-bot logic.
-- Expanded market tooling with market mapping, opportunistic selling, automated energy purchasing, trader and arbitrage support, finance reporting, pricing, refining, buying, selling, order management, and reports.
-- Added room suspension, terminal diagnostics, local refinement, storage-to-terminal transfers, and status reporting to support operational control from the console.
-
-### Roles And Operations
-
-- Added specialized roles for controller attacks, SK operations, tower filling, static distribution, remote supply, extractor assistance, drain demolition, repair, and HD/combat operations.
-- Updated core roles, spawning, tower draining, contested demolition, demolition, labs, suppliers, harvesters, builders, power operations, and remote construction to match the active runtime code.
-- Added and documented management commands for combat, demolition, tower-drain, contested-demolisher, thief, squad, factory, lab, terminal, market, Power Creep, profiling, and scan operations.
-
-### Replaced And Removed Modules
-
-- Removed repository-only modules that are no longer present in the active script set, including legacy factory, repair, scavenger, wall-repair, remote-harvester, squad, observer, room-intel, wide-scan, market-lab forward/reverse, global-orders, memory-profiler, nuke-utils, and road-tracker modules.
-- Their active replacements are the synchronized role modules, unified scanner, `marketLab.js`, `repairManager.js`, `roadBuilder.js`, `memoryQuery.js`, and the dedicated console command reference.
-
-### Documentation
-
-- Added `Documentation/ConsoleCommands.md`, a categorized reference for active console globals.
-- Added `Documentation/IntelWeights.txt` with intelligence scoring configuration.
-- The README remains the architecture and usage guide; the command reference is the authoritative list for console orders and operational commands.
-
-See `Documentation/ConsoleCommands.md` for the current console command and order reference. It is generated from the synchronized modules and should be updated whenever a console global is added or changed.
+- Keep ownership of scarce intents explicit: one manager should own an observer, terminal, spawn, factory, lab group, or market workflow at a time.
+- Use `getRoomState`, `storageManager`, `marketPricing`, `scanner`, and shared navigation helpers rather than duplicating caches or reservations.
+- Preserve compatibility role aliases unless their persisted Memory and spawn paths are migrated deliberately.
+- Document new console globals in `Documentation/ConsoleCommands.md` and update this README when architecture changes.
+- Include CPU impact and cadence notes for new high-frequency work.
+- Run JavaScript syntax checks and verify module-name mappings before deployment.
