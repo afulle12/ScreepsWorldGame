@@ -286,8 +286,44 @@ Each role owns its behavior module, with spawn bodies tuned for distance, TTL, o
 
 ## Synchronization Update (2026-07-10)
 
-The repository now mirrors the active Screeps script directory. Every deployed JavaScript module has one canonical repository copy: creep roles are in `Bots/`, scanning, intelligence, monitoring, and profiling modules are in `Scanners/`, and managers, market systems, console tools, and shared helpers are in `Utilities/`. Repository-only JavaScript modules were removed so this tree contains no stale deployable code.
+This release synchronizes the repository to the active Screeps script directory. All 89 deployed JavaScript modules have one canonical repository copy. Creep roles are in `Bots/`, scanning, intelligence, monitoring, and profiling modules are in `Scanners/`, and managers, market systems, console tools, and shared helpers are in `Utilities/`. Repository-only JavaScript files were removed so the repository contains no stale deployable modules.
 
-Newly synchronized systems include the unified `scanner` intelligence suite, room CPU and creep profiling, automated defense monitoring, room suspension, remote supply, repair management, local mapping, storage management, boost management, market mapping, detailed status reporting, and the expanded role set for controller attack, drain demolition, extractor assistance, remote supply, tower filling, and SK operations.
+### Module Organization
+
+- All `role*.js` modules were consolidated under `Bots/`, including the newly synchronized controller attacker, drain demolisher, extractor assistant, HD, remote supplier, repairer, SK attacker, static distributor, and tower filler roles.
+- The new `Scanners/scanner.js` is the unified intelligence and reconnaissance system. It provides room intel, player analysis, wide scans, registry management, threat monitoring, nuke analysis, energy profiling, and war estimates.
+- Creep profiling, room CPU profiling, deposit observation, IFF, and defense monitoring are now grouped in `Scanners/`.
+- Infrastructure, production, terminal, market, maintenance, console, and shared-helper modules are grouped in `Utilities/`.
+
+### Intelligence, Defense, And Diagnostics
+
+- Added the unified scanner workflow for cached room intelligence, player scans, wide scans, registry operations, threat tracking, nuke threat analysis, and war estimates.
+- Added per-creep and per-room CPU profiling, energy profiling, automated defense monitoring, detailed colony status reporting, and CPU console tools.
+- Added room suspension planning and status controls for managing CPU pressure without losing room-state visibility.
+- Added local map utilities, single-source-room anchors, claimbot range checks, and shared room navigation support.
+
+### Economy, Production, And Logistics
+
+- Added boost management, storage management, remote supply management, repair management, task scheduling, credit tracking, and shared utility helpers.
+- Consolidated lab-market workflows into `marketLab.js`, covering forward and reverse lab operations alongside existing lab management and lab-bot logic.
+- Expanded market tooling with market mapping, opportunistic selling, automated energy purchasing, trader and arbitrage support, finance reporting, pricing, refining, buying, selling, order management, and reports.
+- Added room suspension, terminal diagnostics, local refinement, storage-to-terminal transfers, and status reporting to support operational control from the console.
+
+### Roles And Operations
+
+- Added specialized roles for controller attacks, SK operations, tower filling, static distribution, remote supply, extractor assistance, drain demolition, repair, and HD/combat operations.
+- Updated core roles, spawning, tower draining, contested demolition, demolition, labs, suppliers, harvesters, builders, power operations, and remote construction to match the active runtime code.
+- Added and documented management commands for combat, demolition, tower-drain, contested-demolisher, thief, squad, factory, lab, terminal, market, Power Creep, profiling, and scan operations.
+
+### Replaced And Removed Modules
+
+- Removed repository-only modules that are no longer present in the active script set, including legacy factory, repair, scavenger, wall-repair, remote-harvester, squad, observer, room-intel, wide-scan, market-lab forward/reverse, global-orders, memory-profiler, nuke-utils, and road-tracker modules.
+- Their active replacements are the synchronized role modules, unified scanner, `marketLab.js`, `repairManager.js`, `roadBuilder.js`, `memoryQuery.js`, and the dedicated console command reference.
+
+### Documentation
+
+- Added `Documentation/ConsoleCommands.md`, a categorized reference for active console globals.
+- Added `Documentation/IntelWeights.txt` with intelligence scoring configuration.
+- The README remains the architecture and usage guide; the command reference is the authoritative list for console orders and operational commands.
 
 See `Documentation/ConsoleCommands.md` for the current console command and order reference. It is generated from the synchronized modules and should be updated whenever a console global is added or changed.
