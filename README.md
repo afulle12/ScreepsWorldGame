@@ -1,495 +1,325 @@
-# Screeps Colony - README
-Version: 2026-06-27 (Unified Scanner + Repair Manager Build)
+# Screeps Colony — README
 
-## Overview
+**Version: 2026-08-26 (Market Valuation & Spend Guard Build)**
 
-This repository runs a comprehensive multi-room Screeps AI that automates economy, logistics, combat, market play, and late-game strategy. The repository keeps `main.js` at the root and organizes modules under `Bots/`, `Scanners/`, `Utilities/`, and `Documentation/`. Recent work consolidates several high-traffic systems: `Scanners/scanner.js` now owns observer-backed intelligence, registry, player, nuke, and war-estimate workflows, while `Utilities/repairManager.js` and `Bots/roleRepairer.js` provide unified repair planning and execution.
+A multi-room Screeps AI running on shard3. It automates economy, logistics, combat, market trading, production pipelines, and late-game strategy across 119 runtime modules, 36 creep roles, and 424 console commands.
+
+`main.js` sits at the repository root; modules are filed under `Bots/` (creep roles), `Scanners/` (intelligence and profiling), `Utilities/` (everything else), with `docs/`, `test/`, and `Documentation/` alongside.
+
+---
+
+## Latest Update — Market Valuation & Spend Guard
+
+This build reworks how the colony decides what a resource is worth and what it is willing to pay. It was prompted by an incident on 2026-08-25 in which two buy orders for 25,000 energy each were posted at **12,555 credits per unit** — roughly a thousand times the market — costing 31M credits in order fees before a single unit was delivered.
+
+### What caused it
+
+`autoEnergyBuyer` requests energy without a price, so `marketBuy` falls back to the canonical passive bid. That bid came from `getPriceProfile`, which — when the energy book has **no visible bid side** — derives a bid from the ask side alone: one passive step under the only ask standing. With a single absurd ask on the book, the posted bid was one step under it. Nothing downstream disagreed, because nothing downstream had an opinion about what energy was worth.
+
+### The corroborated buy ceiling
+
+`marketPricing.buyPriceCeiling(resource)` is now a hard cap on any price the colony will pay, built from **the minimum of independent evidence sources**, none of which reads the top order:
+
+| Source | Reference | Cap |
+| :--- | :--- | :--- |
+| `HISTORY_14D` | volume-weighted **median** daily price over 14 days of `getHistory` | 10× |
+| `ASK_DEPTH` | **median** ask across the cheapest `DEPTH_VOLUME` units | 5× |
+| `BID_DEPTH` | median competing bid — **reported only, never caps** | — |
+
+Depth counts as evidence only with at least 3 price levels from 3 distinct rooms and 2,000 units, and the walk outward from the touch **stops at the first gap wider than 2×**. Real books are bimodal — a tradeable cluster at the touch, a gap, then orders nobody expects to fill (or a wall of fake size parked at 0.03 to catch a mistake) — and averaging across that gap prices the wrong half of the book.
+
+The bid side is deliberately excluded from capping: sampled live books show real, unmanipulated bid sides sitting 2×–100× under the price the same resource actually trades at, because almost everyone lifts asks rather than posting bids. The 14-day median also acts as a **floor on the ceiling** — the colony can always pay what the shard has been paying, so a single depressed source can never silently block legitimate buying.
+
+Above the ceiling the book is not believed at all: `passiveBuyPrice` and `getStatusEnergyPrice` fall back to the binding source's reference (fair value), never to the ceiling itself, since paying the ceiling still means paying 10× on purpose.
+
+### `marketSpendGuard` — a price collar at the API boundary
+
+`marketSpendGuard.js` wraps `Game.market.deal` and `Game.market.createOrder` once per tick, before any module can spend, and refuses any buy above the corroborated ceiling. Module-level policy still lives in `marketBuy`; this exists so a module that never learned about the ceiling — or one added later — cannot overpay because one order on an emptied book said so. Blocks are recorded in `Memory.marketGuard` and readable with `marketGuardStatus()`.
+
+### Replacement-cost energy valuation
+
+Energy has two acquisition routes with different economics, and they are no longer conflated:
+
+- **BID** — rest a standing buy order. Freight-free: whoever fills it calls `deal()` and pays the terminal transfer.
+- **DIRECT** — take a live ask now. The colony is the dealer, so it pays the freight — and for energy that freight is paid *in energy*, out of the same terminal being filled.
+
+`acquisitionQuote(resource)` prices both legs in credits per unit **landed** and reports the cheaper one. `getStatusEnergyPrice()` returns that number — replacement cost, not a book price — and it now drives every consumer that values energy: economics, stockpile valuation, scavenger policy, arbitrage, power management, and freight accounting.
+
+Freight lands differently depending on what is bought, and `deliveredBuyQuote` branches on it:
+
+- **Energy**: it comes out of the shipment. `delivered = price × take / (take − transferCost)`, and less arrives than was bought.
+- **Everything else**: the full quantity arrives and the energy is a separate credit cost. `delivered = price + transferCost × energyPrice / take`.
+
+A `MIN_DELIVERY_YIELD` of 0.5 stops the direct route at roughly 20 rooms. Past that a shipment arrives as a rounding error while the freight is real — a seller 120 rooms out delivers 457 units for 24,543 burned in transit, and prices out under the ceiling while doing it.
+
+Note the structural consequence: in an uncrossed book the posted bid always sits under the best ask, so **DIRECT can only win when the book is crossed** — which is the normal state of shard3 energy, where distance segments the market and far bidders bid over near asks.
+
+Posting and valuation stay separate: `passiveBuyPrice()` is what to *post* and stays on the bid leg, because the direct route is captured by acting, not by bidding low.
+
+### `marketChaos` — order book diagnostics
+
+`marketChaos(count)` samples resources at random and reports, for each: the competitive end of both sides of the book, the last three daily prints with their standard deviation, the screen price against the 14-day median, how far the volume-weighted reference sits from the touch, how much of the liquidity near the touch one room or one price level controls, and how far the independent references disagree. Results are ranked by a composite chaos score with every component printed, so the score is always auditable.
+
+```
+  Resource                Chaos   Spread%   vs Hist  Disagree   Room%  Level%   Sd/Avg  state
+  XGH2O                      88       n/a   984.73x       n/a     100     100       3%  sellers-only
+  wire                       70     155.6       n/a       n/a      33      33      n/a  active
+  energy                      8       1.6     1.01x     1.05x      30      30       3%  active
+  silicon                  dead       n/a       n/a       n/a     n/a     n/a       7%  empty
+```
+
+Order rows come from the raw snapshot so our own orders (`*`) and sub-dust orders (`.`) stay visible, while every metric is computed from the competing book only.
+
+### Regression coverage
+
+`test/market_spend_guard_harness.js` replays the incident book and asserts the old path reproduces `12555.228` exactly, that the new bid is the history reference, and that both the `createOrder` and the `deal` are refused with nothing reaching the server. `test/energy_direct_buy_harness.js` covers delivered-cost ordering, the yield floor, the urgency premium, insufficient terminal energy, and the energy-versus-commodity freight split.
+
+---
 
 ## Core Systems
 
-### Creep & Squad Roles
+### Creep Roles (36)
 
-**Base Roles:**
-- Harvesters
-- Upgraders
-- Builders
-- Suppliers / Haulers
-- Scouts
-- Defenders
-- Attackers
-- Signers
-- Wall Repair
-- Scavengers
-- Repair Bots
-- Maintainers
+**Harvesting & logistics** — Harvester, Supplier, RemoteSupplier, StaticDistributor, Scavenger, DepositHarvester, MineralCollector, Extractor, ExtractorAssistant
 
-**Specialized Roles:**
-- Thieves (with order system and observer-scanned routing)
-- Tower Drainers (full 4-position bounce mechanic with route scanning)
-- Tower Fillers (dedicated tower energy supply; new)
-- Demolition teams (with wall-only focus mode)
-- Contested Demolishers (paired demolisher system for hostile rooms)
-- Combo Bots (multi-purpose flexible creeps; new)
-- HD (Heavy Defense; new)
+**Construction & maintenance** — Builder, RemoteBuilder, Repairer, Maintainer, Upgrader
 
-**Resource Extraction & Processing:**
-- Mineral Collectors
-- Extractors
-- Extractor Assistants (dedicated support creeps; new)
-- Factory Bots
-- Lab Bots (forward and reverse reaction support)
-- Power Bots (with low-TTL resource recovery)
-- Deposit Harvesters (highway deposit collection)
+**Production** — LabBot (forward and reverse reactions), PowerBot, Operator (Power Creep with modular power priorities)
 
-**Remote & Specialized Operations:**
-- Claimbots (with hardcoded route support)
-- Remote Builders
-- Remote Harvesters
-- Remote Suppliers (distributed remote supply management; new)
-- Rampart Bots (dedicated rampart construction and reinforcement; new)
-- Static Distributors (fixed-position resource distribution; new)
-- SK Attackers (Source Keeper combat specialists; new)
-- Controller Attackers (controller downgrade operations; new)
+**Combat & missions** — Attacker, Defender, HD (heavy defense), Healer, Harasser, Squad, SKAttacker, ControllerAttacker, TowerDrain, TowerFiller, Demolition, ContestedDemolisher, DrainDemolisher, Thief, NukeFill
 
-**Advanced:**
-- Power Creeps / Operators (with modular power priorities)
-- Squad members and multi-creep mission roles
-- Nuke Fillers
+**Support & scouting** — Scout, Signbot, Claimbot, ComboBot
 
-Each role owns its behavior module, with spawn bodies tuned for distance, TTL, or mission needs. Specialized teams (tower drainers, demolition, contested demolishers, thieves) use observer-scanned routing and staged/rally logic for multi-room operations.
+Each role owns its behavior module and declares its dispatch key and console commands in its header. Specialized teams use observer-scanned routing with staged rally logic for multi-room operations.
 
-### Infrastructure & Room Intelligence
+### Room Intelligence
 
-- **Room state caching**: Centralized, cached views of structures, creeps, and key room metadata.
-- **Room intelligence scoring**: Weighted analysis of rooms across Economic (25%), Military (30%), and Dual Purpose (45%) categories with auto-expiring caches.
-- **Unified scanner**: `scanner.js` consolidates maintenance scanning, room intel, nuke analysis, player analysis, wide scan, war estimate, player monitor, observer scheduling, and room registry workflows.
-- **Observer scheduling**: Shared priority queue for one-shot console commands, WAR hot polls, player monitor polls, deposit scans, and registry sweeps.
-- **Registry-backed wide scan**: Room ownership registry supports `wideScan()`, `wideScanPlayers()`, player monitoring, and war analysis.
-- **Player analysis**: Multi-phase intelligence pipeline with registry discovery, room intel, creep census, nuke threat checks, and strength classifications.
-- **Room navigation**: Shared A* room-level pathfinder respecting observer-scanned blocked rooms and custom ban lists.
-- **Managers**:
-  - Link routing and energy distribution
-  - Terminal balancing and transfers
-  - Towers (streamlined cached-target defense/heal/repair)
-  - Factory production order handling (with COMMODITIES fallback for advanced recipes)
-  - Lab reaction workflows (multi-group edition with order queuing)
-  - Power spawn support
-  - Power Creep (Operator) lifecycle management
+- **Unified scanner** (`scanner.js`) — observer scheduling, room intel, ownership registry, wide scan, nuke analysis, player analysis, player monitoring, and war estimates in one module with a shared priority queue, so subsystems cannot silently collide on the same observer tick.
+- **Room state caching** (`getRoomState.js`) — centralized cached views of structures, creeps, and room metadata.
+- **Permanent room facts** (`permanentRoomFacts.js`) — durable per-room truths persisted through the storage VFS.
+- **Room navigation** (`roomNavigation.js`) — shared A* room-level pathfinder honoring observer-scanned blocked rooms and ban lists.
+- **Local map** (`localMap.js`) — cached local navigation and structure tracking.
+- **Simulation scan** (`simscanQuery.js`) — background room simulation scans.
 
-### Profiling & Diagnostics Systems (New)
+### Market & Economy (33 modules)
 
-- **Creep Profiler** (`creepProfiler.js`): Real-time per-creep role statistics, spawn efficiency tracking, and performance analysis.
-- **Energy profiling**: Room energy flow analysis now lives in the consolidated scanner/intel stack.
-- **Room CPU Profiler** (`roomCPUProfiler.js`): CPU cost tracking per room, per subsystem, with performance trending and bottleneck identification.
-- **CPU optimization patterns**:
-  - Cached state reads and per-tick caches
-  - Throttled/staged execution
-  - Reduced per-tick recalculation where possible
-  - Lookup tables and assignment caching in hot-path roles
-  - Memory path cleanup on idle creeps
-- **Memory query utility** for deep recursive search through Memory.
-- **Console API** for live control, debugging, and scheduling without redeploying code.
-- **Wall/rampart progress tracking** with ETA calculations.
-- **Daily financial reporting**.
-
-### Defense & War Monitoring (New)
-
-- **Defense Monitor** (`defenseMonitor.js`): Real-time threat assessment, tower status, hostile creep tracking, and automatic escalation alerts.
-- **War Estimate** (`scanner.js`): Strategic strength analysis, combat capability prediction, casualty estimation, and battle outcome forecasting.
-- **Player Monitor** (`scanner.js`): Ongoing surveillance of target players, activity tracking, expansion monitoring, and attack pattern analysis.
-- **Nuke Analysis** (`scanner.js`): Nuke landing prediction, incoming nuke detection, damage forecasting, and defensive counter-strategy.
-
-### Resource & Market Automation
-
-- **Automated trading**: Periodic analysis and execution of profitable reverse reactions and factory compression jobs with configurable margin thresholds.
-- **Market arbitrage**: Buy-sell spread exploitation with per-terminal state machines and full energy cost accounting on both transaction legs.
-- **Lab pipelines**: Dedicated forward (buy reagents → combine → sell compound) and reverse (buy compound → break down → sell reagents) operation managers supporting concurrent operations per room.
-- **Market Lab** (`marketLab.js`): Unified lab reaction profit analysis and automated pipeline orchestration.
-- **Centralized pricing**: Weighted Mid-Price calculation across all resources for consistent valuation.
-- **Daily finance tracking**: Transaction monitoring with midnight resets, hourly snapshots, and report generation.
-- **Market analysis**: Comprehensive profitability tables for factory production, factory decompression, lab production, and reverse reactions with price source tracking (LIVE/HIST/MBUY), actionable indicators, and order depth warnings.
-- **Auto energy buying**: Automatic energy purchases when room storage falls below configurable thresholds.
-- **Opportunistic market actions**: Buyer/Seller workflows for routine trading and market opportunities.
-- **Opportunistic Sell** (`opportunisticSell.js`): Proactive sell order placement on price spikes and market windows.
-- **Refining pipelines**: Buy → refine/convert → sell loops for commodity/profit cycles, supporting multi-input COMMODITIES recipes.
-- **Deposit and mineral management**:
-  - Remote deposit harvesting
-  - Mineral extraction and hauling
-  - Automatic bar selling from storage (excluding factory-reserved stock)
-  - Periodic highway deposit selling (mist, biomass, metal, silicon)
-  - Stockpile processing through factory/lab workflows
-
-### Strategic & Safety Operations
-
-- **Friend-or-Foe detection** (IFF) and threat scanning to classify rooms and actors.
-- **Attack/defense tooling**:
-  - Squad orchestration
-  - Tower draining missions (4-position bounce with observer-verified lane assignment and cross-sector routing)
-  - Tower filling missions (dedicated energy supply for tower defense)
-  - Demolition missions (with wall-only focus mode)
-  - Contested demolisher pairs for hostile room operations
-  - SK attacker teams for Source Keeper combat
-  - Controller attacker squads for downgrade operations
-  - Nuker loading and launching support
-  - Remote claim/defense workflows (with hardcoded route support)
-- **Player intelligence gathering**: Scan → analyze → report pipeline with historical tracking.
-- **Mission-style automation**: Callable from the console for manual and auto-triggered operations.
-
-### Storage & Distribution Systems (New)
-
-- **Storage Manager** (`storageManager.js`): Centralized storage optimization, reservation tracking, and multi-room balance coordination.
-- **Room Balance** (`roomBalance.js`): Intra-room resource distribution with priority management and threshold-based triggering.
-- **Local Refine** (`localRefine.js`): On-site refinement operations (factory/lab) without market dependency.
-- **Remote Supply Manager** (`remoteSupplyManager.js`): Distributed supply chains for remote rooms, multi-source orchestration, and demand-based spawning.
-- **Local Map** (`localMap.js`): Cached local navigation, structure tracking, and path optimization.
-
-### Boost & Special Systems (New)
-
-- **Boost Manager** (`boostManager.js`): Automated boost production, creep boost scheduling, and boost reservation management.
-- **Claimbot Range Check** (`claimbotRangeCheck.js`): Pre-mission verification of claim routes and range validation.
-- **Task Scheduler** (`taskScheduler.js`): Deferred task execution, priority queuing, and task batching.
-
-### Unified Repair System (New)
-
-- **Repair Manager** (`repairManager.js`): Unified room repair planner for roads, containers, walls, ramparts, towers, nuke-defense prep, rebuild cache, and repairer spawn requests.
-- **Repairer Role** (`roleRepairer.js`): Generic repair task executor used by repair manager plans.
-- **Legacy repair migration**: Legacy wall repair, repair bot, rampart bot, and defense repair spawning is replaced by repair manager spawn requests. Existing old-role creeps continue running until they expire.
-- **Repair memory compaction**: Compact plan/request formats reduce serialization cost for repair state.
-
-## New Highlights (since 2026-01-09)
-
-- **Unified scanner module**: `Scanners/scanner.js` replaces the separate maintenance scanner, room intel, nuke analysis, player analysis, wide scan, war estimate, player monitor, room observer, and registry modules in the current build.
-- **Shared observer scheduler**: Observer use is coordinated through one priority system so modules do not silently collide on the same observer tick.
-- **Unified repair manager**: `repairManager.js` computes repair plans and `roleRepairer.js` executes them, with `spawnManager.js` consuming `Memory.repairSpawnRequests`.
-- **Shard 3 CPU budgeting**: `main.js` defines explicit CPU budget tiers and section priorities for critical, high, normal, and low-priority work.
-- **Room-filtered market views**: `selling(mode, roomName)` and `buying(mode, roomName)` now accept an optional room filter.
-- **LLM context documentation**: `Documentation/llmcontext.js` is documentation-only context for code review/generation and has no runtime purpose.
-- **Expanded creep role ecosystem**: Tower Fillers, Combo Bots, Rampart Bots, SK Attackers, Controller Attackers, Remote Suppliers, Static Distributors, Extractor Assistants, and HD (Heavy Defense) roles for specialized operations.
-- **Profiling & monitoring suite**: Creep Profiler (per-role efficiency), Energy Profiler (flow analysis), Room CPU Profiler (cost tracking), and comprehensive diagnostics.
-- **War & defense systems**: Defense Monitor (real-time threat tracking), War Estimate (battle prediction), Player Monitor (surveillance), and Nuke Analysis (incoming threat detection).
-- **Advanced market systems**: Opportunistic Sell, Market Lab unified analysis, and expanded arbitrage coverage.
-- **Storage & distribution**: Storage Manager, Remote Supply Manager, Local Refine, and Room Balance for sophisticated logistics.
-- **Full market automation suite**: autoTrader (periodic profit-seeking), marketArbitrage (buy-sell spread exploitation), marketLabForward/Reverse (lab pipeline management), marketPricing (centralized WMP), dailyFinance (transaction tracking), and autoEnergyBuyer.
-- **Intelligence and reconnaissance**: roomIntel (weighted room scoring), wideScan (observer-range sweeps), playerAnalysis (comprehensive player reports), roomNavigation (shared A* pathfinder).
-- **Power Creep support**: roleOperator with modular power priorities, auto-spawning, and full console management lifecycle.
-- **Contested demolisher role**: Paired demolisher system with cross-sector BFS routing and observer-verified route scanning.
-- **Tower drain overhaul**: Rewritten with 4-position bounce mechanic, observer-based lane scanning, cross-sector highway routing, and per-tick caching.
-- **Lab system expansion**: labManager rewritten as multi-group edition with order queuing; roleLabBot expanded for forward and reverse reaction support.
-- **Builder simplification**: Removed job queue overhead in favor of direct closest-job selection with rampart reinforcement targets.
-- **Tower manager streamlining**: Replaced intent-budget system with lean cached-target approach.
-- **Supplier optimization**: Lookup tables, labeled breaks, assignment caching, and distance pre-computation.
-- **Market analysis v2.3**: Price source tracking, actionable indicators, order depth warnings, bid-ask spread detection, volume columns, and factory decompression analysis.
-- **Expanded console commands**: intel, wideScan, player analysis, claim orders, thief orders, financial reports, pricing, arbitrage status, and more.
-
-## Module Structure
-
-### Core Management
-- `main.js` — Main loop orchestration
-- `getRoomState.js` — Centralized room state caching
-- `spawnManager.js` — Creep and Power Creep spawn management (168K, comprehensive body optimization)
-- `taskScheduler.js` — Deferred task execution and priority queuing
-- `Documentation/llmcontext.js` — Documentation-only context for LLM-assisted code review and generation
-
-### Managers
-- `towerManager.js` — Tower defense/heal/repair
-- `terminalManager.js` — Terminal balancing and transfers (104K, sophisticated trading logic)
-- `factoryManager.js` — Factory production orders
-- `labManager.js` — Lab reaction workflows (multi-group)
-- `linkManager.js` — Link energy routing
-- `scanner.js` — Unified observer scheduling, room intel, registry, nuke analysis, player analysis, player monitoring, and war estimates
-- `powerManager.js` — Power spawn management
-- `repairManager.js` — Unified repair, nuke-defense, rebuild-cache, and repairer dispatch planning
+- **`marketPricing.js`** — the single pricing authority: order-book profiles, liquidity classification, theoretical recipe-derived valuation, conversion quotes, the corroborated buy ceiling, and delivered/freight-inclusive acquisition quotes. Consumers never hand-roll price formulas.
+- **`marketSpendGuard.js`** — pre-trade price collar wrapping the `Game.market` API.
+- **`creditLedger.js`** — in-tick committed-spend tracking, so several modules spending in the same tick cannot overdraw.
+- **`marketBuy.js` / `marketSell.js`** — managed standing orders with pending-capture reconciliation (`createOrder` returns `OK` without exposing an order id), reprice-up/down with fee budgets, and tranche sizing.
+- **`marketBatchBuy.js`** — one-deal-per-tick direct purchases against specific sell orders, with terminal capacity, terminal energy, and credit checks.
+- **`opportunisticBuy.js` / `opportunisticSell.js`** — price-triggered purchases and sales with transaction reconciliation.
+- **`autoEnergyBuyer.js`** — three-tier energy procurement (normal / emergency / critical) comparing the direct and standing-bid routes against the battery conversion route on acquisition cost.
+- **`autoTrader.js`** — production orchestration: opportunity scanning, two-step chains, owned-mineral routing, and commodity residue sweeps.
+- **`marketLab.js` / `labCommodityRouter.js` / `labReactionPipeline.js` / `labCommodityPolicy.js`** — lab reaction pipelines, commodity routing, and reservation policy.
+- **`marketRefine.js` / `localRefine.js` / `factoryManager.js` / `factorySlots.js`** — factory production cycles, bar compression, and slot allocation.
+- **`marketArbitrage.js`** — cross-terminal spread exploitation with freight accounting on both legs.
+- **`marketPriceAdjustment.js` / `marketUpdate.js`** — automated and one-shot order repricing.
+- **`marketEconomics.js` / `marketAttribution.js`** — job lifecycle, profit attribution, lot matching, and cold-storage archiving; attribution wraps the market API to record which module incurred each fee.
+- **`marketHistory.js` / `marketConditions.js`** — daily trade history archiving and volume/momentum analysis.
+- **`marketSpeculator.js`** — speculative position scanning and analysis.
+- **`marketAnalysis.js` / `marketReport.js` / `marketQuery.js` / `marketMap.js` / `marketChaosQuery.js` / `marketRoomOrders.js`** — profitability tables, reporting, and console diagnostics.
+- **`marketSales.js`** — sell-lot tracking for realized-margin accounting.
+- **`dailyFinance.js` / `economics.js` / `inventory.js`** — transaction tracking with midnight resets, per-activity contribution ranking, and colony net-worth reporting.
 
 ### Storage & Distribution
-- `storageManager.js` — Centralized storage optimization and reservation (24K)
-- `roomBalance.js` — Intra-room resource distribution
-- `remoteSupplyManager.js` — Distributed remote supply chains (32K)
-- `localRefine.js` — On-site factory/lab operations
-- `localMap.js` — Cached local navigation and structure tracking (20K)
 
-### Intelligence & Reconnaissance
-- `scanner.js` — Consolidated intelligence and scanning system
-- `intel()` / `intelFast()` — Room scoring and analysis
-- `wideScan()` / `wideScanPlayers()` — Registry-backed observer-range room scanning
-- `player()` / `playerScan()` — Comprehensive player intelligence and creep census
-- `roomNavigation.js` — Shared A* room pathfinder
-- `monitor()` — Ongoing player surveillance
-- `warEstimate()` — Strategic battle prediction and strength analysis
-- `defenseMonitor.js` — Real-time threat assessment and tower tracking (32K, new)
-- `nukeAnalyze()` / `nukeThreat()` — Nuke prediction and defense counter-strategy
+- **`storageManager.js`** — centralized storage optimization and reservation tracking.
+- **`storageVfs.js`** — virtual file system over Memory segments with capacity locks, dataset mounts, and legacy migration.
+- **`storageBuckets.js`** — persistent dataset registry across heap, Memory, flags, and signs.
+- **`flagVault.js`** — cold storage in flag names for data too large or too cold for Memory.
+- **`stockpileManager.js`** — strategic stockpile targets, deficit tracking, and job dispatch.
+- **`terminalManager.js` / `roomBalance.js` / `remoteSupplyManager.js`** — terminal transfers, intra-room distribution, and distributed remote supply chains.
+- **`energyManager.js`** — empire energy distribution and transfer status.
+- **`memoryManager.js`** — serialization scheduling, save-rate tracking, and compaction helpers.
+- **`util.js`** — shared primitives every subsystem depends on: the market order snapshot, terminal transfer cost, owned-room lookup, and body cost.
 
-### Profiling & Diagnostics
-- `creepProfiler.js` — Per-creep role statistics and efficiency (20K, new)
-- `roomCPUProfiler.js` — Per-room CPU cost and bottleneck tracking (64K, new)
-- `statusReport.js` — Comprehensive system status reporting (20K, new)
-- `memoryProfiler.js` — Memory usage analysis
-- `memoryQuery.js` — Deep Memory search utility
-- `screeps-profiler.js` — CPU profiling
+### Infrastructure & Automation
 
-### Repair & Maintenance
-- `repairManager.js` — Unified repair planner, nuke repair planner, rebuild cache, and spawn request dispatcher
-- `roleRepairer.js` — Generic repair task executor for repair manager plans
-- `roadBuilder.js` — Automated road construction (8K, new)
+- **`autoBuilder.js`** — automated base layout planning and construction site placement.
+- **`repairManager.js` / `roleRepairer.js`** — unified repair planning for roads, containers, walls, ramparts, towers, and nuke-defense prep, with a rebuild cache and spawn-request dispatch.
+- **`compliance.js`** — empire-wide room layout and structure compliance auditing.
+- **`roomSuspender.js`** — automatic suspension and resumption of underperforming rooms.
+- **`spawnManager.js`** — creep and Power Creep spawning with body optimization.
+- **`towerManager.js` / `linkManager.js` / `labManager.js` / `powerManager.js`** — tower defense/heal/repair, link routing, multi-group lab reactions, and power spawn support.
+- **`boostManager.js`** — boost production, scheduling, and reservation.
+- **`scavengerPolicy.js` / `scavengerLearning.js`** — scavenging value model with a learned dataset.
+- **`nukeLaunch.js`** — nuke targeting, launch sequencing, and silo readiness.
+- **`roadBuilder.js` / `singleSourceRoom.js` / `claimbotRangeCheck.js` / `taskScheduler.js`** — road automation, single-source room tuning, claim route validation, and deferred task execution.
 
-### Market & Economy
-- `autoTrader.js` — Automated profitable trading (76K)
-- `marketArbitrage.js` — Buy-sell spread arbitrage (104K)
-- `marketLab.js` — Unified lab reaction pipeline analysis (36K, new)
-- `marketLabForward.js` — Buy reagents → combine → sell compound
-- `marketLabReverse.js` — Buy compound → break down → sell reagents
-- `marketPricing.js` — Weighted Mid-Price calculations
-- `marketAnalysis.js` — Profitability tables and order analysis (52K)
-- `marketBuy.js` — Buy order workflows
-- `marketSell.js` — Sell order workflows
-- `marketRefine.js` — Factory refining pipelines (32K)
-- `marketQuery.js` — Market order queries
-- `marketReport.js` — Market reporting (24K)
-- `marketRoomOrders.js` — Per-room order management
-- `marketUpdate.js` — Order price updates
-- `marketMap.js` — Market price mapping and analysis (4K, new)
-- `opportunisticBuy.js` — Opportunistic purchase requests (32K)
-- `opportunisticSell.js` — Opportunistic sell order placement (40K, new)
-- `autoEnergyBuyer.js` — Automatic energy purchasing
-- `dailyFinance.js` — Daily transaction tracking (36K)
-- `globalOrders.js` — Global order management
-- `mineralManager.js` — Mineral and bar management (24K)
+### CPU Management & Diagnostics
 
-### Specialized Systems
-- `boostManager.js` — Automated boost production and scheduling (44K, new)
-- `claimbotRangeCheck.js` — Route validation for claim operations (20K, new)
-- `roadTracker.js` — Road usage tracking and analysis
-- `singleSourceRoom.js` — Single-source room optimization (20K, new)
-- `iff.js` — Friend-or-Foe identification
+- **`main.js`** — explicit CPU budget tiers (CRITICAL / HIGH / NORMAL / LOW) with per-section priorities and a bucket refill target; only CRITICAL sections run every tick under pressure.
+- **`cpuSchedulerPolicy.js`** — peak decay and budget policy for the scheduler.
+- **`roomCPUProfiler.js` / `creepProfiler.js` / `screeps-profiler.js`** — per-room, per-role, and per-function CPU attribution.
+- **`statusReport.js`** — colony status: rooms, RCL, energy, creep census, threats, inventory valuation, and the energy market price with its winning acquisition route.
+- **`defenseMonitor.js` / `iff.js`** — real-time threat assessment and friend-or-foe classification.
+- **`memoryQuery.js` / `cpuQuery.js` / `consoleQuery.js`** — Memory inspection, CPU breakdowns, and room state queries.
 
-### Creep Roles
-
-**Harvesting & Energy**
-- `roleHarvester.js` — Energy harvesting (48K)
-- `roleRemoteHarvesters.js` — Remote harvesting
-- `roleDepositHarvester.js` — Highway deposit harvesting (24K)
-- `roleSupplier.js` — Logistics and hauling (68K)
-- `roleRemoteSupplier.js` — Remote room supply (32K, new)
-- `roleStaticDistributor.js` — Fixed-position distribution (8K, new)
-
-**Construction & Maintenance**
-- `roleBuilder.js` — Construction and repair (28K)
-- `roleRemoteBuilder.js` — Remote construction
-- `roleRampartBot.js` — Dedicated rampart building and reinforcement (20K, new)
-- `roleWallRepair.js` — Wall/rampart repair (24K)
-- `roleRepairBot.js` — Structure repair (12K)
-- `roleRepairer.js` — Generic repair manager executor (new)
-- `roleMaintainer.js` — Room maintenance
-- `roadBuilder.js` — Automated road construction (8K, new)
-
-**Upgrading & Control**
-- `roleUpgrader.js` — Controller upgrading (20K)
-
-**Resource Processing**
-- `roleExtractor.js` — Mineral extraction
-- `roleExtractorAssistant.js` — Extractor support creeps (16K, new)
-- `roleMineralCollector.js` — Mineral collection
-- `roleFactoryBot.js` — Factory operations (16K)
-- `roleLabBot.js` — Lab operations (forward and reverse) (60K)
-- `rolePowerBot.js` — Power processing (16K)
-
-**Power Creeps & Advanced**
-- `roleOperator.js` — Power Creep controller (48K)
-- `roleComboBot.js` — Flexible multi-purpose creeps (32K, new)
-- `roleHD.js` — Heavy Defense specialists (8K, new)
-
-**Scouting & Information**
-- `roleScout.js` — Room scouting (48K)
-- `roleSignbot.js` — Controller signing (4K)
-- `roleScavenger.js` — Resource scavenging (4K)
-
-**Combat & Specialized**
-- `roleDefender.js` — Room defense
-- `roleAttacker.js` — Attack missions (20K)
-- `roleDemolition.js` — Demolition missions (36K)
-- `roleContestedDemolisher.js` — Contested room demolition pairs (120K)
-- `roleTowerDrain.js` — Tower draining operations (152K)
-- `roleTowerFiller.js` — Tower energy supply (12K, new)
-- `roleSKAttacker.js` — Source Keeper combat (20K, new)
-- `roleControllerAttacker.js` — Controller downgrade operations (20K, new)
-- `roleNukeFill.js` — Nuker loading (12K)
-- `roleClaimbot.js` — Room claiming (24K)
-
-**Squad & Specialized**
-- `roleSquad.js` — Squad coordination (28K)
-
-### Strategic Operations
-- `nukeLaunch.js` — Nuke targeting and launch (12K)
-- `nukeUtils.js` — Nuke utilities (4K)
-- `depositObserver.js` — Deposit monitoring (32K)
-
-### Documentation
-- `HowEverythingWorks.txt` — Comprehensive system overview
-- `IntelWeights.txt` — Intelligence scoring weights and tuning (16K, new)
-- `Notes.txt` — Development notes and architecture decisions
+---
 
 ## Console Command Reference
 
-### Intelligence & Monitoring
-    intel('W1N1')                          // Score and analyze a room
-    intelFast('W1N1')                      // Instant room snapshot without profiling
-    listIntel()                            // List all cached intel
-    getCachedIntel('W1N1')                 // Return cached room intel
-    registrySweep()                        // Force ownership registry sweep
-    registryStatus()                       // Registry sweep progress and age
-    registryList()                         // List registered players and rooms
-    registryPlayer('PlayerName')           // Rooms owned by one player
-    wideScan('PlayerName')                 // Scan all observer-range rooms for a player
-    wideScanPlayers()                      // List all players in observer range
-    wideScanStatus()                       // Check scan progress
-    wideScanCancel()                       // Cancel pending wideScan report
-    player('PlayerName')                   // Full player analysis pipeline
-    playerStatus()                         // Check analysis progress
-    playerCancel()                         // Cancel active analysis
-    playerLast()                           // Reprint last analysis report
-    playerScan('PlayerName', 'CREEPCOUNT') // Observer-backed creep census
-    playerScanStatus()                     // Creep census progress
-    playerScanCancel()                     // Cancel active creep census
-    warEstimate('PlayerName')              // Battle prediction and strength analysis (new)
-    warEstimateStatus()                    // War estimate phase and progress
-    warEstimateCancel()                    // Cancel active war estimate
-    warEstimateLast()                      // View cached war estimate
-    defenseStatus()                        // Current threat level and defense readiness (new)
-    monitor('PlayerName', 'WAR')           // Assign player monitor status
-    monitorStatus()                        // Player monitor status summary
-    monitorPause() / monitorResume()       // Pause or resume player monitor alerts
+424 console globals are registered. Each module declares its own in a `// Console globals:` header comment — that header is the authoritative list. `help()` prints a curated subset.
 
-### Scanner & Nukes
-    maintScan()                            // Maintenance decay/repair cost report
-    maintScanRoom('W1N1')                  // Maintenance scan for one room
-    nukeAnalyze('W1N1')                    // Best single nuke strike position
-    nukeAnalyze('W1N1', 3)                 // Greedy best-3 strike combination
-    nukeAnalyzeSelf()                      // Analyze owned rooms
-    nukeIncoming()                         // Check owned rooms for incoming nukes
-    nukeThreat('W1N1')                     // Scan 10-room radius for hostile nukers
-    nukeThreatStatus('W1N1')               // Threat scan progress
-    nukeThreatCancel('W1N1')               // Cancel threat scan
+### Market — pricing & diagnostics
+    prices()                          // Pricing table for all resources
+    priceProfile(RESOURCE_ENERGY)     // Full profile: state, depth, liquidity, references
+    marketPrice('energy')             // Buy/sell prices for one resource
+    orderBook('ZO')                   // Top 10 bids and asks with rooms and volumes
+    marketChaos(5)                    // Sampled chaos report: book, history, concentration
+    buyCeiling(RESOURCE_ENERGY)       // Corroborated ceiling and every evidence source
+    marketGuardStatus()               // Recent blocked buys and the ceilings that stopped them
+    marketVolume(7)                   // Daily volume and momentum
+    marketMap()                       // Room liquidity snapshot by sector
+    priceDiagnostics()                // Audit profiles for anomalies
+    conversionQuote(RESOURCE_ENERGY, RESOURCE_BATTERY)
+    compareEnergyCost(100000)         // Energy vs battery, both routes, delivered cost
 
-### Market & Economy
-    prices()                               // Print all resource prices (WMP)
-    prices('energy')                       // Price for specific resource
-    financeReport()                        // Daily transaction summary
-    autoTrader()                           // Show auto-trader status
-    autoTrader('run')                      // Force immediate trading cycle
-    selling()                              // Show all active sell orders
-    selling('compact', 'E0N0')             // Show sell orders filtered by room
-    buying()                               // Show all active buy orders
-    buying('expanded', 'E0N0')             // Show buy orders filtered by room
-    labForward('E3N46', 'ZO')              // Start forward lab operation
-    labReverse('E3N46', 'ZO')              // Start reverse lab operation
-    console.log(marketAnalysis())          // Profitability tables
-    console.log(reverseReactionAnalysis()) // Reverse reaction profits
-    console.log(decompressionAnalysis())   // Factory decompression profits
-    console.log(orderBook('ZO'))           // Order book for a resource
-    arbitrageStatus()                      // Current arbitrage opportunities (new)
+### Market — trading
+    autoTrader()                      // Status; autoTrader('run') forces a cycle
+    selling() / buying()              // Active orders, optional 'compact'/'expanded' + room
+    marketBuy('E1N1', 'ZO', 5000)     // Managed standing buy order
+    marketSell('E1N1', 'ZO', 5000)    // Managed standing sell order
+    marketBuyStatus() / marketSellStatus()
+    marketBatchBuy(RESOURCE_ENERGY, 50000, 10)
+    opportunisticBuy(...) / opportunisticSell(...)
+    marketRefine('E1N1', RESOURCE_COMPOSITE)
+    marketPriceAdjustment('run')      // Reprice active orders
+    marketSpeculator('status')
+    marketEconomicsStatus()           // Profit, turnover, volume by job
+    marketHistoryStatus()             // Archive retention and capacity
+    runAutoEnergyBuyer()              // Force an energy procurement cycle
 
-### Production & Logistics
-    orderFactory('W1N1', 'Composite', 'max')
-    orderLabs('W1N1', 'XGH2O', 2000)
-    marketRefine('W1N1', RESOURCE_COMPOSITE)
-    transferStuff('E1S1', 'E3S3', RESOURCE_ZYNTHIUM, 5000)
-    remoteSupplyStatus('E1S1')             // Check remote supply chains (new)
+### Economy & inventory
+    econReport()                      // Per-activity contribution ranking
+    invReport()                       // Net worth, per-resource table, 7-day history
+    financeReport() / fR()            // Daily transaction summary
+    energyReport()                    // Empire energy distribution
+    transactionSummary(100)
+    stockpileStatus() / stockpileJobs() / stockpileMode(...)
+    storageOverview() / datasetList() / datasetInspect(id)
+    vfsStatus() / vfsLs() / vfsParityReport()
+    flagVault('status')
 
-### Power Creeps
-    createOperator('C1')                   // Create a new Operator
-    upgradeOperator('C1', PWR_GENERATE_OPS) // Upgrade a power
-    setupOperator('C1', 'E2N46')           // Assign to room
-    setupOperator('C1', 'E2N46', [PWR_GENERATE_OPS, PWR_OPERATE_FACTORY]) // With priorities
-    removeOperator('C1')                   // Remove room assignment
+### Intelligence & monitoring
+    intel('W1N1') / intelFast('W1N1') // Room scoring and analysis
+    listIntel() / getCachedIntel('W1N1')
+    registrySweep() / registryStatus() / registryList() / registryPlayer('Name')
+    wideScan('Name') / wideScanPlayers() / wideScanStatus()
+    player('Name') / playerStatus() / playerLast()
+    playerScan('Name', 'CREEPCOUNT')
+    warEstimate('Name') / warEstimateStatus() / warEstimateLast()
+    monitor('Name', 'WAR') / monitorStatus() / monitorPause() / monitorResume()
+    maintScan() / maintScanRoom('W1N1')
+    simScanStart('E1N1') / simScanStatus()
 
-### Combat & Missions
-    orderAttack('E3N44', 5, 'E3N45')
-    orderTowerDrain('E1S1', 'E2S1', 2)
-    orderTowerDrain('E1S1', 'E2S1', 2, 'N')  // Specify attack edge
-    orderTowerFill('E1S1', 'E2S1', 2)        // Tower energy supply (new)
-    orderDemolition('E1S1', 'E2S2', 2)
-    orderDemolition('E1S1', 'E2S2', 2, 'wall') // Wall-only focus
-    orderContestedDemolisher('E4N49', 'E4N51')
-    orderThieves('W1N1', 'W2N1', 3)
-    orderSquad('E1S1', 'W1N1', 2)
-    orderSKAttack('E1S1', 'E2S1', 2)       // SK combat mission (new)
-    orderControllerAttack('E1S1', 'E2S1')  // Controller downgrade (new)
-    launchClaimbot('E1S1', 'E3S3')
-    launchClaimbot('E1S1', 'E3S3', ['E2S3', 'E3S3']) // With route
-
-### Defense & Nukes
-    orderWallRepair('W1N1', 500000)
-    repairPlan('W1N1')                     // Unified repair plan
-    repairStatus('W1N1')                   // Active/idle repairer count
-    repairDispatch('W1N1')                 // Pending repairer spawn requests
-    repairNukePlan('W1N1')                 // Nuke repair tier breakdown
-    repairSetTarget('W1N1', STRUCTURE_RAMPART, 50000000)
-    repairResetTargets('W1N1')             // Clear target overrides
-    repairPause('W1N1') / repairResume('W1N1')
-    repairCacheBuildings('W1N1')           // Snapshot rebuildable structures
-    repairRebuildMissing('W1N1')           // Recreate missing construction sites
+### Nukes
+    nukeAnalyze('W1N1') / nukeAnalyze('W1N1', 3) / nukeAnalyzeSelf()
+    nukeIncoming() / nukeThreat('W1N1') / nukeInRange()
     nukeFill('W1N1', { maxPrice: 1.5 })
     launchNuke('W1N1', 'W3N3', 'spawn')
-    nukeDefense('W1N1')                    // Plan nuke defense (new)
 
-### Status & Diagnostics
-    getTowerDrainStatus()
-    getContestedDemolisherStatus()
-    listClaimOrders()
-    listThiefOrders()
-    statusReport()                         // Full system status (new)
-    creepProfile()                         // Per-role creep efficiency (new)
-    energyFlow()                           // Room energy production/consumption (new)
-    roomCPU('E1S1')                        // Per-room CPU breakdown (new)
-    memoryQuery('searchTerm')              // Search Memory keys and values
-    memoryQueryKeys('searchTerm')          // Search only keys
-    memoryQueryValues('searchTerm')        // Search only values
+### Production & logistics
+    orderFactory('W1N1', 'Composite', 'max')
+    orderLabs('W1N1', 'XGH2O', 2000) / labForward(...) / labReverse(...)
+    labCommodityStatus('E1N1')
+    localRefineStatus() / factoryOrders() / showAllProduction()
+    transferStuff('E1S1', 'E3S3', RESOURCE_ZYNTHIUM, 5000)
+    remoteSupply(...) / listRemoteSupply() / triggerRemoteSupply(...)
+    terminalStatus() / whyTerminal(...) / storageToTerminal(...)
 
-## Installation & Usage
+### Combat & missions
+    orderAttack('E3N44', 5, 'E3N45')
+    orderTowerDrain('E1S1', 'E2S1', 2, 'N')
+    orderDemolition('E1S1', 'E2S2', 2, 'wall')
+    orderContestedDemolisher('E4N49', 'E4N51')
+    orderDrainDemolisher(...) / orderBulldozer(...)
+    orderHarass(...) / orderHeal(...) / orderSquad(...)
+    orderSKAttack(...) / orderControllerAttack(...)
+    orderThieves('W1N1', 'W2N1', 3) / listThiefOrders()
+    launchClaimbot('E1S1', 'E3S3', ['E2S3', 'E3S3'])
 
-- Clone/copy into your Screeps `src` directory.
-- Deploy the main loop (`main.js`) to your Screeps environment.
-- Configure per-module constants (thresholds, margins, allowlists/denylists) before upload.
-- Review scanner scoring and monitor constants in `scanner.js` for room scoring, threat classification, observer priorities, and registry cadence.
-- Use console commands to:
-  - Gather intelligence on rooms and players with war/defense analysis
-  - Schedule factory/lab/market actions
-  - Configure automated trading parameters
-  - Manage Power Creep assignments
-  - Trigger missions (attack/demolition/tower drain/SK combat/controller downgrade)
-  - Run scans, profiling, and diagnostics
-  - Manage cross-room transfers and remote supply chains
-  - View financial reports and market pricing
-  - Monitor energy flow, CPU usage, and creep efficiency
+### Repair & building
+    repairPlan('W1N1') / repairStatus('W1N1') / repairDispatch('W1N1')
+    repairNukePlan('W1N1') / repairSetTarget('W1N1', STRUCTURE_RAMPART, 50000000)
+    repairPause('W1N1') / repairResume('W1N1')
+    repairCacheBuildings('W1N1') / repairRebuildMissing('W1N1')
+    autoBuilder() / buildRoad(...) / removeRoad(...)
+    compliance() / compliance.help()
+
+### Power Creeps
+    createOperator('C1') / upgradeOperator('C1', PWR_GENERATE_OPS)
+    setupOperator('C1', 'E2N46', [PWR_GENERATE_OPS, PWR_OPERATE_FACTORY])
+    powerStatus() / powerUpgradeToLevel(25) / freePowerLevels()
+
+### Status & diagnostics
+    status()                          // Full colony status report
+    roomState('E1N1', true) / printRoomState('E1N1')
+    spawnStatus('W1N1') / creepProfile()
+    cpu() / cpuHud() / cpuHelp() / profileRoom('E1S1')
+    memoryQuery('rooms.E1N1') / memoryOverview() / memoryProfile()
+    roomSuspendStatus() / roomSuspendPlan() / getSuspendedRooms()
+    schedule(...) / listScheduled() / runScheduled(...)
+    help()
+
+---
+
+## Repository Layout
+
+    main.js              Main loop, CPU scheduler, section priorities
+    Bots/                36 creep role modules
+    Scanners/            scanner, iff, depositObserver, creepProfiler, roomCPUProfiler
+    Utilities/           All managers, market modules, storage, diagnostics
+    docs/                codex.js — the module contract read before changing code
+    test/                24 dependency-free regression harnesses
+    Documentation/       HowEverythingWorks, IntelWeights, Notes
+    Archive/             Superseded modules kept for reference, not deployed
+
+Screeps loads only the flat set of modules; the folder structure exists for humans. `docs/` and `test/` are not uploaded.
+
+### Working on this codebase
+
+Read `docs/codex.js` before changing any runtime module — it records the invariants that are not obvious from the code, including market pricing rules, Memory serialization contracts, and the API quirks each subsystem works around. `docs/codex-full.js` holds the long-form version.
+
+Run the regression harnesses with plain Node, no dependencies required:
+
+    node test/market_spend_guard_harness.js
+    node test/energy_direct_buy_harness.js
+    node test/market_lab_queue_harness.js
+
+Syncing from the live Screeps directory into this repository is handled by `tools/sync-to-repo.sh` there, which owns the `Bots`/`Scanners`/`Utilities` placement rules so the two trees cannot silently drift.
+
+---
 
 ## Configuration & Tuning
 
-- **Intel Weights** (`IntelWeights.txt`): Adjust room scoring weights (economic/military/dual-purpose ratios)
-- **Scanner** (`scanner.js`): Adjust room scoring, observer priorities, registry sweep cadence, monitor hot-poll cadence, and war-estimate behavior
-- **Repair Manager** (`repairManager.js`): Adjust repair tiers, rampart/wall targets, nuke safety margins, tower repair limits, and repairer spawn sizing
-- **Boost Management** (`boostManager.js`): Configure boost production priorities and schedules
-- **Storage Thresholds** (`storageManager.js`): Set per-resource storage targets and reserve amounts
-- **Remote Supply** (`remoteSupplyManager.js`): Define remote room supply priorities and demand levels
-- **Tower Strategy** (`towerManager.js`): Tune tower target selection (defend/heal/repair balance)
-- **Market Margins** (`marketArbitrage.js`, `autoTrader.js`): Set minimum profit thresholds
-- **CPU Throttling** (`roomCPUProfiler.js`): Configure CPU budget allocation per room
-- **Main CPU Scheduler** (`main.js`): Tune Shard 3 CPU limits and section priority tiers
+| Area | Where |
+| :--- | :--- |
+| Buy ceiling multipliers, depth gates, delivery yield | `marketPricing.js` (`CEILING_*`, `DELIVERY_MIN_YIELD`) |
+| Energy tier thresholds and buy amounts | `autoEnergyBuyer.js` (`TIERS`, `MAX_ENERGY_PER_RUN`) |
+| Trading margins and hurdles | `autoTrader.js`, `marketArbitrage.js`, `marketAnalysis.js` |
+| Sell floors and exposure caps | `autoTraderSellPolicy.js`, `marketSell.js` |
+| CPU budget tiers and section priorities | `main.js`, `cpuSchedulerPolicy.js` |
+| Repair tiers, rampart targets, nuke margins | `repairManager.js` |
+| Room scoring, observer priorities, registry cadence | `scanner.js`, `Documentation/IntelWeights.txt` |
+| Storage targets and reservations | `storageManager.js`, `stockpileManager.js` |
+| Room suspension thresholds | `roomSuspender.js` |
 
-## Architecture Highlights
+---
 
-The codebase is structured for:
-- **Modularity**: Each subsystem (profiling, storage, market, combat) is independent and reusable
-- **Performance**: Heavy use of caching, per-tick budgets, and lazy evaluation
-- **Observability**: Real-time profiling, status reporting, and performance tracking
-- **Flexibility**: Console API for runtime configuration without redeployment
-- **Scalability**: Distributed systems for remote supply, multi-room operations, and concurrent tasks
+## Architecture Notes
+
+- **Single authorities.** One module owns each shared concern — `marketPricing` for valuation, `getRoomState` for room views, `storageManager` for reservations, `roomNavigation` for inter-room paths. Consumers do not reimplement them.
+- **Caching by snapshot, not by tick.** Market data is keyed to a shared order snapshot with a TTL, because modules run on staggered tick offsets and would otherwise never share a per-tick cache.
+- **Memory is expensive.** Serialization cost is sampled and amortized into the CPU scheduler's reserve; cold data moves to Memory segments through `storageVfs` or into flag names through `flagVault`.
+- **Fail closed on money.** Pricing paths refuse to act on uncorroborated data rather than guessing, and a pre-trade guard sits between every module and the market API.
+- **Console-first operations.** Nearly every subsystem exposes status and control commands, so tuning and diagnosis happen live rather than through redeploys.
 
 ## Contributing
 
-- Keep new functionality modular (one concern per file/module).
-- Document configuration knobs and any console commands added.
-- Include CPU impact notes for large loops and high-frequency logic.
-- Prefer clear, explicit logging that can be toggled or throttled.
-- Add profiling hooks for new hot-path code.
-- Use shared infrastructure (roomNavigation, marketPricing, getRoomState, storageManager) where possible rather than duplicating logic.
-- Test new creep roles with the creepProfiler before deployment.
-- Verify war estimate logic before engaging in major conflicts.
+- Read `docs/codex.js` first; add to it when establishing a new invariant.
+- Keep one concern per module, and register console globals in the module that owns the behavior.
+- Use the shared authorities rather than duplicating their logic.
+- Add a regression harness for anything that spends credits or mutates Memory structure.
+- Note CPU impact for new hot-path loops, and profile with `profileRoom` / `cpu()` before and after.
