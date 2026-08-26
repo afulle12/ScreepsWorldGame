@@ -1,506 +1,367 @@
-/**
- * Auto Energy Buyer Module
- * Automatically buys energy when room storage falls below threshold.
- *
- * Three independent buy tiers fire when their threshold is breached:
- *   Tier 1 (normal):    storage < 250k  →  buy 100k  [price-optimal: batteries or energy]
- *   Tier 2 (emergency): storage < 100k  →  buy 200k  [energy only — forceEnergy]
- *   Tier 3 (critical):  storage <  50k  →  buy 250k  [energy only — forceEnergy]
- *
- * ============================================================
- * CONSOLE COMMANDS
- * ============================================================
- *
- * compareEnergyCost(amount?)
- *   Compares the current market cost of buying energy directly vs buying
- *   batteries and converting them through factory production.
- *   Prints the computed buy price for each resource (mirrors what
- *   marketBuy.marketBuy() will actually pay: highest buy order + 0.1, or
- *   95% of 2-day historical average), the total credit cost to acquire
- *   `amount` energy via each route, and a verdict showing which is cheaper.
- *
- *   @param {number} [amount=100000] - Energy units to price up (default 100k).
- *                                     Battery equivalent is derived automatically
- *                                     (amount / 10 batteries needed).
- *
- *   Examples:
- *     compareEnergyCost()          // compare cost for 100k energy
- *     compareEnergyCost(500000)    // compare cost for 500k energy
- *
- *   Sample output:
- *     === Energy Cost Comparison (100k energy) ===
- *       Energy   (direct) : 0.0420/e    →  4,200.00 cr  (100,000 energy)
- *       Batteries (10e/bat): 0.0350/bat  →  3,500.00 cr  (10,000 batteries)
- *       ✓ Batteries are cheaper by 700.00 cr  (16.7% saving)
- *
- *
- * runAutoEnergyBuyer()
- *   Runs the auto-buyer immediately for all owned rooms, without waiting
- *   for the next scheduled tick. Useful for testing or responding to a
- *   sudden energy shortage. Identical to the automatic run() call.
- *
- *   Example:
- *     runAutoEnergyBuyer()
- *
- * ============================================================
- */
-
-var marketBuyer = require('marketBuy');
-
-// ── Buy tiers ───────────────────────────────────────────────────────────────
-const TIERS = [
-    { label: 'normal',    threshold: 250000, buyAmount: 100000, forceEnergy: false },
-    { label: 'emergency', threshold: 100000, buyAmount: 200000, forceEnergy: true  },
-    { label: 'critical',  threshold:  50000, buyAmount: 250000, forceEnergy: true  },
-];
-
-// Factory conversion constants (must match COMMODITIES: 50 batteries → 500 energy)
-const ENERGY_PER_BATTERY  = 10;
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// autoEnergyBuyer.js
+// Console globals: compareEnergyCost, runAutoEnergyBuyer
+// Example: compareEnergyCost(100000) - Compare buying energy directly vs refinement
+// Example: runAutoEnergyBuyer() - Trigger automated energy buyer cycle across rooms
+const marketBuyer = require("marketBuy");
+const util = require("util");
+const pricing = require("marketPricing");
+const creditLedger = require("creditLedger");
+const storageManager = require("storageManager");
+const factoryManager = require("factoryManager");
+const localRefine = require("localRefine");
+const marketBatchBuy = require("marketBatchBuy");
+const TIERS = [ {
+  label: "normal",
+  threshold: 25e4,
+  buyAmount: 1e5,
+  forceEnergy: false
+}, {
+  label: "emergency",
+  threshold: 1e5,
+  buyAmount: 2e5,
+  forceEnergy: true
+}, {
+  label: "critical",
+  threshold: 5e4,
+  buyAmount: 25e4,
+  forceEnergy: true
+} ];
+const ENERGY_PER_BATTERY = 10;
 const BATTERIES_PER_BATCH = 50;
-
-// Ignore sell orders smaller than this when sampling the best price
-const MIN_ORDER_AMOUNT = 500;
-
-// ── Staleness detection ─────────────────────────────────────────────────────
-// How many ticks between taking a snapshot and evaluating fill progress.
-// If fewer than 25% of the snapshotted remainingAmount has been filled by
-// the time this window elapses, the order is cancelled and repriced.
-const STALE_CHECK_TICKS = 500;
-
-// If an order's price is below this fraction of the current market price it is
-// repriced immediately — no need to wait for the fill-rate window.
-// 0.95 means "reprice if we are more than 5% below current market".
-const PRICE_COMPETITIVE_RATIO = 0.95;
-
-var autoEnergyBuyer = {
-
-    // ── Memory helpers ──────────────────────────────────────────────────────
-
-    ensureMemory: function() {
-        if (!Memory.autoEnergyBuyer) Memory.autoEnergyBuyer = {};
-        if (!Memory.autoEnergyBuyer.orderSnapshots) Memory.autoEnergyBuyer.orderSnapshots = {};
-    },
-
-    // ── Staleness / price-competitiveness ──────────────────────────────────
-
-    /**
-     * Called by route handlers before getTotalOnOrder.
-     * Scans active buy orders for the given room + resource and cancels any
-     * that are either uncompetitive on price or have stalled on fill rate.
-     *
-     * Two reprice triggers (evaluated in order for each order):
-     *   1. Price: order.price < currentMarketPrice * PRICE_COMPETITIVE_RATIO
-     *      → cancel and reprice immediately regardless of age.
-     *   2. Staleness: STALE_CHECK_TICKS have elapsed since the snapshot was
-     *      taken AND fewer than 25% of the snapshotted amount was filled.
-     *      → cancel and reprice; if progress is ≥25% roll the window forward.
-     *
-     * Snapshots are created on first encounter and pruned when orders vanish.
-     */
-    repriceStaleOrders: function(roomName, resourceType, currentMarketPrice) {
-        this.ensureMemory();
-        const snapshots = Memory.autoEnergyBuyer.orderSnapshots;
-        const myOrders  = Game.market.orders;
-
-        // Prune snapshots whose orders have disappeared
-        for (const orderId in snapshots) {
-            if (!myOrders[orderId]) delete snapshots[orderId];
-        }
-
-        for (const orderId in myOrders) {
-            const order = myOrders[orderId];
-            if (order.type         !== ORDER_BUY)    continue;
-            if (order.roomName     !== roomName)      continue;
-            if (order.resourceType !== resourceType)  continue;
-            if (order.remainingAmount <= 0)            continue;
-
-            // Ensure a snapshot baseline exists for this order
-            if (!snapshots[orderId]) {
-                snapshots[orderId] = {
-                    remainingAmount: order.remainingAmount,
-                    snapshotTick:    Game.time,
-                };
-            }
-            const snap = snapshots[orderId];
-
-            // ── Trigger 1: price uncompetitive ─────────────────────────────
-            const priceThreshold = currentMarketPrice * PRICE_COMPETITIVE_RATIO;
-            if (order.price < priceThreshold) {
-                console.log('[AutoBuy] Uncompetitive order ' + orderId
-                    + ' | ' + resourceType + ' | room: ' + roomName
-                    + ' | price: ' + order.price.toFixed(4)
-                    + ' < market threshold: ' + priceThreshold.toFixed(4)
-                    + ' | repricing ' + order.remainingAmount + ' units');
-                this._cancelAndReprice(orderId, order, snapshots);
-                continue;
-            }
-
-            // ── Trigger 2: fill-rate staleness ─────────────────────────────
-            if (Game.time - snap.snapshotTick < STALE_CHECK_TICKS) continue;
-
-            const filled   = snap.remainingAmount - order.remainingAmount;
-            const fillRate = filled / snap.remainingAmount;
-
-            if (fillRate < 0.25) {
-                console.log('[AutoBuy] Stale order ' + orderId
-                    + ' | ' + resourceType + ' | room: ' + roomName
-                    + ' | filled ' + (fillRate * 100).toFixed(1) + '%'
-                    + ' over ' + STALE_CHECK_TICKS + ' ticks'
-                    + ' | price: ' + order.price.toFixed(4)
-                    + ' → new: '   + currentMarketPrice.toFixed(4)
-                    + ' | repricing ' + order.remainingAmount + ' units');
-                this._cancelAndReprice(orderId, order, snapshots);
-            } else {
-                // Good progress — roll the window forward
-                console.log('[AutoBuy] Order ' + orderId
-                    + ' (' + resourceType + ') filled '
-                    + (fillRate * 100).toFixed(1) + '% — staleness window reset.');
-                snap.remainingAmount = order.remainingAmount;
-                snap.snapshotTick    = Game.time;
-            }
-        }
-    },
-
-    /**
-     * Cancel an order and immediately recreate it at the current market price.
-     * Cleans up the snapshot so the new order gets a fresh baseline next call.
-     */
-    _cancelAndReprice: function(orderId, order, snapshots) {
-        const cancelResult = Game.market.cancelOrder(orderId);
-        if (cancelResult === OK) {
-            delete snapshots[orderId];
-            const buyResult = marketBuyer.marketBuy(
-                order.roomName,
-                order.resourceType,
-                order.remainingAmount
-                // price omitted — marketBuy computes current market price
-            );
-            console.log('[AutoBuy] Reprice result → ' + buyResult);
-        } else {
-            console.log('[AutoBuy] Could not cancel order ' + orderId + ': ' + cancelResult);
-        }
-    },
-
-
-
-    // ── Market helpers ──────────────────────────────────────────────────────
-
-    /**
-     * Find the lowest ask price for a resource, ignoring tiny orders.
-     */
-    getBestSellPrice: function(resourceType) {
-        const orders = Game.market.getAllOrders({ type: ORDER_SELL, resourceType });
-        if (!orders || orders.length === 0) return null;
-        let best = Infinity;
-        for (const o of orders) {
-            if (o.amount >= MIN_ORDER_AMOUNT && o.price < best) best = o.price;
-        }
-        return best === Infinity ? null : best;
-    },
-
-    /**
-     * Sum of remainingAmount across all of our active buy orders for a given
-     * room + resource. Used to calculate the deficit without double-ordering.
-     */
-    getTotalOnOrder: function(roomName, resourceType) {
-        let total = 0;
-        for (const orderId in Game.market.orders) {
-            const o = Game.market.orders[orderId];
-            if (o.roomName     === roomName     &&
-                o.resourceType === resourceType &&
-                o.type         === ORDER_BUY    &&
-                o.remainingAmount > 0) {
-                total += o.remainingAmount;
-            }
-        }
-        return total;
-    },
-
-    /**
-     * Return true if an active or queued factory energy-production order
-     * already exists for this room, to avoid stacking duplicates.
-     */
-    hasEnergyProductionOrder: function(roomName) {
-        return !!(Memory.factoryOrders || []).find(function(o) {
-            return o.room    === roomName        &&
-                   o.product === RESOURCE_ENERGY &&
-                   (o.status === 'active' || o.status === 'queued');
-        });
-    },
-
-    /**
-     * Returns true if the room has an active or queued factory production order
-     * for something other than energy. While the factory is busy the energy
-     * conversion cannot run, so buying batteries would just leave them sitting.
-     */
-    hasActiveProductionOrder: function(roomName) {
-        return !!(Memory.factoryOrders || []).find(function(o) {
-            return o.room    === roomName        &&
-                   o.product !== RESOURCE_ENERGY &&
-                   (o.status === 'active' || o.status === 'queued');
-        });
-    },
-
-    // ── Per-room route handlers ─────────────────────────────────────────────
-
-    /**
-     * Battery route.
-     * Triggers factory production (batteries → energy) for any batteries
-     * already in storage/terminal, then buys enough batteries to cover the
-     * total deficit (on-hand + on-order vs totalNeeded in battery units).
-     */
-    handleBatteryRoute: function(room, totalEnergyNeeded, batteryPrice, batteryCostPerUnit, energyPrice) {
-        const roomName             = room.name;
-
-        // Reprice any existing battery orders that are uncompetitive or stale
-        this.repriceStaleOrders(roomName, RESOURCE_BATTERY, batteryPrice);
-
-        const totalBatteriesNeeded = Math.ceil(totalEnergyNeeded / ENERGY_PER_BATTERY);
-
-        const storageBatteries  = room.storage  ? (room.storage.store[RESOURCE_BATTERY]  || 0) : 0;
-        const terminalBatteries = room.terminal  ? (room.terminal.store[RESOURCE_BATTERY] || 0) : 0;
-        const alreadyOnOrder    = this.getTotalOnOrder(roomName, RESOURCE_BATTERY);
-        const totalOnHand       = storageBatteries + terminalBatteries;
-        const totalCovered      = totalOnHand + alreadyOnOrder;
-        const deficit           = totalBatteriesNeeded - totalCovered;
-
-        const savingStr = energyPrice != null
-            ? ' vs ' + energyPrice.toFixed(4) + '/e direct'
-              + ' (saving ' + (((energyPrice - batteryCostPerUnit) / energyPrice) * 100).toFixed(1) + '%)'
-            : ' (no energy sell orders found)';
-
-        console.log('[AutoBuy] ' + roomName + ': battery route'
-            + ' | ' + batteryPrice.toFixed(4) + '/bat → ' + batteryCostPerUnit.toFixed(4) + '/e' + savingStr
-            + ' | need ' + totalBatteriesNeeded + ' bat'
-            + ' | storage: ' + storageBatteries + ' terminal: ' + terminalBatteries
-            + ' | on order: ' + alreadyOnOrder
-            + ' | deficit: ' + deficit);
-
-        // ── Step 1: Trigger factory production if we have batteries ────────
-        if (totalOnHand >= BATTERIES_PER_BATCH) {
-            if (!this.hasEnergyProductionOrder(roomName)) {
-                const result = global.orderFactory(roomName, RESOURCE_ENERGY, 'max');
-                console.log('[AutoBuy] ' + roomName + ': factory energy order placed → ' + result);
-            } else {
-                console.log('[AutoBuy] ' + roomName + ': factory energy production already in progress.');
-            }
-        } else {
-            console.log('[AutoBuy] ' + roomName + ': only ' + totalOnHand
-                + ' batteries available (need ' + BATTERIES_PER_BATCH + ' per batch).');
-        }
-
-        // ── Step 2: Buy the battery deficit ──────────────────────────────
-        if (deficit <= 0) {
-            console.log('[AutoBuy] ' + roomName + ': battery supply fully covered — no market order needed.');
-            return;
-        }
-
-        console.log('[AutoBuy] ' + roomName + ': buying ' + deficit + ' batteries'
-            + ' (~' + Math.round(deficit * ENERGY_PER_BATTERY / 1000) + 'k energy equiv)'
-            + ' at ' + batteryPrice.toFixed(4) + '/bat');
-
-        const result = marketBuyer.marketBuy(roomName, RESOURCE_BATTERY, deficit);
-        if (typeof result === 'number') {
-            console.log('[AutoBuy] ' + roomName + ': marketBuy(BATTERY) → '
-                + (result === OK ? 'OK' : 'ERR ' + result));
-        } else {
-            console.log('[AutoBuy] ' + roomName + ': marketBuy(BATTERY) → ' + result);
-        }
-    },
-
-    /**
-     * Energy route (direct buy).
-     * Calculates the deficit between totalNeeded and already-committed buy
-     * orders, then places a single top-up order for the difference.
-     */
-    handleEnergyRoute: function(room, totalNeeded, energyPrice) {
-        const roomName       = room.name;
-
-        // Reprice any existing energy orders that are uncompetitive or stale
-        this.repriceStaleOrders(roomName, RESOURCE_ENERGY, energyPrice);
-
-        const alreadyOnOrder = this.getTotalOnOrder(roomName, RESOURCE_ENERGY);
-        const deficit        = totalNeeded - alreadyOnOrder;
-
-        const priceStr = energyPrice != null ? energyPrice.toFixed(4) + '/e' : 'market price';
-        console.log('[AutoBuy] ' + roomName + ': energy route'
-            + ' | need '     + Math.round(totalNeeded    / 1000) + 'k'
-            + ', on order '  + Math.round(alreadyOnOrder / 1000) + 'k'
-            + ', deficit '   + Math.round(deficit        / 1000) + 'k'
-            + ' at ' + priceStr);
-
-        if (deficit <= 0) {
-            console.log('[AutoBuy] ' + roomName + ': sufficient orders already active — skipping.');
-            return;
-        }
-
-        const result = marketBuyer.marketBuy(roomName, RESOURCE_ENERGY, deficit);
-        if (typeof result === 'number') {
-            console.log('[AutoBuy] ' + roomName + ': marketBuy(ENERGY) → '
-                + (result === OK ? 'OK' : 'ERR ' + result));
-        } else {
-            console.log('[AutoBuy] ' + roomName + ': marketBuy(ENERGY) → ' + result);
-        }
-    },
-
-    // ── Main entry point ────────────────────────────────────────────────────
-
-    /**
-     * Check all owned rooms and place buy orders as needed.
-     * Prices are sampled once globally; all rooms use the same strategy.
-     */
-    run: function() {
-        if (!Game.market || Game.market.credits < 0.01) {
-            console.log('[AutoBuy] ERROR: Market not available or insufficient credits');
-            return;
-        }
-
-        // ── Sample market prices once ────────────────────────────────────────
-        const energyPrice        = marketBuyer.computeBuyPrice(RESOURCE_ENERGY);
-        const batteryPrice       = marketBuyer.computeBuyPrice(RESOURCE_BATTERY);
-        const batteryCostPerUnit = batteryPrice / ENERGY_PER_BATTERY;
-
-        console.log('[AutoBuy] Computed buy prices:'
-            + '  energy='  + energyPrice.toFixed(4)         + '/e'
-            + '  battery=' + batteryPrice.toFixed(4)         + '/bat'
-            + ' (effective ' + batteryCostPerUnit.toFixed(4) + '/e)');
-
-        const useBatteries = batteryCostPerUnit <= energyPrice;
-        console.log('[AutoBuy] Strategy: ' + (useBatteries ? 'BUY BATTERIES' : 'BUY ENERGY DIRECTLY'));
-
-        // ── Per-room loop ────────────────────────────────────────────────────
-        for (const roomName in Game.rooms) {
-            const room = Game.rooms[roomName];
-            if (!room.controller || !room.controller.my || !room.storage) continue;
-
-            if (!room.terminal) {
-                console.log('[AutoBuy] WARNING: ' + roomName + ' has no terminal — skipping.');
-                continue;
-            }
-
-            const storageEnergy = room.storage.store[RESOURCE_ENERGY] || 0;
-
-            // Evaluate every tier independently
-            let needEnergy  = 0;  // must buy as energy (forceEnergy tiers)
-            let needOptimal = 0;  // price-strategy tiers (battery or energy)
-            const triggeredLabels = [];
-            for (const tier of TIERS) {
-                if (storageEnergy < tier.threshold) {
-                    if (tier.forceEnergy) {
-                        needEnergy += tier.buyAmount;
-                    } else {
-                        needOptimal += tier.buyAmount;
-                    }
-                    triggeredLabels.push(tier.label
-                        + ' (<' + Math.round(tier.threshold / 1000) + 'k → +'
-                        + Math.round(tier.buyAmount  / 1000) + 'k'
-                        + (tier.forceEnergy ? ' energy-only' : '') + ')');
-                }
-            }
-
-            const totalNeeded = needEnergy + needOptimal;
-
-            if (totalNeeded === 0) {
-                // Energy is healthy — but still convert any idle batteries so
-                // they don't accumulate indefinitely waiting for a low-energy event.
-                const storageBats  = room.storage  ? (room.storage.store[RESOURCE_BATTERY]  || 0) : 0;
-                const terminalBats = room.terminal ? (room.terminal.store[RESOURCE_BATTERY] || 0) : 0;
-                const totalBats    = storageBats + terminalBats;
-                if (totalBats >= BATTERIES_PER_BATCH && !this.hasEnergyProductionOrder(roomName)) {
-                    const result = global.orderFactory(roomName, RESOURCE_ENERGY, 'max');
-                    console.log('[AutoBuy] ' + roomName
-                        + ' | storage: ' + Math.round(storageEnergy / 1000) + 'k — above thresholds'
-                        + ' but ' + totalBats + ' idle batteries; factory conversion triggered → ' + result);
-                } else {
-                    console.log('[AutoBuy] ' + roomName
-                        + ' | storage: ' + Math.round(storageEnergy / 1000) + 'k — above all thresholds, OK.');
-                }
-                continue;
-            }
-
-            console.log('[AutoBuy] ' + roomName
-                + ' | storage: '         + Math.round(storageEnergy / 1000) + 'k'
-                + ' | tiers triggered: ' + triggeredLabels.join(', ')
-                + ' | energy-only: '     + Math.round(needEnergy  / 1000) + 'k'
-                + ' | price-optimal: '   + Math.round(needOptimal / 1000) + 'k');
-
-            // Energy-only portion: always direct regardless of price strategy
-            if (needEnergy > 0) {
-                this.handleEnergyRoute(room, needEnergy, energyPrice);
-            }
-
-            // Price-optimal portion: use whichever route is cheaper —
-            // unless the factory is busy with another production order.
-            if (needOptimal > 0) {
-                const factoryBusy = this.hasActiveProductionOrder(roomName);
-                if (useBatteries && !factoryBusy) {
-                    this.handleBatteryRoute(room, needOptimal, batteryPrice, batteryCostPerUnit, energyPrice);
-                } else {
-                    if (factoryBusy && useBatteries) {
-                        console.log('[AutoBuy] ' + roomName + ': factory busy with production order — buying energy directly instead of batteries.');
-                    }
-                    this.handleEnergyRoute(room, needOptimal, energyPrice);
-                }
-            }
-        }
-    }
+const MAX_ENERGY_PER_RUN = 3e5;
+// Direct purchase (dealing against a live SELL order) versus a standing bid.
+// The two are not priced on the same basis: when someone fills OUR buy order
+// they call deal() and pay the terminal transfer, but when we take THEIR ask we
+// are the dealer and pay it ourselves -- in energy, the very thing we are
+// buying. A seller 60 rooms away costs ~86% of the shipment in freight, so the
+// only meaningful comparison is credits per unit that actually lands.
+const MIN_DIRECT_TAKE = 1e3; // ignore dust asks; one deal should be worth the intent
+const DIRECT_PREMIUM = {
+  normal: 1,
+  urgent: 1.5
 };
-
-// ── Console commands ────────────────────────────────────────────────────────
-
-global.compareEnergyCost = function(amount) {
-    amount = (typeof amount === 'number' && amount > 0) ? Math.ceil(amount) : 100000;
-
-    if (!Game.market) {
-        console.log('[AutoBuy] Market not available.');
-        return;
+const ENERGY_QUEUE = "energy";
+const ENERGY_JOB = {
+  queue: ENERGY_QUEUE
+};
+const autoEnergyBuyer = {
+  getBestSellPrice: function(e) {
+    const o = pricing.getPriceProfile(e);
+    return o && typeof o.buyPrice === "number" ? o.buyPrice : null;
+  },
+  getTotalOnOrder: function(e, o) {
+    let t = 0;
+    for (const r in Game.market.orders) {
+      const n = Game.market.orders[r];
+      const a = util.getOrderRemaining(n);
+      if (n.roomName === e && n.resourceType === o && n.type === ORDER_BUY && a > 0) {
+        t += a;
+      }
     }
-
-    const energyPrice  = marketBuyer.computeBuyPrice(RESOURCE_ENERGY);
-    const batteryPrice = marketBuyer.computeBuyPrice(RESOURCE_BATTERY);
-
-    const batteriesNeeded    = Math.ceil(amount / ENERGY_PER_BATTERY);
-    const energyCostTotal    = energyPrice  != null ? energyPrice  * amount           : null;
-    const batteryCostTotal   = batteryPrice != null ? batteryPrice * batteriesNeeded  : null;
-    const batteryCostPerUnit = batteryPrice != null ? batteryPrice / ENERGY_PER_BATTERY : null;
-
-    const fmtPrice = n  => n  != null ? n.toFixed(4)         : 'no orders';
-    const fmtCr    = n  => n  != null ? n.toFixed(2) + ' cr' : 'N/A';
-    const fmtNum   = n  => n.toLocaleString();
-    const amtLabel = Math.round(amount / 1000) + 'k';
-
-    console.log('=== Energy Cost Comparison (' + amtLabel + ' energy) ===');
-    console.log('  Energy    (direct) : ' + fmtPrice(energyPrice)
-        + '/e'
-        + '              →  ' + fmtCr(energyCostTotal)
-        + '  (' + fmtNum(amount) + ' energy)');
-    console.log('  Batteries (' + ENERGY_PER_BATTERY + 'e/bat) : ' + fmtPrice(batteryPrice)
-        + '/bat (= ' + fmtPrice(batteryCostPerUnit) + '/e)'
-        + '  →  ' + fmtCr(batteryCostTotal)
-        + '  (' + fmtNum(batteriesNeeded) + ' batteries)');
-
-    if (energyCostTotal != null && batteryCostTotal != null) {
-        const diff   = energyCostTotal - batteryCostTotal;
-        const pct    = Math.abs((diff / energyCostTotal) * 100).toFixed(1);
-        const absDiff = Math.abs(diff).toFixed(2);
-        if (diff > 0) {
-            console.log('  ✓ Batteries cheaper by ' + absDiff + ' cr  (' + pct + '% saving)');
-        } else if (diff < 0) {
-            console.log('  ✓ Energy cheaper by ' + absDiff + ' cr  (' + pct + '% saving)');
-        } else {
-            console.log('  = Same cost either way.');
-        }
-    } else if (energyCostTotal == null && batteryCostTotal != null) {
-        console.log('  ✓ Batteries only option (no energy market data found).');
-    } else if (batteryCostTotal == null && energyCostTotal != null) {
-        console.log('  ✓ Energy only option (no battery market data found).');
+    return t;
+  },
+  // Amount already committed through direct purchase jobs, so the passive
+  // order is sized against the real outstanding total for this resource.
+  getDirectOnOrder: function(e, o) {
+    var t = marketBatchBuy && typeof marketBatchBuy.getOpenJobs === "function" ? marketBatchBuy.getOpenJobs() : [];
+    var r = 0;
+    for (var n = 0; n < t.length; n++) {
+      var a = t[n];
+      if (a && a.roomName === e && a.resourceType === o) {
+        r += Math.max(0, (a.amount || 0) - (a.fulfilled || 0));
+      }
+    }
+    return r;
+  },
+  // Cheapest live ask in credits per unit delivered here. The freight math and
+  // the yield floor belong to marketPricing; this only adds the execution
+  // constraint that is ours -- an order big enough to be worth an intent.
+  bestDirectOffer: function(e, o, t) {
+    var r = pricing.deliveredBuyQuote(o, t, e);
+    if (!r || r.take < MIN_DIRECT_TAKE) return null;
+    return r;
+  },
+  bestDirectEnergyOffer: function(e, o) {
+    return this.bestDirectOffer(e, RESOURCE_ENERGY, o);
+  },
+  // Take the cheapest delivered ask when it beats resting a bid. The bid leg
+  // is the comparison, never the blended acquisition price -- that already
+  // contains this route, and comparing it against itself always ties.
+  // Returns the NET amount committed so the passive order can be sized around
+  // it (for energy, freight comes out of the shipment).
+  tryDirectPurchase: function(e, o, t, r, n) {
+    var a = e.name;
+    var l = this.bestDirectOffer(a, o, t);
+    if (!l) return 0;
+    var s = o === RESOURCE_ENERGY ? "/e" : "/u";
+    var i = n ? DIRECT_PREMIUM.urgent : DIRECT_PREMIUM.normal;
+    var c = typeof r === "number" && r > 0 ? r * i : null;
+    if (c !== null && l.delivered > c) {
+      console.log("[AutoBuy] " + a + ": best direct " + o + " ask " + l.price.toFixed(3) + " from " + l.sellerRoom + " delivers at " + l.delivered.toFixed(3) + s + " after " + l.freight + " freight — above the " + r.toFixed(3) + " standing bid" + (n ? " x" + i : "") + "; staying passive.");
+      return 0;
+    }
+    var d = e.terminal ? e.terminal.store[RESOURCE_ENERGY] || 0 : 0;
+    if (d < l.freight) {
+      console.log("[AutoBuy] " + a + ": direct " + o + " purchase needs " + l.freight + " terminal energy for freight, have " + d + "; staying passive.");
+      return 0;
+    }
+    var u = marketBatchBuy.create({
+      roomName: a,
+      resourceType: o,
+      amount: l.take,
+      orderId: l.orderId,
+      orderRoomName: l.sellerRoom,
+      orderPrice: l.price,
+      maxPrice: l.price,
+      energyCost: l.freight,
+      queue: ENERGY_QUEUE,
+      ownerId: "autoEnergyBuyer_" + a + "_" + o
+    });
+    if (!u.ok) {
+      console.log("[AutoBuy] " + a + ": direct " + o + " purchase refused — " + u.reason);
+      return 0;
+    }
+    console.log("[AutoBuy] " + a + ": buying " + l.take + " " + o + " directly from " + l.sellerRoom + " at " + l.price.toFixed(3) + " (freight " + l.freight + ", net " + l.net + ", delivered " + l.delivered.toFixed(3) + s + " vs " + (typeof r === "number" && r > 0 ? r.toFixed(3) : "n/a") + " standing bid)" + (u.existing ? " [existing job]" : ""));
+    return u.existing ? 0 : l.net;
+  },
+  tryDirectEnergyPurchase: function(e, o, t, r) {
+    return this.tryDirectPurchase(e, RESOURCE_ENERGY, o, t, r);
+  },
+  hasEnergyProductionOrder: function(e) {
+    var o = factoryManager && typeof factoryManager.getOrders === "function" ? factoryManager.getOrders() : [];
+    return !!o.find(function(o) {
+      return o.room === e && o.product === RESOURCE_ENERGY && (o.status === "active" || o.status === "queued");
+    });
+  },
+  hasActiveProductionOrder: function(e) {
+    var o = factoryManager && typeof factoryManager.getOrders === "function" ? factoryManager.getOrders() : [];
+    return !!o.find(function(o) {
+      return o.room === e && o.product !== RESOURCE_ENERGY && (o.status === "active" || o.status === "queued");
+    });
+  },
+  hasActiveLocalRefineBatteryOp: function(e) {
+    var o = localRefine && typeof localRefine.getOperations === "function" ? localRefine.getOperations() : [];
+    return !!o.find(function(o) {
+      return o && o.room === e && o.output === RESOURCE_BATTERY && o.phase !== "done" && o.phase !== "failed" && o.phase !== "error" && o.phase !== "cancelled";
+    });
+  },
+  getUnreservedBatteries: function(e) {
+    const o = storageManager.storageFind(e, RESOURCE_BATTERY);
+    return o && o.combined ? Math.max(0, o.combined.available || 0) : 0;
+  },
+  handleBatteryRoute: function(e, o, t, r, n) {
+    const a = e.name;
+    const l = Math.ceil(o / ENERGY_PER_BATTERY);
+    const s = e.storage ? e.storage.store[RESOURCE_BATTERY] || 0 : 0;
+    const u = e.terminal ? e.terminal.store[RESOURCE_BATTERY] || 0 : 0;
+    const i = this.getTotalOnOrder(a, RESOURCE_BATTERY) + this.getDirectOnOrder(a, RESOURCE_BATTERY);
+    const c = this.getUnreservedBatteries(a);
+    const E = c + i;
+    let y = l - E;
+    const g = n != null ? " vs " + n.toFixed(4) + "/e direct" + " (saving " + ((n - r) / n * 100).toFixed(1) + "%)" : " (no energy sell orders found)";
+    console.log("[AutoBuy] " + a + ": battery route" + " | " + (t != null ? t.toFixed(4) : "n/a") + "/bat → " + (r != null ? r.toFixed(4) : "n/a") + "/e" + g + " | need " + l + " bat" + " | storage: " + s + " terminal: " + u + " | on order: " + i + " | deficit: " + y);
+    if (this.hasActiveLocalRefineBatteryOp(a)) {
+      console.log("[AutoBuy] " + a + ": active localRefine battery sale; not converting its output back to energy.");
+    } else if (c >= BATTERIES_PER_BATCH) {
+      if (!this.hasEnergyProductionOrder(a)) {
+        const e = global.orderFactory(a, RESOURCE_ENERGY, "max");
+        console.log("[AutoBuy] " + a + ": factory energy order placed → " + e);
+      } else {
+        console.log("[AutoBuy] " + a + ": factory energy production already in progress.");
+      }
     } else {
-        console.log('  ✗ No market data found for either resource.');
+      console.log("[AutoBuy] " + a + ": only " + c + " batteries available (need " + BATTERIES_PER_BATCH + " per batch).");
     }
+    if (y <= 0) {
+      console.log("[AutoBuy] " + a + ": battery supply fully covered — no market order needed.");
+      return;
+    }
+    // Batteries take the same two routes as energy. Their freight does not
+    // come out of the shipment -- the full count arrives and the energy is a
+    // separate cost -- but it is a cost, and deliveredBuyQuote prices it.
+    y -= this.tryDirectPurchase(e, RESOURCE_BATTERY, y, this.batteryBid, false);
+    if (y <= 0) {
+      console.log("[AutoBuy] " + a + ": battery deficit covered by the direct purchase — no standing order needed.");
+      return;
+    }
+    console.log("[AutoBuy] " + a + ": buying " + y + " batteries" + " (~" + Math.round(y * ENERGY_PER_BATTERY / 1e3) + "k energy equiv)" + " at " + t.toFixed(4) + "/bat");
+    const R = marketBuyer.marketBuy(a, RESOURCE_BATTERY, y, undefined, ENERGY_JOB);
+    if (typeof R === "number") {
+      console.log("[AutoBuy] " + a + ": marketBuy(BATTERY) → " + (R === OK ? "OK" : "ERR " + R));
+    } else {
+      console.log("[AutoBuy] " + a + ": marketBuy(BATTERY) → " + R);
+    }
+  },
+  handleEnergyRoute: function(e, o, t, i) {
+    const r = e.name;
+    const n = this.getTotalOnOrder(r, RESOURCE_ENERGY) + this.getDirectOnOrder(r, RESOURCE_ENERGY);
+    let a = o - n;
+    const l = t != null ? t.toFixed(4) + "/e" : "market price";
+    console.log("[AutoBuy] " + r + ": energy route" + " | need " + Math.round(o / 1e3) + "k" + ", on order " + Math.round(n / 1e3) + "k" + ", deficit " + Math.round(a / 1e3) + "k" + " at " + l);
+    if (a <= 0) {
+      console.log("[AutoBuy] " + r + ": sufficient orders already active — skipping.");
+      return;
+    }
+    // Take a cheap ask outright before resting a bid nobody has to fill.
+    a -= this.tryDirectEnergyPurchase(e, a, this.energyBid, !!i);
+    if (a <= 0) {
+      console.log("[AutoBuy] " + r + ": deficit covered by the direct purchase — no standing order needed.");
+      return;
+    }
+    const s = marketBuyer.marketBuy(r, RESOURCE_ENERGY, a, undefined, ENERGY_JOB);
+    if (typeof s === "number") {
+      console.log("[AutoBuy] " + r + ": marketBuy(ENERGY) → " + (s === OK ? "OK" : "ERR " + s));
+    } else {
+      console.log("[AutoBuy] " + r + ": marketBuy(ENERGY) → " + s);
+    }
+  },
+  run: function() {
+    if (!Game.market || creditLedger.available() < .01) {
+      console.log("[AutoBuy] ERROR: Market not available or insufficient credits");
+      return;
+    }
+    if (Memory.autoEnergyBuyer) {
+      delete Memory.autoEnergyBuyer.orderSnapshots;
+      if (Object.keys(Memory.autoEnergyBuyer).length === 0) delete Memory.autoEnergyBuyer;
+    }
+    // Route choice compares acquisition cost, not book price: each resource is
+    // priced at the cheaper of resting a bid or taking a live ask with freight
+    // included, so the battery detour is only chosen when it is genuinely
+    // cheaper per unit of energy than simply buying energy.
+    const q = pricing.acquisitionQuote(RESOURCE_ENERGY);
+    const Q = pricing.acquisitionQuote(RESOURCE_BATTERY);
+    const e = q.price > 0 ? q.price : null;
+    const o = Q.price > 0 ? Q.price : null;
+    // The bid legs are what the direct route is measured against per room.
+    this.energyBid = q.bid;
+    this.batteryBid = Q.bid;
+    const t = o != null ? o / ENERGY_PER_BATTERY : null;
+    const r = t != null && (e == null || t <= e);
+    console.log("[AutoBuy] energy " + (e != null ? e.toFixed(4) : "n/a") + "/e [" + q.route + (q.direct ? " " + q.direct.sellerRoom + " +" + Math.round((1 - q.direct.yield) * 100) + "% freight" : "") + "]" + " | battery " + (o != null ? o.toFixed(4) : "n/a") + "/bat [" + Q.route + "] = " + (t != null ? t.toFixed(4) : "n/a") + "/e" + " | route: " + (r ? "BATTERY" : "ENERGY"));
+    let n = 0;
+    for (const a in Game.rooms) {
+      const l = Game.rooms[a];
+      if (!l.controller || !l.controller.my || !l.storage) continue;
+      if (!l.terminal) {
+        if (l.controller.level >= 6 && Game.time % 1e3 === 0) {
+          console.log("[AutoBuy] WARNING: " + a + " has no terminal — skipping.");
+        }
+        continue;
+      }
+      const s = l.storage.store[RESOURCE_ENERGY] || 0;
+      let u = 0;
+      let i = 0;
+      const c = [];
+      for (const e of TIERS) {
+        if (s < e.threshold) {
+          if (e.forceEnergy) {
+            u += e.buyAmount;
+          } else {
+            i += e.buyAmount;
+          }
+          c.push(e.label + " (<" + Math.round(e.threshold / 1e3) + "k → +" + Math.round(e.buyAmount / 1e3) + "k" + (e.forceEnergy ? " energy-only" : "") + ")");
+        }
+      }
+      const E = u + i;
+      const y = Math.min(E, MAX_ENERGY_PER_RUN);
+      const g = E > MAX_ENERGY_PER_RUN;
+      if (E === 0) {
+        const e = this.getUnreservedBatteries(a);
+        if (this.hasActiveLocalRefineBatteryOp(a)) {
+          console.log("[AutoBuy] " + a + ": active localRefine battery sale; leaving produced batteries for marketSell.");
+        } else if (e >= BATTERIES_PER_BATCH && !this.hasEnergyProductionOrder(a)) {
+          const o = global.orderFactory(a, RESOURCE_ENERGY, "max");
+          console.log("[AutoBuy] " + a + " | storage: " + Math.round(s / 1e3) + "k — above thresholds" + " but " + e + " idle batteries; factory conversion triggered → " + o);
+        }
+        continue;
+      }
+      n++;
+      console.log("[AutoBuy] " + a + " | storage: " + Math.round(s / 1e3) + "k" + " | tiers triggered: " + c.join(", ") + " | energy-only: " + Math.round(u / 1e3) + "k" + " | price-optimal: " + Math.round(i / 1e3) + "k" + (g ? " | cap applied: " + Math.round(y / 1e3) + "k of " + Math.round(E / 1e3) + "k" : ""));
+      let R = u;
+      let d = i;
+      if (g) {
+        R = Math.min(u, MAX_ENERGY_PER_RUN);
+        d = Math.max(0, Math.min(i, MAX_ENERGY_PER_RUN - R));
+      }
+      if (R > 0) {
+        this.handleEnergyRoute(l, R, e, true);
+      }
+      if (d > 0) {
+        const n = this.hasActiveLocalRefineBatteryOp(a);
+        const s = this.hasActiveProductionOrder(a);
+        if (r && !n) {
+          if (s) {
+            console.log("[AutoBuy] " + a + ": factory busy with another order; queueing battery conversion behind it.");
+          }
+          this.handleBatteryRoute(l, d, o, t, e);
+        } else {
+          if (n && r) {
+            console.log("[AutoBuy] " + a + ": localRefine battery sale active — buying energy directly instead of reclaiming sale output.");
+          }
+          this.handleEnergyRoute(l, d, e, false);
+        }
+      }
+    }
+    if (n === 0) {
+      console.log("[AutoBuy] Checked all rooms; no rooms needed energy.");
+    }
+  }
 };
-
+global.compareEnergyCost = function(e) {
+  e = typeof e === "number" && e > 0 ? Math.ceil(e) : 1e5;
+  if (!Game.market) {
+    console.log("[AutoBuy] Market not available.");
+    return;
+  }
+  const q = pricing.acquisitionQuote(RESOURCE_ENERGY, e);
+  const Q = pricing.acquisitionQuote(RESOURCE_BATTERY, Math.ceil(e / ENERGY_PER_BATTERY));
+  const o = q.price > 0 ? q.price : null;
+  const t = Q.price > 0 ? Q.price : null;
+  const r = Math.ceil(e / ENERGY_PER_BATTERY);
+  const n = o != null ? o * e : null;
+  const a = t != null ? t * r : null;
+  const l = t != null ? t / ENERGY_PER_BATTERY : null;
+  const fmtPrice = e => e != null ? e.toFixed(4) : "no orders";
+  const fmtCr = e => e != null ? e.toFixed(2) + " cr" : "N/A";
+  const fmtNum = e => e.toLocaleString();
+  const s = Math.round(e / 1e3) + "k";
+  const leg = (quote, unit) => {
+    const rows = [];
+    rows.push("      rest a bid   : " + (quote.bid != null ? fmtPrice(quote.bid) + unit : "no canonical bid") + "  (freight-free — the filler deals)");
+    if (quote.direct) {
+      rows.push("      take an ask  : " + fmtPrice(quote.direct.delivered) + unit + "  (" + quote.direct.price.toFixed(4) + " from " + quote.direct.sellerRoom + " → " + quote.direct.destinationRoom + ", freight " + fmtNum(quote.direct.freight) + " energy" + (quote.direct.resource === RESOURCE_ENERGY ? ", " + Math.round(quote.direct.yield * 100) + "% lands" : "") + ")");
+    } else {
+      rows.push("      take an ask  : none reachable (over the ceiling, or freight eats the shipment)");
+    }
+    rows.push("      → cheaper route: " + quote.route);
+    return rows.join("\n");
+  };
+  console.log("=== Energy Cost Comparison (" + s + " energy) ===");
+  console.log("  Energy    (direct) : " + fmtPrice(o) + "/e" + "              →  " + fmtCr(n) + "  (" + fmtNum(e) + " energy)");
+  console.log(leg(q, "/e"));
+  console.log("  Batteries (" + ENERGY_PER_BATTERY + "e/bat) : " + fmtPrice(t) + "/bat (= " + fmtPrice(l) + "/e)" + "  →  " + fmtCr(a) + "  (" + fmtNum(r) + " batteries)");
+  console.log(leg(Q, "/bat"));
+  if (n != null && a != null) {
+    const e = n - a;
+    const o = Math.abs(e / n * 100).toFixed(1);
+    const t = Math.abs(e).toFixed(2);
+    if (e > 0) {
+      console.log("  ✓ Batteries cheaper by " + t + " cr  (" + o + "% saving)");
+    } else if (e < 0) {
+      console.log("  ✓ Energy cheaper by " + t + " cr  (" + o + "% saving)");
+    } else {
+      console.log("  = Same cost either way.");
+    }
+  } else if (n == null && a != null) {
+    console.log("  ✓ Batteries only option (no energy market data found).");
+  } else if (a == null && n != null) {
+    console.log("  ✓ Energy only option (no battery market data found).");
+  } else {
+    console.log("  ✗ No market data found for either resource.");
+  }
+};
 global.runAutoEnergyBuyer = function() {
-    autoEnergyBuyer.run();
+  autoEnergyBuyer.run();
 };
-
 module.exports = autoEnergyBuyer;

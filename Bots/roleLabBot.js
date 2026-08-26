@@ -1,1744 +1,1603 @@
-/**
- * =============================================================================
- * LAB BOT ROLE - Screeps Lab Logistics Creep (Multi-Group Edition)
- * =============================================================================
- */
-
-var debugLog = function(message) {
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// roleLabBot.js
+// Role dispatch: memory.role === 'labBot' -> roleLabBot.run(creep).
+// Console globals: forceSpawnLabBot, marketSell
+// Example: forceSpawnLabBot('E1N1') - Force spawn a labBot creep in room next tick
+// Example: marketSell('E1N1', RESOURCE_LEMERGIUM, 1000) - Dispatch labBot terminal transfer for market sell
+// Example: require('roleLabBot').run(creep);
+var debugLog = function(e) {
   if (Memory.labsDebug) {
-    console.log(message);
+    console.log(e);
   }
 };
-
-var getRoomState = require('getRoomState');
-var storageManager = require('storageManager');
-
-function _getLabs(creep) {
-  var rs = getRoomState.get(creep.room.name);
-  if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_LAB]) {
-    return rs.structuresByType[STRUCTURE_LAB];
+var getRoomState = require("getRoomState");
+var storageManager = require("storageManager");
+var spawnManager = require("spawnManager");
+var labCommodityPolicy = require("labCommodityPolicy");
+var labCommodityRouter = require("labCommodityRouter");
+function _getLabs(e) {
+  var r = getRoomState.get(e.room.name);
+  if (r && r.structuresByType && r.structuresByType[STRUCTURE_LAB]) {
+    return r.structuresByType[STRUCTURE_LAB];
   }
-  return creep.room.find(FIND_STRUCTURES, {
-    filter: function(s) { return s.structureType === STRUCTURE_LAB; }
+  return e.room.find(FIND_STRUCTURES, {
+    filter: function(e) {
+      return e.structureType === STRUCTURE_LAB;
+    }
   });
 }
 
-var LAB_CAPACITY = 3000;
-var LAB_REACTION_AMOUNT = 5;
-
-// Thresholds
+var LAB_CAPACITY = 3e3;
+var LAB_REACTION_AMOUNT = labCommodityPolicy.MIN_REACTION_AMOUNT;
 var IDLE_SUICIDE_TICKS = 150;
-
-// Boost manager — lazy loaded
 var _boostManagerModule = null;
 function getBoostManager() {
-  if (!_boostManagerModule) _boostManagerModule = require('boostManager');
+  if (!_boostManagerModule) _boostManagerModule = require("boostManager");
   return _boostManagerModule;
 }
 
-// Boost lab constants
-var LAB_MINERAL_CAPACITY_BOOST = 3000;
-var LAB_ENERGY_CAPACITY_BOOST  = 2000;
-
-// =============================================================================
-// ORDER HELPERS
-// =============================================================================
-
-function requestGracefulSuicide(creep, reason) {
-  creep.memory.suicidePending = true;
-  debugLog("[LabBot " + creep.name + "] graceful suicide requested — " + reason);
+var LAB_MINERAL_CAPACITY_BOOST = 3e3;
+var LAB_ENERGY_CAPACITY_BOOST = 2e3;
+function requestGracefulSuicide(e, r) {
+  e.memory.suicidePending = true;
+  debugLog("[LabBot " + e.name + "] graceful suicide requested — " + r);
 }
 
-function consumeReservedWithdraw(creep, source, resourceType, amount, activeOrder) {
-  if (!source || !activeOrder || !activeOrder.reservationProgram) {
-    return creep.withdraw(source, resourceType, amount);
+function consumeReservedWithdraw(e, r, a, t, o) {
+  if (!r || !o || !o.reservationProgram) {
+    return e.withdraw(r, a, t);
   }
-
-  var building = null;
-  if (source.structureType === STRUCTURE_TERMINAL) building = 'terminal';
-  else if (source.structureType === STRUCTURE_STORAGE) building = 'storage';
-
-  var result = creep.withdraw(source, resourceType, amount);
-  if (result === OK && building) {
-    storageManager.consume(creep.room.name, resourceType, building, activeOrder.reservationProgram, amount);
+  var i = null;
+  if (r.structureType === STRUCTURE_TERMINAL) i = "terminal"; else if (r.structureType === STRUCTURE_STORAGE) i = "storage";
+  var n = e.withdraw(r, a, t);
+  if (n === OK && i) {
+    storageManager.consume(e.room.name, a, i, o.reservationProgram, t);
   }
-  return result;
+  return n;
 }
 
-function consumeBoostWithdraw(creep, source, resourceType, amount) {
-  var result = creep.withdraw(source, resourceType, amount);
-  if (result !== OK || !source) {
-    return result;
+function consumeBoostWithdraw(e, r, a, t) {
+  var o = e.withdraw(r, a, t);
+  if (o !== OK || !r) {
+    return o;
   }
-
-  var building = null;
-  if (source.structureType === STRUCTURE_TERMINAL) building = 'terminal';
-  else if (source.structureType === STRUCTURE_STORAGE) building = 'storage';
-
-  if (building) {
-    var rv = storageManager.consume(creep.room.name, resourceType, building, 'boostManager', amount);
-    if (!rv || !rv.ok) {
-      debugLog('[LabBot ' + creep.name + '] boost consume mismatch ' + resourceType + ' from ' + building + ' amount=' + amount + ' reason=' + (rv && rv.reason ? rv.reason : 'unknown'));
+  var i = null;
+  if (r.structureType === STRUCTURE_TERMINAL) i = "terminal"; else if (r.structureType === STRUCTURE_STORAGE) i = "storage";
+  if (i) {
+    var n = storageManager.consume(e.room.name, a, i, "boostManager", t);
+    if (!n || !n.ok) {
+      debugLog("[LabBot " + e.name + "] boost consume mismatch " + a + " from " + i + " amount=" + t + " reason=" + (n && n.reason ? n.reason : "unknown"));
     }
   }
-  return result;
+  return o;
 }
 
-function getBoostReservedAmount(roomName, building, resourceType) {
-  if (!Memory.storageReservations) return 0;
-  var roomBuckets = Memory.storageReservations[roomName];
-  if (!roomBuckets || !roomBuckets[building] || !roomBuckets[building][resourceType]) return 0;
-
-  var reservations = roomBuckets[building][resourceType];
-  var total = 0;
-  for (var i = 0; i < reservations.length; i++) {
-    if (reservations[i] && reservations[i].program === 'boostManager') {
-      total += (reservations[i].amount || 0);
+function getBoostReservedAmount(e, r, a) {
+  try {
+    const t = require("storageVfs");
+    const o = t.getReservationList(e, r, a);
+    let total = 0;
+    let found = false;
+    for (let i = 0; i < o.length; i++) {
+      if (o[i] && o[i].program === "boostManager") {
+        found = true;
+        total += o[i].amount || 0;
+      }
     }
+    if (found) return total;
+  } catch (error) {
+    if (Game.time % 100 === 0) console.log("[LabBot] V2 reservation read failed: " + ((error && error.message) || error));
   }
-  return total;
+  return storageManager.getProgramReserved(e, r, a, "boostManager");
 }
 
-function getBoostPickupTarget(roomName, resourceType, requestedAmount) {
-  var room = Game.rooms[roomName];
-  if (!room) return null;
-
-  var terminal = room.terminal;
-  var storage = room.storage;
-  if (!terminal && !storage) return null;
-
-  var terminalReserved = terminal ? getBoostReservedAmount(roomName, 'terminal', resourceType) : 0;
-  var storageReserved = storage ? getBoostReservedAmount(roomName, 'storage', resourceType) : 0;
-
-  if (terminalReserved >= requestedAmount && terminal) {
-    return { source: terminal, amount: requestedAmount };
+function getBoostPickupTarget(e, r, a) {
+  var t = Game.rooms[e];
+  if (!t) return null;
+  var o = t.terminal;
+  var i = t.storage;
+  if (!o && !i) return null;
+  var n = o ? getBoostReservedAmount(e, "terminal", r) : 0;
+  var s = i ? getBoostReservedAmount(e, "storage", r) : 0;
+  if (n >= a && o) {
+    return {
+      source: o,
+      amount: a
+    };
   }
-  if (storageReserved >= requestedAmount && storage) {
-    return { source: storage, amount: requestedAmount };
+  if (s >= a && i) {
+    return {
+      source: i,
+      amount: a
+    };
   }
-
-  if (terminalReserved <= 0 && storageReserved <= 0) {
+  if (n <= 0 && s <= 0) {
     return null;
   }
-
-  if (terminalReserved >= storageReserved && terminalReserved > 0 && terminal) {
-    return { source: terminal, amount: Math.min(requestedAmount, terminalReserved) };
+  if (n >= s && n > 0 && o) {
+    return {
+      source: o,
+      amount: Math.min(a, n)
+    };
   }
-
-  if (storage && storageReserved > 0) {
-    return { source: storage, amount: Math.min(requestedAmount, storageReserved) };
+  if (i && s > 0) {
+    return {
+      source: i,
+      amount: Math.min(a, s)
+    };
   }
-
   return null;
 }
 
-// =============================================================================
-// BLOCKING MATERIAL DETECTION AND CLEANUP
-// =============================================================================
-
-function hasBlockers(layout, activeOrder) {
-  var isBreakdown = activeOrder.type === 'breakdown';
-
-  for (var g = 0; g < layout.groups.length; g++) {
-    var group = layout.groups[g];
-
-    if (isBreakdown) {
-      var wrongIn1 = group.in1.mineralType && 
-                     group.in1.mineralType !== activeOrder.reag1 &&
-                     (group.in1.mineralAmount || 0) > 0;
-      var wrongIn2 = group.in2.mineralType && 
-                     group.in2.mineralType !== activeOrder.reag2 &&
-                     (group.in2.mineralAmount || 0) > 0;
-
-      if (wrongIn1 || wrongIn2) return true;
-
-      for (var i = 0; i < group.outs.length; i++) {
-        var out = group.outs[i];
-        if (out.mineralType && 
-            out.mineralType !== activeOrder.compound &&
-            (out.mineralAmount || 0) > 0) {
+function hasBlockers(e, r) {
+  var a = r.type === "breakdown";
+  for (var t = 0; t < e.groups.length; t++) {
+    var o = e.groups[t];
+    if (a) {
+      var i = o.in1.mineralType && o.in1.mineralType !== r.reag1 && (o.in1.mineralAmount || 0) > 0;
+      var n = o.in2.mineralType && o.in2.mineralType !== r.reag2 && (o.in2.mineralAmount || 0) > 0;
+      if (i || n) return true;
+      for (var s = 0; s < o.outs.length; s++) {
+        var u = o.outs[s];
+        if (u.mineralType && u.mineralType !== r.compound && (u.mineralAmount || 0) > 0) {
           return true;
         }
       }
     } else {
-      var wrongIn1b = group.in1.mineralType && group.in1.mineralType !== activeOrder.reag1;
-      var wrongIn2b = group.in2.mineralType && group.in2.mineralType !== activeOrder.reag2;
-
-      if (wrongIn1b || wrongIn2b) return true;
-
-      for (var j = 0; j < group.outs.length; j++) {
-        var outLab = group.outs[j];
-        if (outLab.mineralType && outLab.mineralType !== activeOrder.product) {
+      var m = o.in1.mineralType && o.in1.mineralType !== r.reag1;
+      var l = o.in2.mineralType && o.in2.mineralType !== r.reag2;
+      if (m || l) return true;
+      for (var g = 0; g < o.outs.length; g++) {
+        var v = o.outs[g];
+        if (v.mineralType && v.mineralType !== r.product) {
           return true;
         }
       }
     }
   }
-
   return false;
 }
 
-function clearBlockingLabs(creep, layout, activeOrder) {
-  var isBreakdown = activeOrder.type === 'breakdown';
-  var expectedIn1 = activeOrder.reag1;
-  var expectedIn2 = activeOrder.reag2;
-  var expectedOut = isBreakdown ? activeOrder.compound : activeOrder.product;
-
-  for (var g = 0; g < layout.groups.length; g++) {
-    var group = layout.groups[g];
-
-    if (group.in1.mineralType && 
-        group.in1.mineralType !== expectedIn1 && 
-        (group.in1.mineralAmount || 0) > 0) {
-      if (creep.pos.isNearTo(group.in1)) {
-        var takeAmount = Math.min(group.in1.mineralAmount, creep.store.getFreeCapacity());
-        creep.withdraw(group.in1, group.in1.mineralType, takeAmount);
+function clearBlockingLabs(e, r, a) {
+  var t = a.type === "breakdown";
+  var o = a.reag1;
+  var i = a.reag2;
+  var n = t ? a.compound : a.product;
+  for (var s = 0; s < r.groups.length; s++) {
+    var u = r.groups[s];
+    if (u.in1.mineralType && u.in1.mineralType !== o && (u.in1.mineralAmount || 0) > 0) {
+      if (e.pos.isNearTo(u.in1)) {
+        var m = Math.min(u.in1.mineralAmount, e.store.getFreeCapacity());
+        e.withdraw(u.in1, u.in1.mineralType, m);
         return true;
       } else {
-        creep.moveTo(group.in1, { range: 1, reusePath: 10 });
+        e.moveTo(u.in1, {
+          range: 1,
+          reusePath: 10
+        });
         return true;
       }
     }
-
-    if (group.in2.mineralType && 
-        group.in2.mineralType !== expectedIn2 && 
-        (group.in2.mineralAmount || 0) > 0) {
-      if (creep.pos.isNearTo(group.in2)) {
-        var takeAmount = Math.min(group.in2.mineralAmount, creep.store.getFreeCapacity());
-        creep.withdraw(group.in2, group.in2.mineralType, takeAmount);
+    if (u.in2.mineralType && u.in2.mineralType !== i && (u.in2.mineralAmount || 0) > 0) {
+      if (e.pos.isNearTo(u.in2)) {
+        var m = Math.min(u.in2.mineralAmount, e.store.getFreeCapacity());
+        e.withdraw(u.in2, u.in2.mineralType, m);
         return true;
       } else {
-        creep.moveTo(group.in2, { range: 1, reusePath: 10 });
+        e.moveTo(u.in2, {
+          range: 1,
+          reusePath: 10
+        });
         return true;
       }
     }
-
-    for (var i = 0; i < group.outs.length; i++) {
-      var out = group.outs[i];
-      if (out.mineralType && 
-          out.mineralType !== expectedOut && 
-          (out.mineralAmount || 0) > 0) {
-        if (creep.pos.isNearTo(out)) {
-          var takeAmount = Math.min(out.mineralAmount, creep.store.getFreeCapacity());
-          creep.withdraw(out, out.mineralType, takeAmount);
+    for (var l = 0; l < u.outs.length; l++) {
+      var g = u.outs[l];
+      if (g.mineralType && g.mineralType !== n && (g.mineralAmount || 0) > 0) {
+        if (e.pos.isNearTo(g)) {
+          var m = Math.min(g.mineralAmount, e.store.getFreeCapacity());
+          e.withdraw(g, g.mineralType, m);
           return true;
         } else {
-          creep.moveTo(out, { range: 1, reusePath: 10 });
+          e.moveTo(g, {
+            range: 1,
+            reusePath: 10
+          });
           return true;
         }
       }
     }
   }
-
   return false;
 }
 
-// =============================================================================
-// PRODUCTION MODE HELPERS
-// =============================================================================
-
-function getPerInputTarget(layout, activeOrder) {
-  var remaining = typeof activeOrder.remaining === "number"
-      ? activeOrder.remaining
-      : (activeOrder.amount || 0);
-  if (remaining <= 0) return 0;
- 
-  var outputCapacity = 0;
-  var outStock = 0;
-  for (var g = 0; g < layout.groups.length; g++) {
-    for (var i = 0; i < layout.groups[g].outs.length; i++) {
-      var outLab = layout.groups[g].outs[i];
-      outputCapacity += outLab.store.getFreeCapacity(activeOrder.product) || 0;
-      outStock      += (outLab.store && outLab.store[activeOrder.product]) || 0;
+function getPerInputTarget(e, r) {
+  var a = typeof r.remaining === "number" ? r.remaining : r.amount || 0;
+  if (a <= 0) return 0;
+  var t = 0;
+  var o = 0;
+  for (var i = 0; i < e.groups.length; i++) {
+    for (var n = 0; n < e.groups[i].outs.length; n++) {
+      var s = e.groups[i].outs[n];
+      t += s.store.getFreeCapacity(r.product) || 0;
+      o += s.store && s.store[r.product] || 0;
     }
   }
- 
-  // Product already in output labs counts toward fulfilling the order, so
-  // we only need to size input labs for what is STILL to be produced. This
-  // prevents the labbot from topping up reagents past the point where the
-  // remaining reactions plus already-produced output cover the order.
-  var stillToProduce = Math.max(0, remaining - outStock);
-  if (stillToProduce === 0) return 0;
- 
-  var maxProducible  = Math.min(stillToProduce, outputCapacity);
-  var numGroups      = layout.groups.length;
-  var perGroupTarget = Math.ceil(maxProducible / numGroups);
-  var perInputTarget = Math.min(perGroupTarget, LAB_CAPACITY);
- 
-  var mod = perInputTarget % LAB_REACTION_AMOUNT;
-  if (mod !== 0) {
-    perInputTarget += (LAB_REACTION_AMOUNT - mod);
+  var u = Math.max(0, a - o);
+  if (u === 0) return 0;
+  var m = Math.min(u, t);
+  var l = e.groups.length;
+  var g = Math.ceil(m / l);
+  var v = Math.min(g, LAB_CAPACITY);
+  var f = v % LAB_REACTION_AMOUNT;
+  if (f !== 0) {
+    v += LAB_REACTION_AMOUNT - f;
   }
-  perInputTarget = Math.min(perInputTarget, LAB_CAPACITY);
- 
-  return Math.max(perInputTarget, 0);
+  v = Math.min(v, LAB_CAPACITY);
+  return Math.max(v, 0);
 }
 
-function findMostNeededInput(layout, activeOrder, target, room) {
-  var best = null;
-  var bestDeficit = 0;
-
-  var terminal = room ? room.terminal : null;
-  var storage = room ? room.storage : null;
-  var reag1Available = ((terminal && terminal.store[activeOrder.reag1]) || 0) + 
-                       ((storage && storage.store[activeOrder.reag1]) || 0);
-  var reag2Available = ((terminal && terminal.store[activeOrder.reag2]) || 0) + 
-                       ((storage && storage.store[activeOrder.reag2]) || 0);
-
-  for (var g = 0; g < layout.groups.length; g++) {
-    var group = layout.groups[g];
-
-    if (reag1Available > 0) {
-      var have1 = (group.in1.mineralType === activeOrder.reag1) ? (group.in1.mineralAmount || 0) : 0;
-      var def1 = Math.max(0, target - have1);
-
-      if (def1 > bestDeficit) {
-        bestDeficit = def1;
-        best = { group: group, groupIndex: g, reagent: activeOrder.reag1, lab: group.in1, deficit: def1 };
+function findMostNeededInput(e, r, a, t) {
+  var o = null;
+  var i = 0;
+  var n = t ? t.terminal : null;
+  var s = t ? t.storage : null;
+  var u = (n && n.store[r.reag1] || 0) + (s && s.store[r.reag1] || 0);
+  var m = (n && n.store[r.reag2] || 0) + (s && s.store[r.reag2] || 0);
+  for (var l = 0; l < e.groups.length; l++) {
+    var g = e.groups[l];
+    if (u > 0) {
+      var v = g.in1.mineralType === r.reag1 ? g.in1.mineralAmount || 0 : 0;
+      var f = Math.max(0, a - v);
+      if (f > i) {
+        i = f;
+        o = {
+          group: g,
+          groupIndex: l,
+          reagent: r.reag1,
+          lab: g.in1,
+          deficit: f
+        };
       }
     }
-
-    if (reag2Available > 0) {
-      var have2 = (group.in2.mineralType === activeOrder.reag2) ? (group.in2.mineralAmount || 0) : 0;
-      var def2 = Math.max(0, target - have2);
-
-      if (def2 > bestDeficit) {
-        bestDeficit = def2;
-        best = { group: group, groupIndex: g, reagent: activeOrder.reag2, lab: group.in2, deficit: def2 };
-      }
-    }
-  }
-
-  return best;
-}
-
-function handleReagentDeliveryBalanced(creep, layout, activeOrder, target) {
-  if (creep.store.getUsedCapacity() > 0) {
-    function depositBalanced(reagent, isReag1) {
-      if ((creep.store[reagent] || 0) === 0) return false;
-
-      var needy = [];
-      for (var g = 0; g < layout.groups.length; g++) {
-        var grp = layout.groups[g];
-        var lab = isReag1 ? grp.in1 : grp.in2;
-        var have = (lab.mineralType === reagent) ? (lab.mineralAmount || 0) : 0;
-        if (have < target) needy.push({ lab: lab, have: have });
-      }
-      if (needy.length === 0) return false;
-
-      needy.sort(function(a, b) { return a.have - b.have; });
-      var pick = needy[0];
-
-      if (!creep.pos.isNearTo(pick.lab)) {
-        creep.moveTo(pick.lab, { range: 1, reusePath: 10 });
-        return true;
-      }
-
-      var cap;
-      if (needy.length === 1) {
-        cap = target - pick.have;
-      } else if (needy[1].have > pick.have) {
-        cap = needy[1].have - pick.have;
-      } else {
-        cap = Math.ceil(creep.store[reagent] / needy.length);
-      }
-      cap = Math.max(cap, LAB_REACTION_AMOUNT);
-
-      var space = pick.lab.store.getFreeCapacity(reagent) || 0;
-      var amount = Math.min(creep.store[reagent], space, cap);
-      if (amount > 0) {
-        creep.transfer(pick.lab, reagent, amount);
-        creep.memory.idleTicks = 0;
-      }
-      return true;
-    }
-
-    if (depositBalanced(activeOrder.reag1, true)) return;
-    if (depositBalanced(activeOrder.reag2, false)) return;
-    deliverToBest(creep);
-    return;
-  }
-
-  var needed = findMostNeededInput(layout, activeOrder, target, creep.room);
-  if (!needed || needed.deficit <= 0) return;
-
-  var terminal = creep.room.terminal;
-  var storage = creep.room.storage;
-  var targetReagent = needed.reagent;
-
-  var totalDeficit = 0;
-  for (var g = 0; g < layout.groups.length; g++) {
-    var group = layout.groups[g];
-    var lab = (targetReagent === activeOrder.reag1) ? group.in1 : group.in2;
-    var have = (lab.mineralType === targetReagent) ? (lab.mineralAmount || 0) : 0;
-    totalDeficit += Math.max(0, target - have);
-  }
-
-  var targetAmount = Math.min(totalDeficit, creep.store.getCapacity());
-
-  var source = null;
-  var reservationProgram = activeOrder && activeOrder.reservationProgram;
-  var info = reservationProgram ? storageManager.storageFind(creep.room.name, targetReagent) : null;
-  var terminalReserved = info && info.terminal && Array.isArray(info.terminal.reservations)
-    ? info.terminal.reservations : [];
-  var storageReserved = info && info.storage && Array.isArray(info.storage.reservations)
-    ? info.storage.reservations : [];
-  var termReservedAmt = 0;
-  var storReservedAmt = 0;
-  for (var rr = 0; rr < terminalReserved.length; rr++) {
-    if (terminalReserved[rr] && terminalReserved[rr].program === reservationProgram) termReservedAmt += terminalReserved[rr].amount || 0;
-  }
-  for (var rs = 0; rs < storageReserved.length; rs++) {
-    if (storageReserved[rs] && storageReserved[rs].program === reservationProgram) storReservedAmt += storageReserved[rs].amount || 0;
-  }
-
-  if (terminal && reservationProgram && termReservedAmt > 0) {
-    source = terminal;
-    targetAmount = Math.min(targetAmount, termReservedAmt, terminal.store[targetReagent] || 0);
-  } else if (storage && reservationProgram && storReservedAmt > 0) {
-    source = storage;
-    targetAmount = Math.min(targetAmount, storReservedAmt, storage.store[targetReagent] || 0);
-  } else if (terminal && (terminal.store[targetReagent] || 0) >= targetAmount) {
-    source = terminal;
-  } else if (storage && (storage.store[targetReagent] || 0) >= targetAmount) {
-    source = storage;
-  } else if (terminal && (terminal.store[targetReagent] || 0) > 0) {
-    source = terminal;
-    targetAmount = Math.min(terminal.store[targetReagent], creep.store.getCapacity());
-  } else if (storage && (storage.store[targetReagent] || 0) > 0) {
-    source = storage;
-    targetAmount = Math.min(storage.store[targetReagent], creep.store.getCapacity());
-  }
-
-  if (!source) return;
-
-  if (creep.pos.isNearTo(source)) {
-    var available = source.store[targetReagent] || 0;
-    var takeAmount = Math.min(targetAmount, available, creep.store.getFreeCapacity());
-    if (takeAmount > 0) {
-      consumeReservedWithdraw(creep, source, targetReagent, takeAmount, activeOrder);
-      creep.memory.idleTicks = 0;
-    }
-  } else {
-    creep.moveTo(source, { range: 1, reusePath: 10 });
-  }
-}
-
-function handleMidReactionEvacuation(creep, layout, activeOrder) {
-  var product = activeOrder.product;
-
-  if (creep.store.getUsedCapacity() > 0 && !(creep.store[product] > 0)) {
-    deliverToBest(creep);
-    return true;
-  }
-
-  var nearestLab = null;
-  var nearestRange = Infinity;
-
-  for (var g = 0; g < layout.groups.length; g++) {
-    var group = layout.groups[g];
-    for (var i = 0; i < group.outs.length; i++) {
-      var outLab = group.outs[i];
-      if (outLab.mineralType === product && (outLab.mineralAmount || 0) > 0) {
-        var range = creep.pos.getRangeTo(outLab);
-        if (range < nearestRange) {
-          nearestRange = range;
-          nearestLab = outLab;
-        }
-      }
-    }
-  }
-
-  if ((creep.store[product] || 0) > 0) {
-    var freeCapacity = creep.store.getFreeCapacity();
-
-    if (freeCapacity < LAB_REACTION_AMOUNT) {
-      deliverProductAndRecord(creep, product);
-      return true;
-    }
-
-    if (nearestLab) {
-      if (creep.pos.isNearTo(nearestLab)) {
-        var takeAmount = Math.min(nearestLab.mineralAmount || 0, freeCapacity);
-        creep.withdraw(nearestLab, product, takeAmount);
-        creep.memory.idleTicks = 0;
-      } else {
-        creep.moveTo(nearestLab, { range: 1, reusePath: 10 });
-      }
-      return true;
-    }
-
-    deliverProductAndRecord(creep, product);
-    return true;
-  }
-
-  if (!nearestLab) return false;
-
-  if (creep.pos.isNearTo(nearestLab)) {
-    var takeAmount = Math.min(nearestLab.mineralAmount || 0, creep.store.getCapacity());
-    creep.withdraw(nearestLab, product, takeAmount);
-    creep.memory.idleTicks = 0;
-  } else {
-    creep.moveTo(nearestLab, { range: 1, reusePath: 10 });
-  }
-  return true;
-}
-
-function handleProductionEvacuation(creep, layout, activeOrder) {
-  var cleanupTarget = null;
-  var cleanupResource = null;
-  var cleanupAmount = 0;
-
-  for (var g = 0; g < layout.groups.length && !cleanupTarget; g++) {
-    var group = layout.groups[g];
-
-    for (var i = 0; i < group.outs.length; i++) {
-      var outLab = group.outs[i];
-      if (outLab.mineralType === activeOrder.product && (outLab.mineralAmount || 0) > 0) {
-        cleanupTarget   = outLab;
-        cleanupResource = activeOrder.product;
-        cleanupAmount   = outLab.mineralAmount;
-        break;
-      }
-    }
-
-    if (!cleanupTarget && (group.in1.mineralAmount || 0) > 0) {
-      cleanupTarget   = group.in1;
-      cleanupResource = group.in1.mineralType;
-      cleanupAmount   = group.in1.mineralAmount;
-    } else if (!cleanupTarget && (group.in2.mineralAmount || 0) > 0) {
-      cleanupTarget   = group.in2;
-      cleanupResource = group.in2.mineralType;
-      cleanupAmount   = group.in2.mineralAmount;
-    }
-  }
-
-  if (cleanupTarget) {
-    if (creep.store.getUsedCapacity() > 0 && !(creep.store[cleanupResource] > 0)) {
-      var product = activeOrder.product;
-      if ((creep.store[product] || 0) > 0) deliverProductAndRecord(creep, product);
-      else deliverToBest(creep);
-      return;
-    }
-
-    if (creep.store.getFreeCapacity() === 0) {
-      var product = activeOrder.product;
-      if ((creep.store[product] || 0) > 0) deliverProductAndRecord(creep, product);
-      else deliverToBest(creep);
-      return;
-    }
-
-  if (creep.pos.isNearTo(cleanupTarget)) {
-    consumeReservedWithdraw(creep, cleanupTarget, cleanupResource,
-                            Math.min(cleanupAmount, creep.store.getFreeCapacity()), activeOrder);
-  } else {
-    creep.moveTo(cleanupTarget, { range: 1, reusePath: 10 });
-  }
-    return;
-  }
-
-  if (creep.store.getUsedCapacity() > 0) {
-    var product = activeOrder.product;
-    if ((creep.store[product] || 0) > 0) deliverProductAndRecord(creep, product);
-    else deliverToBest(creep);
-    return;
-  }
-
-  if (layout.groups.length > 0 && !creep.pos.inRangeTo(layout.groups[0].in1, 3)) {
-    creep.moveTo(layout.groups[0].in1, { range: 3, reusePath: 15 });
-  }
-}
-
-// =============================================================================
-// BREAKDOWN MODE HELPERS
-// =============================================================================
-
-function findLowestOutputLab(layout, activeOrder, targetPerLab) {
-  var compound = activeOrder.compound;
-  var best = null;
-  var lowestAmount = Infinity;
-
-  var effectiveTarget = Math.max(targetPerLab, LAB_REACTION_AMOUNT);
-
-  for (var g = 0; g < layout.groups.length; g++) {
-    var group = layout.groups[g];
-
-    for (var i = 0; i < group.outs.length; i++) {
-      var outLab = group.outs[i];
-      var canAccept = outLab.mineralType === compound || !outLab.mineralType || (outLab.mineralAmount || 0) === 0;
-
-      if (!canAccept) continue;
-
-      var currentAmount = (outLab.mineralType === compound) ? (outLab.mineralAmount || 0) : 0;
-      var freeSpace = outLab.store.getFreeCapacity(compound) || 0;
-
-      if (currentAmount < effectiveTarget && freeSpace > 0 && currentAmount < lowestAmount) {
-        lowestAmount = currentAmount;
-        best = {
-          lab: outLab,
-          groupIndex: g,
-          outIndex: i,
-          currentAmount: currentAmount,
-          deficit: effectiveTarget - currentAmount,
-          freeSpace: freeSpace
+    if (m > 0) {
+      var d = g.in2.mineralType === r.reag2 ? g.in2.mineralAmount || 0 : 0;
+      var c = Math.max(0, a - d);
+      if (c > i) {
+        i = c;
+        o = {
+          group: g,
+          groupIndex: l,
+          reagent: r.reag2,
+          lab: g.in2,
+          deficit: c
         };
       }
     }
   }
-
-  return best;
+  return o;
 }
 
-function countTotalOutputLabs(layout) {
-  var count = 0;
-  for (var g = 0; g < layout.groups.length; g++) {
-    count += layout.groups[g].outs.length;
-  }
-  return count;
-}
-
-function handleBreakdownDelivery(creep, layout, activeOrder) {
-  var compound = activeOrder.compound;
-  var carryCapacity = creep.store.getCapacity();
- 
-  var remaining = typeof activeOrder.remaining === "number" ? activeOrder.remaining : (activeOrder.amount || 0);
-  var totalOutputLabs = countTotalOutputLabs(layout);
-
-  var allLabs = _getLabs(creep);
-
-  var compoundInLabs = 0;
-  var processableCompoundInLabs = 0;
- 
-  for (var li = 0; li < allLabs.length; li++) {
-    var lab = allLabs[li];
-    if (lab.mineralType === compound) {
-      var amt = lab.mineralAmount || 0;
-      compoundInLabs += amt;
-      if (amt >= LAB_REACTION_AMOUNT) processableCompoundInLabs += amt;
+function handleReagentDeliveryBalanced(e, r, a, t) {
+  if (e.store.getUsedCapacity() > 0) {
+    function depositBalanced(a, o) {
+      if ((e.store[a] || 0) === 0) return false;
+      var i = [];
+      for (var n = 0; n < r.groups.length; n++) {
+        var s = r.groups[n];
+        var u = o ? s.in1 : s.in2;
+        var m = u.mineralType === a ? u.mineralAmount || 0 : 0;
+        if (m < t) i.push({
+          lab: u,
+          have: m
+        });
+      }
+      if (i.length === 0) return false;
+      i.sort(function(e, r) {
+        return e.have - r.have;
+      });
+      var l = i[0];
+      if (!e.pos.isNearTo(l.lab)) {
+        e.moveTo(l.lab, {
+          range: 1,
+          reusePath: 10
+        });
+        return true;
+      }
+      var g;
+      if (i.length === 1) {
+        g = t - l.have;
+      } else if (i[1].have > l.have) {
+        g = i[1].have - l.have;
+      } else {
+        g = Math.ceil(e.store[a] / i.length);
+      }
+      g = Math.max(g, LAB_REACTION_AMOUNT);
+      var v = l.lab.store.getFreeCapacity(a) || 0;
+      var f = Math.min(e.store[a], v, g);
+      if (f > 0) {
+        e.transfer(l.lab, a, f);
+        e.memory.idleTicks = 0;
+      }
+      return true;
     }
+    if (depositBalanced(a.reag1, true)) return;
+    if (depositBalanced(a.reag2, false)) return;
+    deliverToBest(e);
+    return;
   }
- 
-  var targetPerLab;
-  if (remaining < LAB_REACTION_AMOUNT) {
-    targetPerLab = 0;
+  var o = findMostNeededInput(r, a, t, e.room);
+  if (!o || o.deficit <= 0) return;
+  var i = e.room.terminal;
+  var n = e.room.storage;
+  var s = o.reagent;
+  var u = 0;
+  for (var m = 0; m < r.groups.length; m++) {
+    var l = r.groups[m];
+    var g = s === a.reag1 ? l.in1 : l.in2;
+    var v = g.mineralType === s ? g.mineralAmount || 0 : 0;
+    u += Math.max(0, t - v);
+  }
+  var f = Math.min(u, e.store.getCapacity());
+  var d = null;
+  var c = a && a.reservationProgram;
+  var p = c ? storageManager.storageFind(e.room.name, s) : null;
+  var T = p && p.terminal && Array.isArray(p.terminal.reservations) ? p.terminal.reservations : [];
+  var y = p && p.storage && Array.isArray(p.storage.reservations) ? p.storage.reservations : [];
+  var A = 0;
+  var h = 0;
+  for (var R = 0; R < T.length; R++) {
+    if (T[R] && T[R].program === c) A += T[R].amount || 0;
+  }
+  for (var b = 0; b < y.length; b++) {
+    if (y[b] && y[b].program === c) h += y[b].amount || 0;
+  }
+  if (i && c && A > 0) {
+    d = i;
+    f = Math.min(f, A, i.store[s] || 0);
+  } else if (n && c && h > 0) {
+    d = n;
+    f = Math.min(f, h, n.store[s] || 0);
+  } else if (i && (i.store[s] || 0) >= f) {
+    d = i;
+  } else if (n && (n.store[s] || 0) >= f) {
+    d = n;
+  } else if (i && (i.store[s] || 0) > 0) {
+    d = i;
+    f = Math.min(i.store[s], e.store.getCapacity());
+  } else if (n && (n.store[s] || 0) > 0) {
+    d = n;
+    f = Math.min(n.store[s], e.store.getCapacity());
+  }
+  if (!d) return;
+  if (e.pos.isNearTo(d)) {
+    var C = d.store[s] || 0;
+    var _ = Math.min(f, C, e.store.getFreeCapacity());
+    if (_ > 0) {
+      consumeReservedWithdraw(e, d, s, _, a);
+      e.memory.idleTicks = 0;
+    }
   } else {
-    var totalToDistribute = compoundInLabs + remaining;
-    var rawTarget = Math.ceil(totalToDistribute / Math.max(totalOutputLabs, 1));
-    var mod = rawTarget % LAB_REACTION_AMOUNT;
-    if (mod !== 0) rawTarget += (LAB_REACTION_AMOUNT - mod);
-    targetPerLab = Math.max(rawTarget, LAB_REACTION_AMOUNT);
-    targetPerLab = Math.min(targetPerLab, LAB_CAPACITY);
+    e.moveTo(d, {
+      range: 1,
+      reusePath: 10
+    });
   }
- 
-  var terminal = creep.room.terminal;
-  var storage = creep.room.storage;
-  var terminalCompound = (terminal && terminal.store[compound]) || 0;
-  var storageCompound = (storage && storage.store[compound]) || 0;
-  var compoundInTerminalStorage = terminalCompound + storageCompound;
- 
-  var totalCompoundAnywhere = compoundInTerminalStorage + compoundInLabs;
-  var hasUsableCompound = terminalCompound >= LAB_REACTION_AMOUNT ||
-                          storageCompound >= LAB_REACTION_AMOUNT;
-  var hasProcessableCompoundAnywhere = hasUsableCompound || processableCompoundInLabs > 0;
- 
-  var totalReagentsInInputs = 0;
-  var largestReagentAmount = 0;
-  var reagentLabToEvacuate = null;
- 
-  for (var g = 0; g < layout.groups.length; g++) {
-    var group = layout.groups[g];
- 
-    var in1Amount = group.in1.mineralAmount || 0;
-    totalReagentsInInputs += in1Amount;
-    if (in1Amount > largestReagentAmount) {
-      largestReagentAmount = in1Amount;
-      reagentLabToEvacuate = { lab: group.in1, groupIndex: g, labName: 'IN1' };
-    }
- 
-    var in2Amount = group.in2.mineralAmount || 0;
-    totalReagentsInInputs += in2Amount;
-    if (in2Amount > largestReagentAmount) {
-      largestReagentAmount = in2Amount;
-      reagentLabToEvacuate = { lab: group.in2, groupIndex: g, labName: 'IN2' };
+}
+
+function handleMidReactionEvacuation(e, r, a) {
+  var t = a.product;
+  if (e.store.getUsedCapacity() > 0 && !(e.store[t] > 0)) {
+    deliverToBest(e);
+    return true;
+  }
+  var o = null;
+  var i = Infinity;
+  for (var n = 0; n < r.groups.length; n++) {
+    var s = r.groups[n];
+    for (var u = 0; u < s.outs.length; u++) {
+      var m = s.outs[u];
+      if (m.mineralType === t && (m.mineralAmount || 0) > 0) {
+        var l = e.pos.getRangeTo(m);
+        if (l < i) {
+          i = l;
+          o = m;
+        }
+      }
     }
   }
- 
-  var breakdownEffectivelyComplete = !hasProcessableCompoundAnywhere;
-  var isFinishingUp = breakdownEffectivelyComplete ||
-                      remaining <= 0 ||
-                      (remaining < LAB_REACTION_AMOUNT && !hasUsableCompound) ||
-                      targetPerLab === 0;
- 
-  if (breakdownEffectivelyComplete && totalReagentsInInputs > 0) {
-    debugLog("[LabBot " + creep.name + "] BREAKDOWN COMPLETE - forcing evacuation.");
- 
-    if (!activeOrder.evacuating) {
-      activeOrder.evacuating = true;
-      activeOrder.remaining = 0;
+  if ((e.store[t] || 0) > 0) {
+    var g = e.store.getFreeCapacity();
+    if (g < LAB_REACTION_AMOUNT) {
+      deliverProductAndRecord(e, t);
+      return true;
+    }
+    if (o) {
+      if (e.pos.isNearTo(o)) {
+        var v = Math.min(o.mineralAmount || 0, g);
+        e.withdraw(o, t, v);
+        e.memory.idleTicks = 0;
+      } else {
+        e.moveTo(o, {
+          range: 1,
+          reusePath: 10
+        });
+      }
+      return true;
+    }
+    deliverProductAndRecord(e, t);
+    return true;
+  }
+  if (!o) return false;
+  if (e.pos.isNearTo(o)) {
+    var v = Math.min(o.mineralAmount || 0, e.store.getCapacity());
+    e.withdraw(o, t, v);
+    e.memory.idleTicks = 0;
+  } else {
+    e.moveTo(o, {
+      range: 1,
+      reusePath: 10
+    });
+  }
+  return true;
+}
+
+function handleProductionEvacuation(e, r, a) {
+  var t = null;
+  var o = null;
+  var i = 0;
+  for (var n = 0; n < r.groups.length && !t; n++) {
+    var s = r.groups[n];
+    for (var u = 0; u < s.outs.length; u++) {
+      var m = s.outs[u];
+      if (m.mineralType === a.product && (m.mineralAmount || 0) > 0) {
+        t = m;
+        o = a.product;
+        i = m.mineralAmount;
+        break;
+      }
+    }
+    if (!t && (s.in1.mineralAmount || 0) > 0) {
+      t = s.in1;
+      o = s.in1.mineralType;
+      i = s.in1.mineralAmount;
+    } else if (!t && (s.in2.mineralAmount || 0) > 0) {
+      t = s.in2;
+      o = s.in2.mineralType;
+      i = s.in2.mineralAmount;
     }
   }
- 
-  if ((creep.store[compound] || 0) > 0) {
-    var carryingAmount = creep.store[compound];
- 
-    if (carryingAmount < LAB_REACTION_AMOUNT || isFinishingUp) {
-      deliverToBest(creep);
+  if (t) {
+    if (e.store.getUsedCapacity() > 0 && !(e.store[o] > 0)) {
+      var l = a.product;
+      if ((e.store[l] || 0) > 0) deliverProductAndRecord(e, l); else deliverToBest(e);
       return;
     }
- 
-    var lowestLab = findLowestOutputLab(layout, activeOrder, targetPerLab);
- 
-    if (lowestLab && lowestLab.deficit > 0) {
-      if (creep.pos.isNearTo(lowestLab.lab)) {
-        var amount = Math.min(creep.store[compound], lowestLab.freeSpace, lowestLab.deficit);
-        if (amount > 0) {
-          var code = creep.transfer(lowestLab.lab, compound, amount);
-          if (code === OK) {
-            var labManager = require('labManager');
-            labManager.recordDelivery(creep.room.name, compound, amount);
-            creep.memory.idleTicks = 0;
-            debugLog("[LabBot " + creep.name + "] delivered " + amount + " " + compound + " to output lab (recorded)");
+    if (e.store.getFreeCapacity() === 0) {
+      var l = a.product;
+      if ((e.store[l] || 0) > 0) deliverProductAndRecord(e, l); else deliverToBest(e);
+      return;
+    }
+    if (e.pos.isNearTo(t)) {
+      consumeReservedWithdraw(e, t, o, Math.min(i, e.store.getFreeCapacity()), a);
+    } else {
+      e.moveTo(t, {
+        range: 1,
+        reusePath: 10
+      });
+    }
+    return;
+  }
+  if (e.store.getUsedCapacity() > 0) {
+    var l = a.product;
+    if ((e.store[l] || 0) > 0) deliverProductAndRecord(e, l); else deliverToBest(e);
+    return;
+  }
+  if (r.groups.length > 0 && !e.pos.inRangeTo(r.groups[0].in1, 3)) {
+    e.moveTo(r.groups[0].in1, {
+      range: 3,
+      reusePath: 15
+    });
+  }
+}
+
+function findLowestOutputLab(e, r, a) {
+  var t = r.compound;
+  var o = null;
+  var i = Infinity;
+  var n = Math.max(a, LAB_REACTION_AMOUNT);
+  for (var s = 0; s < e.groups.length; s++) {
+    var u = e.groups[s];
+    for (var m = 0; m < u.outs.length; m++) {
+      var l = u.outs[m];
+      var g = l.mineralType === t || !l.mineralType || (l.mineralAmount || 0) === 0;
+      if (!g) continue;
+      var v = l.mineralType === t ? l.mineralAmount || 0 : 0;
+      var f = l.store.getFreeCapacity(t) || 0;
+      if (v < n && f > 0 && v < i) {
+        i = v;
+        o = {
+          lab: l,
+          groupIndex: s,
+          outIndex: m,
+          currentAmount: v,
+          deficit: n - v,
+          freeSpace: f
+        };
+      }
+    }
+  }
+  return o;
+}
+
+function countTotalOutputLabs(e) {
+  var r = 0;
+  for (var a = 0; a < e.groups.length; a++) {
+    r += e.groups[a].outs.length;
+  }
+  return r;
+}
+
+function handleBreakdownDelivery(e, r, a) {
+  var t = a.compound;
+  var o = e.store.getCapacity();
+  var i = typeof a.remaining === "number" ? a.remaining : a.amount || 0;
+  var n = countTotalOutputLabs(r);
+  var s = _getLabs(e);
+  var u = 0;
+  var m = 0;
+  for (var l = 0; l < s.length; l++) {
+    var g = s[l];
+    if (g.mineralType === t) {
+      var v = g.mineralAmount || 0;
+      u += v;
+      if (v >= LAB_REACTION_AMOUNT) m += v;
+    }
+  }
+  var f;
+  if (i < LAB_REACTION_AMOUNT) {
+    f = 0;
+  } else {
+    var d = u + i;
+    var c = Math.ceil(d / Math.max(n, 1));
+    var p = c % LAB_REACTION_AMOUNT;
+    if (p !== 0) c += LAB_REACTION_AMOUNT - p;
+    f = Math.max(c, LAB_REACTION_AMOUNT);
+    f = Math.min(f, LAB_CAPACITY);
+  }
+  var T = e.room.terminal;
+  var y = e.room.storage;
+  var A = T && T.store[t] || 0;
+  var h = y && y.store[t] || 0;
+  var R = A + h;
+  var b = R + u;
+  var C = A >= LAB_REACTION_AMOUNT || h >= LAB_REACTION_AMOUNT;
+  var _ = C || m > 0;
+  var M = 0;
+  var N = 0;
+  var B = null;
+  for (var L = 0; L < r.groups.length; L++) {
+    var E = r.groups[L];
+    var O = E.in1.mineralAmount || 0;
+    M += O;
+    if (O > N) {
+      N = O;
+      B = {
+        lab: E.in1,
+        groupIndex: L,
+        labName: "IN1"
+      };
+    }
+    var k = E.in2.mineralAmount || 0;
+    M += k;
+    if (k > N) {
+      N = k;
+      B = {
+        lab: E.in2,
+        groupIndex: L,
+        labName: "IN2"
+      };
+    }
+  }
+  var U = !_;
+  var P = U || i <= 0 || i < LAB_REACTION_AMOUNT && !C || f === 0;
+  if (U && M > 0) {
+    debugLog("[LabBot " + e.name + "] BREAKDOWN COMPLETE - forcing evacuation.");
+    if (!a.evacuating) {
+      a.evacuating = true;
+      a.remaining = 0;
+    }
+  }
+  if ((e.store[t] || 0) > 0) {
+    var w = e.store[t];
+    if (w < LAB_REACTION_AMOUNT || P) {
+      deliverToBest(e);
+      return;
+    }
+    var I = findLowestOutputLab(r, a, f);
+    if (I && I.deficit > 0) {
+      if (e.pos.isNearTo(I.lab)) {
+        var S = Math.min(e.store[t], I.freeSpace, I.deficit);
+        if (S > 0) {
+          var F = e.transfer(I.lab, t, S);
+          if (F === OK) {
+            var x = require("labManager");
+            x.recordDelivery(e.room.name, t, S);
+            e.memory.idleTicks = 0;
+            debugLog("[LabBot " + e.name + "] delivered " + S + " " + t + " to output lab (recorded)");
           }
         }
         return;
       } else {
-        creep.moveTo(lowestLab.lab, { range: 1, reusePath: 10 });
+        e.moveTo(I.lab, {
+          range: 1,
+          reusePath: 10
+        });
         return;
       }
     }
- 
-    deliverToBest(creep);
+    deliverToBest(e);
     return;
   }
- 
-  if ((creep.store[activeOrder.reag1] || 0) > 0) {
-    deliverReagentAndRecord(creep, activeOrder.reag1);
+  if ((e.store[a.reag1] || 0) > 0) {
+    deliverReagentAndRecord(e, a.reag1);
     return;
   }
-  if ((creep.store[activeOrder.reag2] || 0) > 0) {
-    deliverReagentAndRecord(creep, activeOrder.reag2);
+  if ((e.store[a.reag2] || 0) > 0) {
+    deliverReagentAndRecord(e, a.reag2);
     return;
   }
- 
-  if (creep.store.getUsedCapacity() > 0) {
-    deliverToBest(creep);
+  if (e.store.getUsedCapacity() > 0) {
+    deliverToBest(e);
     return;
   }
- 
-  if (isFinishingUp) {
-    // If compound is still actively being processed in output labs, only evacuate input
-    // labs when they are full (which would stall the reaction). Never evacuate proactively
-    // while reactions are still running — wait for the reaction to finish first.
-    if (processableCompoundInLabs > 0) {
-      var destIn1Free = layout.groups[0].in1.store.getFreeCapacity(activeOrder.reag1) || 0;
-      var destIn2Free = layout.groups[0].in2.store.getFreeCapacity(activeOrder.reag2) || 0;
-      if (destIn1Free >= LAB_REACTION_AMOUNT && destIn2Free >= LAB_REACTION_AMOUNT) {
-        // Reactions still running and inputs have room — wait, do not unload yet
-        creep.memory.idleTicks = 0;
-        debugLog("[LabBot " + creep.name + "] waiting for breakdown to finish (" + processableCompoundInLabs + " compound remaining in labs)");
-        if (layout.groups.length > 0 && !creep.pos.inRangeTo(layout.groups[0].in1, 3)) {
-          creep.moveTo(layout.groups[0].in1, { range: 3, reusePath: 15 });
+  if (P) {
+    if (m > 0) {
+      var q = r.groups[0].in1.store.getFreeCapacity(a.reag1) || 0;
+      var D = r.groups[0].in2.store.getFreeCapacity(a.reag2) || 0;
+      if (q >= LAB_REACTION_AMOUNT && D >= LAB_REACTION_AMOUNT) {
+        e.memory.idleTicks = 0;
+        debugLog("[LabBot " + e.name + "] waiting for breakdown to finish (" + m + " compound remaining in labs)");
+        if (r.groups.length > 0 && !e.pos.inRangeTo(r.groups[0].in1, 3)) {
+          e.moveTo(r.groups[0].in1, {
+            range: 3,
+            reusePath: 15
+          });
         }
         return;
       }
-      // Inputs are full — must evacuate them now or reactions stall
     }
- 
-    if (largestReagentAmount > 0 && reagentLabToEvacuate) {
-      debugLog("[LabBot " + creep.name + "] finishing: evacuating " + largestReagentAmount +
-               " " + reagentLabToEvacuate.lab.mineralType);
-      if (creep.pos.isNearTo(reagentLabToEvacuate.lab)) {
-        creep.withdraw(reagentLabToEvacuate.lab, reagentLabToEvacuate.lab.mineralType,
-                       Math.min(reagentLabToEvacuate.lab.mineralAmount, carryCapacity));
-        creep.memory.idleTicks = 0;
+    if (N > 0 && B) {
+      debugLog("[LabBot " + e.name + "] finishing: evacuating " + N + " " + B.lab.mineralType);
+      if (e.pos.isNearTo(B.lab)) {
+        e.withdraw(B.lab, B.lab.mineralType, Math.min(B.lab.mineralAmount, o));
+        e.memory.idleTicks = 0;
         return;
       } else {
-        creep.moveTo(reagentLabToEvacuate.lab, { range: 1, reusePath: 10 });
+        e.moveTo(B.lab, {
+          range: 1,
+          reusePath: 10
+        });
         return;
       }
     }
- 
-    if (compoundInLabs > 0) {
-      for (var li = 0; li < allLabs.length; li++) {
-        var lab = allLabs[li];
-        if (lab.mineralType === compound && (lab.mineralAmount || 0) > 0) {
-          if (creep.pos.isNearTo(lab)) {
-            creep.withdraw(lab, compound, Math.min(lab.mineralAmount, carryCapacity));
-            creep.memory.idleTicks = 0;
+    if (u > 0) {
+      for (var l = 0; l < s.length; l++) {
+        var g = s[l];
+        if (g.mineralType === t && (g.mineralAmount || 0) > 0) {
+          if (e.pos.isNearTo(g)) {
+            e.withdraw(g, t, Math.min(g.mineralAmount, o));
+            e.memory.idleTicks = 0;
             return;
           } else {
-            creep.moveTo(lab, { range: 1, reusePath: 10 });
+            e.moveTo(g, {
+              range: 1,
+              reusePath: 10
+            });
             return;
           }
         }
       }
     }
- 
-    if (!activeOrder.evacuating) {
-      activeOrder.evacuating = true;
-      activeOrder.remaining = 0;
+    if (!a.evacuating) {
+      a.evacuating = true;
+      a.remaining = 0;
     }
-    if (layout.groups.length > 0 && !creep.pos.inRangeTo(layout.groups[0].in1, 3)) {
-      creep.moveTo(layout.groups[0].in1, { range: 3, reusePath: 15 });
+    if (r.groups.length > 0 && !e.pos.inRangeTo(r.groups[0].in1, 3)) {
+      e.moveTo(r.groups[0].in1, {
+        range: 3,
+        reusePath: 15
+      });
     }
     return;
   }
- 
-  var destinationsFull = false;
-  for (var g = 0; g < layout.groups.length; g++) {
-    var grp = layout.groups[g];
-    if ((grp.in1.store.getFreeCapacity(activeOrder.reag1) || 0) < LAB_REACTION_AMOUNT) destinationsFull = true;
-    if ((grp.in2.store.getFreeCapacity(activeOrder.reag2) || 0) < LAB_REACTION_AMOUNT) destinationsFull = true;
+  var G = false;
+  for (var L = 0; L < r.groups.length; L++) {
+    var Y = r.groups[L];
+    if ((Y.in1.store.getFreeCapacity(a.reag1) || 0) < LAB_REACTION_AMOUNT) G = true;
+    if ((Y.in2.store.getFreeCapacity(a.reag2) || 0) < LAB_REACTION_AMOUNT) G = true;
   }
-  var noReactionsPossible = !hasUsableCompound && !processableCompoundInLabs;
-  var shouldEvacuateReagents = (destinationsFull || noReactionsPossible) && largestReagentAmount > 0;
- 
-  if (shouldEvacuateReagents && reagentLabToEvacuate) {
-    if (creep.pos.isNearTo(reagentLabToEvacuate.lab)) {
-      consumeReservedWithdraw(creep, reagentLabToEvacuate.lab, reagentLabToEvacuate.lab.mineralType,
-                              Math.min(reagentLabToEvacuate.lab.mineralAmount, carryCapacity), activeOrder);
-      creep.memory.idleTicks = 0;
-      debugLog("[LabBot " + creep.name + "] evacuating " + reagentLabToEvacuate.lab.mineralType);
+  var W = !C && !m;
+  var K = (G || W) && N > 0;
+  if (K && B) {
+    if (e.pos.isNearTo(B.lab)) {
+      consumeReservedWithdraw(e, B.lab, B.lab.mineralType, Math.min(B.lab.mineralAmount, o), a);
+      e.memory.idleTicks = 0;
+      debugLog("[LabBot " + e.name + "] evacuating " + B.lab.mineralType);
       return;
     } else {
-      creep.moveTo(reagentLabToEvacuate.lab, { range: 1, reusePath: 10 });
+      e.moveTo(B.lab, {
+        range: 1,
+        reusePath: 10
+      });
       return;
     }
   }
- 
-  var effectiveTarget = Math.max(targetPerLab, LAB_REACTION_AMOUNT);
-  var lowestLab = findLowestOutputLab(layout, activeOrder, effectiveTarget);
-  var shouldDeliverCompound = lowestLab && lowestLab.deficit > 0 && hasUsableCompound;
- 
-  if (shouldDeliverCompound) {
-    var source = null;
-    var fetchAmount = Math.min(lowestLab.deficit, carryCapacity);
- 
-    if (terminal && terminalCompound >= LAB_REACTION_AMOUNT) {
-      source = terminal;
-      fetchAmount = Math.min(fetchAmount, terminalCompound);
-    } else if (storage && storageCompound >= LAB_REACTION_AMOUNT) {
-      source = storage;
-      fetchAmount = Math.min(fetchAmount, storageCompound);
+  var V = Math.max(f, LAB_REACTION_AMOUNT);
+  var I = findLowestOutputLab(r, a, V);
+  var j = I && I.deficit > 0 && C;
+  if (j) {
+    var z = null;
+    var H = Math.min(I.deficit, o);
+    if (T && A >= LAB_REACTION_AMOUNT) {
+      z = T;
+      H = Math.min(H, A);
+    } else if (y && h >= LAB_REACTION_AMOUNT) {
+      z = y;
+      H = Math.min(H, h);
     }
- 
-    if (source && fetchAmount >= LAB_REACTION_AMOUNT) {
-      if (creep.pos.isNearTo(source)) {
-        creep.withdraw(source, compound, Math.min(fetchAmount, creep.store.getFreeCapacity()));
-        creep.memory.idleTicks = 0;
+    if (z && H >= LAB_REACTION_AMOUNT) {
+      if (e.pos.isNearTo(z)) {
+        e.withdraw(z, t, Math.min(H, e.store.getFreeCapacity()));
+        e.memory.idleTicks = 0;
         return;
       } else {
-        creep.moveTo(source, { range: 1, reusePath: 10 });
+        e.moveTo(z, {
+          range: 1,
+          reusePath: 10
+        });
         return;
       }
     }
   }
- 
-  for (var li = 0; li < allLabs.length; li++) {
-    var lab = allLabs[li];
-    var labAmount = lab.mineralAmount || 0;
-    if (lab.mineralType === compound && labAmount > 0 && labAmount < LAB_REACTION_AMOUNT) {
-      if (creep.pos.isNearTo(lab)) {
-        creep.withdraw(lab, compound, labAmount);
-        creep.memory.idleTicks = 0;
+  for (var l = 0; l < s.length; l++) {
+    var g = s[l];
+    var J = g.mineralAmount || 0;
+    if (g.mineralType === t && J > 0 && J < LAB_REACTION_AMOUNT) {
+      if (e.pos.isNearTo(g)) {
+        e.withdraw(g, t, J);
+        e.memory.idleTicks = 0;
         return;
       } else {
-        creep.moveTo(lab, { range: 1, reusePath: 10 });
+        e.moveTo(g, {
+          range: 1,
+          reusePath: 10
+        });
         return;
       }
     }
   }
- 
-  debugLog("[LabBot " + creep.name + "] idle: reagent=" + largestReagentAmount +
-           ", compound=" + totalCompoundAnywhere);
- 
-  // If breakdown reactions are still running (compound in labs, inputs have room), don't suicide
-  var destIn1Free = layout.groups[0].in1.store.getFreeCapacity(activeOrder.reag1) || 0;
-  var destIn2Free = layout.groups[0].in2.store.getFreeCapacity(activeOrder.reag2) || 0;
-  var breakdownActive = processableCompoundInLabs > 0 &&
-                        destIn1Free >= LAB_REACTION_AMOUNT &&
-                        destIn2Free >= LAB_REACTION_AMOUNT;
- 
-  if (breakdownActive) {
-    creep.memory.idleTicks = 0;
-    debugLog("[LabBot " + creep.name + "] waiting on active breakdown reactions");
-    if (layout.groups.length > 0 && !creep.pos.inRangeTo(layout.groups[0].in1, 3)) {
-      creep.moveTo(layout.groups[0].in1, { range: 3, reusePath: 15 });
+  debugLog("[LabBot " + e.name + "] idle: reagent=" + N + ", compound=" + b);
+  var q = r.groups[0].in1.store.getFreeCapacity(a.reag1) || 0;
+  var D = r.groups[0].in2.store.getFreeCapacity(a.reag2) || 0;
+  var Q = m > 0 && q >= LAB_REACTION_AMOUNT && D >= LAB_REACTION_AMOUNT;
+  if (Q) {
+    e.memory.idleTicks = 0;
+    debugLog("[LabBot " + e.name + "] waiting on active breakdown reactions");
+    if (r.groups.length > 0 && !e.pos.inRangeTo(r.groups[0].in1, 3)) {
+      e.moveTo(r.groups[0].in1, {
+        range: 3,
+        reusePath: 15
+      });
     }
     return;
   }
- 
-  if (typeof creep.memory.idleTicks !== 'number') creep.memory.idleTicks = 0;
-  creep.memory.idleTicks++;
- 
-  if (creep.memory.idleTicks >= IDLE_SUICIDE_TICKS) {
-    requestGracefulSuicide(creep, "idle_too_long_" + creep.memory.idleTicks + "_ticks");
+  if (typeof e.memory.idleTicks !== "number") e.memory.idleTicks = 0;
+  e.memory.idleTicks++;
+  if (e.memory.idleTicks >= IDLE_SUICIDE_TICKS) {
+    requestGracefulSuicide(e, "idle_too_long_" + e.memory.idleTicks + "_ticks");
     return;
   }
- 
-  if (layout.groups.length > 0 && !creep.pos.inRangeTo(layout.groups[0].in1, 3)) {
-    creep.moveTo(layout.groups[0].in1, { range: 3, reusePath: 15 });
+  if (r.groups.length > 0 && !e.pos.inRangeTo(r.groups[0].in1, 3)) {
+    e.moveTo(r.groups[0].in1, {
+      range: 3,
+      reusePath: 15
+    });
   }
 }
 
-
-// =============================================================================
-// DELIVERY HELPERS (second set with pickDeliveryTarget)
-// =============================================================================
-
-function pickDeliveryTarget(creep) {
-  var terminal = creep.room.terminal;
-  var storage  = creep.room.storage;
-
-  if (creep.memory.labSink === 'storage') {
-    if (storage && (storage.store.getFreeCapacity() || 0) > 0) return storage;
-    if (terminal && (terminal.store.getFreeCapacity() || 0) > 0) return terminal;
-    return storage || terminal || null;
+function pickDeliveryTarget(e) {
+  var r = e.room.terminal;
+  var a = e.room.storage;
+  if (e.memory.labSink === "storage") {
+    if (a && (a.store.getFreeCapacity() || 0) > 0) return a;
+    if (r && (r.store.getFreeCapacity() || 0) > 0) return r;
+    return a || r || null;
   }
-
-  if (terminal && (terminal.store.getFreeCapacity() || 0) > 0) return terminal;
-  if (storage)  return storage;
-  return terminal || null;
+  if (r && (r.store.getFreeCapacity() || 0) > 0) return r;
+  if (a) return a;
+  return r || null;
 }
 
-function deliverProductAndRecord(creep, productType) {
-  var amount = creep.store[productType] || 0;
-  if (amount <= 0) return false;
-
-  var target = pickDeliveryTarget(creep);
-  if (!target) {
-    debugLog("[LabBot " + creep.name + "] No terminal or storage for product delivery");
+function deliverProductAndRecord(e, r) {
+  var a = e.store[r] || 0;
+  if (a <= 0) return false;
+  var t = pickDeliveryTarget(e);
+  if (!t) {
+    debugLog("[LabBot " + e.name + "] No terminal or storage for product delivery");
     return false;
   }
-
-  if (creep.pos.isNearTo(target)) {
-    var code = creep.transfer(target, productType);
-    if (code === OK) {
-      creep.memory.lastAction = 'deposit';
-      creep.memory.lastResource = productType;
-      creep.memory.depositReason = 'product_delivery';
-      creep.memory.idleTicks = 0;
-
-      var labManager = require('labManager');
-      labManager.recordDelivery(creep.room.name, productType, amount);
+  if (e.pos.isNearTo(t)) {
+    var o = e.transfer(t, r);
+    if (o === OK) {
+      e.memory.lastAction = "deposit";
+      e.memory.lastResource = r;
+      e.memory.depositReason = "product_delivery";
+      e.memory.idleTicks = 0;
+      var i = require("labManager");
+      i.recordDelivery(e.room.name, r, a);
       return true;
     }
   } else {
-    creep.moveTo(target, { range: 1, reusePath: 10 });
+    e.moveTo(t, {
+      range: 1,
+      reusePath: 10
+    });
   }
   return false;
 }
 
-function deliverReagentAndRecord(creep, reagentType) {
-  var amount = creep.store[reagentType] || 0;
-  if (amount <= 0) return false;
-
-  var target = pickDeliveryTarget(creep);
-  if (!target) return false;
-
-  if (creep.pos.isNearTo(target)) {
-    var code = creep.transfer(target, reagentType);
-    if (code === OK) {
-      creep.memory.lastAction = 'deposit';
-      creep.memory.lastResource = reagentType;
-      creep.memory.depositReason = 'reagent_evacuation';
-      creep.memory.idleTicks = 0;
+function deliverReagentAndRecord(e, r) {
+  var a = e.store[r] || 0;
+  if (a <= 0) return false;
+  var t = pickDeliveryTarget(e);
+  if (!t) return false;
+  if (e.pos.isNearTo(t)) {
+    var o = e.transfer(t, r);
+    if (o === OK) {
+      e.memory.lastAction = "deposit";
+      e.memory.lastResource = r;
+      e.memory.depositReason = "reagent_evacuation";
+      e.memory.idleTicks = 0;
       return true;
     }
   } else {
-    creep.moveTo(target, { range: 1, reusePath: 10 });
+    e.moveTo(t, {
+      range: 1,
+      reusePath: 10
+    });
   }
   return false;
 }
 
-function deliverToBest(creep) {
-  if (creep.store.getUsedCapacity() === 0) return false;
-
-  var target = pickDeliveryTarget(creep);
-  if (!target) return false;
-
-  if (creep.pos.isNearTo(target)) {
-    for (var resourceType in creep.store) {
-      if (creep.store[resourceType] > 0) {
-        var code = creep.transfer(target, resourceType);
-        if (code === OK) {
-          creep.memory.lastAction = 'deposit';
-          creep.memory.lastResource = resourceType;
-          creep.memory.depositReason = 'general_delivery';
+function deliverToBest(e) {
+  if (e.store.getUsedCapacity() === 0) return false;
+  var r = pickDeliveryTarget(e);
+  if (!r) return false;
+  if (e.pos.isNearTo(r)) {
+    for (var a in e.store) {
+      if (e.store[a] > 0) {
+        var t = e.transfer(r, a);
+        if (t === OK) {
+          e.memory.lastAction = "deposit";
+          e.memory.lastResource = a;
+          e.memory.depositReason = "general_delivery";
           return true;
         }
       }
     }
   } else {
-    creep.moveTo(target, { range: 1, reusePath: 10 });
+    e.moveTo(r, {
+      range: 1,
+      reusePath: 10
+    });
   }
   return false;
 }
 
-// === NEW HELPERS (Change 1a) ===
-function orderNeedsResource(order, resource) {
-  if (!order) return false;
-  return resource === order.reag1 ||
-         resource === order.reag2 ||
-         resource === order.product ||
-         resource === order.compound;
+function orderNeedsResource(e, r) {
+  if (!e) return false;
+  return r === e.reag1 || r === e.reag2 || r === e.product || r === e.compound;
 }
 
-function isResourceReservedForRoom(roomName, resource, activeOrder) {
-  if (orderNeedsResource(activeOrder, resource)) return true;
-
-  var rm = Memory.labOrders && Memory.labOrders[roomName];
-  if (rm && rm.queue) {
-    for (var i = 0; i < rm.queue.length; i++) {
-      if (orderNeedsResource(rm.queue[i], resource)) return true;
+function isResourceReservedForRoom(e, r, a) {
+  if (orderNeedsResource(a, r)) return true;
+  var t = require("labManager");
+  var o = t && typeof t.getRoomOrderState === "function" ? t.getRoomOrderState(e) : null;
+  if (o && o.queue) {
+    for (var i = 0; i < o.queue.length; i++) {
+      if (orderNeedsResource(o.queue[i], r)) return true;
     }
   }
-
-  if (Memory.marketLabForward && Memory.marketLabForward.rooms) {
-    var lf = Memory.marketLabForward.rooms[roomName];
-    if (lf) {
-      for (var j = 0; j < lf.length; j++) {
-        var op = lf[j];
-        if (!op) continue;
-        if (op.targetCompound === resource) return true;
-        if (op.reagents && (op.reagents[0] === resource || op.reagents[1] === resource)) return true;
-      }
-    }
+  var n = require("marketLab");
+  var s = n && typeof n.getRoomOperations === "function" ? n.getRoomOperations(e) : [];
+  for (var u = 0; u < s.length; u++) {
+    var m = s[u];
+    if (!m) continue;
+    if (m.targetCompound === r) return true;
+    if (m.direction === "forward" && m.reagents && (m.reagents[0] === r || m.reagents[1] === r)) return true;
   }
-
-  if (Memory.marketLabReverse && Memory.marketLabReverse.rooms) {
-    var lr = Memory.marketLabReverse.rooms[roomName];
-    if (lr) {
-      for (var k = 0; k < lr.length; k++) {
-        var op = lr[k];
-        if (op && op.targetCompound === resource) return true;
-      }
-    }
-  }
-
   return false;
 }
 
-/**
- * Pre-evac delivery helper
- */
-function deliverPreEvacAndSell(creep, activeOrder) {
-  if (creep.store.getUsedCapacity() === 0) return false;
-
-  var terminal = creep.room.terminal;
-  var target   = pickDeliveryTarget(creep);
-  if (!target) return false;
-
-  if (creep.pos.isNearTo(target)) {
-    for (var resourceType in creep.store) {
-      if (creep.store[resourceType] > 0) {
-        var amount = creep.store[resourceType];
-        var code = creep.transfer(target, resourceType);
-        if (code === OK) {
-          creep.memory.lastAction    = 'deposit';
-          creep.memory.lastResource  = resourceType;
-          creep.memory.depositReason = 'pre_evac_sell';
-          creep.memory.idleTicks     = 0;
-
-          // === UPDATED BLOCK (Change 1b) ===
-          var isExpected = isResourceReservedForRoom(creep.room.name, resourceType, activeOrder);
-
-          if (target === terminal &&
-              !isExpected &&
-              resourceType !== RESOURCE_ENERGY &&
-              typeof global.marketSell === 'function') {
-            global.marketSell(creep.room.name, resourceType, amount);
+function deliverPreEvacAndSell(e, r) {
+  if (e.store.getUsedCapacity() === 0) return false;
+  var a = e.room.terminal;
+  var t = pickDeliveryTarget(e);
+  if (!t) return false;
+  if (e.pos.isNearTo(t)) {
+    for (var o in e.store) {
+      if (e.store[o] > 0) {
+        var i = e.store[o];
+        var n = e.transfer(t, o);
+        if (n === OK) {
+          e.memory.lastAction = "deposit";
+          e.memory.lastResource = o;
+          e.memory.depositReason = "pre_evac_sell";
+          e.memory.idleTicks = 0;
+          var s = isResourceReservedForRoom(e.room.name, o, r);
+          if (t === a && !s && o !== RESOURCE_ENERGY) {
+            if (labCommodityPolicy.isTwoLetterLabProduct(o)) {
+              labCommodityRouter.enqueue(e.room.name, o, i, "lab pre-evacuation cleanup");
+            } else if (typeof global.marketSell === "function") {
+              global.marketSell(e.room.name, o, i);
+            }
           }
           return true;
         }
       }
     }
   } else {
-    creep.moveTo(target, { range: 1, reusePath: 10 });
+    e.moveTo(t, {
+      range: 1,
+      reusePath: 10
+    });
   }
   return false;
 }
 
-function handlePreEvacuation(creep, layout, activeOrder) {
-  var allLabs = _getLabs(creep);
-
-  var pickupTarget   = null;
-  var pickupResource = null;
-  var pickupAmount   = 0;
-  for (var i = 0; i < allLabs.length; i++) {
-    var lab = allLabs[i];
-    var mineralAmount = lab.mineralAmount || 0;
-    if (mineralAmount > 0) {
-      pickupTarget   = lab;
-      pickupResource = lab.mineralType;
-      pickupAmount   = mineralAmount;
+function handlePreEvacuation(e, r, a) {
+  var t = _getLabs(e);
+  var o = null;
+  var i = null;
+  var n = 0;
+  for (var s = 0; s < t.length; s++) {
+    var u = t[s];
+    var m = u.mineralAmount || 0;
+    if (m > 0) {
+      o = u;
+      i = u.mineralType;
+      n = m;
       break;
     }
   }
-
-  if (!pickupTarget) {
-    if (creep.store.getUsedCapacity() > 0) {
-      deliverPreEvacAndSell(creep, activeOrder);
+  if (!o) {
+    if (e.store.getUsedCapacity() > 0) {
+      deliverPreEvacAndSell(e, a);
       return;
     }
-    var destIn1 = layout.groups[0].in1;
-    if (!creep.pos.inRangeTo(destIn1, 3)) {
-      creep.moveTo(destIn1, { range: 3, reusePath: 15 });
+    var l = r.groups[0].in1;
+    if (!e.pos.inRangeTo(l, 3)) {
+      e.moveTo(l, {
+        range: 3,
+        reusePath: 15
+      });
     }
     return;
   }
-
-  if (creep.store.getUsedCapacity() > 0 && !(creep.store[pickupResource] > 0)) {
-    deliverPreEvacAndSell(creep, activeOrder);
+  if (e.store.getUsedCapacity() > 0 && !(e.store[i] > 0)) {
+    deliverPreEvacAndSell(e, a);
     return;
   }
-
-  if (creep.store.getFreeCapacity() === 0) {
-    deliverPreEvacAndSell(creep, activeOrder);
+  if (e.store.getFreeCapacity() === 0) {
+    deliverPreEvacAndSell(e, a);
     return;
   }
-
-    if (creep.pos.isNearTo(pickupTarget)) {
-      var takeAmount = Math.min(pickupAmount, creep.store.getFreeCapacity());
-      consumeReservedWithdraw(creep, pickupTarget, pickupResource, takeAmount, activeOrder);
-      creep.memory.idleTicks = 0;
-    } else {
-      creep.moveTo(pickupTarget, { range: 1, reusePath: 10 });
-    }
+  if (e.pos.isNearTo(o)) {
+    var g = Math.min(n, e.store.getFreeCapacity());
+    consumeReservedWithdraw(e, o, i, g, a);
+    e.memory.idleTicks = 0;
+  } else {
+    e.moveTo(o, {
+      range: 1,
+      reusePath: 10
+    });
+  }
 }
 
-function handleBreakdownEvacuation(creep, layout, activeOrder) {
-  // Check if compound is still being processed in output labs.
-  // If so, only evacuate input labs when they are full (to unblock reactions).
-  // Don't do a full evacuation while reactions are still running.
-  var allLabsCheck = _getLabs(creep);
- 
-  var processableCompoundInLabs = 0;
-  for (var pli = 0; pli < allLabsCheck.length; pli++) {
-    var plab = allLabsCheck[pli];
-    if (plab.mineralType === activeOrder.compound && (plab.mineralAmount || 0) >= LAB_REACTION_AMOUNT) {
-      processableCompoundInLabs += plab.mineralAmount;
+function handleBreakdownEvacuation(e, r, a) {
+  var t = _getLabs(e);
+  var o = 0;
+  for (var i = 0; i < t.length; i++) {
+    var n = t[i];
+    if (n.mineralType === a.compound && (n.mineralAmount || 0) >= LAB_REACTION_AMOUNT) {
+      o += n.mineralAmount;
     }
   }
- 
-  if (processableCompoundInLabs > 0) {
-    var in1Free = layout.groups[0].in1.store.getFreeCapacity(activeOrder.reag1) || 0;
-    var in2Free = layout.groups[0].in2.store.getFreeCapacity(activeOrder.reag2) || 0;
- 
-    if (in1Free >= LAB_REACTION_AMOUNT && in2Free >= LAB_REACTION_AMOUNT) {
-      // Reactions still running and inputs have space — wait, do not unload yet
-      creep.memory.idleTicks = 0;
-      debugLog("[LabBot " + creep.name + "] breakdown still running (" + processableCompoundInLabs + " compound in labs), waiting");
-      if (creep.store.getUsedCapacity() > 0) {
-        // Finish delivering anything already in carry before parking
-        if ((creep.store[activeOrder.reag1] || 0) > 0) {
-          deliverReagentAndRecord(creep, activeOrder.reag1);
+  if (o > 0) {
+    var s = r.groups[0].in1.store.getFreeCapacity(a.reag1) || 0;
+    var u = r.groups[0].in2.store.getFreeCapacity(a.reag2) || 0;
+    if (s >= LAB_REACTION_AMOUNT && u >= LAB_REACTION_AMOUNT) {
+      e.memory.idleTicks = 0;
+      debugLog("[LabBot " + e.name + "] breakdown still running (" + o + " compound in labs), waiting");
+      if (e.store.getUsedCapacity() > 0) {
+        if ((e.store[a.reag1] || 0) > 0) {
+          deliverReagentAndRecord(e, a.reag1);
           return;
         }
-        if ((creep.store[activeOrder.reag2] || 0) > 0) {
-          deliverReagentAndRecord(creep, activeOrder.reag2);
+        if ((e.store[a.reag2] || 0) > 0) {
+          deliverReagentAndRecord(e, a.reag2);
           return;
         }
-        deliverToBest(creep);
+        deliverToBest(e);
         return;
       }
-      if (layout.groups.length > 0 && !creep.pos.inRangeTo(layout.groups[0].in1, 3)) {
-        creep.moveTo(layout.groups[0].in1, { range: 3, reusePath: 15 });
+      if (r.groups.length > 0 && !e.pos.inRangeTo(r.groups[0].in1, 3)) {
+        e.moveTo(r.groups[0].in1, {
+          range: 3,
+          reusePath: 15
+        });
       }
       return;
     }
-    // Inputs are full — must evacuate them now or the reaction stalls
   }
- 
-  // Compound is fully processed (or inputs are full and need clearing).
-  // Proceed with normal evacuation logic.
- 
-  var pickupTarget = null;
-  var pickupResource = null;
-  var pickupAmount = 0;
- 
-  outer:
-  for (var g = 0; g < layout.groups.length; g++) {
-    var group = layout.groups[g];
-    var candidates = [
-      { lab: group.in1, expectedResource: activeOrder.reag1 },
-      { lab: group.in2, expectedResource: activeOrder.reag2 }
-    ];
-    for (var c = 0; c < candidates.length; c++) {
-      var lab = candidates[c].lab;
-      if ((lab.mineralAmount || 0) > 0) {
-        pickupTarget   = lab;
-        pickupResource = lab.mineralType;
-        pickupAmount   = lab.mineralAmount;
-        break outer;
+  var m = null;
+  var l = null;
+  var g = 0;
+  e: for (var v = 0; v < r.groups.length; v++) {
+    var f = r.groups[v];
+    var d = [ {
+      lab: f.in1,
+      expectedResource: a.reag1
+    }, {
+      lab: f.in2,
+      expectedResource: a.reag2
+    } ];
+    for (var c = 0; c < d.length; c++) {
+      var p = d[c].lab;
+      if ((p.mineralAmount || 0) > 0) {
+        m = p;
+        l = p.mineralType;
+        g = p.mineralAmount;
+        break e;
       }
     }
   }
- 
-  if (!pickupTarget) {
-    outer2:
-    for (var g = 0; g < layout.groups.length; g++) {
-      for (var i = 0; i < layout.groups[g].outs.length; i++) {
-        var outLab = layout.groups[g].outs[i];
-        if (outLab.mineralType === activeOrder.compound && (outLab.mineralAmount || 0) > 0) {
-          pickupTarget   = outLab;
-          pickupResource = activeOrder.compound;
-          pickupAmount   = outLab.mineralAmount;
-          break outer2;
+  if (!m) {
+    e: for (var v = 0; v < r.groups.length; v++) {
+      for (var T = 0; T < r.groups[v].outs.length; T++) {
+        var y = r.groups[v].outs[T];
+        if (y.mineralType === a.compound && (y.mineralAmount || 0) > 0) {
+          m = y;
+          l = a.compound;
+          g = y.mineralAmount;
+          break e;
         }
       }
     }
   }
- 
-  if (!pickupTarget) {
-  var allLabs = _getLabs(creep);
-    // Catch-all sweep: at this point reactions are finished (or inputs are
-    // full and there's nothing more to react), so anything still sitting in
-    // ANY lab needs to come out — not just the compound. Reagents stranded in
-    // a lab the current layout treats as an output were previously invisible
-    // here, leaving the bot with no pickup target and parked forever.
-    for (var j = 0; j < allLabs.length; j++) {
-      var lab = allLabs[j];
-      if (lab.mineralType && (lab.mineralAmount || 0) > 0) {
-        pickupTarget   = lab;
-        pickupResource = lab.mineralType;
-        pickupAmount   = lab.mineralAmount;
+  if (!m) {
+    var A = _getLabs(e);
+    for (var h = 0; h < A.length; h++) {
+      var p = A[h];
+      if (p.mineralType && (p.mineralAmount || 0) > 0) {
+        m = p;
+        l = p.mineralType;
+        g = p.mineralAmount;
         break;
       }
     }
   }
- 
-  if (!pickupTarget) {
-    if (creep.store.getUsedCapacity() > 0) {
-      if ((creep.store[activeOrder.reag1] || 0) > 0) {
-        deliverReagentAndRecord(creep, activeOrder.reag1);
-      } else if ((creep.store[activeOrder.reag2] || 0) > 0) {
-        deliverReagentAndRecord(creep, activeOrder.reag2);
+  if (!m) {
+    if (e.store.getUsedCapacity() > 0) {
+      if ((e.store[a.reag1] || 0) > 0) {
+        deliverReagentAndRecord(e, a.reag1);
+      } else if ((e.store[a.reag2] || 0) > 0) {
+        deliverReagentAndRecord(e, a.reag2);
       } else {
-        deliverToBest(creep);
+        deliverToBest(e);
       }
       return;
     }
-    if (layout.groups.length > 0 && !creep.pos.inRangeTo(layout.groups[0].in1, 3)) {
-      creep.moveTo(layout.groups[0].in1, { range: 3, reusePath: 15 });
+    if (r.groups.length > 0 && !e.pos.inRangeTo(r.groups[0].in1, 3)) {
+      e.moveTo(r.groups[0].in1, {
+        range: 3,
+        reusePath: 15
+      });
     }
     return;
   }
- 
-  if (creep.store.getUsedCapacity() > 0 && !(creep.store[pickupResource] > 0)) {
-    if ((creep.store[activeOrder.reag1] || 0) > 0) {
-      deliverReagentAndRecord(creep, activeOrder.reag1);
-    } else if ((creep.store[activeOrder.reag2] || 0) > 0) {
-      deliverReagentAndRecord(creep, activeOrder.reag2);
+  if (e.store.getUsedCapacity() > 0 && !(e.store[l] > 0)) {
+    if ((e.store[a.reag1] || 0) > 0) {
+      deliverReagentAndRecord(e, a.reag1);
+    } else if ((e.store[a.reag2] || 0) > 0) {
+      deliverReagentAndRecord(e, a.reag2);
     } else {
-      deliverToBest(creep);
+      deliverToBest(e);
     }
     return;
   }
- 
-  if (creep.store.getFreeCapacity() === 0) {
-    if ((creep.store[activeOrder.reag1] || 0) > 0) {
-      deliverReagentAndRecord(creep, activeOrder.reag1);
-    } else if ((creep.store[activeOrder.reag2] || 0) > 0) {
-      deliverReagentAndRecord(creep, activeOrder.reag2);
+  if (e.store.getFreeCapacity() === 0) {
+    if ((e.store[a.reag1] || 0) > 0) {
+      deliverReagentAndRecord(e, a.reag1);
+    } else if ((e.store[a.reag2] || 0) > 0) {
+      deliverReagentAndRecord(e, a.reag2);
     } else {
-      deliverToBest(creep);
+      deliverToBest(e);
     }
     return;
   }
- 
-  if (creep.pos.isNearTo(pickupTarget)) {
-    var takeAmount = Math.min(pickupAmount, creep.store.getFreeCapacity());
-    consumeReservedWithdraw(creep, pickupTarget, pickupResource, takeAmount, activeOrder);
-    creep.memory.idleTicks = 0;
+  if (e.pos.isNearTo(m)) {
+    var R = Math.min(g, e.store.getFreeCapacity());
+    consumeReservedWithdraw(e, m, l, R, a);
+    e.memory.idleTicks = 0;
   } else {
-    creep.moveTo(pickupTarget, { range: 1, reusePath: 10 });
+    e.moveTo(m, {
+      range: 1,
+      reusePath: 10
+    });
   }
 }
 
-
-// =============================================================================
-// BOOST LAB WORK
-// =============================================================================
-
-function handleBoostLabWork(creep) {
-  var workItems = getBoostManager().getLabWork(creep.room.name);
-  if (workItems.length === 0) return false;
-
-  for (var wi = 0; wi < workItems.length; wi++) {
-    var item = workItems[wi];
-    var lab  = item.lab;
-
-    if (item.stopping) {
-      if (creep.store.getUsedCapacity() > 0) {
-        deliverToBest(creep);
+function handleBoostLabWork(e) {
+  var r = getBoostManager().getLabWork(e.room.name);
+  if (r.length === 0) return false;
+  for (var a = 0; a < r.length; a++) {
+    var t = r[a];
+    var o = t.lab;
+    if (t.stopping) {
+      if (e.store.getUsedCapacity() > 0) {
+        deliverToBest(e);
         return true;
       }
-
-      if (lab.mineralType && (lab.mineralAmount || 0) > 0) {
-        if (creep.pos.isNearTo(lab)) {
-          creep.withdraw(lab, lab.mineralType,
-            Math.min(lab.mineralAmount, creep.store.getCapacity()));
-          creep.memory.idleTicks = 0;
+      if (o.mineralType && (o.mineralAmount || 0) > 0) {
+        if (e.pos.isNearTo(o)) {
+          e.withdraw(o, o.mineralType, Math.min(o.mineralAmount, e.store.getCapacity()));
+          e.memory.idleTicks = 0;
         } else {
-          creep.moveTo(lab, { range: 1, reusePath: 10 });
+          e.moveTo(o, {
+            range: 1,
+            reusePath: 10
+          });
         }
         return true;
       }
-
-      var labEn = lab.store ? (lab.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-      if (labEn > 0) {
-        if (creep.pos.isNearTo(lab)) {
-          creep.withdraw(lab, RESOURCE_ENERGY,
-            Math.min(labEn, creep.store.getCapacity()));
-          creep.memory.idleTicks = 0;
+      var i = o.store ? o.store.getUsedCapacity(RESOURCE_ENERGY) || 0 : 0;
+      if (i > 0) {
+        if (e.pos.isNearTo(o)) {
+          e.withdraw(o, RESOURCE_ENERGY, Math.min(i, e.store.getCapacity()));
+          e.memory.idleTicks = 0;
         } else {
-          creep.moveTo(lab, { range: 1, reusePath: 10 });
+          e.moveTo(o, {
+            range: 1,
+            reusePath: 10
+          });
         }
         return true;
       }
-
       continue;
     }
-
-    if (item.hasWrongMineral) {
-      if (creep.store.getUsedCapacity() > 0) {
-        deliverToBest(creep);
+    if (t.hasWrongMineral) {
+      if (e.store.getUsedCapacity() > 0) {
+        deliverToBest(e);
         return true;
       }
-      if (creep.pos.isNearTo(lab)) {
-        creep.withdraw(lab, lab.mineralType,
-          Math.min(lab.mineralAmount || 0, creep.store.getCapacity()));
-        creep.memory.idleTicks = 0;
+      if (e.pos.isNearTo(o)) {
+        e.withdraw(o, o.mineralType, Math.min(o.mineralAmount || 0, e.store.getCapacity()));
+        e.memory.idleTicks = 0;
       } else {
-        creep.moveTo(lab, { range: 1, reusePath: 10 });
+        e.moveTo(o, {
+          range: 1,
+          reusePath: 10
+        });
       }
       return true;
     }
-
-    if (item.isUnboostDrain) {
-      if (creep.store.getUsedCapacity() > 0) {
+    if (t.isUnboostDrain) {
+      if (e.store.getUsedCapacity() > 0) {
         continue;
       }
-      if (creep.pos.isNearTo(lab)) {
-        var drainAmt = Math.min(
-          item.drainAmount || 500,
-          lab.mineralAmount || 0,
-          creep.store.getCapacity()
-        );
-        if (drainAmt > 0) {
-          creep.withdraw(lab, item.compound, drainAmt);
-          creep.memory.idleTicks = 0;
+      if (e.pos.isNearTo(o)) {
+        var n = Math.min(t.drainAmount || 500, o.mineralAmount || 0, e.store.getCapacity());
+        if (n > 0) {
+          e.withdraw(o, t.compound, n);
+          e.memory.idleTicks = 0;
         }
       } else {
-        creep.moveTo(lab, { range: 1, reusePath: 10 });
+        e.moveTo(o, {
+          range: 1,
+          reusePath: 10
+        });
       }
       return true;
     }
-
-    var compound = item.compound;
-    if ((creep.store[compound] || 0) > 0 && item.needsCompound) {
-      if (creep.pos.isNearTo(lab)) {
-        var boostFillTarget = item.fillTarget || (LAB_MINERAL_CAPACITY_BOOST - 150);
-        var currentAmt = (lab.mineralType === compound) ? (lab.mineralAmount || 0) : 0;
-        var space = Math.max(0, boostFillTarget - currentAmt);
-        var amt = Math.min(creep.store[compound], space);
-
-        if (amt > 0) {
-          creep.transfer(lab, compound, amt);
-          creep.memory.idleTicks = 0;
+    var s = t.compound;
+    if ((e.store[s] || 0) > 0 && t.needsCompound) {
+      if (e.pos.isNearTo(o)) {
+        var u = t.fillTarget || LAB_MINERAL_CAPACITY_BOOST - 150;
+        var m = o.mineralType === s ? o.mineralAmount || 0 : 0;
+        var l = Math.max(0, u - m);
+        var g = Math.min(e.store[s], l);
+        if (g > 0) {
+          e.transfer(o, s, g);
+          e.memory.idleTicks = 0;
         }
       } else {
-        creep.moveTo(lab, { range: 1, reusePath: 10 });
+        e.moveTo(o, {
+          range: 1,
+          reusePath: 10
+        });
       }
       return true;
     }
-
-    if ((creep.store[RESOURCE_ENERGY] || 0) > 0 && item.needsEnergy) {
-      if (creep.pos.isNearTo(lab)) {
-        var enSpace = lab.store.getFreeCapacity(RESOURCE_ENERGY) || 0;
-        var enAmt = Math.min(creep.store[RESOURCE_ENERGY], enSpace);
-        if (enAmt > 0) {
-          creep.transfer(lab, RESOURCE_ENERGY, enAmt);
-          creep.memory.idleTicks = 0;
+    if ((e.store[RESOURCE_ENERGY] || 0) > 0 && t.needsEnergy) {
+      if (e.pos.isNearTo(o)) {
+        var v = o.store.getFreeCapacity(RESOURCE_ENERGY) || 0;
+        var f = Math.min(e.store[RESOURCE_ENERGY], v);
+        if (f > 0) {
+          e.transfer(o, RESOURCE_ENERGY, f);
+          e.memory.idleTicks = 0;
         }
       } else {
-        creep.moveTo(lab, { range: 1, reusePath: 10 });
+        e.moveTo(o, {
+          range: 1,
+          reusePath: 10
+        });
       }
       return true;
     }
-
-    if (creep.store.getUsedCapacity() > 0) {
+    if (e.store.getUsedCapacity() > 0) {
       continue;
     }
-
-    if (item.needsCompound) {
-      var boostFillTarget2 = item.fillTarget || (LAB_MINERAL_CAPACITY_BOOST - 150);
-      var deficit = boostFillTarget2 - (item.compoundAmount || 0);
-      var pickup  = Math.min(deficit, creep.store.getCapacity());
-      var pickupTarget = getBoostPickupTarget(creep.room.name, compound, pickup);
-      var src = pickupTarget ? pickupTarget.source : null;
-      if (pickupTarget) {
-        pickup = pickupTarget.amount;
+    if (t.needsCompound) {
+      var d = t.fillTarget || LAB_MINERAL_CAPACITY_BOOST - 150;
+      var c = d - (t.compoundAmount || 0);
+      var p = Math.min(c, e.store.getCapacity());
+      var T = getBoostPickupTarget(e.room.name, s, p);
+      var y = T ? T.source : null;
+      if (T) {
+        p = T.amount;
       }
-
-      if (src && pickup > 0) {
-        if (creep.pos.isNearTo(src)) {
-          consumeBoostWithdraw(creep, src, compound, pickup);
-          creep.memory.idleTicks = 0;
+      if (y && p > 0) {
+        if (e.pos.isNearTo(y)) {
+          consumeBoostWithdraw(e, y, s, p);
+          e.memory.idleTicks = 0;
         } else {
-          creep.moveTo(src, { range: 1, reusePath: 10 });
+          e.moveTo(y, {
+            range: 1,
+            reusePath: 10
+          });
         }
         return true;
       }
     }
-
-    if (item.needsEnergy) {
-      var enDeficit = LAB_ENERGY_CAPACITY_BOOST - (item.energyAmount || 0);
-      var enPickup  = Math.min(enDeficit, creep.store.getCapacity());
-      var enTarget = getBoostPickupTarget(creep.room.name, RESOURCE_ENERGY, enPickup);
-      var enSrc = enTarget ? enTarget.source : null;
-      if (enTarget) {
-        enPickup = enTarget.amount;
+    if (t.needsEnergy) {
+      var A = LAB_ENERGY_CAPACITY_BOOST - (t.energyAmount || 0);
+      var h = Math.min(A, e.store.getCapacity());
+      var R = getBoostPickupTarget(e.room.name, RESOURCE_ENERGY, h);
+      var b = R ? R.source : null;
+      if (R) {
+        h = R.amount;
       }
-
-      if (enSrc && enPickup > 0) {
-        if (creep.pos.isNearTo(enSrc)) {
-          consumeBoostWithdraw(creep, enSrc, RESOURCE_ENERGY, enPickup);
-          creep.memory.idleTicks = 0;
+      if (b && h > 0) {
+        if (e.pos.isNearTo(b)) {
+          consumeBoostWithdraw(e, b, RESOURCE_ENERGY, h);
+          e.memory.idleTicks = 0;
         } else {
-          creep.moveTo(enSrc, { range: 1, reusePath: 10 });
+          e.moveTo(b, {
+            range: 1,
+            reusePath: 10
+          });
         }
         return true;
       }
     }
   }
-
-  if (creep.store.getUsedCapacity() > 0) {
-    deliverToBest(creep);
+  if (e.store.getUsedCapacity() > 0) {
+    deliverToBest(e);
     return true;
   }
-
   return false;
 }
 
-// =============================================================================
-// MAIN ROLE LOGIC
-// =============================================================================
-
 module.exports = {
-  run: function(creep) {
-    if (creep.memory.phase) {
-      var carryInfo = "";
-      for (var resource in creep.store) {
-        if (creep.store[resource] > 0) {
-          carryInfo += resource + ":" + creep.store[resource] + " ";
+  run: function(e) {
+    if (e.memory.phase) {
+      var r = "";
+      for (var a in e.store) {
+        if (e.store[a] > 0) {
+          r += a + ":" + e.store[a] + " ";
         }
       }
-      debugLog("[LabBot " + creep.name + "] phase=" + creep.memory.phase +
-               " want=(" + (creep.memory.wantedReagents || "unknown") + ") " +
-               "carry=" + carryInfo.trim() + " idle=" + (creep.memory.idleTicks || 0));
+      debugLog("[LabBot " + e.name + "] phase=" + e.memory.phase + " want=(" + (e.memory.wantedReagents || "unknown") + ") " + "carry=" + r.trim() + " idle=" + (e.memory.idleTicks || 0));
     }
- 
-    if (creep.memory.lastAction === 'deposit') {
-      debugLog("[LabBot " + creep.name + "] depositOne(" + (creep.memory.lastResource || "undefined") + ") " +
-               "reason=" + (creep.memory.depositReason || "unknown"));
-      creep.memory.lastAction = null;
-      creep.memory.lastResource = null;
-      creep.memory.depositReason = null;
+    if (e.memory.lastAction === "deposit") {
+      debugLog("[LabBot " + e.name + "] depositOne(" + (e.memory.lastResource || "undefined") + ") " + "reason=" + (e.memory.depositReason || "unknown"));
+      e.memory.lastAction = null;
+      e.memory.lastResource = null;
+      e.memory.depositReason = null;
     }
- 
-    if (typeof creep.ticksToLive === "number" && creep.ticksToLive < 100 && !creep.memory.suicidePending) {
-      requestGracefulSuicide(creep, "low_ttl_" + creep.ticksToLive);
+    if (typeof e.ticksToLive === "number" && e.ticksToLive < 100 && !e.memory.suicidePending) {
+      requestGracefulSuicide(e, "low_ttl_" + e.ticksToLive);
     }
- 
-    if (creep.memory.suicidePending) {
-      var terminal = creep.room.terminal;
-      var storage = creep.room.storage;
-      var depositTarget = terminal || storage;
- 
-      if (creep.store.getUsedCapacity() > 0) {
-        if (!depositTarget) {
-          creep.suicide();
+    if (e.memory.suicidePending) {
+      var t = e.room.terminal;
+      var o = e.room.storage;
+      var i = t || o;
+      if (e.store.getUsedCapacity() > 0) {
+        if (!i) {
+          e.suicide();
           return;
         }
-        if (!creep.pos.isNearTo(depositTarget)) {
-          creep.moveTo(depositTarget, { range: 1, reusePath: 5 });
+        if (!e.pos.isNearTo(i)) {
+          e.moveTo(i, {
+            range: 1,
+            reusePath: 5
+          });
           return;
         }
-        for (var resourceType in creep.store) {
-          if (creep.store[resourceType] > 0) {
-            creep.transfer(depositTarget, resourceType);
+        for (var n in e.store) {
+          if (e.store[n] > 0) {
+            e.transfer(i, n);
             return;
           }
         }
       }
-      creep.suicide();
+      e.suicide();
       return;
     }
- 
-    if (global.__boostActive && handleBoostLabWork(creep)) return;
- 
-    var orders = Memory.labOrders || {};
-    var roomOrders = orders[creep.room.name];
- 
-    if (!roomOrders || !roomOrders.active) {
-      delete creep.memory.labSink;
-      if (global.__boostActive && handleBoostLabWork(creep)) return;
- 
-      if (creep.store.getUsedCapacity() > 0) {
-        deliverToBest(creep);
+    if (global.__boostActive && handleBoostLabWork(e)) return;
+    var s = require("labManager");
+    var u = s && typeof s.getRoomOrderState === "function" ? s.getRoomOrderState(e.room.name) : null;
+    if (!u || !u.active) {
+      delete e.memory.labSink;
+      if (global.__boostActive && handleBoostLabWork(e)) return;
+      if (e.store.getUsedCapacity() > 0) {
+        deliverToBest(e);
         return;
       }
-      if (typeof creep.ticksToLive === "number" && creep.ticksToLive <= 50) {
-        requestGracefulSuicide(creep, "idle_no_orders");
+      if (typeof e.ticksToLive === "number" && e.ticksToLive <= 50) {
+        requestGracefulSuicide(e, "idle_no_orders");
         return;
       }
- 
-      if (typeof creep.memory.idleTicks !== 'number') creep.memory.idleTicks = 0;
-      creep.memory.idleTicks++;
-      if (creep.memory.idleTicks >= 30) {
-        requestGracefulSuicide(creep, "no_orders_idle");
+      if (typeof e.memory.idleTicks !== "number") e.memory.idleTicks = 0;
+      e.memory.idleTicks++;
+      if (e.memory.idleTicks >= 30) {
+        requestGracefulSuicide(e, "no_orders_idle");
         return;
       }
- 
-      var storage = creep.room.storage;
-      if (storage && !creep.pos.inRangeTo(storage, 3)) {
-        creep.moveTo(storage, { range: 3, reusePath: 20 });
+      var o = e.room.storage;
+      if (o && !e.pos.inRangeTo(o, 3)) {
+        e.moveTo(o, {
+          range: 3,
+          reusePath: 20
+        });
       }
       return;
     }
- 
-    var activeOrder = roomOrders.active;
-    creep.memory.labSink = activeOrder.sink || null;
-    var labManager = require('labManager');
-
-    if (activeOrder.origin === 'marketLab' || activeOrder.marketOpId) {
-      delete creep.memory.labSink;
-      requestGracefulSuicide(creep, "marketLab_order_supplier_owned");
+    var m = u.active;
+    e.memory.labSink = m.sink || null;
+    if ((m.origin === "marketLab" || m.marketOpId) && !m.stockpile) {
+      delete e.memory.labSink;
+      requestGracefulSuicide(e, "marketLab_order_supplier_owned");
       return;
     }
- 
-    if (activeOrder.type === 'cleanup') {
-      creep.memory.phase = 'cleanup';
- 
-      if (creep.store.getUsedCapacity() > 0) {
-        deliverPreEvacAndSell(creep, activeOrder);
+    if (m.type === "cleanup") {
+      e.memory.phase = "cleanup";
+      if (e.store.getUsedCapacity() > 0) {
+        deliverPreEvacAndSell(e, m);
         return;
       }
-
-      var allLabsCleanup = _getLabs(creep);
-
-      for (var cli = 0; cli < allLabsCleanup.length; cli++) {
-        var clab = allLabsCleanup[cli];
-        if ((clab.mineralAmount || 0) > 0) {
-          if (creep.pos.isNearTo(clab)) {
-            creep.withdraw(clab, clab.mineralType,
-              Math.min(clab.mineralAmount, creep.store.getFreeCapacity()));
-            creep.memory.idleTicks = 0;
+      var l = _getLabs(e);
+      for (var g = 0; g < l.length; g++) {
+        var v = l[g];
+        if ((v.mineralAmount || 0) > 0) {
+          if (e.pos.isNearTo(v)) {
+            e.withdraw(v, v.mineralType, Math.min(v.mineralAmount, e.store.getFreeCapacity()));
+            e.memory.idleTicks = 0;
           } else {
-            creep.moveTo(clab, { range: 1, reusePath: 10 });
+            e.moveTo(v, {
+              range: 1,
+              reusePath: 10
+            });
           }
           return;
         }
       }
- 
-      var cleanupStorage = creep.room.storage;
-      if (cleanupStorage && !creep.pos.inRangeTo(cleanupStorage, 3)) {
-        creep.moveTo(cleanupStorage, { range: 3, reusePath: 20 });
+      var f = e.room.storage;
+      if (f && !e.pos.inRangeTo(f, 3)) {
+        e.moveTo(f, {
+          range: 3,
+          reusePath: 20
+        });
       }
       return;
     }
- 
-    var isBreakdown = activeOrder.type === 'breakdown';
-    var layout = isBreakdown ? labManager.getBreakdownLayout(creep.room) : labManager.getLayout(creep.room);
- 
-    if (!layout || !layout.groups || layout.groups.length === 0) {
-      debugLog("[LabBot " + creep.name + "] No valid lab layout found");
+    var d = m.type === "breakdown";
+    var c = d ? s.getBreakdownLayout(e.room) : s.getLayout(e.room);
+    if (!c || !c.groups || c.groups.length === 0) {
+      debugLog("[LabBot " + e.name + "] No valid lab layout found");
       return;
     }
- 
-    if (activeOrder.needsPreEvacuation) {
-      creep.memory.phase = 'pre-evac';
-      creep.memory.idleTicks = 0;
-      handlePreEvacuation(creep, layout, activeOrder);
+    if (m.needsPreEvacuation) {
+      e.memory.phase = "pre-evac";
+      e.memory.idleTicks = 0;
+      handlePreEvacuation(e, c, m);
       return;
     }
- 
-    var remaining = typeof activeOrder.remaining === "number" ? activeOrder.remaining : (activeOrder.amount || 0);
-    var shouldEvacuate = (remaining <= 0) || activeOrder.evacuating;
- 
-    if (shouldEvacuate) {
-      creep.memory.phase = 'final';
-      creep.memory.idleTicks = 0;
- 
-      if (isBreakdown) {
-        handleBreakdownEvacuation(creep, layout, activeOrder);
+    var p = typeof m.remaining === "number" ? m.remaining : m.amount || 0;
+    var T = p <= 0 || m.evacuating;
+    if (T) {
+      e.memory.phase = "final";
+      e.memory.idleTicks = 0;
+      if (d) {
+        handleBreakdownEvacuation(e, c, m);
       } else {
-        handleProductionEvacuation(creep, layout, activeOrder);
+        handleProductionEvacuation(e, c, m);
       }
       return;
     }
- 
-    if (hasBlockers(layout, activeOrder)) {
-      creep.memory.phase = 'cleanup';
-      creep.memory.idleTicks = 0;
- 
-      if (creep.store.getUsedCapacity() > 0) {
-        deliverToBest(creep);
+    if (hasBlockers(c, m)) {
+      e.memory.phase = "cleanup";
+      e.memory.idleTicks = 0;
+      if (e.store.getUsedCapacity() > 0) {
+        deliverToBest(e);
         return;
       }
- 
-      if (clearBlockingLabs(creep, layout, activeOrder)) {
+      if (clearBlockingLabs(e, c, m)) {
         return;
       }
     }
- 
-    creep.memory.phase = 'buildA';
- 
-    if (isBreakdown) {
-      creep.memory.wantedReagents = activeOrder.compound + " -> " + activeOrder.reag1 + "," + activeOrder.reag2;
-      handleBreakdownDelivery(creep, layout, activeOrder);
+    e.memory.phase = "buildA";
+    if (d) {
+      e.memory.wantedReagents = m.compound + " -> " + m.reag1 + "," + m.reag2;
+      handleBreakdownDelivery(e, c, m);
     } else {
-      creep.memory.wantedReagents = activeOrder.reag1 + "," + activeOrder.reag2;
- 
-      var carryCapacity = creep.store.getCapacity();
-      var target = getPerInputTarget(layout, activeOrder);
- 
-      if (creep.store.getUsedCapacity() > 0) {
-        var product = activeOrder.product;
-        if ((creep.store[product] || 0) > 0) {
-          deliverProductAndRecord(creep, product);
+      e.memory.wantedReagents = m.reag1 + "," + m.reag2;
+      var y = e.store.getCapacity();
+      var A = getPerInputTarget(c, m);
+      if (e.store.getUsedCapacity() > 0) {
+        var h = m.product;
+        if ((e.store[h] || 0) > 0) {
+          deliverProductAndRecord(e, h);
           return;
         }
-        handleReagentDeliveryBalanced(creep, layout, activeOrder, target);
+        handleReagentDeliveryBalanced(e, c, m, A);
         return;
       }
- 
-      var largestReagentDeficit = 0;
-      var reagentDeficits = {};
-      reagentDeficits[activeOrder.reag1] = 0;
-      reagentDeficits[activeOrder.reag2] = 0;
- 
-      for (var g = 0; g < layout.groups.length; g++) {
-        var group = layout.groups[g];
-        var have1 = (group.in1.mineralType === activeOrder.reag1) ? (group.in1.mineralAmount || 0) : 0;
-        var have2 = (group.in2.mineralType === activeOrder.reag2) ? (group.in2.mineralAmount || 0) : 0;
-        var def1 = Math.max(0, target - have1);
-        var def2 = Math.max(0, target - have2);
-        reagentDeficits[activeOrder.reag1] = Math.max(reagentDeficits[activeOrder.reag1], def1);
-        reagentDeficits[activeOrder.reag2] = Math.max(reagentDeficits[activeOrder.reag2], def2);
-        largestReagentDeficit = Math.max(largestReagentDeficit, def1, def2);
+      var R = 0;
+      var b = {};
+      b[m.reag1] = 0;
+      b[m.reag2] = 0;
+      for (var C = 0; C < c.groups.length; C++) {
+        var _ = c.groups[C];
+        var M = _.in1.mineralType === m.reag1 ? _.in1.mineralAmount || 0 : 0;
+        var N = _.in2.mineralType === m.reag2 ? _.in2.mineralAmount || 0 : 0;
+        var B = Math.max(0, A - M);
+        var L = Math.max(0, A - N);
+        b[m.reag1] = Math.max(b[m.reag1], B);
+        b[m.reag2] = Math.max(b[m.reag2], L);
+        R = Math.max(R, B, L);
       }
- 
-      var terminal = creep.room.terminal;
-      var storage = creep.room.storage;
-      var reag1Available = ((terminal && terminal.store[activeOrder.reag1]) || 0) +
-                           ((storage && storage.store[activeOrder.reag1]) || 0);
-      var reag2Available = ((terminal && terminal.store[activeOrder.reag2]) || 0) +
-                           ((storage && storage.store[activeOrder.reag2]) || 0);
- 
-      var canDeliverReag1 = reagentDeficits[activeOrder.reag1] >= carryCapacity && reag1Available >= carryCapacity;
-      var canDeliverReag2 = reagentDeficits[activeOrder.reag2] >= carryCapacity && reag2Available >= carryCapacity;
- 
-      var largestProductAmount = 0;
-      var product = activeOrder.product;
-      for (var g = 0; g < layout.groups.length; g++) {
-        var group = layout.groups[g];
-        for (var i = 0; i < group.outs.length; i++) {
-          var outLab = group.outs[i];
-          if (outLab.mineralType === product) {
-            var amt = outLab.mineralAmount || 0;
-            largestProductAmount = Math.max(largestProductAmount, amt);
+      var t = e.room.terminal;
+      var o = e.room.storage;
+      var E = (t && t.store[m.reag1] || 0) + (o && o.store[m.reag1] || 0);
+      var O = (t && t.store[m.reag2] || 0) + (o && o.store[m.reag2] || 0);
+      var k = b[m.reag1] >= y && E >= y;
+      var U = b[m.reag2] >= y && O >= y;
+      var P = 0;
+      var h = m.product;
+      for (var C = 0; C < c.groups.length; C++) {
+        var _ = c.groups[C];
+        for (var w = 0; w < _.outs.length; w++) {
+          var I = _.outs[w];
+          if (I.mineralType === h) {
+            var S = I.mineralAmount || 0;
+            P = Math.max(P, S);
           }
         }
       }
- 
-      var isFinishingUp = remaining < carryCapacity;
-      var canDeliverReag1Partial = reagentDeficits[activeOrder.reag1] > 0 && reag1Available > 0;
-      var canDeliverReag2Partial = reagentDeficits[activeOrder.reag2] > 0 && reag2Available > 0;
- 
-      var shouldDeliverReagents = canDeliverReag1 || canDeliverReag2 ||
-                                   (isFinishingUp && (canDeliverReag1Partial || canDeliverReag2Partial));
- 
-      var reag1CompletelyMissing = reag1Available === 0 && reagentDeficits[activeOrder.reag1] > 0;
-      var reag2CompletelyMissing = reag2Available === 0 && reagentDeficits[activeOrder.reag2] > 0;
- 
-      if (!shouldDeliverReagents) {
-        if (reag1CompletelyMissing && canDeliverReag2Partial) {
-          shouldDeliverReagents = true;
-        } else if (reag2CompletelyMissing && canDeliverReag1Partial) {
-          shouldDeliverReagents = true;
+      var F = p < y;
+      var x = b[m.reag1] > 0 && E > 0;
+      var q = b[m.reag2] > 0 && O > 0;
+      var D = k || U || F && (x || q);
+      var G = E === 0 && b[m.reag1] > 0;
+      var Y = O === 0 && b[m.reag2] > 0;
+      if (!D) {
+        if (G && q) {
+          D = true;
+        } else if (Y && x) {
+          D = true;
         }
       }
- 
-      if (shouldDeliverReagents) {
-        creep.memory.phase = 'buildA';
-        creep.memory.idleTicks = 0;
-        handleReagentDeliveryBalanced(creep, layout, activeOrder, target);
+      if (D) {
+        e.memory.phase = "buildA";
+        e.memory.idleTicks = 0;
+        handleReagentDeliveryBalanced(e, c, m, A);
         return;
       }
- 
-      var allOutputsFull = true;
-      for (var g = 0; g < layout.groups.length && allOutputsFull; g++) {
-        var grp = layout.groups[g];
-        for (var i = 0; i < grp.outs.length; i++) {
-          if ((grp.outs[i].store.getFreeCapacity(activeOrder.product) || 0) >= LAB_REACTION_AMOUNT) {
-            allOutputsFull = false;
+      var W = true;
+      for (var C = 0; C < c.groups.length && W; C++) {
+        var K = c.groups[C];
+        for (var w = 0; w < K.outs.length; w++) {
+          if ((K.outs[w].store.getFreeCapacity(m.product) || 0) >= LAB_REACTION_AMOUNT) {
+            W = false;
             break;
           }
         }
       }
- 
-      var allReactionsStalled = true;
-      for (var g = 0; g < layout.groups.length; g++) {
-        var grp = layout.groups[g];
-        if ((grp.in1.mineralAmount || 0) >= LAB_REACTION_AMOUNT &&
-            (grp.in2.mineralAmount || 0) >= LAB_REACTION_AMOUNT) {
-          allReactionsStalled = false;
+      var V = true;
+      for (var C = 0; C < c.groups.length; C++) {
+        var K = c.groups[C];
+        if ((K.in1.mineralAmount || 0) >= LAB_REACTION_AMOUNT && (K.in2.mineralAmount || 0) >= LAB_REACTION_AMOUNT) {
+          V = false;
           break;
         }
       }
-      var shouldEvacuateProducts = allOutputsFull || allReactionsStalled;
- 
-      if (shouldEvacuateProducts) {
-        creep.memory.phase = 'mid-evac';
-        var didWork = handleMidReactionEvacuation(creep, layout, activeOrder);
-        if (didWork) {
-          creep.memory.idleTicks = 0;
+      var j = W || V;
+      if (j) {
+        e.memory.phase = "mid-evac";
+        var z = handleMidReactionEvacuation(e, c, m);
+        if (z) {
+          e.memory.idleTicks = 0;
           return;
         }
-        // Fall through to idle logic if nothing was evacuated
       }
- 
-      // If reactions are still running (inverse of allReactionsStalled), don't count toward suicide.
-      // allReactionsStalled is already computed above — reuse it rather than looping again.
-      var reactionsActive = !allReactionsStalled;
- 
-      if (reactionsActive) {
-        creep.memory.idleTicks = 0;
-        debugLog("[LabBot " + creep.name + "] waiting on active reactions");
-        if (layout.groups.length > 0 && !creep.pos.inRangeTo(layout.groups[0].in1, 3)) {
-          creep.moveTo(layout.groups[0].in1, { range: 3, reusePath: 15 });
+      var H = !V;
+      if (H) {
+        e.memory.idleTicks = 0;
+        debugLog("[LabBot " + e.name + "] waiting on active reactions");
+        if (c.groups.length > 0 && !e.pos.inRangeTo(c.groups[0].in1, 3)) {
+          e.moveTo(c.groups[0].in1, {
+            range: 3,
+            reusePath: 15
+          });
         }
         return;
       }
- 
-      if (typeof creep.memory.idleTicks !== 'number') creep.memory.idleTicks = 0;
-      creep.memory.idleTicks++;
- 
-      if (creep.memory.idleTicks >= IDLE_SUICIDE_TICKS) {
-        requestGracefulSuicide(creep, "production_idle_" + creep.memory.idleTicks + "_ticks");
+      if (typeof e.memory.idleTicks !== "number") e.memory.idleTicks = 0;
+      e.memory.idleTicks++;
+      if (e.memory.idleTicks >= IDLE_SUICIDE_TICKS) {
+        requestGracefulSuicide(e, "production_idle_" + e.memory.idleTicks + "_ticks");
         return;
       }
- 
-      debugLog("[LabBot " + creep.name + "] waiting: reagent deficit=" + largestReagentDeficit +
-               " (reag1 avail=" + reag1Available + ", reag2 avail=" + reag2Available + ")" +
-               ", product=" + largestProductAmount +
-               ", idle=" + creep.memory.idleTicks + "/" + IDLE_SUICIDE_TICKS);
-      if (layout.groups.length > 0 && !creep.pos.inRangeTo(layout.groups[0].in1, 3)) {
-        creep.moveTo(layout.groups[0].in1, { range: 3, reusePath: 15 });
+      debugLog("[LabBot " + e.name + "] waiting: reagent deficit=" + R + " (reag1 avail=" + E + ", reag2 avail=" + O + ")" + ", product=" + P + ", idle=" + e.memory.idleTicks + "/" + IDLE_SUICIDE_TICKS);
+      if (c.groups.length > 0 && !e.pos.inRangeTo(c.groups[0].in1, 3)) {
+        e.moveTo(c.groups[0].in1, {
+          range: 3,
+          reusePath: 15
+        });
       }
     }
   }
+};
+global.forceSpawnLabBot = function(e) {
+  var r = Game.rooms[e];
+  if (!r) return "No vision in " + e;
+  var a = getRoomState.get(e);
+  var t = null;
+  if (a && a.structuresByType && a.structuresByType[STRUCTURE_SPAWN]) {
+    for (var o = 0; o < a.structuresByType[STRUCTURE_SPAWN].length; o++) {
+      var i = a.structuresByType[STRUCTURE_SPAWN][o];
+      if (i.my && !i.spawning) {
+        t = i;
+        break;
+      }
+    }
+  } else {
+    t = r.find(FIND_MY_SPAWNS)[0];
+  }
+  if (!t) return "No spawn in " + e;
+  if (t.spawning) return "Spawn busy in " + e;
+  var n = spawnManager.getCreepBody("labBot", t.room.energyAvailable);
+  if (!n) return "Cannot generate labBot body";
+  var s = "LabBot_" + e + "_" + Game.time;
+  var u = {
+    role: "labBot",
+    homeRoom: e,
+    assignedRoom: e,
+    phase: "buildA"
+  };
+  var m = spawnManager.spawnCustomCreep(t, n, s, u);
+  return m === OK ? "LabBot spawn queued" : "LabBot spawn failed: " + m;
 };

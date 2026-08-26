@@ -1,854 +1,763 @@
-/**
- * Opportunistic Market Sell Module
- * 
- * Scans for open BUY orders on the market and fulfills them when prices are favorable,
- * selling resources from your terminals via Game.market.deal().
- * Supports both terminal-based resources and account-level resources (pixel, cpuUnlock, accessKey).
- * 
- * Usage:
- * 1. Call opportunisticSell.setup('ROOM#', RESOURCE, AMOUNT, MINPRICE) from console
- *    - For account resources (PIXEL, CPU_UNLOCK, ACCESS_KEY), the room name is used only as
- *      a key; no terminal is needed. You can use any string (e.g. your main room name).
- * 2. Call opportunisticSell.process() in your main loop (every tick is fine)
- * 3. Call opportunisticSell.listActiveRequests() to view current orders
- * 4. Call opportunisticSell.cancelRequest('ROOM', RESOURCE) to delete a request
- * 5. Call opportunisticSell.setup('ROOM', RESOURCE_ENERGY, 10000, true) to fulfill to the highest available order
-
-/**
- * Opportunistic Market Sell Module
- * 
- * Scans for open BUY orders on the market and fulfills them when prices are favorable,
- * selling resources from your terminals via Game.market.deal().
- * Supports both terminal-based resources and account-level resources (pixel, cpuUnlock, accessKey).
- * 
- * Usage:
- * 1. Call opportunisticSell.setup('ROOM#', RESOURCE, AMOUNT, MINPRICE) from console
- *    - Pass a number as 4th arg to set a minimum price floor.
- *    - Pass true as 4th arg for best-offer mode: scores the top 10 orders by net profit
- *      per unit after subtracting energy transmission cost (valued at market energy price).
- *    - Optional 5th arg: reserve amount to keep in terminal and never sell below.
- *    - For account resources (PIXEL, CPU_UNLOCK, ACCESS_KEY), the room name is used only as
- *      a key; no terminal is needed. You can use any string (e.g. your main room name).
- * 2. Call opportunisticSell.process() in your main loop (every tick is fine)
- * 3. Call opportunisticSell.listActiveRequests() to view current orders
- * 4. Call opportunisticSell.cancelRequest('ROOM#', RESOURCE) to delete a request
-
- */
-
-// Confirmation timeout in ticks for pending market deals
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// opportunisticSell.js
+// Console globals: opportunisticSell
+// Example: opportunisticSell('status') - Run or query opportunistic market seller
 var CONFIRMATION_TIMEOUT_TICKS = 20;
-
-// Account-level resources that go to your account, not a terminal
-var ACCOUNT_RESOURCES = { pixel: true, cpuUnlock: true, accessKey: true };
-
-function isAccountResource(resourceType) {
-    return !!ACCOUNT_RESOURCES[resourceType];
-}
-
-// Initialize memory structure on first run
-if (!Memory.opportunisticSell) {
-    Memory.opportunisticSell = {
-        requests: {}
-    };
-}
-
-/**
- * Build a set of our owned room names
- * @returns {Object} - Map of roomName -> true for owned rooms
- */
-function getMyRooms() {
-    var myRooms = {};
-    for (var rn in Game.rooms) {
-        var r = Game.rooms[rn];
-        if (r && r.controller && r.controller.my) {
-            myRooms[rn] = true;
-        }
-    }
-    return myRooms;
-}
-
-// Cache energy market price for one tick to avoid repeated scans
-var _energyPriceCache = { tick: -1, price: 0 };
-
-/**
- * Get the current market price of energy — what we would pay to buy it.
- * Looks at the cheapest external SELL orders for energy (>=1000 remaining),
- * falling back to 2-day historical average from Game.market.getHistory.
- * Result is cached per tick.
- * 
- * @returns {number} Energy price in credits per unit
- */
-function getEnergyMarketPrice() {
-    if (_energyPriceCache.tick === Game.time) return _energyPriceCache.price;
-
-    var myRooms = getMyRooms();
-    var orders = Game.market.getAllOrders({ type: ORDER_SELL, resourceType: RESOURCE_ENERGY });
-
-    var valid = [];
-    for (var i = 0; i < orders.length; i++) {
-        var o = orders[i];
-        if (!o || !o.roomName) continue;
-        if (myRooms[o.roomName]) continue;
-        if (typeof o.amount !== 'number' || o.amount < 1000) continue;
-        if (typeof o.price !== 'number') continue;
-        valid.push(o);
-    }
-
-    valid.sort(function(a, b) { return a.price - b.price; });
-
-    var price;
-    if (valid.length > 0) {
-        price = valid[0].price;
-    } else {
-        // Fall back to 2-day historical average
-        var hist = Game.market.getHistory(RESOURCE_ENERGY) || [];
-        var sum = 0;
-        var count = 0;
-        if (hist.length >= 1) {
-            var h1 = hist[hist.length - 1];
-            if (h1 && typeof h1.avgPrice === 'number') { sum += h1.avgPrice; count++; }
-        }
-        if (hist.length >= 2) {
-            var h2 = hist[hist.length - 2];
-            if (h2 && typeof h2.avgPrice === 'number') { sum += h2.avgPrice; count++; }
-        }
-        price = (count > 0) ? (sum / count) : 0.01;
-    }
-
-    _energyPriceCache = { tick: Game.time, price: price };
-    return price;
-}
-
-/**
- * Sets up an opportunistic sell request.
- * 
- * @param {string} roomName - The room name where the terminal is located.
- *   For account-level resources (pixel, cpuUnlock, accessKey), this is only used as a key.
- * @param {string} resourceType - RESOURCE_* constant for the resource to sell
- * @param {number} amount - Target amount to sell
- * @param {number|boolean} minPriceOrBestOffer - Minimum price per unit (number), or true
- *   to enable best-offer mode (scores top 10 orders by net profit after energy cost).
- * @param {number} [reserve=0] - Amount to keep in terminal and never sell below
- * @returns {string} Status message confirming request setup
- */
-function setup(roomName, resourceType, amount, minPriceOrBestOffer, reserve) {
-    var key = roomName + '_' + resourceType;
-    var existing = Memory.opportunisticSell.requests[key];
-
-    // Determine mode from 4th argument
-    var bestOffer = (minPriceOrBestOffer === true);
-    var minPrice = bestOffer ? 0 : minPriceOrBestOffer;
-
-    // Preserve original createdAt if request already exists
-    var createdAt = existing && typeof existing.createdAt === 'number' ? existing.createdAt : Game.time;
-
-    // Store or update the sell request
-    Memory.opportunisticSell.requests[key] = {
-        roomName: roomName,
-        resourceType: resourceType,
-        totalAmount: amount,
-        remaining: amount,
-        minPrice: minPrice,
-        reserve: (typeof reserve === 'number' && reserve >= 0) ? reserve : 0,
-        bestOffer: bestOffer,
-        lastCheck: 0,
-        checkInterval: 1, // attempt every tick by default
-        cachedOrderId: null,
-        cachedOrderRoomName: null,
-        createdAt: createdAt,
-        fulfilled: 0,
-        pending: null // { pre: number, expected: number, tick: number, orderId, orderRoom, price, energyCost }
-    };
-
-    var acctTag = isAccountResource(resourceType) ? ' [ACCOUNT RESOURCE]' : '';
-    var reserveTag = (reserve && reserve > 0) ? ' (reserve ' + reserve + ')' : '';
-    var modeTag = bestOffer ? ' [BEST OFFER MODE]' : ' (min ' + minPrice + ' credits/unit)';
-    var message = 'Sell request for ' + amount + ' ' + resourceType + ' from ' + roomName + ' created' + modeTag + reserveTag + acctTag;
-    console.log('[OpportunisticSell] ' + message);
-    return message;
-}
-
-/**
- * Optionally adjust the check interval (ticks between attempts) for an existing request.
- * 
- * @param {string} roomName
- * @param {string} resourceType
- * @param {number} ticks - Minimum ticks between attempts (1 = every tick)
- * @returns {string} Status
- */
-function setCheckInterval(roomName, resourceType, ticks) {
-    var key = roomName + '_' + resourceType;
-    var requests = Memory.opportunisticSell.requests;
-    if (!requests || !requests[key]) {
-        var msgMissing = 'No active sell request found for ' + resourceType + ' in ' + roomName;
-        console.log('[OpportunisticSell] ' + msgMissing);
-        return msgMissing;
-    }
-    if (typeof ticks !== 'number' || ticks < 1) {
-        var msgBad = 'Invalid checkInterval ' + ticks + ' (must be number >= 1)';
-        console.log('[OpportunisticSell] ' + msgBad);
-        return msgBad;
-    }
-    requests[key].checkInterval = ticks;
-    var msgOk = 'Set checkInterval for ' + roomName + ' ' + resourceType + ' to ' + ticks + ' ticks';
-    console.log('[OpportunisticSell] ' + msgOk);
-    return msgOk;
-}
-
-/**
- * Optionally adjust the reserve amount for an existing request.
- * 
- * @param {string} roomName
- * @param {string} resourceType
- * @param {number} amount - Amount to keep in terminal and never sell below
- * @returns {string} Status
- */
-function setReserve(roomName, resourceType, amount) {
-    var key = roomName + '_' + resourceType;
-    var requests = Memory.opportunisticSell.requests;
-    if (!requests || !requests[key]) {
-        var msgMissing = 'No active sell request found for ' + resourceType + ' in ' + roomName;
-        console.log('[OpportunisticSell] ' + msgMissing);
-        return msgMissing;
-    }
-    if (typeof amount !== 'number' || amount < 0) {
-        var msgBad = 'Invalid reserve ' + amount + ' (must be number >= 0)';
-        console.log('[OpportunisticSell] ' + msgBad);
-        return msgBad;
-    }
-    requests[key].reserve = amount;
-    var msgOk = 'Set reserve for ' + roomName + ' ' + resourceType + ' to ' + amount;
-    console.log('[OpportunisticSell] ' + msgOk);
-    return msgOk;
-}
-
-/**
- * Toggle best-offer mode for an existing request.
- * When enabled, scores the top 10 BUY orders by net profit per unit after subtracting
- * energy transmission cost (valued at current market energy price).
- * When disabled (default), among equally-priced orders prefers the largest feasible volume.
- * 
- * @param {string} roomName
- * @param {string} resourceType
- * @param {boolean} enabled - true to enable best-offer mode
- * @returns {string} Status
- */
-function setBestOffer(roomName, resourceType, enabled) {
-    var key = roomName + '_' + resourceType;
-    var requests = Memory.opportunisticSell.requests;
-    if (!requests || !requests[key]) {
-        var msgMissing = 'No active sell request found for ' + resourceType + ' in ' + roomName;
-        console.log('[OpportunisticSell] ' + msgMissing);
-        return msgMissing;
-    }
-    requests[key].bestOffer = !!enabled;
-    var msgOk = (enabled ? 'Enabled' : 'Disabled') + ' best-offer mode for ' + roomName + ' ' + resourceType;
-    console.log('[OpportunisticSell] ' + msgOk);
-    return msgOk;
-}
-
-/**
- * Helper: cap desired sell amount by available terminal energy using exact calcTransactionCost.
- * Uses binary search to find the largest amount whose transfer energy cost does not exceed energyAvail.
- * 
- * The seller (dealer) pays the energy cost when calling Game.market.deal() on a BUY order.
- * When selling energy itself, both the sold amount AND the transfer cost come from the same pool,
- * so the check becomes (amount + transferCost) <= energyAvail.
- * 
- * @param {number} desired - Desired units to sell
- * @param {string} fromRoom - Your room name (terminal that will send and pay energy)
- * @param {string} toRoom - Remote buyer's room name
- * @param {number} energyAvail - Energy currently available in your terminal
- * @param {boolean} [sellingEnergy=false] - True when the resource being sold is energy
- * @returns {number} Amount capped by energy
- */
-function capByEnergy(desired, fromRoom, toRoom, energyAvail, sellingEnergy) {
-    if (energyAvail <= 0 || desired <= 0) return 0;
-    if (!toRoom) return 0; // guard against undefined room names
-    var low = 0;
-    var high = desired;
-    while (low < high) {
-        var mid = low + Math.ceil((high - low) / 2);
-        var cost = Game.market.calcTransactionCost(mid, fromRoom, toRoom);
-        // When selling energy, both the amount sent and the transfer fee come from the terminal's energy
-        var totalNeeded = sellingEnergy ? (mid + cost) : cost;
-        if (totalNeeded <= energyAvail) {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    return low;
-}
-
-/**
- * Process a single account-level resource request (pixel, cpuUnlock, accessKey).
- * No terminal, energy, or capacity checks needed. deal() is called without a room name.
- * On OK, progress is counted immediately (no pending confirmation needed).
- *
- * @param {string} key_i - The request key in Memory
- * @param {Object} request - The request object
- * @param {Object} requests - Reference to Memory.opportunisticSell.requests
- * @param {Object} myRooms - Map of owned room names
- */
-function processAccountResource(key_i, request, requests, myRooms) {
-    // Check interval
-    var interval = request.checkInterval || 1;
-    if (Game.time - request.lastCheck < interval) return;
-    request.lastCheck = Game.time;
-
-    /**
-     * Attempt a deal for an account-level resource.
-     * No energy cost, no room name passed to deal().
-     * Progress is counted immediately on OK.
-     *
-     * @param {Object} order - Market order to attempt
-     * @returns {boolean} true if an attempt was made (success or consumed error), false if not feasible
-     */
-    function attemptAccountDeal(order) {
-        var isOwnRoom = !!(order.roomName && myRooms[order.roomName]);
-
-        var candidate = order.amount;
-        if (candidate > request.remaining) candidate = request.remaining;
-        if (candidate <= 0) return false;
-
-        // Account-level resources: no room name in deal()
-        var result = Game.market.deal(order.id, candidate);
-        if (result === OK) {
-            var creditsCost = candidate * order.price;
-            request.fulfilled = (request.fulfilled || 0) + candidate;
-            request.remaining -= candidate;
-
-            // Cache this order for next attempts
-            request.cachedOrderId = order.id;
-            request.cachedOrderRoomName = order.roomName;
-
-            var ownTag = isOwnRoom ? ' [OWN ROOM]' : '';
-            console.log('[OpportunisticSell] Sold ' + candidate + ' ' + request.resourceType +
-                ' (account resource) to ' + (order.roomName || 'market') + ownTag +
-                ' @ ' + order.price + ' (credits earned: ' + creditsCost.toFixed(3) + '). Progress: ' +
-                request.fulfilled + '/' + request.totalAmount);
-            return true;
-        } else {
-            var errorMessage = 'Unknown error: ' + result;
-            if (result === ERR_NOT_ENOUGH_RESOURCES) {
-                errorMessage = 'Insufficient resources';
-            } else if (result === ERR_INVALID_ARGS) {
-                errorMessage = 'Invalid arguments';
-            } else if (result === ERR_NOT_FOUND) {
-                errorMessage = 'Order no longer available';
-            }
-            console.log('[OpportunisticSell] Error selling account resource to order ' +
-                order.id + ' (' + (order.roomName || 'unknown') + '): ' + errorMessage);
-
-            // Drop cache if the order failed
-            request.cachedOrderId = null;
-            request.cachedOrderRoomName = null;
-            return true; // consume attempt
-        }
-    }
-
-    var attempted = false;
-
-    // 1) Try cached order first (fast path)
-    if (request.cachedOrderId) {
-        var cached = Game.market.getOrderById(request.cachedOrderId);
-        var cachedIsOwn = !!(cached && cached.roomName && myRooms[cached.roomName]);
-        if (cached &&
-            cached.resourceType === request.resourceType &&
-            (cached.price >= request.minPrice || cachedIsOwn) &&
-            cached.amount > 0) {
-            attempted = attemptAccountDeal(cached);
-        } else {
-            // Invalidate cache if not usable
-            request.cachedOrderId = null;
-            request.cachedOrderRoomName = null;
-        }
-    }
-
-    // 2) If no attempt yet, scan orders for the best feasible one
-    if (!attempted) {
-        var orders = Game.market.getAllOrders({
-            type: ORDER_BUY,
-            resourceType: request.resourceType
-        }).filter(function(order) {
-            // Accept orders from our own rooms regardless of price
-            if (order.roomName && myRooms[order.roomName]) return order.amount > 0;
-            return order.price >= request.minPrice && order.amount > 0;
-        }).sort(function(a, b) {
-            // Prefer own-room orders first, then highest price
-            var aOwn = (a.roomName && myRooms[a.roomName]) ? 1 : 0;
-            var bOwn = (b.roomName && myRooms[b.roomName]) ? 1 : 0;
-            if (aOwn !== bOwn) return bOwn - aOwn; // own rooms first
-            return b.price - a.price; // then highest price
-        });
-
-        // Try each order in priority order until one succeeds
-        for (var ai = 0; ai < orders.length && !attempted; ai++) {
-            attempted = attemptAccountDeal(orders[ai]);
-        }
-    }
-
-    // Clean up if fully fulfilled
-    if (request.remaining <= 0) {
-        delete requests[key_i];
-        console.log('[OpportunisticSell] Completed sell request for ' + request.resourceType +
-            ' (' + request.totalAmount + ' total)');
-    }
-}
-
-/**
- * Processes all active opportunistic sell requests.
- * Should be called periodically in your main loop.
- * 
- * - Handles account-level resources (pixel, cpuUnlock, accessKey) without terminal logic.
- * - Confirms pending terminal deals by comparing terminal before/after counts.
- * - Executes at most one deal per terminal per tick.
- * - Among requests for the same terminal, the earlier created is processed first.
- * - Orders from our own rooms are accepted regardless of minPrice (credits cycle back).
- */
-function process() {
-    if (!Memory.opportunisticSell || !Memory.opportunisticSell.requests) return;
-
-    var requests = Memory.opportunisticSell.requests;
-
-    // Build owned room set once per tick for own-room order detection
-    var myRooms = getMyRooms();
-
-    // Build and order the request list by creation time (oldest first)
-    var entries = [];
-    for (var key in requests) {
-        var req = requests[key];
-        if (!req || typeof req.remaining !== 'number' || req.remaining <= 0) continue;
-
-        // Drop terminal-resource requests whose room is no longer owned.
-        // Account-resource requests (pixel, cpuUnlock, accessKey) use the room name
-        // as a key only and are preserved.
-        if (!isAccountResource(req.resourceType) && !myRooms[req.roomName]) {
-            console.log('[OpportunisticSell] Removing orphaned request for ' + req.remaining + '/' + req.totalAmount +
-                ' ' + req.resourceType + ' in ' + req.roomName + ' (room no longer owned); ' +
-                (req.fulfilled || 0) + ' already fulfilled.');
-            delete requests[key];
-            continue;
-        }
-
-        entries.push({ key: key, req: req });
-    }
-    entries.sort(function(a, b) {
-        var ca = (a.req.createdAt || 0) - (b.req.createdAt || 0);
-        if (ca !== 0) return ca;
-        if (a.key < b.key) return -1;
-        if (a.key > b.key) return 1;
-        return 0;
-    });
-
-    // Track terminals that already acted this tick to enforce one deal per terminal
-    var roomAttemptedThisTick = {};
-
-    for (var i = 0; i < entries.length; i++) {
-        var key_i = entries[i].key;
-        var request = entries[i].req;
-
-        // Skip completed
-        if (request.remaining <= 0) continue;
-
-        // ======= ACCOUNT-LEVEL RESOURCE PATH =======
-        if (isAccountResource(request.resourceType)) {
-            processAccountResource(key_i, request, requests, myRooms);
-            continue;
-        }
-
-        // ======= TERMINAL RESOURCE PATH =======
-        var roomName = request.roomName;
-        var room = Game.rooms[roomName];
-        var terminal = room && room.terminal;
-        if (!room || !terminal) continue;
-
-        // Always try to confirm a pending deal first; block new deals in this room until confirmed
-        if (request.pending && typeof request.pending.expected === 'number') {
-            var pre = request.pending.pre || 0;
-            var curr = terminal.store[request.resourceType] || 0;
-            var expected = request.pending.expected;
-            // For selling, the resource should DECREASE by expected amount
-            var delta = pre - curr;
-
-            if (delta >= expected) {
-                // Confirm full expected send
-                request.fulfilled = (request.fulfilled || 0) + expected;
-                request.remaining -= expected;
-
-                console.log('[OpportunisticSell] Confirmed ' + expected + ' ' + request.resourceType + ' sent from ' + roomName +
-                    ' to ' + (request.pending.orderRoom || 'unknown') + '. Progress: ' +
-                    request.fulfilled + '/' + request.totalAmount + ' ' + request.resourceType + ' sold.');
-
-                request.pending = null;
-
-                if (request.remaining <= 0) {
-                    delete requests[key_i];
-                    console.log('[OpportunisticSell] Completed sell request for ' + request.resourceType + ' in ' + roomName);
-                }
-
-                // Move to next request after confirmation
-                continue;
-            } else {
-                // Timeout logic
-                var pendingTick = request.pending.tick || 0;
-                var waited = Game.time - pendingTick;
-                if (waited > CONFIRMATION_TIMEOUT_TICKS) {
-                    // Assume the deal went through to avoid overselling
-                    request.fulfilled = (request.fulfilled || 0) + expected;
-                    request.remaining -= expected;
-                    console.log('[OpportunisticSell] Confirmation timeout after ' + waited + ' ticks for order ' +
-                        (request.pending.orderId || 'unknown') + ' from ' + roomName + '. Counting ' +
-                        expected + ' ' + request.resourceType + ' as sold (conservative). Progress: ' +
-                        request.fulfilled + '/' + request.totalAmount);
-                    request.pending = null;
-                    request.cachedOrderId = null;
-                    request.cachedOrderRoomName = null;
-
-                    if (request.remaining <= 0) {
-                        delete requests[key_i];
-                        console.log('[OpportunisticSell] Completed sell request for ' + request.resourceType + ' in ' + roomName);
-                        continue;
-                    }
-                    // Fall through to attempt new deals this tick
-                } else {
-                    // Still waiting; block new deals from this terminal
-                    roomAttemptedThisTick[roomName] = true;
-                    continue;
-                }
-            }
-        }
-
-        // If another request from this terminal already acted this tick, skip
-        if (roomAttemptedThisTick[roomName]) continue;
-
-        var interval = request.checkInterval || 1;
-        if (Game.time - request.lastCheck < interval) continue;
-        request.lastCheck = Game.time;
-
-        // Terminal cooldown gate
-        if (terminal.cooldown > 0) continue;
-
-        // Current resource balance and energy for transfer costs
-        var availableResource = terminal.store[request.resourceType] || 0;
-        var reserve = request.reserve || 0;
-        var sellableResource = Math.max(0, availableResource - reserve);
-        if (sellableResource <= 0) continue;
-
-        var availableEnergy = terminal.store[RESOURCE_ENERGY] || 0;
-        var isSellingEnergy = (request.resourceType === RESOURCE_ENERGY);
-
-        // Helper: attempt a single deal, but only mark progress after confirmation
-        function attemptDeal(order) {
-            var isOwnRoom = !!(order.roomName && myRooms[order.roomName]);
-
-            var candidate = order.amount;
-            if (candidate > request.remaining) candidate = request.remaining;
-            if (candidate > sellableResource) candidate = sellableResource;
-
-            var cappedByEnergy = capByEnergy(candidate, roomName, order.roomName, availableEnergy, isSellingEnergy);
-            if (cappedByEnergy <= 0) {
-                // Not feasible due to energy; try another order
-                return false;
-            }
-            candidate = cappedByEnergy;
-
-            var preStore = terminal.store[request.resourceType] || 0;
-
-            var result = Game.market.deal(order.id, candidate, roomName);
-            if (result === OK) {
-                var energyCost = Game.market.calcTransactionCost(candidate, roomName, order.roomName);
-                var creditsEarned = candidate * order.price;
-
-                // Defer progress update until terminal count reflects the transfer
-                request.pending = {
-                    pre: preStore,
-                    expected: candidate,
-                    tick: Game.time,
-                    orderId: order.id,
-                    orderRoom: order.roomName,
-                    price: order.price,
-                    energyCost: energyCost
-                };
-
-                // Cache this order for next attempts
-                request.cachedOrderId = order.id;
-                request.cachedOrderRoomName = order.roomName;
-
-                // Only one deal per terminal this tick
-                roomAttemptedThisTick[roomName] = true;
-
-                var ownTag = isOwnRoom ? ' [OWN ROOM]' : '';
-                console.log('[OpportunisticSell] Placed deal to sell ' + candidate + ' ' + request.resourceType + ' to ' + order.roomName + ownTag +
-                    ' @ ' + order.price + ' (credits earned: ' + creditsEarned.toFixed(3) + ', energy: ' + energyCost + '). Awaiting terminal confirmation.');
-                return true;
-            } else {
-                var errorMessage = 'Unknown error: ' + result;
-                if (result === ERR_NOT_ENOUGH_RESOURCES) {
-                    errorMessage = 'Insufficient resources in terminal';
-                } else if (result === ERR_INVALID_ARGS) {
-                    errorMessage = 'Invalid arguments';
-                } else if (result === ERR_NOT_ENOUGH_ENERGY) {
-                    errorMessage = 'Insufficient terminal energy';
-                } else if (result === ERR_NOT_FOUND) {
-                    errorMessage = 'Order no longer available';
-                } else if (result === ERR_TIRED) {
-                    errorMessage = 'Terminal cooldown';
-                }
-                console.log('[OpportunisticSell] Error selling to order ' + order.id + ' (' + order.roomName + '): ' + errorMessage);
-
-                request.cachedOrderId = null;
-                request.cachedOrderRoomName = null;
-
-                return true; // consume attempt
-            }
-        }
-
-        var attempted = false;
-
-        // In bestOffer mode, skip cache — always re-evaluate which order is truly best
-        // 1) Try cached order first (fast path) — only in default mode
-        if (!request.bestOffer && request.cachedOrderId) {
-            var cached = Game.market.getOrderById(request.cachedOrderId);
-            var cachedIsOwn = !!(cached && cached.roomName && myRooms[cached.roomName]);
-            if (cached &&
-                cached.roomName &&
-                cached.resourceType === request.resourceType &&
-                (cached.price >= request.minPrice || cachedIsOwn) &&
-                cached.amount > 0) {
-                attempted = attemptDeal(cached);
-            } else {
-                request.cachedOrderId = null;
-                request.cachedOrderRoomName = null;
-            }
-        }
-
-        // 2) If no attempt yet, scan orders for the best feasible one
-        if (!attempted) {
-            var orders = Game.market.getAllOrders({
-                type: ORDER_BUY,
-                resourceType: request.resourceType
-            }).filter(function(order) {
-                // Skip orders with no roomName
-                if (!order.roomName) return false;
-                // Skip orders from ourselves buying in THIS room (no self-transfer)
-                if (order.roomName === roomName) return false;
-                // Accept orders from our own rooms regardless of price
-                if (myRooms[order.roomName]) return order.amount > 0;
-                return order.price >= request.minPrice && order.amount > 0;
-            }).sort(function(a, b) {
-                // Prefer own-room orders first, then highest price
-                var aOwn = (a.roomName && myRooms[a.roomName]) ? 1 : 0;
-                var bOwn = (b.roomName && myRooms[b.roomName]) ? 1 : 0;
-                if (aOwn !== bOwn) return bOwn - aOwn; // own rooms first
-                return b.price - a.price; // then highest price
-            });
-
-            if (orders.length === 0) continue;
-
-            // Check if the best order is from our own room
-            var bestIsOwn = !!(orders[0].roomName && myRooms[orders[0].roomName]);
-
-            if (bestIsOwn) {
-                // Prefer own-room orders: try each until one works
-                for (var oj = 0; oj < orders.length && !attempted; oj++) {
-                    var ownOrd = orders[oj];
-                    if (!(ownOrd.roomName && myRooms[ownOrd.roomName])) break; // past own-room orders
-
-                    // Skip self-room transfers
-                    if (ownOrd.roomName === roomName) continue;
-
-                    var candidate0 = ownOrd.amount;
-                    if (candidate0 > request.remaining) candidate0 = request.remaining;
-                    if (candidate0 > sellableResource) candidate0 = sellableResource;
-                    candidate0 = capByEnergy(candidate0, roomName, ownOrd.roomName, availableEnergy, isSellingEnergy);
-                    if (candidate0 > 0) {
-                        attempted = attemptDeal(ownOrd);
-                    }
-                }
-            }
-
-            // If own-room orders didn't work out, fall back to external orders
-            if (!attempted) {
-                var externalOrders = [];
-                for (var ei = 0; ei < orders.length; ei++) {
-                    if (!(orders[ei].roomName && myRooms[orders[ei].roomName])) {
-                        externalOrders.push(orders[ei]);
-                    }
-                }
-
-                if (externalOrders.length > 0) {
-                    if (request.bestOffer) {
-                        // Best-offer mode: score the top 10 orders by net profit per unit.
-                        // net = order.price - (energyCost / amount * energyMarketPrice)
-                        // This accounts for distance: a far room at a high price may net less
-                        // than a closer room at a slightly lower price.
-                        var energyPrice = getEnergyMarketPrice();
-                        var topOrders = externalOrders.slice(0, 10);
-                        var scored = [];
-
-                        for (var ti = 0; ti < topOrders.length; ti++) {
-                            var tOrd = topOrders[ti];
-
-                            var tCandidate = tOrd.amount;
-                            if (tCandidate > request.remaining) tCandidate = request.remaining;
-                            if (tCandidate > sellableResource) tCandidate = sellableResource;
-
-                            tCandidate = capByEnergy(tCandidate, roomName, tOrd.roomName, availableEnergy, isSellingEnergy);
-                            if (tCandidate <= 0) continue;
-
-                            var tEnergyCost = Game.market.calcTransactionCost(tCandidate, roomName, tOrd.roomName);
-                            var energyCostPerUnit = tEnergyCost / tCandidate;
-                            // When selling energy, the resource itself has value (energyPrice per unit),
-                            // so net must subtract both the transfer cost AND the replacement cost of the energy sold.
-                            // For non-energy resources, only the transfer energy cost matters.
-                            var netPerUnit = isSellingEnergy
-                                ? tOrd.price - energyPrice - (energyCostPerUnit * energyPrice)
-                                : tOrd.price - (energyCostPerUnit * energyPrice);
-
-                            scored.push({
-                                order: tOrd,
-                                feasible: tCandidate,
-                                netPerUnit: netPerUnit,
-                                energyCost: tEnergyCost
-                            });
-                        }
-
-                        // Sort by net profit per unit, highest first
-                        scored.sort(function(a, b) { return b.netPerUnit - a.netPerUnit; });
-
-                        // Try the best scoring order(s)
-                        for (var si = 0; si < scored.length && !attempted; si++) {
-                            if (scored[si].netPerUnit > 0) {
-                                attempted = attemptDeal(scored[si].order);
-                            }
-                        }
-
-                        // Log the top pick for visibility (only if we attempted)
-                        if (attempted && scored.length > 0) {
-                            var top = scored[0];
-                            console.log('[OpportunisticSell] Best offer: ' + top.order.roomName +
-                                ' @ ' + top.order.price + ' | net/unit: ' + top.netPerUnit.toFixed(4) +
-                                ' (energy cost: ' + top.energyCost + ' @ ' + energyPrice.toFixed(4) + '/unit)' +
-                                (scored.length > 1 ? ' | runner-up net/unit: ' + scored[1].netPerUnit.toFixed(4) : ''));
-                        }
-                    } else {
-                        // Default mode: among the highest external price, pick the one allowing
-                        // the largest feasible sell this tick (often closest, saving energy)
-                        var maxPrice = externalOrders[0].price;
-                        var bestOrder = null;
-                        var bestFeasible = 0;
-
-                        for (var j = 0; j < externalOrders.length; j++) {
-                            var ord = externalOrders[j];
-                            if (ord.price !== maxPrice) break;
-
-                            var candidate2 = ord.amount;
-                            if (candidate2 > request.remaining) candidate2 = request.remaining;
-                            if (candidate2 > sellableResource) candidate2 = sellableResource;
-
-                            candidate2 = capByEnergy(candidate2, roomName, ord.roomName, availableEnergy, isSellingEnergy);
-                            if (candidate2 > bestFeasible) {
-                                bestFeasible = candidate2;
-                                bestOrder = ord;
-                            }
-                        }
-
-                        if (bestOrder && bestFeasible > 0) {
-                            attempted = attemptDeal(bestOrder);
-                        } else {
-                            // Fallback: first feasible across all filtered external orders
-                            for (var k = 0; k < externalOrders.length && !attempted; k++) {
-                                var ord2 = externalOrders[k];
-
-                                var candidate3 = ord2.amount;
-                                if (candidate3 > request.remaining) candidate3 = request.remaining;
-                                if (candidate3 > sellableResource) candidate3 = sellableResource;
-
-                                candidate3 = capByEnergy(candidate3, roomName, ord2.roomName, availableEnergy, isSellingEnergy);
-                                if (candidate3 > 0) {
-                                    attempted = attemptDeal(ord2);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // If nothing was feasible, no transaction this tick. Will try again next eligible tick.
-    }
-}
-
-/**
- * Displays all active sell requests in a readable format
- * 
- * @returns {string} Formatted list of active requests
- */
-function listActiveRequests() {
-    if (!Memory.opportunisticSell || !Memory.opportunisticSell.requests) {
-        var message = 'No active sell requests';
-        console.log('[OpportunisticSell] ' + message);
-        return message;
-    }
-
-    var requests = Memory.opportunisticSell.requests;
-    var output = 'Active sell requests:\n';
-
-    for (var key in requests) {
-        var req = requests[key];
-        var fulfilled = req.fulfilled || 0;
-        var acctTag = isAccountResource(req.resourceType) ? ' [ACCOUNT]' : '';
-        var reserveTag = (req.reserve && req.reserve > 0) ? ' (reserve ' + req.reserve + ')' : '';
-        var bestOfferTag = req.bestOffer ? ' [BEST OFFER]' : '';
-        var priceTag = req.bestOffer ? '' : ' (min ' + req.minPrice + ' credits)';
-        var pendingStr = req.pending && typeof req.pending.expected === 'number'
-            ? ' (pending ' + req.pending.expected + ' awaiting confirmation)'
-            : '';
-        output += '- ' + req.roomName + ': ' + (req.remaining) + '/' + req.totalAmount + ' ' + req.resourceType +
-                  acctTag + ' (fulfilled ' + fulfilled + ')' + priceTag + reserveTag + bestOfferTag + pendingStr + '\n';
-    }
-
-    console.log('[OpportunisticSell] ' + output);
-    return output;
-}
-
-/**
- * Cancels an active sell request.
- * 
- * @param {string} roomName - The room name where the terminal is located
- * @param {string} resourceType - RESOURCE_* constant for the resource to cancel
- * @returns {string} Status message confirming cancellation
- */
-function cancelRequest(roomName, resourceType) {
-    var key = roomName + '_' + resourceType;
-    var requests = Memory.opportunisticSell.requests;
-
-    if (requests[key]) {
-        var request = requests[key];
-        var remaining = request.remaining;
-        var total = request.totalAmount;
-
-        delete requests[key];
-
-        var message = 'Cancelled sell request for ' + remaining + '/' + total + ' ' + resourceType + ' in ' + roomName;
-        console.log('[OpportunisticSell] ' + message);
-        return message;
-    } else {
-        var message2 = 'No active sell request found for ' + resourceType + ' in ' + roomName;
-        console.log('[OpportunisticSell] ' + message2);
-        return message2;
-    }
-}
-
-// Export functions for module system
-module.exports = {
-    setup: setup,
-    setCheckInterval: setCheckInterval,
-    setReserve: setReserve,
-    setBestOffer: setBestOffer,
-    process: process,
-    listActiveRequests: listActiveRequests,
-    cancelRequest: cancelRequest
+var MARKET_TRANSACTION_HISTORY_LIMIT = 100;
+var roomSuspender = require("roomSuspender");
+var util = require("util");
+var pricing = require("marketPricing");
+var autoTraderSellPolicy = require("autoTraderSellPolicy");
+var memoryManager = require("memoryManager");
+var storageManager = require("storageManager");
+var terminalManager = require("terminalManager");
+var RESERVATION_PROGRAM = "opportunisticSell";
+var ACCOUNT_RESOURCES = {
+  pixel: true,
+  cpuUnlock: true,
+  accessKey: true
 };
+function isAccountResource(e) {
+  return !!ACCOUNT_RESOURCES[e];
+}
+
+function configuredSellFloor(e) {
+  return autoTraderSellPolicy && typeof autoTraderSellPolicy.getFloor === "function" ? autoTraderSellPolicy.getFloor(e) : 0;
+}
+
+function effectiveMinimumPrice(e) {
+  var r = e && typeof e.minPrice === "number" && isFinite(e.minPrice) ? Math.max(0, e.minPrice) : 0;
+  return Math.max(r, configuredSellFloor(e && e.resourceType));
+}
+
+if (!Memory.opportunisticSell) {
+  Memory.opportunisticSell = {
+    requests: {}
+  };
+}
+var getMyRooms = util.getMyRooms;
+function getEnergyMarketPrice() {
+  var e = pricing.getStatusEnergyPrice();
+  return typeof e === "number" && isFinite(e) && e > 0 ? e : 0;
+}
+
+function addJobAllocation(e, r, o) {
+  if (!e || !r) return;
+  var t = Array.isArray(r.jobAllocations) ? r.jobAllocations : null;
+  if (!t) {
+    t = r.jobId ? [ {
+      jobId: r.jobId,
+      amount: typeof r.jobAmount === "number" && r.jobAmount > 0 ? r.jobAmount : o
+    } ] : [];
+  }
+  if (!Array.isArray(e.jobAllocations)) e.jobAllocations = [];
+  for (var n = 0; n < t.length; n++) {
+    var a = t[n];
+    if (!a || !a.jobId || !(a.amount > 0)) continue;
+    var i = null;
+    for (var l = 0; l < e.jobAllocations.length; l++) {
+      if (e.jobAllocations[l] && e.jobAllocations[l].jobId === a.jobId) {
+        i = e.jobAllocations[l];
+        break;
+      }
+    }
+    if (i) i.amount = Math.max(i.amount, a.amount); else e.jobAllocations.push({
+      jobId: a.jobId,
+      amount: a.amount
+    });
+  }
+}
+
+function setup(e, r, o, t, n, a, i, l) {
+  var s = e + "_" + r;
+  var u = Memory.opportunisticSell.requests[s];
+  var c = t === true;
+  var m = c ? 0 : t;
+  var f = u && typeof u.createdAt === "number" ? u.createdAt : Game.time;
+  if (u) {
+    if (!Array.isArray(u.jobAllocations) && u.jobId && u.remaining > 0) {
+      u.jobAllocations = [ {
+        jobId: u.jobId,
+        amount: u.remaining
+      } ];
+    }
+    u.totalAmount = Math.max(u.totalAmount || 0, (u.fulfilled || 0) + o);
+    u.remaining = Math.max(u.remaining || 0, o);
+    u.minPrice = m;
+    u.bestOffer = c;
+    u.reserve = typeof n === "number" && n >= 0 ? n : u.reserve || 0;
+    if (i) u.externalOnly = true;
+    if (l) u.stagingOpId = l;
+    addJobAllocation(u, a, o);
+    syncRequestReservation(u);
+    memoryManager.requestSave();
+    return "Sell request for " + o + " " + r + " from " + e + " already active";
+  }
+  Memory.opportunisticSell.requests[s] = {
+    roomName: e,
+    resourceType: r,
+    totalAmount: o,
+    remaining: o,
+    minPrice: m,
+    reserve: typeof n === "number" && n >= 0 ? n : 0,
+    bestOffer: c,
+    externalOnly: !!i,
+    stagingOpId: l || null,
+    lastCheck: 0,
+    checkInterval: 1,
+    cachedOrderId: null,
+    cachedOrderRoomName: null,
+    createdAt: f,
+    fulfilled: 0,
+    pending: null
+  };
+  if (a && a.jobId) Memory.opportunisticSell.requests[s].jobId = a.jobId;
+  addJobAllocation(Memory.opportunisticSell.requests[s], a, o);
+  syncRequestReservation(Memory.opportunisticSell.requests[s]);
+  var p = isAccountResource(r) ? " [ACCOUNT RESOURCE]" : "";
+  var v = n && n > 0 ? " (reserve " + n + ")" : "";
+  var d = c ? " [BEST OFFER MODE]" : " (min " + m + " credits/unit)";
+  var g = "Sell request for " + o + " " + r + " from " + e + " created" + d + v + p;
+  console.log("[OpportunisticSell] " + g);
+  return g;
+}
+
+function setCheckInterval(e, r, o) {
+  var t = e + "_" + r;
+  var n = Memory.opportunisticSell.requests;
+  if (!n || !n[t]) {
+    var a = "No active sell request found for " + r + " in " + e;
+    console.log("[OpportunisticSell] " + a);
+    return a;
+  }
+  if (typeof o !== "number" || o < 1) {
+    var i = "Invalid checkInterval " + o + " (must be number >= 1)";
+    console.log("[OpportunisticSell] " + i);
+    return i;
+  }
+  n[t].checkInterval = o;
+  var l = "Set checkInterval for " + e + " " + r + " to " + o + " ticks";
+  console.log("[OpportunisticSell] " + l);
+  return l;
+}
+
+function setReserve(e, r, o) {
+  var t = e + "_" + r;
+  var n = Memory.opportunisticSell.requests;
+  if (!n || !n[t]) {
+    var a = "No active sell request found for " + r + " in " + e;
+    console.log("[OpportunisticSell] " + a);
+    return a;
+  }
+  if (typeof o !== "number" || o < 0) {
+    var i = "Invalid reserve " + o + " (must be number >= 0)";
+    console.log("[OpportunisticSell] " + i);
+    return i;
+  }
+  n[t].reserve = o;
+  syncRequestReservation(n[t]);
+  memoryManager.requestSave();
+  var l = "Set reserve for " + e + " " + r + " to " + o;
+  console.log("[OpportunisticSell] " + l);
+  return l;
+}
+
+function setBestOffer(e, r, o) {
+  var t = e + "_" + r;
+  var n = Memory.opportunisticSell.requests;
+  if (!n || !n[t]) {
+    var a = "No active sell request found for " + r + " in " + e;
+    console.log("[OpportunisticSell] " + a);
+    return a;
+  }
+  n[t].bestOffer = !!o;
+  var i = (o ? "Enabled" : "Disabled") + " best-offer mode for " + e + " " + r;
+  console.log("[OpportunisticSell] " + i);
+  return i;
+}
+
+var capByEnergy = util.capByEnergy;
+function reservesTerminalStock(e) {
+  return !isAccountResource(e) && e !== RESOURCE_ENERGY;
+}
+
+function getTerminalReservation(e, r) {
+  var o = storageManager.storageFind(e, r);
+  var t = o && o.terminal && o.terminal.reservations;
+  if (!Array.isArray(t)) return null;
+  for (var n = 0; n < t.length; n++) {
+    if (t[n] && t[n].program === RESERVATION_PROGRAM) {
+      return t[n];
+    }
+  }
+  return null;
+}
+
+function getAvailableTerminalAmount(e, r, o) {
+  var t = Game.rooms[e];
+  var n = t && t.terminal;
+  var a = n && n.store ? n.store[r] || 0 : 0;
+  if (!(a > 0) || !storageManager || typeof storageManager.storageFind !== "function") return Math.max(0, a);
+  var i = storageManager.storageFind(e, r);
+  var l = i && i.terminal && i.terminal.reservations;
+  if (!Array.isArray(l)) return Math.max(0, a);
+  for (var s = 0; s < l.length; s++) {
+    if (l[s] && l[s].program !== o) {
+      a -= l[s].amount || 0;
+    }
+  }
+  return Math.max(0, a);
+}
+
+function releaseRequestReservation(e) {
+  if (!e || !reservesTerminalStock(e.resourceType)) return false;
+  var r = getTerminalReservation(e.roomName, e.resourceType);
+  if (!r) return false;
+  storageManager.unReserve(e.roomName, e.resourceType, "terminal", RESERVATION_PROGRAM);
+  memoryManager.requestSave();
+  return true;
+}
+
+function syncRequestReservation(e) {
+  if (!e || !reservesTerminalStock(e.resourceType)) return 0;
+  var r = getTerminalReservation(e.roomName, e.resourceType);
+  if (e.pending && typeof e.pending.expected === "number") {
+    return r ? Math.min(r.amount || 0, e.remaining || 0) : 0;
+  }
+  var o = Game.rooms[e.roomName];
+  var t = o && o.terminal;
+  if (!t) {
+    if (r) releaseRequestReservation(e);
+    return 0;
+  }
+  var n = getAvailableTerminalAmount(e.roomName, e.resourceType, RESERVATION_PROGRAM);
+  var a = typeof e.reserve === "number" && e.reserve > 0 ? e.reserve : 0;
+  var i = Math.min(Math.max(0, e.remaining || 0), Math.max(0, n - a));
+  if (i <= 0) {
+    if (r) releaseRequestReservation(e);
+    return 0;
+  }
+  var l = r && typeof r.time === "number" && Game.time - r.time > 1e3;
+  if (r && r.amount === i && !l) return i;
+  var s = storageManager.reserve(e.roomName, e.resourceType, "terminal", RESERVATION_PROGRAM, i);
+  if (s && s.ok) {
+    memoryManager.requestSave();
+    return i;
+  }
+  if (Game.time % 100 === 0) {
+    console.log("[OpportunisticSell] Could not reserve " + i + " " + e.resourceType + " in " + e.roomName + ": " + (s && s.reason ? s.reason : "unknown error"));
+  }
+  return r ? Math.min(r.amount || 0, e.remaining || 0) : 0;
+}
+
+function processAccountResource(e, r, o, t) {
+  var n = r.checkInterval || 1;
+  if (Game.time - r.lastCheck < n) return;
+  r.lastCheck = Game.time;
+  function attemptAccountDeal(e) {
+    var o = Game.market.getOrderById(e.id);
+    if (!o || o.amount <= 0) return false;
+    e = o;
+    var n = !!(e.roomName && t[e.roomName]);
+    if (l > 0 && e.price < l) return false;
+    if (!n && !r.bestOffer && e.price < i) return false;
+    var a = e.amount;
+    if (a > r.remaining) a = r.remaining;
+    if (a <= 0) return false;
+    var s = Game.market.deal(e.id, a);
+    if (s === OK) {
+      var u = a * e.price;
+      r.fulfilled = (r.fulfilled || 0) + a;
+      r.remaining -= a;
+      r.cachedOrderId = e.id;
+      r.cachedOrderRoomName = e.roomName;
+      memoryManager.requestImmediateSave("opportunisticSell.accountDeal");
+      var c = n ? " [OWN ROOM]" : "";
+      console.log("[OpportunisticSell] Sold " + a + " " + r.resourceType + " (account resource) to " + (e.roomName || "market") + c + " @ " + e.price + " (credits earned: " + u.toFixed(3) + "). Progress: " + r.fulfilled + "/" + r.totalAmount);
+      return true;
+    } else {
+      var m = "Unknown error: " + s;
+      if (s === ERR_NOT_ENOUGH_RESOURCES) {
+        m = "Insufficient resources";
+      } else if (s === ERR_INVALID_ARGS) {
+        m = "Invalid arguments";
+      } else if (s === ERR_NOT_FOUND) {
+        m = "Order no longer available";
+      }
+      console.log("[OpportunisticSell] Error selling account resource to order " + e.id + " (" + (e.roomName || "unknown") + "): " + m);
+      r.cachedOrderId = null;
+      r.cachedOrderRoomName = null;
+      return true;
+    }
+  }
+  var a = false;
+  var i = effectiveMinimumPrice(r);
+  var l = configuredSellFloor(r.resourceType);
+  if (r.cachedOrderId) {
+    var s = Game.market.getOrderById(r.cachedOrderId);
+    var u = !!(s && s.roomName && t[s.roomName]);
+    if (s && s.resourceType === r.resourceType && (s.price >= i || u && l <= 0) && s.amount > 0) {
+      a = attemptAccountDeal(s);
+    } else {
+      r.cachedOrderId = null;
+      r.cachedOrderRoomName = null;
+    }
+  }
+  if (!a) {
+    var c = util.marketOrders(r.resourceType, ORDER_BUY).filter(function(e) {
+      if (e.roomName && t[e.roomName]) {
+        return (l <= 0 || e.price >= l) && e.amount > 0;
+      }
+      return e.price >= i && e.amount > 0;
+    }).sort(function(e, r) {
+      var o = e.roomName && t[e.roomName] ? 1 : 0;
+      var n = r.roomName && t[r.roomName] ? 1 : 0;
+      if (o !== n) return n - o;
+      return r.price - e.price;
+    });
+    for (var m = 0; m < c.length && !a; m++) {
+      a = attemptAccountDeal(c[m]);
+    }
+  }
+  if (r.remaining <= 0) {
+    delete o[e];
+    console.log("[OpportunisticSell] Completed sell request for " + r.resourceType + " (" + r.totalAmount + " total)");
+  }
+}
+
+function process() {
+  if (!Memory.opportunisticSell || !Memory.opportunisticSell.requests) return;
+  reconcilePending();
+  var e = Memory.opportunisticSell.requests;
+  var r = getMyRooms();
+  var o = [];
+  for (var t in e) {
+    var n = e[t];
+    if (!n || typeof n.remaining !== "number") continue;
+    if (n.remaining <= 0) {
+      releaseRequestReservation(n);
+      delete e[t];
+      continue;
+    }
+    if (!isAccountResource(n.resourceType) && !r[n.roomName]) {
+      console.log("[OpportunisticSell] Removing orphaned request for " + n.remaining + "/" + n.totalAmount + " " + n.resourceType + " in " + n.roomName + " (room no longer owned); " + (n.fulfilled || 0) + " already fulfilled.");
+      releaseRequestReservation(n);
+      delete e[t];
+      continue;
+    }
+    o.push({
+      key: t,
+      req: n
+    });
+  }
+  o.sort(function(e, r) {
+    var o = (e.req.createdAt || 0) - (r.req.createdAt || 0);
+    if (o !== 0) return o;
+    if (e.key < r.key) return -1;
+    if (e.key > r.key) return 1;
+    return 0;
+  });
+  var a = {};
+  var i = {};
+  for (var l = 0; l < o.length; l++) {
+    var s = o[l].req;
+    if (s && s.pending && s.roomName && !isAccountResource(s.resourceType)) {
+      a[s.roomName] = true;
+    }
+  }
+  for (var u = 0; u < o.length; u++) {
+    var c = o[u].key;
+    var m = o[u].req;
+    if (m.remaining <= 0) continue;
+    if (isAccountResource(m.resourceType)) {
+      processAccountResource(c, m, e, r);
+      continue;
+    }
+    var f = m.roomName;
+    if (roomSuspender.shouldAvoidRoomWork(f)) continue;
+    var p = Game.rooms[f];
+    var v = p && p.terminal;
+    if (!p || !v) {
+      if (p && !v) releaseRequestReservation(m);
+      continue;
+    }
+    if (m.pending && typeof m.pending.expected === "number") continue;
+    var d = reservesTerminalStock(m.resourceType);
+    var g = d ? syncRequestReservation(m) : 0;
+    if (a[f]) continue;
+    var y = m.checkInterval || 1;
+    if (Game.time - m.lastCheck < y) continue;
+    m.lastCheck = Game.time;
+    if (v.cooldown > 0 || util.wasTerminalUsed && util.wasTerminalUsed(f)) continue;
+    if (terminalManager && typeof terminalManager.isRoomBusyWithTransfer === "function" && terminalManager.isRoomBusyWithTransfer(f)) continue;
+    var R = m.reserve || 0;
+    var O = d ? g : getAvailableTerminalAmount(f, m.resourceType);
+    var S = d ? O : Math.max(0, O - R);
+    if (S <= 0) continue;
+    var T = getAvailableTerminalAmount(f, RESOURCE_ENERGY);
+    var N = m.resourceType === RESOURCE_ENERGY;
+    var A = effectiveMinimumPrice(m);
+    var M = configuredSellFloor(m.resourceType);
+    function attemptDeal(e) {
+      var o = Game.market.getOrderById(e.id);
+      if (!o || o.amount <= 0) return false;
+      e = o;
+      var t = !!(e.roomName && r[e.roomName]);
+      if (m.externalOnly && t) return false;
+      if (M > 0 && e.price < M) return false;
+      if (!t && !m.bestOffer && e.price < A) return false;
+      var n = e.amount;
+      var l = i[e.id] || 0;
+      n -= l;
+      if (n <= 0) return false;
+      if (n > m.remaining) n = m.remaining;
+      if (n > S) n = S;
+      var s = capByEnergy(n, f, e.roomName, T, N);
+      if (s <= 0) {
+        return false;
+      }
+      n = s;
+      if (m.bestOffer) {
+        var u = getEnergyMarketPrice();
+        var c = util.calcTransactionCost(n, f, e.roomName);
+        var p = c / n;
+        var d = e.price - p * u;
+        if (!(d > 0)) return false;
+      }
+      var g = v.store[m.resourceType] || 0;
+      var y = Game.market.deal(e.id, n, f);
+      if (y === OK) {
+        var R = util.calcTransactionCost(n, f, e.roomName);
+        var O = n * e.price;
+        m.pending = {
+          pre: g,
+          expected: n,
+          tick: Game.time,
+          orderId: e.id,
+          orderRoom: e.roomName,
+          price: e.price,
+          energyCost: R
+        };
+        i[e.id] = (i[e.id] || 0) + n;
+        if (util.markTerminalUsed) util.markTerminalUsed(f);
+        m.cachedOrderId = e.id;
+        m.cachedOrderRoomName = e.roomName;
+        memoryManager.requestImmediateSave("opportunisticSell.terminalDeal");
+        a[f] = true;
+        var h = t ? " [OWN ROOM]" : "";
+        console.log("[OpportunisticSell] Placed deal to sell " + n + " " + m.resourceType + " to " + e.roomName + h + " (order " + e.id + ") @ " + e.price + " (credits earned: " + O.toFixed(3) + ", energy: " + R + "). Awaiting terminal confirmation.");
+        return true;
+      } else {
+        var b = "Unknown error: " + y;
+        if (y === ERR_NOT_ENOUGH_RESOURCES) {
+          b = "Insufficient resources in terminal";
+        } else if (y === ERR_INVALID_ARGS) {
+          b = "Invalid arguments";
+        } else if (y === ERR_NOT_ENOUGH_ENERGY) {
+          b = "Insufficient terminal energy";
+        } else if (y === ERR_NOT_FOUND) {
+          b = "Order no longer available";
+        } else if (y === ERR_TIRED) {
+          b = "Terminal cooldown";
+        }
+        console.log("[OpportunisticSell] Error selling to order " + e.id + " (" + e.roomName + "): " + b);
+        m.cachedOrderId = null;
+        m.cachedOrderRoomName = null;
+        return true;
+      }
+    }
+    var h = false;
+    if (!m.bestOffer && m.cachedOrderId) {
+      var b = Game.market.getOrderById(m.cachedOrderId);
+      var I = !!(b && b.roomName && r[b.roomName]);
+      if (b && b.roomName && b.resourceType === m.resourceType && (b.price >= A || I && M <= 0) && b.amount > 0) {
+        h = attemptDeal(b);
+      } else {
+        m.cachedOrderId = null;
+        m.cachedOrderRoomName = null;
+      }
+    }
+    if (!h) {
+      var E = util.marketOrders(m.resourceType, ORDER_BUY).filter(function(e) {
+        if (!e.roomName) return false;
+        if (e.roomName === f) return false;
+        if (r[e.roomName]) {
+          return (M <= 0 || e.price >= M) && e.amount > 0;
+        }
+        return e.price >= A && e.amount > 0;
+      }).sort(function(e, o) {
+        var t = e.roomName && r[e.roomName] ? 1 : 0;
+        var n = o.roomName && r[o.roomName] ? 1 : 0;
+        if (t !== n) return n - t;
+        return o.price - e.price;
+      });
+      if (E.length === 0) continue;
+      if (m.bestOffer) {
+        var k = [];
+        var q = getEnergyMarketPrice();
+        for (var C = 0; C < E.length; C++) {
+          var _ = E[C];
+          var G = Math.min(m.remaining, S, _.amount || 0);
+          G = capByEnergy(G, f, _.roomName, T, N);
+          if (!(G > 0)) continue;
+          var P = util.calcTransactionCost(G, f, _.roomName);
+          var x = _.price - P / G * q;
+          if (!(x > 0)) continue;
+          k.push({
+            order: _,
+            netPerUnit: x
+          });
+        }
+        k.sort(function(e, r) {
+          return r.netPerUnit - e.netPerUnit;
+        });
+        for (var j = 0; j < k.length && !h; j++) {
+          h = attemptDeal(k[j].order);
+        }
+        continue;
+      }
+      var U = !!(E[0].roomName && r[E[0].roomName]);
+      if (U) {
+        for (var D = 0; D < E.length && !h; D++) {
+          var F = E[D];
+          if (!(F.roomName && r[F.roomName])) break;
+          if (F.roomName === f) continue;
+          var B = F.amount;
+          if (B > m.remaining) B = m.remaining;
+          if (B > S) B = S;
+          B = capByEnergy(B, f, F.roomName, T, N);
+          if (B > 0) {
+            h = attemptDeal(F);
+          }
+        }
+      }
+      if (!h) {
+        var w = [];
+        for (var V = 0; V < E.length; V++) {
+          if (!(E[V].roomName && r[E[V].roomName])) {
+            w.push(E[V]);
+          }
+        }
+        if (w.length > 0) {
+          if (m.bestOffer) {
+            var Y = getEnergyMarketPrice();
+            var H = w.slice(0, 10);
+            var K = [];
+            for (var W = 0; W < H.length; W++) {
+              var L = H[W];
+              var J = L.amount;
+              if (J > m.remaining) J = m.remaining;
+              if (J > S) J = S;
+              J = capByEnergy(J, f, L.roomName, T, N);
+              if (J <= 0) continue;
+              var z = util.calcTransactionCost(J, f, L.roomName);
+              var Q = z / J;
+              var X = L.price - Q * Y;
+              K.push({
+                order: L,
+                feasible: J,
+                netPerUnit: X,
+                energyCost: z
+              });
+            }
+            K.sort(function(e, r) {
+              return r.netPerUnit - e.netPerUnit;
+            });
+            for (var Z = 0; Z < K.length && !h; Z++) {
+              if (K[Z].netPerUnit > 0) {
+                h = attemptDeal(K[Z].order);
+              }
+            }
+            if (h && K.length > 0) {
+              var $ = K[0];
+              console.log("[OpportunisticSell] Best offer: " + $.order.roomName + " @ " + $.order.price + " | net/unit: " + $.netPerUnit.toFixed(4) + " (energy cost: " + $.energyCost + " @ " + Y.toFixed(4) + "/unit)" + (K.length > 1 ? " | runner-up net/unit: " + K[1].netPerUnit.toFixed(4) : ""));
+            }
+          } else {
+            var ee = w[0].price;
+            var re = null;
+            var oe = 0;
+            for (var te = 0; te < w.length; te++) {
+              var ne = w[te];
+              if (ne.price !== ee) break;
+              var ae = ne.amount;
+              if (ae > m.remaining) ae = m.remaining;
+              if (ae > S) ae = S;
+              ae = capByEnergy(ae, f, ne.roomName, T, N);
+              if (ae > oe) {
+                oe = ae;
+                re = ne;
+              }
+            }
+            if (re && oe > 0) {
+              h = attemptDeal(re);
+            } else {
+              for (var ie = 0; ie < w.length && !h; ie++) {
+                var le = w[ie];
+                var se = le.amount;
+                if (se > m.remaining) se = m.remaining;
+                if (se > S) se = S;
+                se = capByEnergy(se, f, le.roomName, T, N);
+                if (se > 0) {
+                  h = attemptDeal(le);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+function findOutgoingDeal(e, r, o) {
+  var t = Game.market && Game.market.outgoingTransactions;
+  if (!t) return null;
+  for (var n = 0; n < t.length; n++) {
+    var a = t[n];
+    if (typeof a.time === "number" && a.time < o.tick) break;
+    if (a.from === e && a.resourceType === r && a.amount >= o.expected && a.order && a.order.id === o.orderId) {
+      return a;
+    }
+  }
+  return null;
+}
+
+function transactionHistoryCovers(e, r) {
+  if (!Array.isArray(e)) return false;
+  if (e.length < MARKET_TRANSACTION_HISTORY_LIMIT) return true;
+  var o = e[e.length - 1];
+  return !!o && typeof o.time === "number" && o.time < r;
+}
+
+function reconcilePending() {
+  if (memoryManager.heap.opportunisticSellReconcileTick === Game.time) return;
+  memoryManager.heap.opportunisticSellReconcileTick = Game.time;
+  if (!Memory.opportunisticSell || !Memory.opportunisticSell.requests) return;
+  var e = Memory.opportunisticSell.requests;
+  for (var r in e) {
+    var o = e[r];
+    if (!o || isAccountResource(o.resourceType) || !o.pending || typeof o.pending.expected !== "number" || o.pending.ambiguous) continue;
+    var t = o.roomName;
+    var n = Game.rooms[t];
+    var a = n && n.terminal;
+    var i = o.pending;
+    var l = findOutgoingDeal(t, o.resourceType, i);
+    var s = !!(Game.market && Game.market.outgoingTransactions);
+    var u = i.pre || 0;
+    var c = a && a.store ? a.store[o.resourceType] || 0 : 0;
+    var m = !!l;
+    if (!s && a) m = u - c >= i.expected;
+    if (m) {
+      if (reservesTerminalStock(o.resourceType)) {
+        storageManager.consume(t, o.resourceType, "terminal", RESERVATION_PROGRAM, i.expected);
+      }
+      o.fulfilled = (o.fulfilled || 0) + i.expected;
+      o.remaining -= i.expected;
+      if (Array.isArray(o.jobAllocations) && o.jobAllocations.length > 0) {
+        var f = i.expected;
+        for (var p = 0; p < o.jobAllocations.length && f > 0; p++) {
+          var v = o.jobAllocations[p];
+          if (!v || !(v.amount > 0)) continue;
+          var d = Math.min(v.amount, f);
+          try {
+            require("marketEconomics").recordSale(v.jobId, o.resourceType, d, d * i.price, (i.energyCost || 0) * d / i.expected, 0);
+          } catch (e) {}
+          v.amount -= d;
+          f -= d;
+        }
+        o.jobAllocations = o.jobAllocations.filter(function(e) {
+          return e && e.amount > 0;
+        });
+      } else if (o.jobId) {
+        try {
+          require("marketEconomics").recordSale(o.jobId, o.resourceType, i.expected, i.expected * i.price, i.energyCost || 0, 0);
+        } catch (e) {}
+      }
+      console.log("[OpportunisticSell] Confirmed " + i.expected + " " + o.resourceType + " sent from " + t + " to " + (i.orderRoom || "unknown") + " (order " + (i.orderId || "unknown") + "). Progress: " + o.fulfilled + "/" + o.totalAmount + " " + o.resourceType + " sold.");
+      o.pending = null;
+      if (o.remaining <= 0) {
+        releaseRequestReservation(o);
+        delete e[r];
+        console.log("[OpportunisticSell] Completed sell request for " + o.resourceType + " in " + t);
+      }
+      memoryManager.requestImmediateSave("opportunisticSell.confirmDeal");
+      continue;
+    }
+    var g = Game.time - (i.tick || 0);
+    if (g > CONFIRMATION_TIMEOUT_TICKS) {
+      if (transactionHistoryCovers(Game.market && Game.market.outgoingTransactions, i.tick)) {
+        console.log("[OpportunisticSell] No outgoing transaction after " + g + " ticks for order " + (i.orderId || "unknown") + " from " + t + "; clearing ghost deal and retrying.");
+        o.pending = null;
+        o.cachedOrderId = null;
+        o.cachedOrderRoomName = null;
+        memoryManager.requestSave();
+        continue;
+      }
+      i.ambiguous = true;
+      i.ambiguousTick = Game.time;
+      console.log("[OpportunisticSell] Confirmation unresolved after " + g + " ticks for order " + (i.orderId || "unknown") + " from " + t + ". Transaction history no longer covers tick " + i.tick + "; holding " + i.expected + " " + o.resourceType + " to avoid a duplicate sale.");
+      memoryManager.requestSave();
+    }
+  }
+}
+
+function listActiveRequests() {
+  if (!Memory.opportunisticSell || !Memory.opportunisticSell.requests) {
+    var e = "No active sell requests";
+    console.log("[OpportunisticSell] " + e);
+    return e;
+  }
+  var r = Memory.opportunisticSell.requests;
+  var o = "Active sell requests:\n";
+  for (var t in r) {
+    var n = r[t];
+    var a = n.fulfilled || 0;
+    var i = isAccountResource(n.resourceType) ? " [ACCOUNT]" : "";
+    var l = n.reserve && n.reserve > 0 ? " (reserve " + n.reserve + ")" : "";
+    var s = n.bestOffer ? " [BEST OFFER]" : "";
+    var u = n.bestOffer ? "" : " (min " + n.minPrice + " credits)";
+    var c = n.pending && typeof n.pending.expected === "number" ? " (pending " + n.pending.expected + " awaiting confirmation)" : "";
+    o += "- " + n.roomName + ": " + n.remaining + "/" + n.totalAmount + " " + n.resourceType + i + " (fulfilled " + a + ")" + u + l + s + c + "\n";
+  }
+  console.log("[OpportunisticSell] " + o);
+  return o;
+}
+
+function cancelRequest(e, r) {
+  var o = e + "_" + r;
+  var t = Memory.opportunisticSell.requests;
+  if (t[o]) {
+    var n = t[o];
+    if (n.pending) {
+      var a = "[OpportunisticSell] Cannot cancel request with in-flight pending deal for " + r + " in " + e;
+      console.log(a);
+      return a;
+    }
+    var i = n.remaining;
+    var l = n.totalAmount;
+    if (n.stagingOpId && terminalManager && typeof terminalManager.cancelOperation === "function") {
+      terminalManager.cancelOperation(e, n.stagingOpId);
+    }
+    releaseRequestReservation(n);
+    delete t[o];
+    var s = "Cancelled sell request for " + i + "/" + l + " " + r + " in " + e;
+    console.log("[OpportunisticSell] " + s);
+    return s;
+  } else {
+    var u = "No active sell request found for " + r + " in " + e;
+    console.log("[OpportunisticSell] " + u);
+    return u;
+  }
+}
+
+module.exports = {
+  setup: setup,
+  setCheckInterval: setCheckInterval,
+  setReserve: setReserve,
+  setBestOffer: setBestOffer,
+  process: process,
+  reconcilePending: reconcilePending,
+  listActiveRequests: listActiveRequests,
+  cancelRequest: cancelRequest
+};
+global.opportunisticSell = module.exports;

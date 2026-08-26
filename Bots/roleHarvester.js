@@ -1,1135 +1,1139 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // roleHarvester.js
-
-const getRoomState = require('getRoomState');
+// Role dispatch: memory.role === 'harvester' -> roleHarvester.run(creep).
+// Console globals: harvesterPathVis
+// Example: harvesterPathVis(true) - Toggle visual path overlay for stationary harvesters
+// Example: require('roleHarvester').run(creep);
+//   harvesterPathVis('H_E1N46_63662b_81693190')  Draw path while this harvester moves
+//   harvesterPathVis()                          Disable
+// Project conventions: docs/codex.js. The console command is documented above.
+const getRoomState = require("getRoomState");
+const memoryManager = require("memoryManager");
 const SUICIDE_TTL_THRESHOLD = 121;
 const RENEW_TTL_THRESHOLD = 500;
-
-// Module-level anchor cache — survives tick boundaries (game objects don't).
-// Keyed by creep.name. Entries cleared when creep leaves anchor or dies.
+const SUSPENDED_HARVESTER_RENEW_TTL = 600;
+const WAYPOINT_SEGMENT_LENGTH = 40;
+const WAYPOINT_MAX_PATH_OPS = 5e3;
+const WAYPOINT_MAX_AGE = 2e3;
 var anchorCache = {};
 var anchorCacheLastPrune = 0;
+function getStuckCache() {
+  if (!memoryManager.heap.harvesterStuck) memoryManager.heap.harvesterStuck = {};
+  return memoryManager.heap.harvesterStuck;
+}
 
-// Module-level stuck cache — heap memory, cleared on global reset.
-// Keyed by creep.name. Tracks position + consecutive ticks without movement.
-var stuckCache = {};
+function drawHarvesterPath(e) {
+  if (anchorCache[e.name]) return;
+  if (!e.memory._move || !e.memory._move.path) return;
+  try {
+    var r = Room.deserializePath(e.memory._move.path);
+    if (!r || r.length === 0) return;
+    var t = [ e.pos ];
+    for (var i = 0; i < r.length; i++) {
+      t.push(new RoomPosition(r[i].x, r[i].y, e.room.name));
+    }
+    e.room.visual.poly(t, {
+      fill: "transparent",
+      stroke: "#ffff00",
+      lineStyle: "dashed",
+      strokeWidth: .1
+    });
+  } catch (e) {}
+}
 
 var roleHarvester = {
-    run: function(creep) {
-        // Prune dead creep entries from anchor cache (~once per 200 ticks)
-        if (Game.time - anchorCacheLastPrune > 200) {
-            anchorCacheLastPrune = Game.time;
-            for (var name in anchorCache) {
-                if (!Game.creeps[name]) delete anchorCache[name];
-            }
-            for (var name in stuckCache) {
-                if (!Game.creeps[name]) delete stuckCache[name];
-            }
-        }
-
-        var state = getRoomState.get(creep.room.name);
-        if (!state) {
-            console.log('[Harvester] ' + creep.name + ' no room state available for ' + creep.room.name + ' at tick ' + Game.time);
-            return;
-        }
-
-        // ═══════════════════════════════════════════════════════
-        // ANCHOR FAST-PATH — skip all preamble for confirmed-anchored creeps.
-        // Once anchored, source/link IDs and creep position are invariant.
-        // We only need two Game.getObjectById calls per tick.
-        // Full revalidation (source exists, link exists, position correct)
-        // happens every 100 ticks via the hood refresh.
-        // ═══════════════════════════════════════════════════════
-        var anchor = anchorCache[creep.name];
-        if (anchor) {
-            var source = Game.getObjectById(anchor.srcId);
-            if (anchor.isContainerAnchor) {
-                var sourceContainer = Game.getObjectById(anchor.ctnId);
-                if (!source || !sourceContainer ||
-                    (Game.time % 100 === 0 && (creep.pos.x !== anchor.cx || creep.pos.y !== anchor.cy))) {
-                    delete anchorCache[creep.name];
-                    // Fall through to full path
-                } else {
-                    this.runContainerAnchored(creep, source, sourceContainer, state, anchor.cx, anchor.cy);
-                    return;
-                }
-            } else {
-                var sourceLink = Game.getObjectById(anchor.lnkId);
-                if (!source || !sourceLink || !sourceLink.my ||
-                    (Game.time % 100 === 0 && (creep.pos.x !== anchor.cx || creep.pos.y !== anchor.cy))) {
-                    delete anchorCache[creep.name];
-                } else {
-                    this.runAnchored(creep, source, sourceLink, state, anchor.cx, anchor.cy);
-                    return;
-                }
-            }
-        }
-
-        // ── Full path: validate source, find link, check positions ──
-
-        if (!creep.memory.sourceId) {
-            console.log('[Harvester] ' + creep.name + ' has no sourceId assigned!');
-            this.findNearestSource(creep, state);
-            return;
-        }
-
-        var source = Game.getObjectById(creep.memory.sourceId);
-        if (!source) {
-            console.log('[Harvester] ' + creep.name + ' assigned source no longer exists!');
-            this.findNearestSource(creep, state);
-            return;
-        }
-
-        // ═══════════════════════════════════════════════════════
-        // SOURCE-LINK ANCHOR — first-time detection and walk-in.
-        // Once confirmed at anchor position, sets creep._anchor for fast-path.
-        // ═══════════════════════════════════════════════════════
-        var sourceLink = this.getSourceLink(creep, source, state);
-
-        if (sourceLink) {
-            var cx = creep.pos.x, cy = creep.pos.y;
-            var dxS = Math.abs(cx - source.pos.x), dyS = Math.abs(cy - source.pos.y);
-            var atSource = (dxS <= 1 && dyS <= 1);
-            var dxL = Math.abs(cx - sourceLink.pos.x), dyL = Math.abs(cy - sourceLink.pos.y);
-            var atLink = (dxL <= 1 && dyL <= 1);
-
-            if (atSource && atLink) {
-                // ★ Establish anchor fast-path for all future ticks
-                anchorCache[creep.name] = {
-                    srcId: source.id,
-                    lnkId: sourceLink.id,
-                    cx: cx,
-                    cy: cy,
-                    moveCleared: false
-                };
-                this.runAnchored(creep, source, sourceLink, state, cx, cy);
-                return;
-            } else {
-                // ── NOT YET ANCHORED ──
-                if (!atSource) {
-                    if (creep.fatigue === 0) {
-                        var move = this.clearIfStuck(creep);
-                        creep.moveTo(source, {
-                            reusePath: move.reusePath,
-                            maxOps: move.maxOps,
-                            ignoreCreeps: move.ignoreCreeps
-                        });
-                    }
-                    return;
-                }
-                // atSource but not atLink — fall through to normal behavior below
-            }
-        } else {
-            // No source link — try container anchor
-            var sourceContainer = this.getSourceContainer(creep, source, state);
-            if (sourceContainer) {
-                if (creep.pos.x === sourceContainer.pos.x && creep.pos.y === sourceContainer.pos.y) {
-                    // Standing on the container tile — establish anchor
-                    anchorCache[creep.name] = {
-                        srcId: source.id,
-                        ctnId: sourceContainer.id,
-                        isContainerAnchor: true,
-                        cx: creep.pos.x,
-                        cy: creep.pos.y,
-                        moveCleared: false
-                    };
-                    this.runContainerAnchored(creep, source, sourceContainer, state, creep.pos.x, creep.pos.y);
-                    return;
-                } else {
-                    // If another creep is already standing on the container tile,
-                    // the anchor spot is taken — skip the container anchor entirely
-                    // and fall through to normal harvesting behavior.
-                    var occupants = sourceContainer.pos.lookFor(LOOK_CREEPS);
-                    if (occupants.length > 0 && occupants[0].name !== creep.name) {
-                        // Fall through to normal behavior below
-                    } else {
-                        // Walk onto the container tile.
-                        // Evict stale paths older than 3 ticks — the container is
-                        // always nearby and an old long-distance path will route
-                        // straight through impassable structures like spawns.
-                        if (creep.memory._move && creep.memory._move.time < Game.time - 3) {
-                            delete creep.memory._move;
-                        }
-                        if (creep.fatigue === 0) {
-                            var move = this.clearIfStuck(creep);
-                            creep.moveTo(sourceContainer.pos, {
-                                reusePath: move.reusePath,
-                                maxOps: move.maxOps,
-                                ignoreCreeps: move.ignoreCreeps,
-                                range: 0,
-                                costCallback: function(rn) {
-                                    var matrix = new PathFinder.CostMatrix();
-                                    var base = getRoomState.get(rn);
-                                    if (!base || !base.structuresByType) return matrix;
-                                    var allStructs = base.structuresByType;
-                                    for (var type in allStructs) {
-                                        var arr = allStructs[type];
-                                        if (!arr) continue;
-                                        for (var i = 0; i < arr.length; i++) {
-                                            var s = arr[i];
-                                            if (!s) continue;
-                                            if (type === STRUCTURE_ROAD) {
-                                                matrix.set(s.pos.x, s.pos.y, 1);
-                                            } else if (type === STRUCTURE_CONTAINER) {
-                                                // containers are walkable, leave at terrain cost
-                                            } else if (type === STRUCTURE_RAMPART) {
-                                                if (!s.my && !s.isPublic) matrix.set(s.pos.x, s.pos.y, 255);
-                                            } else if (type !== STRUCTURE_WALL) {
-                                                // walls are repair targets — leave walkable so
-                                                // the creep can path adjacent to them
-                                                matrix.set(s.pos.x, s.pos.y, 255);
-                                            }
-                                        }
-                                    }
-                                    return matrix;
-                                }
-                            });
-                        }
-                        return;
-                    }
-                }
-            }
-            // No container either — fall through to normal delivery behavior
-        }
-
-        // ═══════════════════════════════════════════════════════
-        // NORMAL (non-link) harvester behavior below
-        // ═══════════════════════════════════════════════════════
-
-        // Suicide flag if TTL low and source drained (last resort if renewal didn't save us)
-        if (creep.ticksToLive <= SUICIDE_TTL_THRESHOLD && source.energy === 0) {
-            creep.memory.suicideAfterDelivery = true;
-            if (creep.memory.idleUntil) delete creep.memory.idleUntil;
-        }
-
-        // Handle pending suicide
-        if (creep.memory.suicideAfterDelivery === true) {
-            if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-                this.deliverEnergy(creep, source, state);
-                if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-                    creep.say('💀');
-                    creep.suicide();
-                }
-            } else {
-                creep.say('💀');
-                creep.suicide();
-            }
-            return;
-        }
-
-        // Idle window: 0 intents per tick; break idle early if capacity opens or buffers disappear
-        if (creep.memory.idleUntil) {
-            if (Game.time < creep.memory.idleUntil) {
-                if (!this.shouldIdleAtSource(creep, source, state)) {
-                    delete creep.memory.idleUntil;
-                } else {
-                    return;
-                }
-            } else {
-                delete creep.memory.idleUntil;
-            }
-        }
-
-        // Consolidated state management using cached used capacity
-        const usedEnergy = creep.store.getUsedCapacity(RESOURCE_ENERGY);
-        const capEnergy = creep.store.getCapacity(RESOURCE_ENERGY);
-        if (usedEnergy === capEnergy) {
-            creep.memory.harvesting = false;
-        } else if (usedEnergy === 0) {
-            creep.memory.harvesting = true;
-        }
-
-        // Early exit: fatigued in delivery mode — only adjacent transfers, no movement
-        if (creep.fatigue > 0 && !creep.memory.harvesting) {
-            if (usedEnergy > 0) {
-                this.attemptImmediateTransfer(creep, state);
-            }
-            return;
-        }
-
-        // Main behavior
-        if (creep.memory.harvesting) {
-            if (source.energy === 0) {
-                this.handleDepletedSource(creep, source, state);
-                return;
-            }
-
-            if (!creep.pos.isNearTo(source)) {
-                if (creep.fatigue === 0) {
-                    var move = this.clearIfStuck(creep);
-                    creep.moveTo(source, {
-                        reusePath: move.reusePath,
-                        maxOps: move.maxOps,
-                        ignoreCreeps: move.ignoreCreeps
-                    });
-                }
-                return;
-            }
-
-            // Arrived at source - clear cached path to save memory
-            if (creep.memory._move) delete creep.memory._move;
-
-            var result = creep.harvest(source);
-            if (result === ERR_NOT_ENOUGH_RESOURCES) {
-                this.handleDepletedSource(creep, source, state);
-            }
-        } else {
-            this.deliverEnergy(creep, source, state);
-        }
-    },
-
-    // ═══════════════════════════════════════════════════════
-    // ANCHORED HARVESTER — extracted from run() for clarity.
-    // The creep is adjacent to both source and sourceLink.
-    // It never moves. Only interacts with structures in its
-    // pre-computed neighborhood (range ≤ 1 from creep).
-    //
-    // BATCHED TRANSFERS: To avoid wasting an intent (~0.2 CPU)
-    // every tick on tiny partial transfers, we only flush energy
-    // when: (a) carry is full, (b) source is depleted, or
-    // (c) an adjacent spawn needs energy. This cuts transfer
-    // intents by ~80-90% on typical bodies.
-    // ═══════════════════════════════════════════════════════
-    runAnchored: function(creep, source, sourceLink, state, cx, cy) {
-        // ── RENEWAL CHECK: leave anchor if needed ──
-        if (source.energy === 0 &&
-            creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0 &&
-            creep.ticksToLive < RENEW_TTL_THRESHOLD) {
-
-            var hood = this.getAnchorHood(creep, source, sourceLink, state, cx, cy);
-
-            // Try adjacent spawn first (stay anchored)
-            for (var i = 0; i < hood.spawns.length; i++) {
-                if (!hood.spawns[i].spawning) {
-                    if (creep.memory.suicideAfterDelivery) delete creep.memory.suicideAfterDelivery;
-                    hood.spawns[i].renewCreep(creep);
-                    creep.say('♻️');
-                    return;
-                }
-            }
-            // If there's an adjacent spawn that's just busy spawning, wait at anchor
-            if (hood.spawns.length > 0) {
-                if (Game.time % 10 === 0) creep.say('♻️⏳');
-                return;
-            }
-            // No adjacent spawn — fall through to normal anchored behavior
-        }
-
-        // ── ANCHORED: adjacent to both source and link. Never move. ──
-        // Guard _move delete: only read memory once, then set flag in anchor cache
-        var anchor = anchorCache[creep.name];
-        if (anchor && !anchor.moveCleared) {
-            if (creep.memory._move) delete creep.memory._move;
-            anchor.moveCleared = true;
-        }
-
-        // Build neighborhood (cached per tick, IDs recomputed every 50 ticks)
-        var hood = this.getAnchorHood(creep, source, sourceLink, state, cx, cy);
-
-        // Suicide: TTL low, source drained, creep empty (last resort if renewal didn't save us)
-        if (creep.ticksToLive <= SUICIDE_TTL_THRESHOLD && source.energy === 0 &&
-            creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-            creep.suicide();
-            return;
-        }
-
-        // Harvest if source has energy and we have room
-        if (source.energy > 0 && creep.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-            creep.harvest(source);
-        }
-
-        // ── BATCHED Transfer: only flush when carry full, source empty, or spawn hungry ──
-        var usedEnergy = creep.store.getUsedCapacity(RESOURCE_ENERGY);
-
-        if (usedEnergy > 0) {
-            var carryFull = (creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0);
-            var sourceDepleted = (source.energy === 0);
-            var shouldFlush = carryFull || sourceDepleted;
-
-            // Even if carry isn't full, flush immediately if an adjacent spawn needs energy
-            if (!shouldFlush) {
-                for (var si = 0; si < hood.spawns.length; si++) {
-                    if (hood.spawns[si].store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                        shouldFlush = true;
-                        break;
-                    }
-                }
-            }
-
-            if (shouldFlush) {
-                var transferred = false;
-                var transferredToContainer = false;
-
-                // Priority 1: adjacent spawns (hood is pre-filtered to range 1)
-                for (var si = 0; si < hood.spawns.length; si++) {
-                    var sp = hood.spawns[si];
-                    if (sp.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                        creep.transfer(sp, RESOURCE_ENERGY);
-                        transferred = true;
-                        break;
-                    }
-                }
-
-                // Priority 2: repair adjacent containers before feeding the link.
-                // repair() and transfer() share the same intent slot, so repairing
-                // delays the link fill by one tick — worth it to keep containers healthy.
-                // Cap at 240k: containers max at 250k but the last 10k isn't worth the CPU.
-                if (!transferred) {
-                    for (var ci = 0; ci < hood.containers.length; ci++) {
-                        var ct = hood.containers[ci];
-                        if (ct.hits < 240000) {
-                            creep.repair(ct);
-                            transferred = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Priority 3: primary source link
-                if (!transferred) {
-                    if (sourceLink.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                        creep.transfer(sourceLink, RESOURCE_ENERGY);
-                        transferred = true;
-                    }
-                }
-
-                // Priority 4: any other adjacent owned link (already filtered to range 1 + my)
-                if (!transferred) {
-                    for (var li = 0; li < hood.links.length; li++) {
-                        var lk = hood.links[li];
-                        if (lk.id === sourceLink.id) continue;
-                        if (lk.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                            creep.transfer(lk, RESOURCE_ENERGY);
-                            transferred = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Priority 5: adjacent containers (last resort overflow)
-                if (!transferred) {
-                    for (var ci = 0; ci < hood.containers.length; ci++) {
-                        var ct = hood.containers[ci];
-                        if (ct.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                            creep.transfer(ct, RESOURCE_ENERGY);
-                            transferred = true;
-                            transferredToContainer = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Pipeline: if source is depleted and we just fed a high-priority
-                // target (spawn/link), pre-withdraw from an adjacent container so
-                // we have energy ready next tick.
-                // withdraw() and transfer() are different intent pipelines,
-                // so both can execute in the same tick.
-                if (source.energy === 0 && transferred && !transferredToContainer) {
-                    this.hoodWithdrawContainer(creep, hood);
-                }
-            }
-        }
-
-        // Source depleted, creep empty: shuttle container → spawn/link
-        if (source.energy === 0 && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-            // If any adjacent spawn or link still needs energy,
-            // pull from a nearby container to keep them fed.
-            if (this.hoodTargetNeedsEnergy(hood, sourceLink)) {
-                this.hoodWithdrawContainer(creep, hood);
-            }
-
-            // Throttle idle say to every 10 ticks
-            if (typeof source.ticksToRegeneration === 'number' && Game.time % 10 === 0) {
-                creep.say('⏳' + source.ticksToRegeneration);
-            }
-        }
-    },
-
-    runContainerAnchored: function(creep, source, sourceContainer, state, cx, cy) {
-        // If a source link has since been built, break anchor so next tick re-derives.
-        // Recheck infrequently: links are built once and rarely change mid-game,
-        // and the scan costs a loop through the links array.
-        if (Game.time % 200 === 0) {
-            if (creep.memory.sourceLinkId === false) delete creep.memory.sourceLinkId;
-            var newLink = this.getSourceLink(creep, source, state);
-            if (newLink) {
-                delete anchorCache[creep.name];
-                return;
-            }
-        }
-
-        // Renewal check — same logic as runAnchored
-        if (source.energy === 0 &&
-            creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0 &&
-            creep.ticksToLive < RENEW_TTL_THRESHOLD) {
-
-            var hood = this.getAnchorHood(creep, source, null, state, cx, cy);
-
-            for (var i = 0; i < hood.spawns.length; i++) {
-                if (!hood.spawns[i].spawning) {
-                    if (creep.memory.suicideAfterDelivery) delete creep.memory.suicideAfterDelivery;
-                    hood.spawns[i].renewCreep(creep);
-                    creep.say('♻️');
-                    return;
-                }
-            }
-            if (hood.spawns.length > 0) {
-                if (Game.time % 10 === 0) creep.say('♻️⏳');
-                return;
-            }
-        }
-
-        // Clear cached path once on first anchored tick
-        var anchor = anchorCache[creep.name];
-        if (anchor && !anchor.moveCleared) {
-            if (creep.memory._move) delete creep.memory._move;
-            anchor.moveCleared = true;
-        }
-
-        // Suicide: TTL low, source drained, carry empty
-        if (creep.ticksToLive <= SUICIDE_TTL_THRESHOLD && source.energy === 0 &&
-            creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-            creep.suicide();
-            return;
-        }
-
-        // Harvest if possible
-        if (source.energy > 0 && creep.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-            creep.harvest(source);
-        }
-
-        var usedEnergy = creep.store.getUsedCapacity(RESOURCE_ENERGY);
-
-        if (usedEnergy > 0) {
-            var carryFull   = (creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0);
-            var sourceDepleted = (source.energy === 0);
-            var shouldFlush = carryFull || sourceDepleted;
-
-            var hood = this.getAnchorHood(creep, source, null, state, cx, cy);
-
-            // Also flush immediately if an adjacent spawn is hungry
-            if (!shouldFlush) {
-                for (var si = 0; si < hood.spawns.length; si++) {
-                    if (hood.spawns[si].store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                        shouldFlush = true;
-                        break;
-                    }
-                }
-            }
-
-            if (shouldFlush) {
-                var transferred = false;
-
-                // Priority 1: adjacent spawns (urgent — they block colony production)
-                for (var si = 0; si < hood.spawns.length; si++) {
-                    var sp = hood.spawns[si];
-                    if (sp.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                        creep.transfer(sp, RESOURCE_ENERGY);
-                        transferred = true;
-                        break;
-                    }
-                }
-
-                // Priority 2: repair or deposit into the container we're sitting on.
-                // repair() and transfer() share the same intent slot, so we pick one.
-                // Repair wins whenever the container is below max health; only deposit
-                // once it is fully repaired.
-                if (!transferred) {
-                    if (sourceContainer.hits < 240000) {
-                        creep.repair(sourceContainer);
-                    } else if (sourceContainer.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                        creep.transfer(sourceContainer, RESOURCE_ENERGY);
-                    }
-                }
-            }
-        }
-
-        // Idle message while waiting on regen
-        if (source.energy === 0 && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-            if (typeof source.ticksToRegeneration === 'number' && Game.time % 10 === 0) {
-                creep.say('⏳' + source.ticksToRegeneration);
-            }
-        }
-    },
-
-    // ───────────────────────────────────────────────
-    // Anchor neighborhood: structures at range ≤ 1 from the creep.
-    // ID sets recomputed every 50 ticks (catches construction/destruction).
-    // Live objects resolved once per tick via Game.getObjectById.
-    // Typical hood size: 0-4 structures total.
-    // ───────────────────────────────────────────────
-    getAnchorHood: function(creep, source, sourceLink, state, cx, cy) {
-        var anchor = anchorCache[creep.name];
-        if (!anchor) return { tick: Game.time, spawns: [], links: [], containers: [] };
-
-        // Per-tick cache hit
-        if (anchor.hoodTick === Game.time) {
-            return anchor.hood;
-        }
-
-        // Recompute ID sets every 50 ticks or on first call
-        if (!anchor.ids || (Game.time - anchor.idsAt) >= 50) {
-            var byType = state.structuresByType || {};
-            var sIds = [], lIds = [], cIds = [];
-
-            var spawns = byType[STRUCTURE_SPAWN] || [];
-            for (var i = 0; i < spawns.length; i++) {
-                var s = spawns[i];
-                if (!s.my) continue;
-                if (Math.abs(cx - s.pos.x) <= 1 && Math.abs(cy - s.pos.y) <= 1) {
-                    sIds.push(s.id);
-                }
-            }
-
-            var links = byType[STRUCTURE_LINK] || [];
-            for (var i = 0; i < links.length; i++) {
-                var s = links[i];
-                if (!s.my) continue;
-                if (Math.abs(cx - s.pos.x) <= 1 && Math.abs(cy - s.pos.y) <= 1) {
-                    lIds.push(s.id);
-                }
-            }
-
-            var containers = byType[STRUCTURE_CONTAINER] || [];
-            for (var i = 0; i < containers.length; i++) {
-                var s = containers[i];
-                if (Math.abs(cx - s.pos.x) <= 1 && Math.abs(cy - s.pos.y) <= 1) {
-                    cIds.push(s.id);
-                }
-            }
-
-            anchor.ids = { s: sIds, l: lIds, c: cIds };
-            anchor.idsAt = Game.time;
-        }
-
-        // Resolve live objects once per tick
-        var ids = anchor.ids;
-        var hood = { spawns: [], links: [], containers: [] };
-
-        for (var i = 0; i < ids.s.length; i++) {
-            var o = Game.getObjectById(ids.s[i]);
-            if (o) hood.spawns.push(o);
-        }
-        for (var i = 0; i < ids.l.length; i++) {
-            var o = Game.getObjectById(ids.l[i]);
-            if (o) hood.links.push(o);
-        }
-        for (var i = 0; i < ids.c.length; i++) {
-            var o = Game.getObjectById(ids.c[i]);
-            if (o) hood.containers.push(o);
-        }
-
-        anchor.hood = hood;
-        anchor.hoodTick = Game.time;
-        return hood;
-    },
-
-    // ───────────────────────────────────────────────
-    // Hood helpers — no range checks needed, hood is pre-filtered.
-    // Live objects already resolved, so no Game.getObjectById calls.
-    // ───────────────────────────────────────────────
-
-    // Withdraw from the first adjacent container that has energy.
-    hoodWithdrawContainer: function(creep, hood) {
-        for (var i = 0; i < hood.containers.length; i++) {
-            var ct = hood.containers[i];
-            if (ct.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-                creep.withdraw(ct, RESOURCE_ENERGY);
-                return true;
-            }
-        }
-        return false;
-    },
-
-    // Check whether any adjacent spawn or link still has free energy capacity.
-    hoodTargetNeedsEnergy: function(hood, sourceLink) {
-        for (var i = 0; i < hood.spawns.length; i++) {
-            if (hood.spawns[i].store.getFreeCapacity(RESOURCE_ENERGY) > 0) return true;
-        }
-        if (sourceLink.store.getFreeCapacity(RESOURCE_ENERGY) > 0) return true;
-        for (var i = 0; i < hood.links.length; i++) {
-            var lk = hood.links[i];
-            if (lk.id === sourceLink.id) continue;
-            if (lk.store.getFreeCapacity(RESOURCE_ENERGY) > 0) return true;
-        }
-        return false;
-    },
-
-    // ───────────────────────────────────────────────
-    // Stuck detection — heap memory only, never touches creep.memory.
-    // Returns { maxOps, reusePath, ignoreCreeps } to control the moveTo call.
-    //
-    // Normal:           maxOps 200,  reusePath 50, ignoreCreeps false
-    // Stuck ≥2 ticks:   maxOps 1500, reusePath 1,  ignoreCreeps true   (route around + push through)
-    // ───────────────────────────────────────────────
-    clearIfStuck: function(creep) {
-        var s = stuckCache[creep.name];
-        if (!s) {
-            stuckCache[creep.name] = { x: creep.pos.x, y: creep.pos.y, ticks: 0, repaths: 0 };
-            return { maxOps: 200, reusePath: 50, ignoreCreeps: false };
-        }
-
-        if (creep.pos.x !== s.x || creep.pos.y !== s.y) {
-            // Moved — reset fully
-            s.x = creep.pos.x; s.y = creep.pos.y;
-            s.ticks = 0; s.repaths = 0;
-            return { maxOps: 200, reusePath: 50, ignoreCreeps: false };
-        }
-
-        s.ticks++;
-
-        if (s.ticks >= 2) {  // Faster trigger than 3
-            // Nuke cached path EVERY stuck tick, not just on first detection
-            if (creep.memory._move) delete creep.memory._move;
-            s.repaths++;
-            s.ticks = 0;
-
-            var ignoreCreeps = s.repaths >= 1;  // Escalate faster
-            var maxOps = Math.min(1500 + s.repaths * 500, 5000);
-            return { maxOps: maxOps, reusePath: 1, ignoreCreeps: ignoreCreeps };
-        }
-
-        return { maxOps: 200, reusePath: 50, ignoreCreeps: false };
-    },
-
-    // ───────────────────────────────────────────────
-    // Source-link detection: find an owned link within range 2 of the assigned source.
-    // Cached in creep.memory.sourceLinkId and per-tick on the creep object.
-    // ───────────────────────────────────────────────
-    getSourceLink: function(creep, source, state) {
-        if (creep._sourceLinkTick === Game.time) {
-            return creep._sourceLinkObj || null;
-        }
-        creep._sourceLinkTick = Game.time;
-
-        if (creep.memory.sourceLinkId === false) {
-            creep._sourceLinkObj = null;
-            return null;
-        }
-
-        if (creep.memory.sourceLinkId) {
-            var cached = Game.getObjectById(creep.memory.sourceLinkId);
-            if (cached && cached.my) {
-                creep._sourceLinkObj = cached;
-                return cached;
-            }
-            delete creep.memory.sourceLinkId;
-        }
-
-        var byType = state.structuresByType || {};
-        var links = byType[STRUCTURE_LINK] || [];
-        var best = null, bestRange = Infinity;
-
-        for (var i = 0; i < links.length; i++) {
-            var link = links[i];
-            if (!link.my) continue;
-            var r = source.pos.getRangeTo(link);
-            if (r <= 2 && r < bestRange) {
-                best = link;
-                bestRange = r;
-            }
-        }
-
-        if (best) {
-            creep.memory.sourceLinkId = best.id;
-            creep._sourceLinkObj = best;
-            return best;
-        }
-
-        creep.memory.sourceLinkId = false;
-        creep._sourceLinkObj = null;
-        return null;
-    },
-
-    // ───────────────────────────────────────────────
-    // Container-at-source detection (analogous to getSourceLink)
-    // ───────────────────────────────────────────────
-    getSourceContainer: function(creep, source, state) {
-        if (creep._sourceCtnTick === Game.time) {
-            return creep._sourceCtnObj || null;
-        }
-        creep._sourceCtnTick = Game.time;
-
-        if (creep.memory.sourceCtnId) {
-            var cached = Game.getObjectById(creep.memory.sourceCtnId);
-            if (cached) {
-                creep._sourceCtnObj = cached;
-                return cached;
-            }
-            delete creep.memory.sourceCtnId;
-        }
-
-        var byType = state.structuresByType || {};
-        var containers = byType[STRUCTURE_CONTAINER] || [];
-        var best = null, bestRange = Infinity;
-
-        for (var i = 0; i < containers.length; i++) {
-            var c = containers[i];
-            var r = source.pos.getRangeTo(c);
-            if (r <= 1 && r < bestRange) {
-                best = c;
-                bestRange = r;
-            }
-        }
-
-        if (best) {
-            // If this is a newly discovered container, nuke any stale long-distance
-            // path so the creep recomputes from its current position rather than
-            // resuming a route that was calculated before the container existed.
-            if (creep.memory.sourceCtnId !== best.id) {
-                if (creep.memory._move) delete creep.memory._move;
-            }
-            creep.memory.sourceCtnId = best.id;
-            creep._sourceCtnObj = best;
-            return best;
-        }
-
-        creep._sourceCtnObj = null;
-        return null;
-    },
-
-    // ───────────────────────────────────────────────
-    // PWR_REGEN_SOURCE detection
-    // ───────────────────────────────────────────────
-    hasRegenPower: function(source) {
-        if (!source.effects || source.effects.length === 0) return false;
-        for (var i = 0; i < source.effects.length; i++) {
-            if (source.effects[i].effect === PWR_REGEN_SOURCE) return true;
-        }
-        return false;
-    },
-
-    // ───────────────────────────────────────────────
-
-    handleDepletedSource: function(creep, source, state) {
-        if (creep.ticksToLive <= SUICIDE_TTL_THRESHOLD) {
-            creep.memory.suicideAfterDelivery = true;
-            if (creep.memory.idleUntil) delete creep.memory.idleUntil;
-        }
-
-        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-            this.deliverEnergy(creep, source, state);
-            if (creep.memory.suicideAfterDelivery === true &&
-                creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-                creep.say('💀');
-                creep.suicide();
-            }
-        } else {
-            if (!creep.pos.isNearTo(source)) {
-                if (creep.fatigue === 0) {
-                    var move = this.clearIfStuck(creep);
-                    creep.moveTo(source, {
-                        reusePath: move.reusePath,
-                        maxOps: move.maxOps,
-                        ignoreCreeps: move.ignoreCreeps
-                    });
-                }
-            } else {
-                if (creep.memory._move) delete creep.memory._move;
-                if (typeof source.ticksToRegeneration === 'number' && Game.time % 10 === 0) {
-                    creep.say('⏳' + source.ticksToRegeneration);
-                }
-            }
-        }
-    },
-
-    deliverEnergy: function(creep, source, state) {
-        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-            delete creep.memory.deliveryId;
-            delete creep._deliveryTarget;
-            return;
-        }
-
-        let target = null;
-
-        if (creep.memory.deliveryId) {
-            if (creep._deliveryTarget && creep._deliveryTarget.id === creep.memory.deliveryId) {
-                target = creep._deliveryTarget;
-            } else {
-                target = Game.getObjectById(creep.memory.deliveryId);
-                if (target) creep._deliveryTarget = target;
-            }
-
-            if (!target || this.freeEnergyCapacity(target) <= 0) {
-                target = null;
-                delete creep.memory.deliveryId;
-                delete creep._deliveryTarget;
-            }
-        }
-
-        if (!target) {
-            target = this.pickDeliveryTargetQuick(creep, state, source);
-            if (target) {
-                creep.memory.deliveryId = target.id;
-                creep._deliveryTarget = target;
-            }
-        }
-
-        if (target) {
-            const tType = target.structureType;
-            const isAlreadyHighPri = (creep.pos.getRangeTo(target) <= 1 &&
-                (tType === STRUCTURE_SPAWN || tType === STRUCTURE_LINK));
-            if (!isAlreadyHighPri) {
-                const override = this.findAdjacentHighPriority(creep, state);
-                if (override) {
-                    target = override;
-                    creep.memory.deliveryId = target.id;
-                    creep._deliveryTarget = target;
-                }
-            }
-        }
-
-        if (!target) {
-            if (creep.pos.isNearTo(source) && this.shouldIdleAtSource(creep, source, state)) {
-                this.startIdle(creep);
-                return;
-            }
-            if (!creep.pos.inRangeTo(source, 3) && creep.fatigue === 0) {
-                creep.moveTo(source, {
-                    reusePath: 50,
-                    maxOps: 200,
-                    ignoreCreeps: false
-                });
-            } else if (creep.pos.inRangeTo(source, 3)) {
-                if (creep.memory._move) delete creep.memory._move;
-            }
-            return;
-        }
-
-        if (!creep.pos.isNearTo(target)) {
-            if (creep.fatigue === 0) {
-                creep.moveTo(target, {
-                    reusePath: 50,
-                    maxOps: 300,
-                    ignoreCreeps: false
-                });
-            }
-            return;
-        }
-
-        const tr = creep.transfer(target, RESOURCE_ENERGY);
-        if (tr === OK) {
-            if (this.freeEnergyCapacity(target) <= 0 || creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-                delete creep.memory.deliveryId;
-                delete creep._deliveryTarget;
-                if (creep.memory._move) delete creep.memory._move;
-            }
-            return;
-        }
-
-        if (tr === ERR_FULL || tr === ERR_INVALID_TARGET || tr === ERR_NOT_ENOUGH_RESOURCES) {
-            delete creep.memory.deliveryId;
-            delete creep._deliveryTarget;
-        }
-    },
-
-    freeEnergyCapacity: function(s) {
-        if (s.structureType === STRUCTURE_POWER_SPAWN) return 0;
-        var live = Game.getObjectById(s.id);
-        if (!live) return 0;
-        if (live.store && typeof live.store.getFreeCapacity === 'function') {
-            return live.store.getFreeCapacity(RESOURCE_ENERGY) || 0;
-        }
-        if (live.energyCapacity !== undefined && live.energy !== undefined) {
-            return live.energyCapacity - live.energy;
-        }
-        return 0;
-    },
-
-    pickDeliveryTargetQuick: function(creep, state, source) {
-        const byType = state.structuresByType || {};
-        const containers = byType[STRUCTURE_CONTAINER] || [];
-        const links = byType[STRUCTURE_LINK] || [];
-        const spawns = byType[STRUCTURE_SPAWN] || [];
-        const extensions = byType[STRUCTURE_EXTENSION] || [];
-
-        let best = null, bestRange = Infinity;
-
-        for (let i = 0; i < containers.length; i++) {
-            const s = containers[i];
-            if (this.freeEnergyCapacity(s) <= 0) continue;
-            const r = creep.pos.getRangeTo(s);
-            if (r <= 3 && r < bestRange) { best = s; bestRange = r; }
-        }
-        for (let i = 0; i < links.length; i++) {
-            const s = links[i];
-            if (s.my && this.freeEnergyCapacity(s) <= 0) continue;
-            const r = creep.pos.getRangeTo(s);
-            if (r <= 3 && r < bestRange) { best = s; bestRange = r; }
-        }
-        if (best) return best;
-
-        for (let i = 0; i < spawns.length; i++) {
-            const s = spawns[i];
-            if (this.freeEnergyCapacity(s) <= 0) continue;
-            if (creep.pos.getRangeTo(s) <= 1) return s;
-        }
-
-        best = null; bestRange = Infinity;
-        for (let i = 0; i < spawns.length; i++) {
-            const s = spawns[i];
-            if (this.freeEnergyCapacity(s) <= 0) continue;
-            const r = creep.pos.getRangeTo(s);
-            if (r < bestRange) { best = s; bestRange = r; }
-        }
-        for (let i = 0; i < extensions.length; i++) {
-            const s = extensions[i];
-            if (this.freeEnergyCapacity(s) <= 0) continue;
-            const r = creep.pos.getRangeTo(s);
-            if (r < bestRange) { best = s; bestRange = r; }
-        }
-        if (best) return best;
-
-        if (state.storage && this.freeEnergyCapacity(state.storage) > 0) {
-            return state.storage;
-        }
-
-        best = null; bestRange = Infinity;
-        for (let i = 0; i < containers.length; i++) {
-            const s = containers[i];
-            if (this.freeEnergyCapacity(s) <= 0) continue;
-            const r = creep.pos.getRangeTo(s);
-            if (r < bestRange) { best = s; bestRange = r; }
-        }
-        return best || null;
-    },
-
-    shouldIdleAtSource: function(creep, source, state) {
-        if (creep._idleCheckTick === Game.time) {
-            return !!creep._idleCheckResult;
-        }
-        creep._idleCheckTick = Game.time;
-
-        if (!creep.pos.isNearTo(source)) {
-            creep._idleCheckResult = false;
-            return false;
-        }
-
-        const byType = state.structuresByType || {};
-        const containers = byType[STRUCTURE_CONTAINER] || [];
-        const links = byType[STRUCTURE_LINK] || [];
-        const spawns = byType[STRUCTURE_SPAWN] || [];
-        const extensions = byType[STRUCTURE_EXTENSION] || [];
-
-        for (let i = 0; i < spawns.length; i++) {
-            if (creep.pos.getRangeTo(spawns[i]) <= 1 && this.freeEnergyCapacity(spawns[i]) > 0) {
-                creep._idleCheckResult = false;
-                return false;
-            }
-        }
-        for (let i = 0; i < extensions.length; i++) {
-            if (creep.pos.getRangeTo(extensions[i]) <= 1 && this.freeEnergyCapacity(extensions[i]) > 0) {
-                creep._idleCheckResult = false;
-                return false;
-            }
-        }
-
-        let sawAny = false;
-        const allBuffers = [];
-        for (let i = 0; i < containers.length; i++) allBuffers.push(containers[i]);
-        for (let i = 0; i < links.length; i++) {
-            const s = links[i];
-            if (s.my) allBuffers.push(s);
-        }
-
-        for (let i = 0; i < allBuffers.length; i++) {
-            const s = allBuffers[i];
-            if (creep.pos.getRangeTo(s) > 1) continue;
-            sawAny = true;
-            if (this.freeEnergyCapacity(s) > 0) {
-                creep._idleCheckResult = false;
-                return false;
-            }
-        }
-
-        creep._idleCheckResult = sawAny;
-        return sawAny;
-    },
-
-    attemptImmediateTransfer: function(creep, state) {
-        if (creep.store.getUsedCapacity(RESOURCE_ENERGY) <= 0) return false;
-
-        if (creep.memory.deliveryId) {
-            const t = Game.getObjectById(creep.memory.deliveryId);
-            if (t && creep.pos.isNearTo(t) && this.freeEnergyCapacity(t) > 0) {
-                const tr = creep.transfer(t, RESOURCE_ENERGY);
-                if (tr === OK) return true;
-                if (tr === ERR_FULL || tr === ERR_INVALID_TARGET) delete creep.memory.deliveryId;
-                return true;
-            }
-        }
-
-        const byType = state.structuresByType || {};
-        const containers = byType[STRUCTURE_CONTAINER] || [];
-        const links = byType[STRUCTURE_LINK] || [];
-        const spawns = byType[STRUCTURE_SPAWN] || [];
-        const extensions = byType[STRUCTURE_EXTENSION] || [];
-        const candidates = [];
-
-        for (let i = 0; i < spawns.length; i++) {
-            const s = spawns[i];
-            if (this.freeEnergyCapacity(s) > 0 && creep.pos.getRangeTo(s) <= 1) candidates.push(s);
-        }
-        for (let i = 0; i < links.length; i++) {
-            const s = links[i];
-            if (s.my && this.freeEnergyCapacity(s) > 0 && creep.pos.getRangeTo(s) <= 1) candidates.push(s);
-        }
-        for (let i = 0; i < containers.length; i++) {
-            const s = containers[i];
-            if (this.freeEnergyCapacity(s) > 0 && creep.pos.getRangeTo(s) <= 1) candidates.push(s);
-        }
-        for (let i = 0; i < extensions.length; i++) {
-            const s = extensions[i];
-            if (this.freeEnergyCapacity(s) > 0 && creep.pos.getRangeTo(s) <= 1) candidates.push(s);
-        }
-        if (state.storage && this.freeEnergyCapacity(state.storage) > 0 && creep.pos.getRangeTo(state.storage) <= 1) {
-            candidates.push(state.storage);
-        }
-
-        if (candidates.length === 0) return false;
-
-        const target = candidates[0];
-        const tr = creep.transfer(target, RESOURCE_ENERGY);
-        if (tr === OK) return true;
-        if (tr === ERR_FULL || tr === ERR_INVALID_TARGET) {
-            if (creep.memory.deliveryId && creep.memory.deliveryId === target.id) delete creep.memory.deliveryId;
-        }
-        return true;
-    },
-
-    findAdjacentHighPriority: function(creep, state) {
-        const byType = state.structuresByType || {};
-        const spawns = byType[STRUCTURE_SPAWN] || [];
-        const links = byType[STRUCTURE_LINK] || [];
-
-        for (let i = 0; i < spawns.length; i++) {
-            const s = spawns[i];
-            if (creep.pos.getRangeTo(s) <= 1 && this.freeEnergyCapacity(s) > 0) return s;
-        }
-        for (let i = 0; i < links.length; i++) {
-            const s = links[i];
-            if (s.my && creep.pos.getRangeTo(s) <= 1 && this.freeEnergyCapacity(s) > 0) return s;
-        }
-        return null;
-    },
-
-    startIdle: function(creep) {
-        if (!creep.memory.idleUntil || Game.time >= creep.memory.idleUntil) {
-            creep.memory.idleUntil = Game.time + 5;
-            if (creep.memory._move) delete creep.memory._move;
-            creep.say('😴');
-        }
-    },
-
-    findNearestSource: function(creep, state) {
-        var sources = state.sources || [];
-        if (sources.length === 0) return;
-
-        var closestSource = creep.pos.findClosestByRange(sources);
-        if (closestSource) {
-            creep.memory.sourceId = closestSource.id;
-            console.log('[Harvester] ' + creep.name + ' assigned to emergency source: ' + closestSource.id);
-        }
+  runSuspended: function(e) {
+    if (e.ticksToLive >= SUSPENDED_HARVESTER_RENEW_TTL) return;
+    if (Memory.harvesterPathVisName === e.name) drawHarvesterPath(e);
+    var r = getRoomState.get(e.room.name);
+    if (!r) return;
+    var t = r.structuresByType && r.structuresByType[STRUCTURE_SPAWN] || [];
+    var i = null;
+    var a = null;
+    var o = Infinity;
+    var s = Infinity;
+    for (var n = 0; n < t.length; n++) {
+      var f = t[n];
+      if (!f || !f.my) continue;
+      var m = e.pos.getRangeTo(f);
+      if (m < s) {
+        a = f;
+        s = m;
+      }
+      if (!f.spawning && m < o) {
+        i = f;
+        o = m;
+      }
     }
+    i = i || a;
+    if (!i) return;
+    if (e.pos.isNearTo(i)) {
+      if (e.memory._move) delete e.memory._move;
+      if (!i.spawning) i.renewCreep(e);
+      return;
+    }
+    delete anchorCache[e.name];
+    if (e.fatigue === 0) {
+      e.moveTo(i, {
+        reusePath: 20,
+        maxRooms: 1,
+        maxOps: 300
+      });
+    }
+  },
+  run: function(e) {
+    if (Memory.harvesterPathVisName === e.name) drawHarvesterPath(e);
+    if (Game.time - anchorCacheLastPrune > 200) {
+      anchorCacheLastPrune = Game.time;
+      for (var r in anchorCache) {
+        if (!Game.creeps[r]) delete anchorCache[r];
+      }
+      var t = getStuckCache();
+      for (var r in t) {
+        if (!Game.creeps[r]) delete t[r];
+      }
+    }
+    var i = getRoomState.get(e.room.name);
+    if (!i) {
+      console.log("[Harvester] " + e.name + " no room state available for " + e.room.name + " at tick " + Game.time);
+      return;
+    }
+    if (this.renewAtAdjacentSpawn(e, i)) return;
+    var a = anchorCache[e.name];
+    if (a) {
+      if (e.memory.harvesterWaypoints) this.clearWaypoints(e);
+      var o = Game.getObjectById(a.srcId);
+      if (a.isContainerAnchor) {
+        var s = Game.getObjectById(a.ctnId);
+        if (!o || !s || Game.time % 100 === 0 && (e.pos.x !== a.cx || e.pos.y !== a.cy)) {
+          delete anchorCache[e.name];
+        } else {
+          this.runContainerAnchored(e, o, s, i, a.cx, a.cy);
+          return;
+        }
+      } else {
+        var n = Game.getObjectById(a.lnkId);
+        var f = false;
+        if (o && n && n.my && Game.time % 100 === 0) {
+          var m = this.getSourceContainer(e, o, i);
+          f = m && m.pos.getRangeTo(n) <= 1 && (e.pos.x !== m.pos.x || e.pos.y !== m.pos.y);
+        }
+        if (!o || !n || !n.my || Game.time % 100 === 0 && (e.pos.x !== a.cx || e.pos.y !== a.cy) || f) {
+          delete anchorCache[e.name];
+        } else {
+          this.runAnchored(e, o, n, i, a.cx, a.cy);
+          return;
+        }
+      }
+    }
+    if (!e.memory.sourceId) {
+      console.log("[Harvester] " + e.name + " has no sourceId assigned!");
+      this.findNearestSource(e, i);
+      return;
+    }
+    var o = Game.getObjectById(e.memory.sourceId);
+    if (!o) {
+      console.log("[Harvester] " + e.name + " assigned source no longer exists!");
+      this.findNearestSource(e, i);
+      return;
+    }
+    var n = this.getSourceLink(e, o, i);
+    var s = this.getSourceContainer(e, o, i);
+    if (n) {
+      var c = e.pos.x, u = e.pos.y;
+      var l = Math.abs(c - o.pos.x), y = Math.abs(u - o.pos.y);
+      var h = l <= 1 && y <= 1;
+      var p = Math.abs(c - n.pos.x), g = Math.abs(u - n.pos.y);
+      var E = p <= 1 && g <= 1;
+      var v = s && c === s.pos.x && u === s.pos.y;
+      var R = s && s.pos.getRangeTo(n) <= 1;
+      if (h && E && (!s || v)) {
+        this.clearWaypoints(e);
+        anchorCache[e.name] = {
+          srcId: o.id,
+          lnkId: n.id,
+          cx: c,
+          cy: u,
+          moveCleared: false
+        };
+        this.runAnchored(e, o, n, i, c, u);
+        return;
+      }
+      if (s && R && !v) {
+        if (e.memory._move && e.memory._move.time < Game.time - 3) {
+          delete e.memory._move;
+        }
+        if (e.fatigue === 0) {
+          var d = this.clearIfStuck(e);
+          if (this.moveToWithWaypoints(e, s.pos, {
+            reusePath: d.reusePath,
+            maxOps: d.maxOps,
+            ignoreCreeps: d.ignoreCreeps,
+            range: 0,
+            costCallback: this.getHarvesterCostCallback
+          })) {
+            return;
+          }
+        }
+        return;
+      }
+      if (!h) {
+        if (e.fatigue === 0) {
+          var C = this.clearIfStuck(e);
+          if (this.moveToWithWaypoints(e, o.pos, {
+            reusePath: C.reusePath,
+            maxOps: C.maxOps,
+            ignoreCreeps: C.ignoreCreeps
+          })) {
+            return;
+          }
+        }
+        return;
+      }
+    } else {
+      if (s) {
+        if (e.pos.x === s.pos.x && e.pos.y === s.pos.y) {
+          this.clearWaypoints(e);
+          anchorCache[e.name] = {
+            srcId: o.id,
+            ctnId: s.id,
+            isContainerAnchor: true,
+            cx: e.pos.x,
+            cy: e.pos.y,
+            moveCleared: false
+          };
+          this.runContainerAnchored(e, o, s, i, e.pos.x, e.pos.y);
+          return;
+        } else {
+          if (e.memory._move && e.memory._move.time < Game.time - 3) {
+            delete e.memory._move;
+          }
+          if (e.fatigue === 0) {
+            var C = this.clearIfStuck(e);
+            if (this.moveToWithWaypoints(e, s.pos, {
+              reusePath: C.reusePath,
+              maxOps: C.maxOps,
+              ignoreCreeps: C.ignoreCreeps,
+              range: 0,
+              costCallback: this.getHarvesterCostCallback
+            })) {
+              return;
+            }
+          }
+          return;
+        }
+      }
+    }
+    if (e.ticksToLive <= SUICIDE_TTL_THRESHOLD && o.energy === 0) {
+      e.memory.suicideAfterDelivery = true;
+      if (e.memory.idleUntil) delete e.memory.idleUntil;
+    }
+    if (e.memory.suicideAfterDelivery === true) {
+      if (e.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+        this.deliverEnergy(e, o, i);
+        if (e.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+          e.say("💀");
+          e.suicide();
+        }
+      } else {
+        e.say("💀");
+        e.suicide();
+      }
+      return;
+    }
+    if (e.memory.idleUntil) {
+      if (Game.time < e.memory.idleUntil) {
+        if (!this.shouldIdleAtSource(e, o, i)) {
+          delete e.memory.idleUntil;
+        } else {
+          return;
+        }
+      } else {
+        delete e.memory.idleUntil;
+      }
+    }
+    const T = e.store.getUsedCapacity(RESOURCE_ENERGY);
+    const _ = e.store.getCapacity(RESOURCE_ENERGY);
+    if (T === _) {
+      e.memory.harvesting = false;
+    } else if (T === 0) {
+      e.memory.harvesting = true;
+    }
+    if (e.fatigue > 0 && !e.memory.harvesting) {
+      if (T > 0) {
+        this.attemptImmediateTransfer(e, i);
+      }
+      return;
+    }
+    if (e.memory.harvesting) {
+      if (o.energy === 0) {
+        this.handleDepletedSource(e, o, i);
+        return;
+      }
+      if (!e.pos.isNearTo(o)) {
+        if (e.fatigue === 0) {
+          var C = this.clearIfStuck(e);
+          if (this.moveToWithWaypoints(e, o.pos, {
+            reusePath: C.reusePath,
+            maxOps: C.maxOps,
+            ignoreCreeps: C.ignoreCreeps
+          })) {
+            return;
+          }
+        }
+        return;
+      }
+      if (e.memory._move) delete e.memory._move;
+      if (e.memory.harvesterWaypoints) this.clearWaypoints(e);
+      var S = e.harvest(o);
+      if (S === ERR_NOT_ENOUGH_RESOURCES) {
+        this.handleDepletedSource(e, o, i);
+      }
+    } else {
+      this.deliverEnergy(e, o, i);
+    }
+  },
+  runAnchored: function(e, r, t, i, a, o) {
+    var s = anchorCache[e.name];
+    if (s && !s.moveCleared) {
+      if (e.memory._move) delete e.memory._move;
+      s.moveCleared = true;
+    }
+    var n = this.getAnchorHood(e, r, t, i, a, o);
+    if (e.ticksToLive <= SUICIDE_TTL_THRESHOLD && r.energy === 0 && e.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+      e.suicide();
+      return;
+    }
+    if (r.energy > 0 && e.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+      e.harvest(r);
+    }
+    var f = e.store.getUsedCapacity(RESOURCE_ENERGY);
+    if (f > 0) {
+      var m = e.store.getFreeCapacity(RESOURCE_ENERGY) === 0;
+      var c = r.energy === 0;
+      var u = m || c;
+      if (!u) {
+        for (var l = 0; l < n.spawns.length; l++) {
+          if (n.spawns[l].store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            u = true;
+            break;
+          }
+        }
+      }
+      if (u) {
+        var y = false;
+        var h = false;
+        for (var l = 0; l < n.spawns.length; l++) {
+          var p = n.spawns[l];
+          if (p.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            e.transfer(p, RESOURCE_ENERGY);
+            y = true;
+            break;
+          }
+        }
+        if (!y) {
+          for (var g = 0; g < n.containers.length; g++) {
+            var E = n.containers[g];
+            if (E.hits < 24e4) {
+              e.repair(E);
+              y = true;
+              break;
+            }
+          }
+        }
+        if (!y) {
+          if (t.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            e.transfer(t, RESOURCE_ENERGY);
+            y = true;
+          }
+        }
+        if (!y) {
+          for (var v = 0; v < n.links.length; v++) {
+            var R = n.links[v];
+            if (R.id === t.id) continue;
+            if (R.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+              e.transfer(R, RESOURCE_ENERGY);
+              y = true;
+              break;
+            }
+          }
+        }
+        if (!y) {
+          for (var g = 0; g < n.containers.length; g++) {
+            var E = n.containers[g];
+            if (E.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+              e.transfer(E, RESOURCE_ENERGY);
+              y = true;
+              h = true;
+              break;
+            }
+          }
+        }
+        if (r.energy === 0 && y && !h) {
+          this.hoodWithdrawContainer(e, n);
+        }
+      }
+    }
+    if (r.energy === 0 && e.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+      if (this.hoodTargetNeedsEnergy(n, t)) {
+        this.hoodWithdrawContainer(e, n);
+      }
+      if (typeof r.ticksToRegeneration === "number" && Game.time % 10 === 0) {
+        e.say("⏳" + r.ticksToRegeneration);
+      }
+    }
+  },
+  runContainerAnchored: function(e, r, t, i, a, o) {
+    if (Game.time % 200 === 0) {
+      if (e.memory.sourceLinkId === false) delete e.memory.sourceLinkId;
+      var s = this.getSourceLink(e, r, i);
+      if (s) {
+        delete anchorCache[e.name];
+        return;
+      }
+    }
+    var n = anchorCache[e.name];
+    if (n && !n.moveCleared) {
+      if (e.memory._move) delete e.memory._move;
+      n.moveCleared = true;
+    }
+    if (e.ticksToLive <= SUICIDE_TTL_THRESHOLD && r.energy === 0 && e.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+      e.suicide();
+      return;
+    }
+    if (r.energy > 0 && e.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+      e.harvest(r);
+    }
+    var f = e.store.getUsedCapacity(RESOURCE_ENERGY);
+    if (f > 0) {
+      var m = e.store.getFreeCapacity(RESOURCE_ENERGY) === 0;
+      var c = r.energy === 0;
+      var u = m || c;
+      var l = this.getAnchorHood(e, r, null, i, a, o);
+      if (!u) {
+        for (var y = 0; y < l.spawns.length; y++) {
+          if (l.spawns[y].store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            u = true;
+            break;
+          }
+        }
+      }
+      if (u) {
+        var h = false;
+        for (var y = 0; y < l.spawns.length; y++) {
+          var p = l.spawns[y];
+          if (p.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            e.transfer(p, RESOURCE_ENERGY);
+            h = true;
+            break;
+          }
+        }
+        if (!h) {
+          if (t.hits < 24e4) {
+            e.repair(t);
+          } else if (t.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+            e.transfer(t, RESOURCE_ENERGY);
+          }
+        }
+      }
+    }
+    if (r.energy === 0 && e.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+      if (typeof r.ticksToRegeneration === "number" && Game.time % 10 === 0) {
+        e.say("⏳" + r.ticksToRegeneration);
+      }
+    }
+  },
+  getAnchorHood: function(e, r, t, i, a, o) {
+    var s = anchorCache[e.name];
+    if (!s) return {
+      tick: Game.time,
+      spawns: [],
+      links: [],
+      containers: []
+    };
+    if (s.hoodTick === Game.time) {
+      return s.hood;
+    }
+    if (!s.ids || Game.time - s.idsAt >= 50) {
+      var n = i.structuresByType || {};
+      var f = [], m = [], c = [];
+      var u = n[STRUCTURE_SPAWN] || [];
+      for (var l = 0; l < u.length; l++) {
+        var y = u[l];
+        if (!y.my) continue;
+        if (Math.abs(a - y.pos.x) <= 1 && Math.abs(o - y.pos.y) <= 1) {
+          f.push(y.id);
+        }
+      }
+      var h = n[STRUCTURE_LINK] || [];
+      for (var l = 0; l < h.length; l++) {
+        var y = h[l];
+        if (!y.my) continue;
+        if (Math.abs(a - y.pos.x) <= 1 && Math.abs(o - y.pos.y) <= 1) {
+          m.push(y.id);
+        }
+      }
+      var p = n[STRUCTURE_CONTAINER] || [];
+      for (var l = 0; l < p.length; l++) {
+        var y = p[l];
+        if (Math.abs(a - y.pos.x) <= 1 && Math.abs(o - y.pos.y) <= 1) {
+          c.push(y.id);
+        }
+      }
+      s.ids = {
+        s: f,
+        l: m,
+        c: c
+      };
+      s.idsAt = Game.time;
+    }
+    var g = s.ids;
+    var E = {
+      spawns: [],
+      links: [],
+      containers: []
+    };
+    for (var l = 0; l < g.s.length; l++) {
+      var v = Game.getObjectById(g.s[l]);
+      if (v) E.spawns.push(v);
+    }
+    for (var l = 0; l < g.l.length; l++) {
+      var v = Game.getObjectById(g.l[l]);
+      if (v) E.links.push(v);
+    }
+    for (var l = 0; l < g.c.length; l++) {
+      var v = Game.getObjectById(g.c[l]);
+      if (v) E.containers.push(v);
+    }
+    s.hood = E;
+    s.hoodTick = Game.time;
+    return E;
+  },
+  renewAtAdjacentSpawn: function(e, r) {
+    if (e.ticksToLive >= RENEW_TTL_THRESHOLD) return false;
+    var t = r.structuresByType && r.structuresByType[STRUCTURE_SPAWN] || [];
+    for (var i = 0; i < t.length; i++) {
+      var a = t[i];
+      if (!a || !a.my || a.spawning || !e.pos.isNearTo(a)) continue;
+      if (a.renewCreep(e) === OK) {
+        if (e.memory.suicideAfterDelivery) delete e.memory.suicideAfterDelivery;
+        e.say("♻️");
+        return true;
+      }
+    }
+    return false;
+  },
+  hoodWithdrawContainer: function(e, r) {
+    for (var t = 0; t < r.containers.length; t++) {
+      var i = r.containers[t];
+      if (i.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+        e.withdraw(i, RESOURCE_ENERGY);
+        return true;
+      }
+    }
+    return false;
+  },
+  hoodTargetNeedsEnergy: function(e, r) {
+    for (var t = 0; t < e.spawns.length; t++) {
+      if (e.spawns[t].store.getFreeCapacity(RESOURCE_ENERGY) > 0) return true;
+    }
+    if (r.store.getFreeCapacity(RESOURCE_ENERGY) > 0) return true;
+    for (var t = 0; t < e.links.length; t++) {
+      var i = e.links[t];
+      if (i.id === r.id) continue;
+      if (i.store.getFreeCapacity(RESOURCE_ENERGY) > 0) return true;
+    }
+    return false;
+  },
+  //                   ignoreCreeps false (one creep-aware path calculation)
+  clearIfStuck: function(e) {
+    var r = getStuckCache();
+    var t = r[e.name];
+    if (!t) {
+      r[e.name] = {
+        x: e.pos.x,
+        y: e.pos.y,
+        ticks: 0,
+        repaths: 0,
+        ignoreCreepsOverride: false
+      };
+      return {
+        maxOps: 200,
+        reusePath: 50,
+        ignoreCreeps: true
+      };
+    }
+    if (e.pos.x !== t.x || e.pos.y !== t.y) {
+      t.x = e.pos.x;
+      t.y = e.pos.y;
+      t.ticks = 0;
+      t.repaths = 0;
+      t.ignoreCreepsOverride = false;
+      return {
+        maxOps: 200,
+        reusePath: 50,
+        ignoreCreeps: true
+      };
+    }
+    t.ticks++;
+    if (t.ticks >= 5) {
+      if (e.memory._move) delete e.memory._move;
+      t.repaths++;
+      t.ticks = 0;
+      t.ignoreCreepsOverride = true;
+      var i = Math.min(1500 + t.repaths * 500, 5e3);
+      return {
+        maxOps: i,
+        reusePath: 5,
+        ignoreCreeps: false
+      };
+    }
+    if (t.ignoreCreepsOverride) {
+      t.ignoreCreepsOverride = false;
+    }
+    return {
+      maxOps: 200,
+      reusePath: 50,
+      ignoreCreeps: true
+    };
+  },
+  clearWaypoints: function(e) {
+    delete e.memory.harvesterWaypoints;
+    delete e.memory.harvesterWaypointsAt;
+  },
+  getCurrentWaypoint: function(e) {
+    var r = e.memory.harvesterWaypoints;
+    if (!r || !Array.isArray(r) || r.length === 0) return null;
+    while (r.length > 0) {
+      var t = r[0];
+      if (!t || typeof t.x !== "number" || typeof t.y !== "number" || !t.roomName) {
+        r.shift();
+        continue;
+      }
+      var i = new RoomPosition(t.x, t.y, t.roomName);
+      if (e.pos.isNearTo(i)) {
+        r.shift();
+        continue;
+      }
+      return i;
+    }
+    return null;
+  },
+  buildWaypointsAndMove: function(e, r, t) {
+    var i = PathFinder.search(e.pos, {
+      pos: r,
+      range: 0
+    }, {
+      maxOps: WAYPOINT_MAX_PATH_OPS,
+      plainCost: 2,
+      swampCost: 10,
+      roomCallback: this.getHarvesterCostCallback
+    });
+    if (i.incomplete || !i.path || i.path.length === 0) return false;
+    if (i.path.length <= WAYPOINT_SEGMENT_LENGTH) return false;
+    var a = [];
+    for (var o = WAYPOINT_SEGMENT_LENGTH; o < i.path.length; o += WAYPOINT_SEGMENT_LENGTH) {
+      var s = i.path[o];
+      if (s.x === r.x && s.y === r.y && s.roomName === r.roomName) continue;
+      a.push({
+        x: s.x,
+        y: s.y,
+        roomName: s.roomName
+      });
+    }
+    if (a.length === 0) return false;
+    e.memory.harvesterWaypoints = a;
+    e.memory.harvesterWaypointsAt = {
+      x: e.pos.x,
+      y: e.pos.y,
+      roomName: e.room.name,
+      time: Game.time
+    };
+    var n = this.getCurrentWaypoint(e);
+    if (n) {
+      if (e.fatigue === 0) this.moveToWaypoint(e, n, t);
+      return true;
+    }
+    return false;
+  },
+  moveToWaypoint: function(e, r, t) {
+    var i = {};
+    for (var a in t) i[a] = t[a];
+    i.reusePath = 5;
+    i.maxOps = 500;
+    i.range = 0;
+    if (e.fatigue === 0) e.moveTo(r, i);
+  },
+  moveToWithWaypoints: function(e, r, t) {
+    var i = e.memory.harvesterWaypoints;
+    if (i && Array.isArray(i) && i.length > 0) {
+      var a = e.memory.harvesterWaypointsAt;
+      if (!a || Game.time - a.time > WAYPOINT_MAX_AGE) {
+        this.clearWaypoints(e);
+        return this.buildWaypointsAndMove(e, r, t) || this.fallbackMoveTo(e, r, t);
+      }
+      var o = this.getCurrentWaypoint(e);
+      if (!o) {
+        this.clearWaypoints(e);
+        return this.fallbackMoveTo(e, r, t);
+      }
+      if (e.pos.getRangeTo(o) > WAYPOINT_SEGMENT_LENGTH * 2) {
+        this.clearWaypoints(e);
+        return this.buildWaypointsAndMove(e, r, t) || this.fallbackMoveTo(e, r, t);
+      }
+      if (e.fatigue === 0) this.moveToWaypoint(e, o, t);
+      return true;
+    }
+    return this.buildWaypointsAndMove(e, r, t) || this.fallbackMoveTo(e, r, t);
+  },
+  fallbackMoveTo: function(e, r, t) {
+    if (e.fatigue === 0) e.moveTo(r, t);
+    return true;
+  },
+  getHarvesterCostCallback: function(e) {
+    var r = new PathFinder.CostMatrix;
+    var t = Game.rooms[e];
+    if (t) {
+      var i = t.getTerrain();
+      for (var a = 0; a < 50; a++) {
+        for (var o = 0; o < 50; o++) {
+          if (i.get(a, o) === TERRAIN_MASK_WALL) {
+            r.set(a, o, 255);
+          }
+        }
+      }
+    }
+    var s = getRoomState.get(e);
+    if (!s || !s.structuresByType) return r;
+    var n = s.structuresByType;
+    for (var f in n) {
+      var m = n[f];
+      if (!m) continue;
+      for (var c = 0; c < m.length; c++) {
+        var u = m[c];
+        if (!u) continue;
+        if (f === STRUCTURE_ROAD) {
+          r.set(u.pos.x, u.pos.y, 1);
+        } else if (f === STRUCTURE_CONTAINER) {} else if (f === STRUCTURE_RAMPART) {
+          if (!u.my && !u.isPublic) r.set(u.pos.x, u.pos.y, 255);
+        } else if (f === STRUCTURE_WALL || OBSTACLE_OBJECT_TYPES.indexOf(f) !== -1) {
+          r.set(u.pos.x, u.pos.y, 255);
+        }
+      }
+    }
+    return r;
+  },
+  getSourceLink: function(e, r, t) {
+    if (e._sourceLinkTick === Game.time) {
+      return e._sourceLinkObj || null;
+    }
+    e._sourceLinkTick = Game.time;
+    if (e.memory.sourceLinkId === false) {
+      e._sourceLinkObj = null;
+      return null;
+    }
+    if (e.memory.sourceLinkId) {
+      var i = Game.getObjectById(e.memory.sourceLinkId);
+      if (i && i.my) {
+        e._sourceLinkObj = i;
+        return i;
+      }
+      delete e.memory.sourceLinkId;
+    }
+    var a = t.structuresByType || {};
+    var o = a[STRUCTURE_LINK] || [];
+    var s = null, n = Infinity;
+    for (var f = 0; f < o.length; f++) {
+      var m = o[f];
+      if (!m.my) continue;
+      var c = r.pos.getRangeTo(m);
+      if (c <= 2 && c < n) {
+        s = m;
+        n = c;
+      }
+    }
+    if (s) {
+      e.memory.sourceLinkId = s.id;
+      e._sourceLinkObj = s;
+      return s;
+    }
+    e.memory.sourceLinkId = false;
+    e._sourceLinkObj = null;
+    return null;
+  },
+  getSourceContainer: function(e, r, t) {
+    if (e._sourceCtnTick === Game.time) {
+      return e._sourceCtnObj || null;
+    }
+    e._sourceCtnTick = Game.time;
+    if (e.memory.sourceCtnId) {
+      var i = Game.getObjectById(e.memory.sourceCtnId);
+      if (i && i.pos.roomName === r.pos.roomName && r.pos.getRangeTo(i) <= 1) {
+        e._sourceCtnObj = i;
+        return i;
+      }
+      delete e.memory.sourceCtnId;
+    }
+    var a = t.structuresByType || {};
+    var o = a[STRUCTURE_CONTAINER] || [];
+    var s = null, n = Infinity;
+    for (var f = 0; f < o.length; f++) {
+      var m = o[f];
+      var c = r.pos.getRangeTo(m);
+      if (c <= 1 && c < n) {
+        s = m;
+        n = c;
+      }
+    }
+    if (s) {
+      if (e.memory.sourceCtnId !== s.id) {
+        if (e.memory._move) delete e.memory._move;
+      }
+      e.memory.sourceCtnId = s.id;
+      e._sourceCtnObj = s;
+      return s;
+    }
+    e._sourceCtnObj = null;
+    return null;
+  },
+  hasRegenPower: function(e) {
+    if (!e.effects || e.effects.length === 0) return false;
+    for (var r = 0; r < e.effects.length; r++) {
+      if (e.effects[r].effect === PWR_REGEN_SOURCE) return true;
+    }
+    return false;
+  },
+  handleDepletedSource: function(e, r, t) {
+    if (e.ticksToLive <= SUICIDE_TTL_THRESHOLD) {
+      e.memory.suicideAfterDelivery = true;
+      if (e.memory.idleUntil) delete e.memory.idleUntil;
+    }
+    if (e.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+      this.deliverEnergy(e, r, t);
+      if (e.memory.suicideAfterDelivery === true && e.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+        e.say("💀");
+        e.suicide();
+      }
+    } else {
+      if (!e.pos.isNearTo(r)) {
+        if (e.fatigue === 0) {
+          var i = this.clearIfStuck(e);
+          if (this.moveToWithWaypoints(e, r.pos, {
+            reusePath: i.reusePath,
+            maxOps: i.maxOps,
+            ignoreCreeps: i.ignoreCreeps
+          })) {
+            return;
+          }
+        }
+        return;
+      } else {
+        if (e.memory._move) delete e.memory._move;
+        if (e.memory.harvesterWaypoints) this.clearWaypoints(e);
+        if (typeof r.ticksToRegeneration === "number" && Game.time % 10 === 0) {
+          e.say("⏳" + r.ticksToRegeneration);
+        }
+      }
+    }
+  },
+  deliverEnergy: function(e, r, t) {
+    if (e.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+      delete e.memory.deliveryId;
+      delete e._deliveryTarget;
+      return;
+    }
+    let i = null;
+    if (e.memory.deliveryId) {
+      if (e._deliveryTarget && e._deliveryTarget.id === e.memory.deliveryId) {
+        i = e._deliveryTarget;
+      } else {
+        i = Game.getObjectById(e.memory.deliveryId);
+        if (i) e._deliveryTarget = i;
+      }
+      if (!i || this.freeEnergyCapacity(i) <= 0) {
+        i = null;
+        delete e.memory.deliveryId;
+        delete e._deliveryTarget;
+      }
+    }
+    if (!i) {
+      i = this.pickDeliveryTargetQuick(e, t, r);
+      if (i) {
+        e.memory.deliveryId = i.id;
+        e._deliveryTarget = i;
+      }
+    }
+    if (i) {
+      const r = i.structureType;
+      const a = e.pos.getRangeTo(i) <= 1 && (r === STRUCTURE_SPAWN || r === STRUCTURE_LINK);
+      if (!a) {
+        const r = this.findAdjacentHighPriority(e, t);
+        if (r) {
+          i = r;
+          e.memory.deliveryId = i.id;
+          e._deliveryTarget = i;
+        }
+      }
+    }
+    if (!i) {
+      if (e.pos.isNearTo(r) && this.shouldIdleAtSource(e, r, t)) {
+        this.startIdle(e);
+        return;
+      }
+      if (!e.pos.inRangeTo(r, 3) && e.fatigue === 0) {
+        if (this.moveToWithWaypoints(e, r.pos, {
+          reusePath: 50,
+          maxOps: 200,
+          ignoreCreeps: false
+        })) {
+          return;
+        }
+      } else if (e.pos.inRangeTo(r, 3)) {
+        if (e.memory._move) delete e.memory._move;
+        if (e.memory.harvesterWaypoints) this.clearWaypoints(e);
+      }
+      return;
+    }
+    if (!e.pos.isNearTo(i)) {
+      if (e.fatigue === 0) {
+        if (this.moveToWithWaypoints(e, i.pos, {
+          reusePath: 50,
+          maxOps: 300,
+          ignoreCreeps: false
+        })) {
+          return;
+        }
+      }
+      return;
+    }
+    const a = e.transfer(i, RESOURCE_ENERGY);
+    if (a === OK) {
+      if (this.freeEnergyCapacity(i) <= 0 || e.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+        delete e.memory.deliveryId;
+        delete e._deliveryTarget;
+        if (e.memory._move) delete e.memory._move;
+      }
+      return;
+    }
+    if (a === ERR_FULL || a === ERR_INVALID_TARGET || a === ERR_NOT_ENOUGH_RESOURCES) {
+      delete e.memory.deliveryId;
+      delete e._deliveryTarget;
+    }
+  },
+  freeEnergyCapacity: function(e) {
+    if (e.structureType === STRUCTURE_POWER_SPAWN) return 0;
+    var r = Game.getObjectById(e.id);
+    if (!r) return 0;
+    if (r.store && typeof r.store.getFreeCapacity === "function") {
+      return r.store.getFreeCapacity(RESOURCE_ENERGY) || 0;
+    }
+    if (r.energyCapacity !== undefined && r.energy !== undefined) {
+      return r.energyCapacity - r.energy;
+    }
+    return 0;
+  },
+  pickDeliveryTargetQuick: function(e, r, t) {
+    const i = r.structuresByType || {};
+    const a = i[STRUCTURE_CONTAINER] || [];
+    const o = i[STRUCTURE_LINK] || [];
+    const s = i[STRUCTURE_SPAWN] || [];
+    const n = i[STRUCTURE_EXTENSION] || [];
+    let f = null, m = Infinity;
+    for (let r = 0; r < a.length; r++) {
+      const t = a[r];
+      if (this.freeEnergyCapacity(t) <= 0) continue;
+      const i = e.pos.getRangeTo(t);
+      if (i <= 3 && i < m) {
+        f = t;
+        m = i;
+      }
+    }
+    for (let r = 0; r < o.length; r++) {
+      const t = o[r];
+      if (t.my && this.freeEnergyCapacity(t) <= 0) continue;
+      const i = e.pos.getRangeTo(t);
+      if (i <= 3 && i < m) {
+        f = t;
+        m = i;
+      }
+    }
+    if (f) return f;
+    for (let r = 0; r < s.length; r++) {
+      const t = s[r];
+      if (this.freeEnergyCapacity(t) <= 0) continue;
+      if (e.pos.getRangeTo(t) <= 1) return t;
+    }
+    f = null;
+    m = Infinity;
+    for (let r = 0; r < s.length; r++) {
+      const t = s[r];
+      if (this.freeEnergyCapacity(t) <= 0) continue;
+      const i = e.pos.getRangeTo(t);
+      if (i < m) {
+        f = t;
+        m = i;
+      }
+    }
+    for (let r = 0; r < n.length; r++) {
+      const t = n[r];
+      if (this.freeEnergyCapacity(t) <= 0) continue;
+      const i = e.pos.getRangeTo(t);
+      if (i < m) {
+        f = t;
+        m = i;
+      }
+    }
+    if (f) return f;
+    if (r.storage && this.freeEnergyCapacity(r.storage) > 0) {
+      return r.storage;
+    }
+    f = null;
+    m = Infinity;
+    for (let r = 0; r < a.length; r++) {
+      const t = a[r];
+      if (this.freeEnergyCapacity(t) <= 0) continue;
+      const i = e.pos.getRangeTo(t);
+      if (i < m) {
+        f = t;
+        m = i;
+      }
+    }
+    return f || null;
+  },
+  shouldIdleAtSource: function(e, r, t) {
+    if (e._idleCheckTick === Game.time) {
+      return !!e._idleCheckResult;
+    }
+    e._idleCheckTick = Game.time;
+    if (!e.pos.isNearTo(r)) {
+      e._idleCheckResult = false;
+      return false;
+    }
+    const i = t.structuresByType || {};
+    const a = i[STRUCTURE_CONTAINER] || [];
+    const o = i[STRUCTURE_LINK] || [];
+    const s = i[STRUCTURE_SPAWN] || [];
+    const n = i[STRUCTURE_EXTENSION] || [];
+    for (let r = 0; r < s.length; r++) {
+      if (e.pos.getRangeTo(s[r]) <= 1 && this.freeEnergyCapacity(s[r]) > 0) {
+        e._idleCheckResult = false;
+        return false;
+      }
+    }
+    for (let r = 0; r < n.length; r++) {
+      if (e.pos.getRangeTo(n[r]) <= 1 && this.freeEnergyCapacity(n[r]) > 0) {
+        e._idleCheckResult = false;
+        return false;
+      }
+    }
+    let f = false;
+    const m = [];
+    for (let e = 0; e < a.length; e++) m.push(a[e]);
+    for (let e = 0; e < o.length; e++) {
+      const r = o[e];
+      if (r.my) m.push(r);
+    }
+    for (let r = 0; r < m.length; r++) {
+      const t = m[r];
+      if (e.pos.getRangeTo(t) > 1) continue;
+      f = true;
+      if (this.freeEnergyCapacity(t) > 0) {
+        e._idleCheckResult = false;
+        return false;
+      }
+    }
+    e._idleCheckResult = f;
+    return f;
+  },
+  attemptImmediateTransfer: function(e, r) {
+    if (e.store.getUsedCapacity(RESOURCE_ENERGY) <= 0) return false;
+    if (e.memory.deliveryId) {
+      const r = Game.getObjectById(e.memory.deliveryId);
+      if (r && e.pos.isNearTo(r) && this.freeEnergyCapacity(r) > 0) {
+        const t = e.transfer(r, RESOURCE_ENERGY);
+        if (t === OK) return true;
+        if (t === ERR_FULL || t === ERR_INVALID_TARGET) delete e.memory.deliveryId;
+        return true;
+      }
+    }
+    const t = r.structuresByType || {};
+    const i = t[STRUCTURE_CONTAINER] || [];
+    const a = t[STRUCTURE_LINK] || [];
+    const o = t[STRUCTURE_SPAWN] || [];
+    const s = t[STRUCTURE_EXTENSION] || [];
+    const n = [];
+    for (let r = 0; r < o.length; r++) {
+      const t = o[r];
+      if (this.freeEnergyCapacity(t) > 0 && e.pos.getRangeTo(t) <= 1) n.push(t);
+    }
+    for (let r = 0; r < a.length; r++) {
+      const t = a[r];
+      if (t.my && this.freeEnergyCapacity(t) > 0 && e.pos.getRangeTo(t) <= 1) n.push(t);
+    }
+    for (let r = 0; r < i.length; r++) {
+      const t = i[r];
+      if (this.freeEnergyCapacity(t) > 0 && e.pos.getRangeTo(t) <= 1) n.push(t);
+    }
+    for (let r = 0; r < s.length; r++) {
+      const t = s[r];
+      if (this.freeEnergyCapacity(t) > 0 && e.pos.getRangeTo(t) <= 1) n.push(t);
+    }
+    if (r.storage && this.freeEnergyCapacity(r.storage) > 0 && e.pos.getRangeTo(r.storage) <= 1) {
+      n.push(r.storage);
+    }
+    if (n.length === 0) return false;
+    const f = n[0];
+    const m = e.transfer(f, RESOURCE_ENERGY);
+    if (m === OK) return true;
+    if (m === ERR_FULL || m === ERR_INVALID_TARGET) {
+      if (e.memory.deliveryId && e.memory.deliveryId === f.id) delete e.memory.deliveryId;
+    }
+    return true;
+  },
+  findAdjacentHighPriority: function(e, r) {
+    const t = r.structuresByType || {};
+    const i = t[STRUCTURE_SPAWN] || [];
+    const a = t[STRUCTURE_LINK] || [];
+    for (let r = 0; r < i.length; r++) {
+      const t = i[r];
+      if (e.pos.getRangeTo(t) <= 1 && this.freeEnergyCapacity(t) > 0) return t;
+    }
+    for (let r = 0; r < a.length; r++) {
+      const t = a[r];
+      if (t.my && e.pos.getRangeTo(t) <= 1 && this.freeEnergyCapacity(t) > 0) return t;
+    }
+    return null;
+  },
+  startIdle: function(e) {
+    if (!e.memory.idleUntil || Game.time >= e.memory.idleUntil) {
+      e.memory.idleUntil = Game.time + 5;
+      if (e.memory._move) delete e.memory._move;
+      e.say("😴");
+    }
+  },
+  findNearestSource: function(e, r) {
+    var t = r.sources || [];
+    if (t.length === 0) return;
+    var i = e.pos.findClosestByRange(t);
+    if (i) {
+      if (e.memory.sourceId !== i.id) {
+        e.memory.sourceId = i.id;
+        memoryManager.requestSave();
+      }
+      console.log("[Harvester] " + e.name + " assigned to emergency source: " + i.id);
+    }
+  }
 };
-
+//   harvesterPathVis(name?)  Enable / disable path overlay for one harvester.
+//   Set a creep name to draw its movement path as a dashed yellow polyline.
+//   Call with no argument to disable. See header comment for details.
+global.harvesterPathVis = function(e) {
+  if (!e) {
+    delete Memory.harvesterPathVisName;
+    console.log("[Harvester Paths] Disabled.");
+  } else {
+    Memory.harvesterPathVisName = e;
+    console.log("[Harvester Paths] Enabled for " + e + ". Call harvesterPathVis() to disable.");
+  }
+};
 module.exports = roleHarvester;

@@ -1,87 +1,65 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // marketRoomOrders.js
-// Purpose: Console command(s) to list your active market orders per owned room.
-// Usage:
-//   - In console: listRoomMarketOrders()                 -> lists for all owned rooms
-//   - In console: listRoomMarketOrders('W1N1')           -> lists only for a specific owned room
-// Notes:
+// Console globals: listRoomMarketOrders
+// Example: listRoomMarketOrders('E1N1') - List all market orders originating from room
+//   - listRoomMarketOrders()                 -> lists for all owned rooms
+//   - listRoomMarketOrders('W1N1')           -> lists only for a specific owned room
 //   - This module uses Game.market.orders (your orders) and filters by order.roomName.
 //   - Optional chaining is NOT used in this file (Screeps does not support it).
 //   - Output is printed to console and the function returns a structured result for programmatic use.
-//
-// References:
 //   - Game.market is the global market interface【1】.
 //   - Orders are tied to the room/terminal they were created from【2】.
 //   - getAllOrders is slow and intended for global queries; not used here【1】.
-
-function listRoomMarketOrders(targetRoomName) {
-  var results = {};
-
-  // Collect my orders from Game.market.orders (hash keyed by order id).
-  var myOrdersObj = Game.market && Game.market.orders ? Game.market.orders : {};
-  var myOrdersArr = [];
-  for (var oid in myOrdersObj) {
-    if (myOrdersObj[oid]) {
-      myOrdersArr.push(myOrdersObj[oid]);
+var util = require("util");
+function listRoomMarketOrders(e) {
+  var r = {};
+  var t = Game.market && Game.market.orders ? Game.market.orders : {};
+  var o = [];
+  for (var i in t) {
+    if (t[i]) {
+      o.push(t[i]);
     }
   }
-
-  // Iterate owned rooms and group active orders by room
-  for (var roomName in Game.rooms) {
-    var room = Game.rooms[roomName];
-    if (!room || !room.controller || !room.controller.my) continue;
-    if (targetRoomName && roomName !== targetRoomName) continue;
-
-    var roomOrders = [];
-    for (var i = 0; i < myOrdersArr.length; i++) {
-      var o = myOrdersArr[i];
-      if (!o) continue;
-
-      // Filter by the room the order is tied to
-      if (o.roomName === roomName) {
-        // Consider orders "active" if they have remaining amount, and either no 'active' flag or it's true
-        var isActiveFlag = (typeof o.active === 'undefined') ? true : !!o.active;
-        var hasRemaining = (typeof o.remainingAmount === 'number') ? (o.remainingAmount > 0) : true;
-
-        if (isActiveFlag && hasRemaining) {
-          roomOrders.push({
-            id: o.id,
-            type: o.type,                 // ORDER_BUY or ORDER_SELL
-            resourceType: o.resourceType, // e.g. RESOURCE_ENERGY
-            price: o.price,
-            remainingAmount: o.remainingAmount,
-            totalAmount: o.totalAmount,
-            created: o.created
+  for (var a in Game.rooms) {
+    var n = Game.rooms[a];
+    if (!n || !n.controller || !n.controller.my) continue;
+    if (e && a !== e) continue;
+    var u = [];
+    for (var m = 0; m < o.length; m++) {
+      var s = o[m];
+      if (!s) continue;
+      if (s.roomName === a) {
+        var c = typeof s.active === "undefined" ? true : !!s.active;
+        var l = util.getOrderRemaining(s) > 0;
+        if (c && l) {
+          u.push({
+            id: s.id,
+            type: s.type,
+            resourceType: s.resourceType,
+            price: s.price,
+            remainingAmount: util.getOrderRemaining(s),
+            totalAmount: s.totalAmount,
+            created: s.created
           });
         }
       }
     }
-
-    // Sort for readability: type, resourceType, then price desc
-    roomOrders.sort(function(a, b) {
-      if (a.type !== b.type) return a.type < b.type ? -1 : 1;
-      if (a.resourceType !== b.resourceType) return a.resourceType < b.resourceType ? -1 : 1;
-      return b.price - a.price;
+    u.sort(function(e, r) {
+      if (e.type !== r.type) return e.type < r.type ? -1 : 1;
+      if (e.resourceType !== r.resourceType) return e.resourceType < r.resourceType ? -1 : 1;
+      return r.price - e.price;
     });
-
-    // Console output summary
-    console.log("Room " + roomName + " - Active orders: " + roomOrders.length);
-    for (var j = 0; j < roomOrders.length; j++) {
-      var it = roomOrders[j];
-      console.log(
-        "  [" + it.type + "] " + it.resourceType +
-        " | price: " + it.price +
-        " | remaining: " + it.remainingAmount +
-        " | total: " + it.totalAmount +
-        " | id: " + it.id
-      );
+    console.log("Room " + a + " - Active orders: " + u.length);
+    for (var p = 0; p < u.length; p++) {
+      var d = u[p];
+      console.log("  [" + d.type + "] " + d.resourceType + " | price: " + d.price + " | remaining: " + d.remainingAmount + " | total: " + d.totalAmount + " | id: " + d.id);
     }
-
-    results[roomName] = roomOrders;
+    r[a] = u;
   }
-
-  return results;
+  return r;
 }
 
+global.listRoomMarketOrders = listRoomMarketOrders;
 module.exports = {
   listRoomMarketOrders: listRoomMarketOrders
 };

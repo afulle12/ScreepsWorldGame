@@ -1,34 +1,20 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // iff.js
-// Identify Friend or Foe logic, used for towers and monitoring hostiles.
-
-const IFF_WHITELIST = [
-    //'tarenty',
-    'TimelessTacticianEon',
-    'dustinc555',
-    'PhilipSchlump',
-    'Atlas_Dominion',
-    'Netloc',
-    'fR1dj'
-    // Add more player usernames to whitelist here.
-];
-
-function isFriendlyUsername(username) {
-    if (!username) return false;
-    return IFF_WHITELIST.includes(username);
+const IFF_WHITELIST = [ "TimelessTacticianEon", "dustinc555", "PhilipSchlump", "Atlas_Dominion", "Netloc", "fR1dj", "Ricardo306", "Broden1616" ];
+function isFriendlyUsername(e) {
+  if (!e) return false;
+  return IFF_WHITELIST.includes(e);
 }
 
 module.exports = {
-    isHostileCreep(creep) {
-        if (!creep || !creep.owner) return false;
-        return !IFF_WHITELIST.includes(creep.owner.username);
-    },
-
-    isWhitelistedCreep(creep) {
-        if (!creep || !creep.owner) return false;
-        return IFF_WHITELIST.includes(creep.owner.username);
-    },
-
-    isFriendlyUsername,   // NEW export
-
-    IFF_WHITELIST
+  isHostileCreep(e) {
+    if (!e || !e.owner) return false;
+    return !IFF_WHITELIST.includes(e.owner.username);
+  },
+  isWhitelistedCreep(e) {
+    if (!e || !e.owner) return false;
+    return IFF_WHITELIST.includes(e.owner.username);
+  },
+  isFriendlyUsername: isFriendlyUsername,
+  IFF_WHITELIST: IFF_WHITELIST
 };

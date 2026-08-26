@@ -1,585 +1,409 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// marketReport.js
+// Console globals: marketPrices, reverseReactionValue, transactionSummary
+// Example: marketPrices() - Generate summary of top traded resources and price trends
+// Example: reverseReactionValue('XGH2O') - Calculate net value of breaking down compound
+// Example: transactionSummary(100) - Print summary of recent market transactions
 /**
  * =============================================================================
  * MODULE: Market Report Generator with Reverse Reaction Calculator
  * =============================================================================
- * 
+ *
  * COMMANDS:
- * 
+ *
  *   transactionSummary(days)
  *     Generate a market report for the last N days.
  *     Example: transactionSummary(1)
  *     Example: transactionSummary(7)
- * 
+ *
  *   reverseReactionValue([resourceType])
  *     Calculate profit/loss from breaking down compounds and selling reagents.
  *     Example: reverseReactionValue()        // All compounds
  *     Example: reverseReactionValue('XGH2O') // Specific compound
- * 
+ *
  *   marketPrices([resourceType])
- *     Show current buy/sell prices for resources.
- *     Example: marketPrices()          // All resources with orders
+ *     Show canonical market, immediate sell, and immediate buy prices.
+ *     Dead commodities show recipe-derived theoretical values when available.
+ *     Example: marketPrices()          // All known resources/commodities
  *     Example: marketPrices('energy')  // Specific resource
- * 
+ *
  * =============================================================================
  */
-
-var TICKS_PER_DAY = 28800; // ~3 seconds per tick
-
-// Max safe integer in JavaScript (2^53 - 1)
+var util = require("util");
+var pricing = require("marketPricing");
+var TICKS_PER_DAY = 28800;
 var MAX_SAFE_INT = 9007199254740991;
+function getBestSellPrice(e) {
+  var r = pricing.getPriceProfile(e);
+  return r && typeof r.sellPrice === "number" ? r.sellPrice : null;
+}
 
-// =============================================================================
-// PRICE LOOKUP HELPERS
-// =============================================================================
-
-/**
- * Get the best buy price (lowest sell order) for a resource
- * This is what you'd pay to acquire the resource
- * @param {string} resourceType
- * @returns {number|null} Best buy price or null if no orders
- */
-function getBestBuyPrice(resourceType) {
-    var orders = Game.market.getAllOrders({
-        type: ORDER_SELL,
-        resourceType: resourceType
-    });
-    
-    if (!orders || orders.length === 0) return null;
-    
-    var best = null;
-    for (var i = 0; i < orders.length; i++) {
-        if (orders[i].amount > 0) {
-            if (best === null || orders[i].price < best) {
-                best = orders[i].price;
-            }
-        }
+function findReagents(e) {
+  for (var r in REACTIONS) {
+    var t = REACTIONS[r];
+    for (var i in t) {
+      if (t[i] === e) {
+        return {
+          a: r,
+          b: i
+        };
+      }
     }
-    return best;
+  }
+  return null;
 }
 
-/**
- * Get the best sell price (highest buy order) for a resource
- * This is what you'd receive when selling the resource
- * @param {string} resourceType
- * @returns {number|null} Best sell price or null if no orders
- */
-function getBestSellPrice(resourceType) {
-    var orders = Game.market.getAllOrders({
-        type: ORDER_BUY,
-        resourceType: resourceType
-    });
-    
-    if (!orders || orders.length === 0) return null;
-    
-    var best = null;
-    for (var i = 0; i < orders.length; i++) {
-        if (orders[i].amount > 0) {
-            if (best === null || orders[i].price > best) {
-                best = orders[i].price;
-            }
-        }
-    }
-    return best;
-}
-
-/**
- * Get average price from recent market history
- * @param {string} resourceType
- * @returns {number|null} Average price or null if no history
- */
-function getAveragePrice(resourceType) {
-    var history = Game.market.getHistory(resourceType);
-    if (!history || history.length === 0) return null;
-    
-    // Use the most recent day's average
-    return history[history.length - 1].avgPrice;
-}
-
-/**
- * Find the reagents that make up a compound
- * @param {string} compound
- * @returns {Object|null} {a: reagent1, b: reagent2} or null
- */
-function findReagents(compound) {
-    for (var left in REACTIONS) {
-        var row = REACTIONS[left];
-        for (var right in row) {
-            if (row[right] === compound) {
-                return { a: left, b: right };
-            }
-        }
-    }
-    return null;
-}
-
-/**
- * Get all compounds that can be broken down
- * @returns {Array} List of compound names
- */
 function getAllCompounds() {
-    var compounds = new Set();
-    for (var left in REACTIONS) {
-        var row = REACTIONS[left];
-        for (var right in row) {
-            compounds.add(row[right]);
-        }
+  var e = new Set;
+  for (var r in REACTIONS) {
+    var t = REACTIONS[r];
+    for (var i in t) {
+      e.add(t[i]);
     }
-    return Array.from(compounds);
+  }
+  return Array.from(e);
 }
 
-/**
- * Clamp a value to a safe integer and floor it
- * @param {number} value
- * @returns {number} Integer clamped to MAX_SAFE_INT
- */
-function toSafeInt(value) {
-    var floored = Math.floor(value);
-    if (floored > MAX_SAFE_INT) return MAX_SAFE_INT;
-    if (floored < -MAX_SAFE_INT) return -MAX_SAFE_INT;
-    return floored;
+function toSafeInt(e) {
+  var r = Math.floor(e);
+  if (r > MAX_SAFE_INT) return MAX_SAFE_INT;
+  if (r < -MAX_SAFE_INT) return -MAX_SAFE_INT;
+  return r;
 }
 
-// =============================================================================
-// REVERSE REACTION VALUE CALCULATOR
-// =============================================================================
-
-global.reverseReactionValue = function(specificResource) {
-    var compounds = specificResource ? [specificResource] : getAllCompounds();
-    var results = [];
-    
-    for (var i = 0; i < compounds.length; i++) {
-        var compound = compounds[i];
-        var reagents = findReagents(compound);
-        
-        if (!reagents) {
-            if (specificResource) {
-                return 'Error: ' + compound + ' is not a compound (cannot be broken down)';
-            }
-            continue;
-        }
-        
-        // Get prices
-        var compoundBuyPrice = getBestBuyPrice(compound);      // Cost to acquire compound
-        var compoundAvgPrice = getAveragePrice(compound);      // Historical average
-        var reagentASellPrice = getBestSellPrice(reagents.a);  // What we get for reagent A
-        var reagentBSellPrice = getBestSellPrice(reagents.b);  // What we get for reagent B
-        var reagentAAvgPrice = getAveragePrice(reagents.a);
-        var reagentBAvgPrice = getAveragePrice(reagents.b);
-        
-        // Skip if we don't have enough price data
-        if (compoundBuyPrice === null && compoundAvgPrice === null) continue;
-        if (reagentASellPrice === null && reagentAAvgPrice === null) continue;
-        if (reagentBSellPrice === null && reagentBAvgPrice === null) continue;
-        
-        // Use best available prices (prefer live market, fallback to average)
-        var buyAt = compoundBuyPrice !== null ? compoundBuyPrice : compoundAvgPrice;
-        var sellAAt = reagentASellPrice !== null ? reagentASellPrice : reagentAAvgPrice;
-        var sellBAt = reagentBSellPrice !== null ? reagentBSellPrice : reagentBAvgPrice;
-        
-        // Calculate profit per unit broken down
-        // Breaking down 1 compound yields 1 of each reagent (actually 5:5:5 ratio but same proportion)
-        var revenuePerUnit = sellAAt + sellBAt;
-        var costPerUnit = buyAt;
-        var profitPerUnit = revenuePerUnit - costPerUnit;
-        var profitPercent = costPerUnit > 0 ? (profitPerUnit / costPerUnit * 100) : 0;
-        
-        results.push({
-            compound: compound,
-            reagentA: reagents.a,
-            reagentB: reagents.b,
-            buyPrice: buyAt,
-            sellAPrice: sellAAt,
-            sellBPrice: sellBAt,
-            revenue: revenuePerUnit,
-            profit: profitPerUnit,
-            profitPercent: profitPercent,
-            // Flag if using historical vs live prices
-            usingAvgCompound: compoundBuyPrice === null,
-            usingAvgA: reagentASellPrice === null,
-            usingAvgB: reagentBSellPrice === null
-        });
+global.reverseReactionValue = function(e) {
+  var r = e ? [ e ] : getAllCompounds();
+  var t = [];
+  for (var i = 0; i < r.length; i++) {
+    var a = r[i];
+    var n = findReagents(a);
+    if (!n) {
+      if (e) {
+        return "Error: " + a + " is not a compound (cannot be broken down)";
+      }
+      continue;
     }
-    
-    // Sort by profit (most profitable first)
-    results.sort(function(a, b) { return b.profit - a.profit; });
-    
-    // Generate output
-    var output = [];
-    output.push('=== Reverse Reaction Profitability ===');
-    output.push('Buy compound -> Break down -> Sell reagents');
-    output.push('(* = using historical avg price, no live orders)');
-    output.push('');
-    
-    if (results.length === 0) {
-        output.push('No price data available for compounds.');
-        return output.join('\n');
+    var o = pricing.getPriceProfile(a);
+    var c = pricing.getPriceProfile(n.a);
+    var l = pricing.getPriceProfile(n.b);
+    var u = o.buyPrice !== null ? o.buyPrice : o.marketPriceSource === "THEORETICAL" ? o.marketPrice : null;
+    var s = c.sellPrice !== null ? c.sellPrice : c.marketPriceSource === "THEORETICAL" ? c.marketPrice : null;
+    var d = l.sellPrice !== null ? l.sellPrice : l.marketPriceSource === "THEORETICAL" ? l.marketPrice : null;
+    if (u === null || s === null || d === null) continue;
+    var f = u;
+    var h = s;
+    var v = d;
+    var m = h + v;
+    var p = f;
+    var P = m - p;
+    var g = p > 0 ? P / p * 100 : 0;
+    t.push({
+      compound: a,
+      reagentA: n.a,
+      reagentB: n.b,
+      buyPrice: f,
+      sellAPrice: h,
+      sellBPrice: v,
+      revenue: m,
+      profit: P,
+      profitPercent: g,
+      usingTheoreticalCompound: o.marketPriceSource === "THEORETICAL",
+      usingTheoreticalA: c.marketPriceSource === "THEORETICAL",
+      usingTheoreticalB: l.marketPriceSource === "THEORETICAL"
+    });
+  }
+  t.sort(function(e, r) {
+    return r.profit - e.profit;
+  });
+  var T = [];
+  T.push("=== Reverse Reaction Profitability ===");
+  T.push("Buy compound -> Break down -> Sell reagents");
+  T.push("(* = using a recipe-derived theoretical value; no reliable live side)");
+  T.push("");
+  if (t.length === 0) {
+    T.push("No price data available for compounds.");
+    return T.join("\n");
+  }
+  var A = t.filter(function(e) {
+    return e.profit > 0;
+  });
+  var b = t.filter(function(e) {
+    return e.profit <= 0;
+  });
+  if (A.length > 0) {
+    T.push("--- PROFITABLE BREAKDOWNS ---");
+    for (var y = 0; y < A.length; y++) {
+      var S = A[y];
+      var F = "";
+      if (S.usingTheoreticalCompound) F += "*";
+      T.push(S.compound + F + " (" + S.buyPrice.toFixed(2) + ") -> " + S.reagentA + (S.usingTheoreticalA ? "*" : "") + " (" + S.sellAPrice.toFixed(2) + ") + " + S.reagentB + (S.usingTheoreticalB ? "*" : "") + " (" + S.sellBPrice.toFixed(2) + ") = " + "+" + S.profit.toFixed(2) + " (" + S.profitPercent.toFixed(1) + "%)");
     }
-    
-    // Show profitable opportunities first
-    var profitable = results.filter(function(r) { return r.profit > 0; });
-    var unprofitable = results.filter(function(r) { return r.profit <= 0; });
-    
-    if (profitable.length > 0) {
-        output.push('--- PROFITABLE BREAKDOWNS ---');
-        for (var j = 0; j < profitable.length; j++) {
-            var r = profitable[j];
-            var flags = '';
-            if (r.usingAvgCompound) flags += '*';
-            output.push(
-                r.compound + flags + ' (' + r.buyPrice.toFixed(2) + ') -> ' +
-                r.reagentA + (r.usingAvgA ? '*' : '') + ' (' + r.sellAPrice.toFixed(2) + ') + ' +
-                r.reagentB + (r.usingAvgB ? '*' : '') + ' (' + r.sellBPrice.toFixed(2) + ') = ' +
-                '+' + r.profit.toFixed(2) + ' (' + r.profitPercent.toFixed(1) + '%)'
-            );
-        }
-        output.push('');
+    T.push("");
+  }
+  if (!e && b.length > 0) {
+    T.push("--- UNPROFITABLE (top 10) ---");
+    for (var I = 0; I < Math.min(10, b.length); I++) {
+      var S = b[I];
+      var F = "";
+      if (S.usingTheoreticalCompound) F += "*";
+      T.push(S.compound + F + " (" + S.buyPrice.toFixed(2) + ") -> " + S.reagentA + (S.usingTheoreticalA ? "*" : "") + " (" + S.sellAPrice.toFixed(2) + ") + " + S.reagentB + (S.usingTheoreticalB ? "*" : "") + " (" + S.sellBPrice.toFixed(2) + ") = " + S.profit.toFixed(2) + " (" + S.profitPercent.toFixed(1) + "%)");
     }
-    
-    if (!specificResource && unprofitable.length > 0) {
-        output.push('--- UNPROFITABLE (top 10) ---');
-        for (var k = 0; k < Math.min(10, unprofitable.length); k++) {
-            var r = unprofitable[k];
-            var flags = '';
-            if (r.usingAvgCompound) flags += '*';
-            output.push(
-                r.compound + flags + ' (' + r.buyPrice.toFixed(2) + ') -> ' +
-                r.reagentA + (r.usingAvgA ? '*' : '') + ' (' + r.sellAPrice.toFixed(2) + ') + ' +
-                r.reagentB + (r.usingAvgB ? '*' : '') + ' (' + r.sellBPrice.toFixed(2) + ') = ' +
-                r.profit.toFixed(2) + ' (' + r.profitPercent.toFixed(1) + '%)'
-            );
-        }
-    } else if (specificResource && unprofitable.length > 0) {
-        var r = unprofitable[0];
-        output.push('--- NOT PROFITABLE ---');
-        output.push(
-            r.compound + ' (' + r.buyPrice.toFixed(2) + ') -> ' +
-            r.reagentA + ' (' + r.sellAPrice.toFixed(2) + ') + ' +
-            r.reagentB + ' (' + r.sellBPrice.toFixed(2) + ') = ' +
-            r.profit.toFixed(2) + ' (' + r.profitPercent.toFixed(1) + '%)'
-        );
-    }
-    
-    return output.join('\n');
+  } else if (e && b.length > 0) {
+    var S = b[0];
+    T.push("--- NOT PROFITABLE ---");
+    T.push(S.compound + " (" + S.buyPrice.toFixed(2) + ") -> " + S.reagentA + " (" + S.sellAPrice.toFixed(2) + ") + " + S.reagentB + " (" + S.sellBPrice.toFixed(2) + ") = " + S.profit.toFixed(2) + " (" + S.profitPercent.toFixed(1) + "%)");
+  }
+  return T.join("\n");
 };
-
-// =============================================================================
-// MARKET PRICES HELPER
-// =============================================================================
-
-global.marketPrices = function(resourceType) {
-    if (resourceType) {
-        var buyPrice = getBestBuyPrice(resourceType);
-        var sellPrice = getBestSellPrice(resourceType);
-        var avgPrice = getAveragePrice(resourceType);
-        
-        var output = [];
-        output.push('=== ' + resourceType + ' Prices ===');
-        output.push('Best buy at (lowest sell order): ' + (buyPrice !== null ? buyPrice.toFixed(2) : 'N/A'));
-        output.push('Best sell at (highest buy order): ' + (sellPrice !== null ? sellPrice.toFixed(2) : 'N/A'));
-        output.push('Historical average: ' + (avgPrice !== null ? avgPrice.toFixed(2) : 'N/A'));
-        return output.join('\n');
+global.marketPrices = function(e) {
+  function formatProfile(e) {
+    var r = pricing.getPriceProfile(e);
+    var t = [];
+    t.push("=== " + e + " Prices ===");
+    t.push("Market price: " + (r.marketPrice !== null ? r.marketPrice.toFixed(3) : "N/A") + " [" + r.marketPriceSource + ", " + r.confidence + "]");
+    t.push("Sell now: " + (r.sellPrice !== null ? r.sellPrice.toFixed(3) : "N/A") + " [" + r.sellLiquidity + "]");
+    t.push("Buy now: " + (r.buyPrice !== null ? r.buyPrice.toFixed(3) : "N/A") + " [" + r.buyLiquidity + "]");
+    t.push("State: " + r.state);
+    t.push("Passive sell: " + (r.postedSellPrice !== null ? r.postedSellPrice.toFixed(3) : "N/A"));
+    t.push("Passive buy: " + (r.postedBuyPrice !== null ? r.postedBuyPrice.toFixed(3) : "N/A"));
+    if (r.historyPrice !== null) {
+      t.push("48h history: " + r.historyPrice.toFixed(3) + (r.historyIgnoredReason ? " [" + r.historyIgnoredReason + "]" : ""));
     }
-    
-    // Show all resources with orders
-    var allOrders = Game.market.getAllOrders();
-    var resources = {};
-    
-    for (var i = 0; i < allOrders.length; i++) {
-        var order = allOrders[i];
-        if (!resources[order.resourceType]) {
-            resources[order.resourceType] = { buy: null, sell: null };
-        }
-        if (order.type === ORDER_SELL) {
-            if (resources[order.resourceType].buy === null || order.price < resources[order.resourceType].buy) {
-                resources[order.resourceType].buy = order.price;
-            }
-        } else {
-            if (resources[order.resourceType].sell === null || order.price > resources[order.resourceType].sell) {
-                resources[order.resourceType].sell = order.price;
-            }
-        }
+    if (r.theoreticalPrice !== null) {
+      t.push("Theoretical: " + r.theoreticalPrice.toFixed(3) + " (cost " + r.theoreticalCost.toFixed(3) + ")");
     }
-    
-    var output = [];
-    output.push('=== Market Prices (Buy/Sell) ===');
-    var keys = Object.keys(resources).sort();
-    for (var j = 0; j < keys.length; j++) {
-        var res = keys[j];
-        var data = resources[res];
-        output.push(
-            res + ': Buy@' + (data.buy !== null ? data.buy.toFixed(2) : 'N/A') +
-            ' / Sell@' + (data.sell !== null ? data.sell.toFixed(2) : 'N/A')
-        );
-    }
-    return output.join('\n');
+    return t.join("\n");
+  }
+  if (e) return formatProfile(e);
+  var r = {};
+  var t = util.marketSnapshot().all;
+  for (var i = 0; i < t.length; i++) r[t[i].resourceType] = true;
+  if (typeof COMMODITIES !== "undefined" && COMMODITIES) {
+    for (var a in COMMODITIES) r[a] = true;
+  }
+  var n = [ "=== Market Prices ===" ];
+  var o = Object.keys(r).sort();
+  for (var c = 0; c < o.length; c++) {
+    var l = pricing.getPriceProfile(o[c]);
+    n.push(o[c] + ": market@" + (l.marketPrice !== null ? l.marketPrice.toFixed(3) : "N/A") + " / sell@" + (l.sellPrice !== null ? l.sellPrice.toFixed(3) : "N/A") + " / buy@" + (l.buyPrice !== null ? l.buyPrice.toFixed(3) : "N/A") + " [" + l.state + "/" + l.marketPriceSource + "]");
+  }
+  return n.join("\n");
 };
-
-// =============================================================================
-// TRANSACTION SUMMARY (FIXED)
-// =============================================================================
-
-global.transactionSummary = function(days) {
-    if (days === undefined) days = 1;
-    if (typeof days !== 'number') {
-        return 'Error: input days as integer.';
+global.transactionSummary = function(e) {
+  if (e === undefined) e = 1;
+  if (typeof e !== "number") {
+    return "Error: input days as integer.";
+  }
+  var r = e * TICKS_PER_DAY;
+  var t = Game.time - r;
+  var i = {};
+  var a = {};
+  var n = {};
+  var o = {};
+  var c = 0;
+  var l = 0;
+  var u = {};
+  var s = Game.market.incomingTransactions;
+  var d = Game.market.outgoingTransactions;
+  var f = Game.time;
+  var h = false;
+  var v = 0;
+  if (s.length > 0) {
+    var m = s[s.length - 1];
+    if (m.time > t) {
+      h = true;
+      if (m.time < f) f = m.time;
     }
-
-    var timeWindow = days * TICKS_PER_DAY;
-    var cutoffTime = Game.time - timeWindow;
-
-    // --- Data Processing ---
-    var incomeStats = {};
-    var expenseStats = {};
-    var buyers = {};
-    var sellers = {};
-    
-    // Totals for Net Profit
-    var totalIncome = 0;
-    var totalExpense = 0;
-
-    // Per-day transaction counters (keyed by day number offset from now)
-    var dailyTransactions = {};
-
-    var incoming = Game.market.incomingTransactions;
-    var outgoing = Game.market.outgoingTransactions;
-    
-    // Track oldest transaction seen to warn about data limits
-    var oldestSeen = Game.time;
-    var partialData = false;
-
-    // Total transaction count within window
-    var totalTransactionCount = 0;
-
-    // 1. Process Income (YOU SOLD something, money coming in)
-    if (incoming.length > 0) {
-        var lastIn = incoming[incoming.length - 1];
-        if (lastIn.time > cutoffTime) {
-            partialData = true;
-            if (lastIn.time < oldestSeen) oldestSeen = lastIn.time;
-        }
-
-        for (var i = 0; i < incoming.length; i++) {
-            var t = incoming[i];
-            if (t.time < cutoffTime) continue;
-
-            totalTransactionCount++;
-
-            // Determine which day bucket this transaction falls into
-            var ticksAgo = Game.time - t.time;
-            var dayIndex = Math.floor(ticksAgo / TICKS_PER_DAY);
-            if (dailyTransactions[dayIndex] === undefined) {
-                dailyTransactions[dayIndex] = 0;
-            }
-            dailyTransactions[dayIndex]++;
-
-            // BUG FIX: Price is in t.order.price, not t.unitPrice
-            var unitPrice = 0;
-            if (t.order && typeof t.order.price === 'number') {
-                unitPrice = t.order.price;
-            }
-            
-            var creditValue = t.amount * unitPrice;
-            totalIncome = totalIncome + creditValue;
-
-            var res = t.resourceType;
-            if (incomeStats[res] === undefined) {
-                incomeStats[res] = { count: 0, credits: 0, transactions: 0, avgPrice: 0 };
-            }
-            incomeStats[res].count = incomeStats[res].count + t.amount;
-            incomeStats[res].credits = incomeStats[res].credits + creditValue;
-            incomeStats[res].transactions = incomeStats[res].transactions + 1;
-
-            var buyerName = 'Unknown';
-            if (t.sender && t.sender.username) {
-                buyerName = t.sender.username;
-            }
-            if (buyers[buyerName] === undefined) buyers[buyerName] = 0;
-            buyers[buyerName] = buyers[buyerName] + creditValue;
-        }
+    for (var p = 0; p < s.length; p++) {
+      var P = s[p];
+      if (P.time < t) continue;
+      v++;
+      var g = Game.time - P.time;
+      var T = Math.floor(g / TICKS_PER_DAY);
+      if (u[T] === undefined) {
+        u[T] = 0;
+      }
+      u[T]++;
+      var A = 0;
+      if (P.order && typeof P.order.price === "number") {
+        A = P.order.price;
+      }
+      var b = P.amount * A;
+      c = c + b;
+      var y = P.resourceType;
+      if (i[y] === undefined) {
+        i[y] = {
+          count: 0,
+          credits: 0,
+          transactions: 0,
+          avgPrice: 0
+        };
+      }
+      i[y].count = i[y].count + P.amount;
+      i[y].credits = i[y].credits + b;
+      i[y].transactions = i[y].transactions + 1;
+      var S = "Unknown";
+      if (P.sender && P.sender.username) {
+        S = P.sender.username;
+      }
+      if (n[S] === undefined) n[S] = 0;
+      n[S] = n[S] + b;
     }
-    
-    // Calculate average prices for income
-    for (var iRes in incomeStats) {
-        if (incomeStats[iRes].count > 0) {
-            incomeStats[iRes].avgPrice = incomeStats[iRes].credits / incomeStats[iRes].count;
-        }
+  }
+  for (var F in i) {
+    if (i[F].count > 0) {
+      i[F].avgPrice = i[F].credits / i[F].count;
     }
-
-    // 2. Process Expenses (YOU BOUGHT something, money going out)
-    if (outgoing.length > 0) {
-        var lastOut = outgoing[outgoing.length - 1];
-        if (lastOut.time > cutoffTime) {
-            partialData = true;
-            if (lastOut.time < oldestSeen) oldestSeen = lastOut.time;
-        }
-
-        for (var j = 0; j < outgoing.length; j++) {
-            var t = outgoing[j];
-            if (t.time < cutoffTime) continue;
-
-            totalTransactionCount++;
-
-            // Determine which day bucket this transaction falls into
-            var ticksAgo = Game.time - t.time;
-            var dayIndex = Math.floor(ticksAgo / TICKS_PER_DAY);
-            if (dailyTransactions[dayIndex] === undefined) {
-                dailyTransactions[dayIndex] = 0;
-            }
-            dailyTransactions[dayIndex]++;
-
-            // BUG FIX: Price is in t.order.price, not t.unitPrice
-            var unitPrice = 0;
-            if (t.order && typeof t.order.price === 'number') {
-                unitPrice = t.order.price;
-            }
-            
-            var creditCost = t.amount * unitPrice;
-            totalExpense = totalExpense + creditCost;
-
-            var res = t.resourceType;
-            if (expenseStats[res] === undefined) {
-                expenseStats[res] = { count: 0, credits: 0, transactions: 0, avgPrice: 0 };
-            }
-            expenseStats[res].count = expenseStats[res].count + t.amount;
-            expenseStats[res].credits = expenseStats[res].credits + creditCost;
-            expenseStats[res].transactions = expenseStats[res].transactions + 1;
-
-            var sellerName = 'Unknown';
-            if (t.recipient && t.recipient.username) {
-                sellerName = t.recipient.username;
-            }
-            if (sellers[sellerName] === undefined) sellers[sellerName] = 0;
-            sellers[sellerName] = sellers[sellerName] + creditCost;
-        }
+  }
+  if (d.length > 0) {
+    var I = d[d.length - 1];
+    if (I.time > t) {
+      h = true;
+      if (I.time < f) f = I.time;
     }
-    
-    // Calculate average prices for expenses
-    for (var eRes in expenseStats) {
-        if (expenseStats[eRes].count > 0) {
-            expenseStats[eRes].avgPrice = expenseStats[eRes].credits / expenseStats[eRes].count;
-        }
+    for (var k = 0; k < d.length; k++) {
+      var P = d[k];
+      if (P.time < t) continue;
+      v++;
+      var g = Game.time - P.time;
+      var T = Math.floor(g / TICKS_PER_DAY);
+      if (u[T] === undefined) {
+        u[T] = 0;
+      }
+      u[T]++;
+      var A = 0;
+      if (P.order && typeof P.order.price === "number") {
+        A = P.order.price;
+      }
+      var x = P.amount * A;
+      l = l + x;
+      var y = P.resourceType;
+      if (a[y] === undefined) {
+        a[y] = {
+          count: 0,
+          credits: 0,
+          transactions: 0,
+          avgPrice: 0
+        };
+      }
+      a[y].count = a[y].count + P.amount;
+      a[y].credits = a[y].credits + x;
+      a[y].transactions = a[y].transactions + 1;
+      var E = "Unknown";
+      if (P.recipient && P.recipient.username) {
+        E = P.recipient.username;
+      }
+      if (o[E] === undefined) o[E] = 0;
+      o[E] = o[E] + x;
     }
-
-    // --- Save ONLY last 24h transaction count to Memory (wipe stale data) ---
-    // Count transactions from just the last 24h regardless of report window
-    var last24hCutoff = Game.time - TICKS_PER_DAY;
-    var last24hCount = 0;
-
-    for (var ii = 0; ii < incoming.length; ii++) {
-        if (incoming[ii].time >= last24hCutoff) last24hCount++;
+  }
+  for (var R in a) {
+    if (a[R].count > 0) {
+      a[R].avgPrice = a[R].credits / a[R].count;
     }
-    for (var jj = 0; jj < outgoing.length; jj++) {
-        if (outgoing[jj].time >= last24hCutoff) last24hCount++;
-    }
-
-    // Wipe and replace — only the current 24h window is stored
-    Memory.marketStats = {
-        transactions24h: toSafeInt(last24hCount),
-        recordedAtTick: toSafeInt(Game.time)
-    };
-
-    // --- HTML Generation (Table-Safe Mode) ---
-    var msg = '<h1>Market Report (' + days + ' Days)</h1>';
-
-    if (partialData) {
-        var actualDays = (Game.time - oldestSeen) / TICKS_PER_DAY;
-        msg += '<p><strong>WARNING: Limited Data.</strong><br>';
-        msg += 'Server history limit reached. Report covers last ' + actualDays.toFixed(2) + ' days.</p>';
-    }
-
-    // Summary Section
-    var netProfit = totalIncome - totalExpense;
-    msg += '<p>';
-    msg += 'Total Income: ' + totalIncome.toFixed(0) + '<br>';
-    msg += 'Total Expense: ' + totalExpense.toFixed(0) + '<br>';
-    msg += '<strong>Net Profit: ' + netProfit.toFixed(0) + '</strong><br>';
-    msg += 'Total Transactions: ' + toSafeInt(totalTransactionCount) + '<br>';
-    msg += 'Transactions (last 24h): ' + toSafeInt(last24hCount);
-    msg += '</p>';
-
-    // Table: Transactions Per 24h Period
-    msg += '<h3>Transactions Per 24h Period</h3>';
-    msg += '<table border="1" cellspacing="0" cellpadding="4">';
-    msg += '<tr><th>Period</th><th>Transactions</th></tr>';
-    var sortedDayKeys = Object.keys(dailyTransactions).map(Number).sort(function(a, b) { return a - b; });
-    for (var d = 0; d < sortedDayKeys.length; d++) {
-        var dk = sortedDayKeys[d];
-        var label = dk === 0 ? 'Today (last 24h)' : dk + ' day' + (dk > 1 ? 's' : '') + ' ago';
-        msg += '<tr><td>' + label + '</td><td>' + toSafeInt(dailyTransactions[dk]) + '</td></tr>';
-    }
-    msg += '</table>';
-
-    // Helper to make simple rows
-    function makeRow(c1, c2, c3, c4, c5) {
-        var r = '<tr>';
-        r += '<td>' + c1 + '</td>';
-        r += '<td>' + c2 + '</td>';
-        if (c3 !== undefined) r += '<td>' + c3 + '</td>';
-        if (c4 !== undefined) r += '<td>' + c4 + '</td>';
-        if (c5 !== undefined) r += '<td>' + c5 + '</td>';
-        r += '</tr>';
-        return r;
-    }
-
-    // Table 1: Income
-    msg += '<h3>Income (Sold)</h3>';
-    msg += '<table border="1" cellspacing="0" cellpadding="4">';
-    msg += '<tr><th>Resource</th><th>Amount</th><th>Credits</th><th>Avg Price</th><th>Trans</th></tr>';
-    for (var iRes in incomeStats) {
-        var d = incomeStats[iRes];
-        msg += makeRow(iRes, d.count, d.credits.toFixed(0), d.avgPrice.toFixed(2), d.transactions);
-    }
-    msg += '</table>';
-
-    // Table 2: Expense
-    msg += '<h3>Expenses (Bought)</h3>';
-    msg += '<table border="1" cellspacing="0" cellpadding="4">';
-    msg += '<tr><th>Resource</th><th>Amount</th><th>Credits</th><th>Avg Price</th><th>Trans</th></tr>';
-    for (var eRes in expenseStats) {
-        var d = expenseStats[eRes];
-        msg += makeRow(eRes, d.count, d.credits.toFixed(0), d.avgPrice.toFixed(2), d.transactions);
-    }
-    msg += '</table>';
-
-    // Sort Buyers
-    var buyersArr = [];
-    for (var bName in buyers) {
-        buyersArr.push({ name: bName, total: buyers[bName] });
-    }
-    buyersArr.sort(function(a, b) { return b.total - a.total; });
-
-    // Table 3: Top Buyers
-    msg += '<h3>Top Buyers (bought from you)</h3>';
-    msg += '<table border="1" cellspacing="0" cellpadding="4">';
-    msg += '<tr><th>Player</th><th>Spent</th></tr>';
-    for (var k = 0; k < 10; k++) {
-        if (k >= buyersArr.length) break;
-        msg += makeRow(buyersArr[k].name, buyersArr[k].total.toFixed(0));
-    }
-    msg += '</table>';
-
-    // Sort Sellers
-    var sellersArr = [];
-    for (var sName in sellers) {
-        sellersArr.push({ name: sName, total: sellers[sName] });
-    }
-    sellersArr.sort(function(a, b) { return b.total - a.total; });
-
-    // Table 4: Top Sellers
-    msg += '<h3>Top Sellers (you bought from)</h3>';
-    msg += '<table border="1" cellspacing="0" cellpadding="4">';
-    msg += '<tr><th>Player</th><th>Earned</th></tr>';
-    for (var m = 0; m < 10; m++) {
-        if (m >= sellersArr.length) break;
-        msg += makeRow(sellersArr[m].name, sellersArr[m].total.toFixed(0));
-    }
-    msg += '</table>';
-
-    // Saved stats note
-    msg += '<p><em>24h transaction count saved to Memory.marketStats.transactions24h (wiped each run)</em></p>';
-
-    Game.notify(msg);
-    return 'Report sent. Check email. 24h transactions: ' + toSafeInt(last24hCount);
+  }
+  var C = Game.time - TICKS_PER_DAY;
+  var N = 0;
+  for (var B = 0; B < s.length; B++) {
+    if (s[B].time >= C) N++;
+  }
+  for (var O = 0; O < d.length; O++) {
+    if (d[O].time >= C) N++;
+  }
+  Memory.marketStats = {
+    transactions24h: toSafeInt(N),
+    recordedAtTick: toSafeInt(Game.time)
+  };
+  var _ = "<h1>Market Report (" + e + " Days)</h1>";
+  if (h) {
+    var M = (Game.time - f) / TICKS_PER_DAY;
+    _ += "<p><strong>WARNING: Limited Data.</strong><br>";
+    _ += "Server history limit reached. Report covers last " + M.toFixed(2) + " days.</p>";
+  }
+  var w = c - l;
+  _ += "<p>";
+  _ += "Total Income: " + c.toFixed(0) + "<br>";
+  _ += "Total Expense: " + l.toFixed(0) + "<br>";
+  _ += "<strong>Net Profit: " + w.toFixed(0) + "</strong><br>";
+  _ += "Total Transactions: " + toSafeInt(v) + "<br>";
+  _ += "Transactions (last 24h): " + toSafeInt(N);
+  _ += "</p>";
+  _ += "<h3>Transactions Per 24h Period</h3>";
+  _ += '<table border="1" cellspacing="0" cellpadding="4">';
+  _ += "<tr><th>Period</th><th>Transactions</th></tr>";
+  var D = Object.keys(u).map(Number).sort(function(e, r) {
+    return e - r;
+  });
+  for (var L = 0; L < D.length; L++) {
+    var G = D[L];
+    var K = G === 0 ? "Today (last 24h)" : G + " day" + (G > 1 ? "s" : "") + " ago";
+    _ += "<tr><td>" + K + "</td><td>" + toSafeInt(u[G]) + "</td></tr>";
+  }
+  _ += "</table>";
+  function makeRow(e, r, t, i, a) {
+    var n = "<tr>";
+    n += "<td>" + e + "</td>";
+    n += "<td>" + r + "</td>";
+    if (t !== undefined) n += "<td>" + t + "</td>";
+    if (i !== undefined) n += "<td>" + i + "</td>";
+    if (a !== undefined) n += "<td>" + a + "</td>";
+    n += "</tr>";
+    return n;
+  }
+  _ += "<h3>Income (Sold)</h3>";
+  _ += '<table border="1" cellspacing="0" cellpadding="4">';
+  _ += "<tr><th>Resource</th><th>Amount</th><th>Credits</th><th>Avg Price</th><th>Trans</th></tr>";
+  for (var F in i) {
+    var L = i[F];
+    _ += makeRow(F, L.count, L.credits.toFixed(0), L.avgPrice.toFixed(2), L.transactions);
+  }
+  _ += "</table>";
+  _ += "<h3>Expenses (Bought)</h3>";
+  _ += '<table border="1" cellspacing="0" cellpadding="4">';
+  _ += "<tr><th>Resource</th><th>Amount</th><th>Credits</th><th>Avg Price</th><th>Trans</th></tr>";
+  for (var R in a) {
+    var L = a[R];
+    _ += makeRow(R, L.count, L.credits.toFixed(0), L.avgPrice.toFixed(2), L.transactions);
+  }
+  _ += "</table>";
+  var j = [];
+  for (var H in n) {
+    j.push({
+      name: H,
+      total: n[H]
+    });
+  }
+  j.sort(function(e, r) {
+    return r.total - e.total;
+  });
+  _ += "<h3>Top Buyers (bought from you)</h3>";
+  _ += '<table border="1" cellspacing="0" cellpadding="4">';
+  _ += "<tr><th>Player</th><th>Spent</th></tr>";
+  for (var Y = 0; Y < 10; Y++) {
+    if (Y >= j.length) break;
+    _ += makeRow(j[Y].name, j[Y].total.toFixed(0));
+  }
+  _ += "</table>";
+  var X = [];
+  for (var q in o) {
+    X.push({
+      name: q,
+      total: o[q]
+    });
+  }
+  X.sort(function(e, r) {
+    return r.total - e.total;
+  });
+  _ += "<h3>Top Sellers (you bought from)</h3>";
+  _ += '<table border="1" cellspacing="0" cellpadding="4">';
+  _ += "<tr><th>Player</th><th>Earned</th></tr>";
+  for (var U = 0; U < 10; U++) {
+    if (U >= X.length) break;
+    _ += makeRow(X[U].name, X[U].total.toFixed(0));
+  }
+  _ += "</table>";
+  _ += "<p><em>24h transaction count saved to Memory.marketStats.transactions24h (wiped each run)</em></p>";
+  Game.notify(_);
+  return "Report sent. Check email. 24h transactions: " + toSafeInt(N);
 };
-
 module.exports = {};

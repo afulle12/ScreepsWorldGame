@@ -1,496 +1,403 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // singleSourceRoom.js
-// ============================================================================
-// Utility for 1-source RCL 8 rooms: detection, anchor tile computation,
-// link chain identification, and spawn helpers.
-//
-// Console commands:
+// Console globals: detectAnchors, setAnchor, showAnchors, enableSingleSource, disableSingleSource
+// Example: detectAnchors('W1N1') - Auto-detect and record base anchor tiles in room
+// Example: setAnchor('W1N1', 25, 25) - Manually set room center anchor coordinates
+// Example: showAnchors('W1N1') - Display stored anchor coordinates and status
+// Example: enableSingleSource('W1N1') - Enable single-source room optimizations
+// Example: disableSingleSource('W1N1') - Disable single-source room optimizations
 //   detectAnchors('W1N1')     — auto-detect and store anchor tiles
 //   setAnchor('W1N1', 'hd', 25, 30)  — manually set an anchor tile
 //   showAnchors('W1N1')       — display current anchor config
 //   enableSingleSource('W1N1') — mark room for single-source mode
 //   disableSingleSource('W1N1') — revert to normal mode
-//
-// Anchor data is stored under Memory.anchors[roomName] (NOT Memory.rooms)
-// to prevent it being wiped by getRoomState or any other Memory.rooms writer.
-//
-// ============================================================================
-
-var getRoomState = require('getRoomState');
-
-// Direction map for spawn directions
+var getRoomState = require("getRoomState");
 var DIR_OFFSETS = {};
-DIR_OFFSETS[TOP]          = { dx:  0, dy: -1 };
-DIR_OFFSETS[TOP_RIGHT]    = { dx:  1, dy: -1 };
-DIR_OFFSETS[RIGHT]        = { dx:  1, dy:  0 };
-DIR_OFFSETS[BOTTOM_RIGHT] = { dx:  1, dy:  1 };
-DIR_OFFSETS[BOTTOM]       = { dx:  0, dy:  1 };
-DIR_OFFSETS[BOTTOM_LEFT]  = { dx: -1, dy:  1 };
-DIR_OFFSETS[LEFT]         = { dx: -1, dy:  0 };
-DIR_OFFSETS[TOP_LEFT]     = { dx: -1, dy: -1 };
-
+DIR_OFFSETS[TOP] = {
+  dx: 0,
+  dy: -1
+};
+DIR_OFFSETS[TOP_RIGHT] = {
+  dx: 1,
+  dy: -1
+};
+DIR_OFFSETS[RIGHT] = {
+  dx: 1,
+  dy: 0
+};
+DIR_OFFSETS[BOTTOM_RIGHT] = {
+  dx: 1,
+  dy: 1
+};
+DIR_OFFSETS[BOTTOM] = {
+  dx: 0,
+  dy: 1
+};
+DIR_OFFSETS[BOTTOM_LEFT] = {
+  dx: -1,
+  dy: 1
+};
+DIR_OFFSETS[LEFT] = {
+  dx: -1,
+  dy: 0
+};
+DIR_OFFSETS[TOP_LEFT] = {
+  dx: -1,
+  dy: -1
+};
 var REVERSE_DIR = {};
-REVERSE_DIR['0,-1']  = TOP;
-REVERSE_DIR['1,-1']  = TOP_RIGHT;
-REVERSE_DIR['1,0']   = RIGHT;
-REVERSE_DIR['1,1']   = BOTTOM_RIGHT;
-REVERSE_DIR['0,1']   = BOTTOM;
-REVERSE_DIR['-1,1']  = BOTTOM_LEFT;
-REVERSE_DIR['-1,0']  = LEFT;
-REVERSE_DIR['-1,-1'] = TOP_LEFT;
-
-// ============================================================================
-// Memory helpers — isolated namespace so Memory.rooms resets can't nuke anchors
-// ============================================================================
-
-function getAnchorMemory(roomName) {
-    if (!Memory.anchors) return null;
-    return Memory.anchors[roomName] || null;
+REVERSE_DIR["0,-1"] = TOP;
+REVERSE_DIR["1,-1"] = TOP_RIGHT;
+REVERSE_DIR["1,0"] = RIGHT;
+REVERSE_DIR["1,1"] = BOTTOM_RIGHT;
+REVERSE_DIR["0,1"] = BOTTOM;
+REVERSE_DIR["-1,1"] = BOTTOM_LEFT;
+REVERSE_DIR["-1,0"] = LEFT;
+REVERSE_DIR["-1,-1"] = TOP_LEFT;
+function getAnchorMemory(r) {
+  if (!Memory.anchors) return null;
+  return Memory.anchors[r] || null;
 }
 
-function setAnchorMemory(roomName, data) {
-    if (!Memory.anchors) Memory.anchors = {};
-    Memory.anchors[roomName] = data;
+function setAnchorMemory(r, e) {
+  if (!Memory.anchors) Memory.anchors = {};
+  Memory.anchors[r] = e;
 }
 
-// ============================================================================
-// Detection
-// ============================================================================
-
-function isSingleSourceRoom(roomName) {
-    if (!Memory.singleSourceRooms) return false;
-    return !!Memory.singleSourceRooms[roomName];
+function isSingleSourceRoom(r) {
+  if (!Memory.singleSourceRooms) return false;
+  return !!Memory.singleSourceRooms[r];
 }
 
-function isSingleSourceActive(roomName) {
-    if (!isSingleSourceRoom(roomName)) return false;
-    var room = Game.rooms[roomName];
-    if (!room || !room.controller || !room.controller.my) return false;
-    if (room.controller.level < 8) return false;
-    var rs = getRoomState.get(roomName);
-    if (!rs || !rs.sources || rs.sources.length !== 1) return false;
-    return true;
+function isSingleSourceActive(r) {
+  if (!isSingleSourceRoom(r)) return false;
+  var e = Game.rooms[r];
+  if (!e || !e.controller || !e.controller.my) return false;
+  if (e.controller.level < 8) return false;
+  var n = getRoomState.get(r);
+  if (!n || !n.sources || n.sources.length !== 1) return false;
+  return true;
 }
 
-// ============================================================================
-// Anchor Tile Computation
-// ============================================================================
-
-/**
- * Get 8 adjacent tiles around a position (excludes edges 0/49).
- */
-function getAdjacentTiles(pos) {
-    var tiles = [];
-    for (var dx = -1; dx <= 1; dx++) {
-        for (var dy = -1; dy <= 1; dy++) {
-            if (dx === 0 && dy === 0) continue;
-            var x = pos.x + dx;
-            var y = pos.y + dy;
-            if (x < 1 || x > 48 || y < 1 || y > 48) continue;
-            tiles.push({ x: x, y: y });
-        }
+function getAdjacentTiles(r) {
+  var e = [];
+  for (var n = -1; n <= 1; n++) {
+    for (var o = -1; o <= 1; o++) {
+      if (n === 0 && o === 0) continue;
+      var t = r.x + n;
+      var i = r.y + o;
+      if (t < 1 || t > 48 || i < 1 || i > 48) continue;
+      e.push({
+        x: t,
+        y: i
+      });
     }
-    return tiles;
+  }
+  return e;
 }
 
-/**
- * Check if a tile is walkable (not a wall, not an obstacle structure).
- */
-function isWalkable(room, x, y) {
-    var terrain = room.getTerrain();
-    if (terrain.get(x, y) === TERRAIN_MASK_WALL) return false;
-
-    var structs = room.lookForAt(LOOK_STRUCTURES, x, y);
-    for (var i = 0; i < structs.length; i++) {
-        var st = structs[i].structureType;
-        if (st === STRUCTURE_ROAD || st === STRUCTURE_CONTAINER || st === STRUCTURE_RAMPART) continue;
-        if (OBSTACLE_OBJECT_TYPES.indexOf(st) !== -1) return false;
-    }
-    return true;
+function isWalkable(r, e, n) {
+  var o = r.getTerrain();
+  if (o.get(e, n) === TERRAIN_MASK_WALL) return false;
+  var t = r.lookForAt(LOOK_STRUCTURES, e, n);
+  for (var i = 0; i < t.length; i++) {
+    var a = t[i].structureType;
+    if (a === STRUCTURE_ROAD || a === STRUCTURE_CONTAINER || a === STRUCTURE_RAMPART) continue;
+    if (OBSTACLE_OBJECT_TYPES.indexOf(a) !== -1) return false;
+  }
+  return true;
 }
 
-/**
- * Check if position is within range 1 of a target position.
- */
-function inRange1(tileX, tileY, target) {
-    return Math.abs(tileX - target.x) <= 1 && Math.abs(tileY - target.y) <= 1;
+function inRange1(r, e, n) {
+  return Math.abs(r - n.x) <= 1 && Math.abs(e - n.y) <= 1;
 }
 
-/**
- * Count structures of a type within range 1 of a tile.
- */
-function countAdjacent(tileX, tileY, structures) {
-    var count = 0;
-    for (var i = 0; i < structures.length; i++) {
-        if (inRange1(tileX, tileY, structures[i].pos)) count++;
-    }
-    return count;
-}
-
-/**
- * Find a tile that is adjacent (range 1) to ALL required structures
- * and preferably adjacent to as many optional structures as possible.
- *
- * @param {Room} room
- * @param {Array} required - Array of game objects or {pos} objects. Tile must be range 1 to all.
- * @param {Array} optional - Array of game objects. More adjacency = better score.
- * @returns {{ x: number, y: number }|null}
- */
-function findAnchorTile(room, required, optional) {
-    if (!required || required.length === 0) return null;
-
-    // Start with tiles adjacent to first required structure
-    var firstPos = required[0].pos || required[0];
-    var candidates = getAdjacentTiles(firstPos);
-
-    // Intersect with each additional required structure
-    for (var r = 1; r < required.length; r++) {
-        var reqPos = required[r].pos || required[r];
-        candidates = candidates.filter(function(tile) {
-            return inRange1(tile.x, tile.y, reqPos);
-        });
-    }
-
-    // Filter out non-walkable tiles
-    candidates = candidates.filter(function(tile) {
-        return isWalkable(room, tile.x, tile.y);
+function findAnchorTile(r, e, n) {
+  if (!e || e.length === 0) return null;
+  var o = e[0].pos || e[0];
+  var t = getAdjacentTiles(o);
+  for (var i = 1; i < e.length; i++) {
+    var a = e[i].pos || e[i];
+    t = t.filter(function(r) {
+      return inRange1(r.x, r.y, a);
     });
-
-    if (candidates.length === 0) return null;
-    if (candidates.length === 1) return candidates[0];
-
-    // Score by number of optional structures adjacent
-    var best = candidates[0];
-    var bestScore = 0;
-
-    for (var c = 0; c < candidates.length; c++) {
-        var tile = candidates[c];
-        var score = 0;
-        if (optional) {
-            for (var o = 0; o < optional.length; o++) {
-                var optPos = optional[o].pos || optional[o];
-                if (inRange1(tile.x, tile.y, optPos)) score++;
-            }
-        }
-        if (score > bestScore) {
-            bestScore = score;
-            best = tile;
-        }
+  }
+  t = t.filter(function(e) {
+    return isWalkable(r, e.x, e.y);
+  });
+  if (t.length === 0) return null;
+  if (t.length === 1) return t[0];
+  var l = t[0];
+  var u = 0;
+  for (var c = 0; c < t.length; c++) {
+    var s = t[c];
+    var f = 0;
+    if (n) {
+      for (var R = 0; R < n.length; R++) {
+        var T = n[R].pos || n[R];
+        if (inRange1(s.x, s.y, T)) f++;
+      }
     }
-
-    return best;
+    if (f > u) {
+      u = f;
+      l = s;
+    }
+  }
+  return l;
 }
 
-/**
- * Classify links for a 1-source room.
- * Returns { source: id, factory: id, tower: id, controller: id }
- */
-function classifyLinks(roomName) {
-    var rs = getRoomState.get(roomName);
-    if (!rs) return null;
-
-    var room = Game.rooms[roomName];
-    if (!room) return null;
-
-    var byType = rs.structuresByType || {};
-    var links = byType[STRUCTURE_LINK] || [];
-    var sources = rs.sources || [];
-    var towers = byType[STRUCTURE_TOWER] || [];
-    var factory = (byType[STRUCTURE_FACTORY] && byType[STRUCTURE_FACTORY].length > 0) ? byType[STRUCTURE_FACTORY][0] : null;
-    var terminal = (byType[STRUCTURE_TERMINAL] && byType[STRUCTURE_TERMINAL].length > 0) ? byType[STRUCTURE_TERMINAL][0] : null;
-    var controller = rs.controller;
-
-    var result = { source: null, factory: null, tower: null, controller: null };
-    var assigned = {};
-
-    // 1. Source link: range 2 of source
-    for (var i = 0; i < links.length; i++) {
-        var link = links[i];
-        if (assigned[link.id]) continue;
-        for (var s = 0; s < sources.length; s++) {
-            if (link.pos.getRangeTo(sources[s]) <= 2) {
-                result.source = link.id;
-                assigned[link.id] = true;
-                break;
-            }
-        }
-        if (result.source) break;
+function classifyLinks(r) {
+  var e = getRoomState.get(r);
+  if (!e) return null;
+  var n = Game.rooms[r];
+  if (!n) return null;
+  var o = e.structuresByType || {};
+  var t = o[STRUCTURE_LINK] || [];
+  var i = e.sources || [];
+  var a = o[STRUCTURE_TOWER] || [];
+  var l = o[STRUCTURE_FACTORY] && o[STRUCTURE_FACTORY].length > 0 ? o[STRUCTURE_FACTORY][0] : null;
+  var u = o[STRUCTURE_TERMINAL] && o[STRUCTURE_TERMINAL].length > 0 ? o[STRUCTURE_TERMINAL][0] : null;
+  var c = e.controller;
+  var s = {
+    source: null,
+    factory: null,
+    tower: null,
+    controller: null
+  };
+  var f = {};
+  for (var R = 0; R < t.length; R++) {
+    var T = t[R];
+    if (f[T.id]) continue;
+    for (var h = 0; h < i.length; h++) {
+      if (T.pos.getRangeTo(i[h]) <= 2) {
+        s.source = T.id;
+        f[T.id] = true;
+        break;
+      }
     }
-
-    // 2. Controller link: range 2 of controller
-    for (var i = 0; i < links.length; i++) {
-        var link = links[i];
-        if (assigned[link.id]) continue;
-        if (controller && link.pos.getRangeTo(controller) <= 3) {
-            result.controller = link.id;
-            assigned[link.id] = true;
-            break;
-        }
+    if (s.source) break;
+  }
+  for (var R = 0; R < t.length; R++) {
+    var T = t[R];
+    if (f[T.id]) continue;
+    if (c && T.pos.getRangeTo(c) <= 3) {
+      s.controller = T.id;
+      f[T.id] = true;
+      break;
     }
-
-    // 3. Factory link: range 2 of factory or terminal
-    for (var i = 0; i < links.length; i++) {
-        var link = links[i];
-        if (assigned[link.id]) continue;
-        var nearFactory = factory && link.pos.getRangeTo(factory) <= 2;
-        var nearTerminal = terminal && link.pos.getRangeTo(terminal) <= 2;
-        if (nearFactory || nearTerminal) {
-            result.factory = link.id;
-            assigned[link.id] = true;
-            break;
-        }
+  }
+  for (var R = 0; R < t.length; R++) {
+    var T = t[R];
+    if (f[T.id]) continue;
+    var S = l && T.pos.getRangeTo(l) <= 2;
+    var g = u && T.pos.getRangeTo(u) <= 2;
+    if (S || g) {
+      s.factory = T.id;
+      f[T.id] = true;
+      break;
     }
-
-    // 4. Tower link: range 2 of any tower (whatever is left)
-    for (var i = 0; i < links.length; i++) {
-        var link = links[i];
-        if (assigned[link.id]) continue;
-        for (var t = 0; t < towers.length; t++) {
-            if (link.pos.getRangeTo(towers[t]) <= 2) {
-                result.tower = link.id;
-                assigned[link.id] = true;
-                break;
-            }
-        }
-        if (result.tower) break;
+  }
+  for (var R = 0; R < t.length; R++) {
+    var T = t[R];
+    if (f[T.id]) continue;
+    for (var v = 0; v < a.length; v++) {
+      if (T.pos.getRangeTo(a[v]) <= 2) {
+        s.tower = T.id;
+        f[T.id] = true;
+        break;
+      }
     }
-
-    return result;
+    if (s.tower) break;
+  }
+  return s;
 }
 
-/**
- * Auto-detect anchor positions for all 3 stationary roles.
- * Stores in Memory.anchors[roomName]  (isolated from Memory.rooms)
- */
-function detectAnchors(roomName) {
-    var room = Game.rooms[roomName];
-    if (!room) return '[SingleSource] Room not visible: ' + roomName;
-
-    var rs = getRoomState.get(roomName);
-    if (!rs) return '[SingleSource] No room state for: ' + roomName;
-
-    var byType = rs.structuresByType || {};
-    var sources = rs.sources || [];
-    var spawns = (byType[STRUCTURE_SPAWN] || []).filter(function(s) { return s.my; });
-    var links = (byType[STRUCTURE_LINK] || []).filter(function(s) { return s.my; });
-    var extensions = (byType[STRUCTURE_EXTENSION] || []).filter(function(s) { return s.my; });
-    var towers = (byType[STRUCTURE_TOWER] || []).filter(function(s) { return s.my; });
-    var factories = byType[STRUCTURE_FACTORY] || [];
-    var terminals = byType[STRUCTURE_TERMINAL] || [];
-    var extractors = (byType[STRUCTURE_EXTRACTOR] || []).filter(function(s) { return s.my; });
-    var minerals = rs.minerals || [];
-    var storage = rs.storage;
-
-    if (sources.length !== 1) return '[SingleSource] Room has ' + sources.length + ' sources, expected 1.';
-
-    // Classify links
-    var linkClass = classifyLinks(roomName);
-    if (!linkClass) return '[SingleSource] Could not classify links.';
-
-    var sourceLink = linkClass.source ? Game.getObjectById(linkClass.source) : null;
-    var factoryLink = linkClass.factory ? Game.getObjectById(linkClass.factory) : null;
-    var towerLink = linkClass.tower ? Game.getObjectById(linkClass.tower) : null;
-    var controllerLink = linkClass.controller ? Game.getObjectById(linkClass.controller) : null;
-
-    var results = [];
-
-    // --- HD Anchor: adjacent to source + spawn + sourceLink ---
-    var hdAnchor = null;
-    if (sources[0] && sourceLink) {
-        var sourceSpawns = spawns.filter(function(sp) {
-            return sp.pos.getRangeTo(sources[0]) <= 2;
-        });
-        if (sourceSpawns.length > 0) {
-            var hdRequired = [sources[0], sourceSpawns[0], sourceLink];
-            hdAnchor = findAnchorTile(room, hdRequired, extensions);
-            if (hdAnchor) {
-                results.push('HD anchor: (' + hdAnchor.x + ',' + hdAnchor.y + ') near source');
-            } else {
-                results.push('HD anchor: FAILED - no valid tile adjacent to source + spawn + link');
-            }
-        } else {
-            results.push('HD anchor: FAILED - no spawn near source');
-        }
-    }
-
-    // --- ComboBot Anchor: adjacent to mineral + factory + terminal + factoryLink + spawn + storage ---
-    var comboAnchor = null;
-    if (minerals.length > 0 && factories.length > 0 && terminals.length > 0 && factoryLink && storage) {
-        var factorySpawns = spawns.filter(function(sp) {
-            return sp.pos.getRangeTo(factories[0]) <= 2 || sp.pos.getRangeTo(terminals[0]) <= 2;
-        });
-        if (factorySpawns.length > 0) {
-            var comboRequired = [minerals[0], factories[0], terminals[0], factoryLink, factorySpawns[0], storage];
-            comboAnchor = findAnchorTile(room, comboRequired, []);
-            if (comboAnchor) {
-                results.push('ComboBot anchor: (' + comboAnchor.x + ',' + comboAnchor.y + ') near factory/terminal');
-            } else {
-                var comboRequired2 = [minerals[0], factories[0], terminals[0], factoryLink, factorySpawns[0]];
-                comboAnchor = findAnchorTile(room, comboRequired2, storage ? [storage] : []);
-                if (comboAnchor) {
-                    results.push('ComboBot anchor: (' + comboAnchor.x + ',' + comboAnchor.y + ') near factory (storage range 2)');
-                } else {
-                    results.push('ComboBot anchor: FAILED - no valid tile');
-                }
-            }
-        } else {
-            results.push('ComboBot anchor: FAILED - no spawn near factory area');
-        }
-    }
-
-    // --- Distributor Anchor: adjacent to towerLink + spawn + towers ---
-    var distAnchor = null;
-    if (towerLink && towers.length > 0) {
-        var towerSpawns = spawns.filter(function(sp) {
-            for (var t = 0; t < towers.length; t++) {
-                if (sp.pos.getRangeTo(towers[t]) <= 2) return true;
-            }
-            return false;
-        });
-        if (towerSpawns.length > 0) {
-            var distRequired = [towerLink, towerSpawns[0], towers[0]];
-            distAnchor = findAnchorTile(room, distRequired, extensions.concat(towers.slice(1)));
-            if (distAnchor) {
-                results.push('Distributor anchor: (' + distAnchor.x + ',' + distAnchor.y + ') near towers');
-            } else {
-                results.push('Distributor anchor: FAILED - no valid tile adjacent to link + spawn + tower');
-            }
-        } else {
-            results.push('Distributor anchor: FAILED - no spawn near towers');
-        }
-    }
-
-    // Store results in isolated Memory.anchors namespace
-    setAnchorMemory(roomName, {
-        hd: hdAnchor,
-        distributor: distAnchor,
-        comboBot: comboAnchor,
-        linkChain: linkClass,
-        hdSpawn: hdAnchor ? findSpawnNear(spawns, sources[0], 2) : null,
-        distributorSpawn: distAnchor ? findSpawnNear(spawns, towers[0], 3) : null,
-        comboBotSpawn: comboAnchor ? findSpawnNear(spawns, factories[0] || terminals[0], 3) : null,
-        detectedAt: Game.time
+function detectAnchors(r) {
+  var e = Game.rooms[r];
+  if (!e) return "[SingleSource] Room not visible: " + r;
+  var n = getRoomState.get(r);
+  if (!n) return "[SingleSource] No room state for: " + r;
+  var o = n.structuresByType || {};
+  var t = n.sources || [];
+  var i = (o[STRUCTURE_SPAWN] || []).filter(function(r) {
+    return r.my;
+  });
+  var a = (o[STRUCTURE_LINK] || []).filter(function(r) {
+    return r.my;
+  });
+  var l = (o[STRUCTURE_EXTENSION] || []).filter(function(r) {
+    return r.my;
+  });
+  var u = (o[STRUCTURE_TOWER] || []).filter(function(r) {
+    return r.my;
+  });
+  var c = o[STRUCTURE_FACTORY] || [];
+  var s = o[STRUCTURE_TERMINAL] || [];
+  var f = (o[STRUCTURE_EXTRACTOR] || []).filter(function(r) {
+    return r.my;
+  });
+  var R = n.minerals || [];
+  var T = n.storage;
+  if (t.length !== 1) return "[SingleSource] Room has " + t.length + " sources, expected 1.";
+  var h = classifyLinks(r);
+  if (!h) return "[SingleSource] Could not classify links.";
+  var S = h.source ? Game.getObjectById(h.source) : null;
+  var g = h.factory ? Game.getObjectById(h.factory) : null;
+  var v = h.tower ? Game.getObjectById(h.tower) : null;
+  var E = h.controller ? Game.getObjectById(h.controller) : null;
+  var d = [];
+  var m = null;
+  if (t[0] && S) {
+    var y = i.filter(function(r) {
+      return r.pos.getRangeTo(t[0]) <= 2;
     });
-
-    var output = '[SingleSource] Anchor detection for ' + roomName + ':\n' + results.join('\n');
-    console.log(output);
-    return output;
-}
-
-function findSpawnNear(spawns, target, range) {
-    if (!target || !spawns) return null;
-    for (var i = 0; i < spawns.length; i++) {
-        if (spawns[i].pos.getRangeTo(target) <= range) return spawns[i].id;
+    if (y.length > 0) {
+      var A = [ t[0], y[0], S ];
+      m = findAnchorTile(e, A, l);
+      if (m) {
+        d.push("HD anchor: (" + m.x + "," + m.y + ") near source");
+      } else {
+        d.push("HD anchor: FAILED - no valid tile adjacent to source + spawn + link");
+      }
+    } else {
+      d.push("HD anchor: FAILED - no spawn near source");
     }
-    return null;
-}
-
-/**
- * Get the spawn direction to place a creep on the anchor tile.
- * Returns [direction] array suitable for spawnCreep options.
- */
-function getAnchorSpawnDirection(spawnPos, anchorPos) {
-    var dx = anchorPos.x - spawnPos.x;
-    var dy = anchorPos.y - spawnPos.y;
-
-    dx = dx === 0 ? 0 : (dx > 0 ? 1 : -1);
-    dy = dy === 0 ? 0 : (dy > 0 ? 1 : -1);
-
-    var key = dx + ',' + dy;
-    var dir = REVERSE_DIR[key];
-
-    if (dir !== undefined) return [dir];
-    return undefined;
-}
-
-/**
- * Get anchor config for a room. Returns null if not configured.
- * Reads from Memory.anchors[roomName] (isolated namespace).
- */
-function getAnchors(roomName) {
-    return getAnchorMemory(roomName);
-}
-
-/**
- * Get the link chain for a 1-source room.
- * Returns ordered array of link IDs: [source, factory, tower, controller]
- */
-function getLinkChain(roomName) {
-    var anchors = getAnchors(roomName);
-    if (!anchors || !anchors.linkChain) return null;
-
-    var lc = anchors.linkChain;
-    var chain = [];
-    if (lc.source) chain.push(lc.source);
-    if (lc.factory) chain.push(lc.factory);
-    if (lc.tower) chain.push(lc.tower);
-    if (lc.controller) chain.push(lc.controller);
-
-    return chain.length >= 2 ? chain : null;
-}
-
-// ============================================================================
-// Console Commands
-// ============================================================================
-
-global.detectAnchors = function(roomName) {
-    getRoomState.init();
-    return detectAnchors(roomName);
-};
-
-global.setAnchor = function(roomName, role, x, y) {
-    if (!Memory.anchors) Memory.anchors = {};
-    if (!Memory.anchors[roomName]) Memory.anchors[roomName] = {};
-    Memory.anchors[roomName][role] = { x: x, y: y };
-    return '[SingleSource] Set ' + role + ' anchor in ' + roomName + ' to (' + x + ',' + y + ')';
-};
-
-global.showAnchors = function(roomName) {
-    var anchors = getAnchors(roomName);
-    if (!anchors) return '[SingleSource] No anchors configured for ' + roomName;
-
-    var lines = ['=== ANCHORS FOR ' + roomName + ' ==='];
-    if (anchors.hd) lines.push('HD: (' + anchors.hd.x + ',' + anchors.hd.y + ')');
-    else lines.push('HD: NOT SET');
-
-    if (anchors.distributor) lines.push('Distributor: (' + anchors.distributor.x + ',' + anchors.distributor.y + ')');
-    else lines.push('Distributor: NOT SET');
-
-    if (anchors.comboBot) lines.push('ComboBot: (' + anchors.comboBot.x + ',' + anchors.comboBot.y + ')');
-    else lines.push('ComboBot: NOT SET');
-
-    if (anchors.linkChain) {
-        var lc = anchors.linkChain;
-        lines.push('Link chain: source=' + (lc.source || 'N/A') + ' factory=' + (lc.factory || 'N/A') + ' tower=' + (lc.tower || 'N/A') + ' controller=' + (lc.controller || 'N/A'));
+  }
+  var p = null;
+  if (R.length > 0 && c.length > 0 && s.length > 0 && g && T) {
+    var O = i.filter(function(r) {
+      return r.pos.getRangeTo(c[0]) <= 2 || r.pos.getRangeTo(s[0]) <= 2;
+    });
+    if (O.length > 0) {
+      var _ = [ R[0], c[0], s[0], g, O[0], T ];
+      p = findAnchorTile(e, _, []);
+      if (p) {
+        d.push("ComboBot anchor: (" + p.x + "," + p.y + ") near factory/terminal");
+      } else {
+        var b = [ R[0], c[0], s[0], g, O[0] ];
+        p = findAnchorTile(e, b, T ? [ T ] : []);
+        if (p) {
+          d.push("ComboBot anchor: (" + p.x + "," + p.y + ") near factory (storage range 2)");
+        } else {
+          d.push("ComboBot anchor: FAILED - no valid tile");
+        }
+      }
+    } else {
+      d.push("ComboBot anchor: FAILED - no spawn near factory area");
     }
+  }
+  var I = null;
+  if (v && u.length > 0) {
+    var C = i.filter(function(r) {
+      for (var e = 0; e < u.length; e++) {
+        if (r.pos.getRangeTo(u[e]) <= 2) return true;
+      }
+      return false;
+    });
+    if (C.length > 0) {
+      var D = [ v, C[0], u[0] ];
+      I = findAnchorTile(e, D, l.concat(u.slice(1)));
+      if (I) {
+        d.push("Distributor anchor: (" + I.x + "," + I.y + ") near towers");
+      } else {
+        d.push("Distributor anchor: FAILED - no valid tile adjacent to link + spawn + tower");
+      }
+    } else {
+      d.push("Distributor anchor: FAILED - no spawn near towers");
+    }
+  }
+  setAnchorMemory(r, {
+    hd: m,
+    distributor: I,
+    comboBot: p,
+    linkChain: h,
+    hdSpawn: m ? findSpawnNear(i, t[0], 2) : null,
+    distributorSpawn: I ? findSpawnNear(i, u[0], 3) : null,
+    comboBotSpawn: p ? findSpawnNear(i, c[0] || s[0], 3) : null,
+    detectedAt: Game.time
+  });
+  var U = "[SingleSource] Anchor detection for " + r + ":\n" + d.join("\n");
+  return U;
+}
 
-    lines.push('Detected at tick: ' + (anchors.detectedAt || 'manual'));
+function findSpawnNear(r, e, n) {
+  if (!e || !r) return null;
+  for (var o = 0; o < r.length; o++) {
+    if (r[o].pos.getRangeTo(e) <= n) return r[o].id;
+  }
+  return null;
+}
 
-    var output = lines.join('\n');
-    console.log(output);
-    return output;
+function getAnchorSpawnDirection(r, e) {
+  var n = e.x - r.x;
+  var o = e.y - r.y;
+  n = n === 0 ? 0 : n > 0 ? 1 : -1;
+  o = o === 0 ? 0 : o > 0 ? 1 : -1;
+  var t = n + "," + o;
+  var i = REVERSE_DIR[t];
+  if (i !== undefined) return [ i ];
+  return undefined;
+}
+
+function getAnchors(r) {
+  return getAnchorMemory(r);
+}
+
+function getLinkChain(r) {
+  var e = getAnchors(r);
+  if (!e || !e.linkChain) return null;
+  var n = e.linkChain;
+  var o = [];
+  if (n.source) o.push(n.source);
+  if (n.factory) o.push(n.factory);
+  if (n.tower) o.push(n.tower);
+  if (n.controller) o.push(n.controller);
+  return o.length >= 2 ? o : null;
+}
+
+global.detectAnchors = function(r) {
+  getRoomState.init();
+  return detectAnchors(r);
 };
-
-global.enableSingleSource = function(roomName) {
-    if (!Memory.singleSourceRooms) Memory.singleSourceRooms = {};
-    Memory.singleSourceRooms[roomName] = true;
-    return '[SingleSource] Enabled for ' + roomName + '. Run detectAnchors(\'' + roomName + '\') to configure.';
+global.setAnchor = function(r, e, n, o) {
+  if (!Memory.anchors) Memory.anchors = {};
+  if (!Memory.anchors[r]) Memory.anchors[r] = {};
+  Memory.anchors[r][e] = {
+    x: n,
+    y: o
+  };
+  return "[SingleSource] Set " + e + " anchor in " + r + " to (" + n + "," + o + ")";
 };
-
-global.disableSingleSource = function(roomName) {
-    if (Memory.singleSourceRooms) delete Memory.singleSourceRooms[roomName];
-    return '[SingleSource] Disabled for ' + roomName + '. Room will use normal creep roles.';
+global.showAnchors = function(r) {
+  var e = getAnchors(r);
+  if (!e) return "[SingleSource] No anchors configured for " + r;
+  var n = [ "=== ANCHORS FOR " + r + " ===" ];
+  if (e.hd) n.push("HD: (" + e.hd.x + "," + e.hd.y + ")"); else n.push("HD: NOT SET");
+  if (e.distributor) n.push("Distributor: (" + e.distributor.x + "," + e.distributor.y + ")"); else n.push("Distributor: NOT SET");
+  if (e.comboBot) n.push("ComboBot: (" + e.comboBot.x + "," + e.comboBot.y + ")"); else n.push("ComboBot: NOT SET");
+  if (e.linkChain) {
+    var o = e.linkChain;
+    n.push("Link chain: source=" + (o.source || "N/A") + " factory=" + (o.factory || "N/A") + " tower=" + (o.tower || "N/A") + " controller=" + (o.controller || "N/A"));
+  }
+  n.push("Detected at tick: " + (e.detectedAt || "manual"));
+  var t = n.join("\n");
+  return t;
 };
-
-// ============================================================================
-// Exports
-// ============================================================================
-
+global.enableSingleSource = function(r) {
+  if (!Memory.singleSourceRooms) Memory.singleSourceRooms = {};
+  Memory.singleSourceRooms[r] = true;
+  return "[SingleSource] Enabled for " + r + ". Run detectAnchors('" + r + "') to configure.";
+};
+global.disableSingleSource = function(r) {
+  if (Memory.singleSourceRooms) delete Memory.singleSourceRooms[r];
+  return "[SingleSource] Disabled for " + r + ". Room will use normal creep roles.";
+};
 module.exports = {
-    isSingleSourceRoom: isSingleSourceRoom,
-    isSingleSourceActive: isSingleSourceActive,
-    getAnchors: getAnchors,
-    getLinkChain: getLinkChain,
-    getAnchorSpawnDirection: getAnchorSpawnDirection,
-    classifyLinks: classifyLinks,
-    detectAnchors: detectAnchors
+  isSingleSourceRoom: isSingleSourceRoom,
+  isSingleSourceActive: isSingleSourceActive,
+  getAnchors: getAnchors,
+  getLinkChain: getLinkChain,
+  getAnchorSpawnDirection: getAnchorSpawnDirection,
+  classifyLinks: classifyLinks,
+  detectAnchors: detectAnchors
 };

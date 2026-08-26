@@ -1,249 +1,214 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // roleRemoteSupplier.js
-// ============================================================================
-// Remote Supplier
-//
-// Handles two mission types set in creep.memory.mission:
-//
+// Role dispatch: memory.role === 'remoteSupplier' -> roleRemoteSupplier.run(creep).
+// Example: require('roleRemoteSupplier').run(creep);
+// Example: require('roleRemoteSupplier').run(creep);
 //   'extensions'  Load full carry from homeRoom, travel to targetRoom,
 //                 fill extensions then spawns. Any leftover energy is
 //                 dumped into storage if present.
-//
-//   'storage'     Load exactly memory.amountNeeded energy (capped at carry
+//   'storage'     Load memory.amountNeeded energy when set (otherwise fill carry
 //                 capacity) from homeRoom, travel to targetRoom, deposit
 //                 into storage until it reaches 7500 or creep is empty.
-
-
+var util = require("util");
+var getRoomState = require("getRoomState");
+var scanner = require("scanner");
 var STORAGE_TARGET = 7500;
 var OBSERVER_RANGE = 10;
 var MAX_RECOMPUTES = 5;
-var SCAN_TIMEOUT   = 6;    // ticks to wait for observer vision before skipping
+var SCAN_TIMEOUT = 60;
+var SCAN_HOLD_TICKS = 15;
+var ROUTE_CACHE_TTL = 1500;
+function _structuresByType(e, r) {
+  if (!e) return [];
+  var t = getRoomState.get(e.name);
+  if (t && t.structuresByType && t.structuresByType[r]) {
+    return t.structuresByType[r];
+  }
+  return [];
+}
+
+function _filterEnergyStore(e, r) {
+  var t = [];
+  for (var o = 0; o < e.length; o++) {
+    var a = e[o];
+    if (!a || !a.store) continue;
+    if (r) {
+      if (a.store.getFreeCapacity(RESOURCE_ENERGY) > 0) t.push(a);
+    } else if (a.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+      t.push(a);
+    }
+  }
+  return t;
+}
 
 module.exports = {
-
-    run: function(creep) {
-        var mission = creep.memory.mission || 'extensions';
-
-        // ── State transitions ─────────────────────────────────────────────────
-        if (creep.memory.working && creep.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-            creep.memory.working = false;
-            creep.say('🏠');
-            _clearExitCache(creep);
-        }
-        if (!creep.memory.working &&
-                creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0 &&
-                creep.room.name === creep.memory.homeRoom) {
-            creep.memory.working = true;
-            creep.say(mission === 'storage' ? '📦' : '🔌');
-            _clearExitCache(creep);
-        }
-
-        // Storage mission: transition when loaded enough
-        if (!creep.memory.working && mission === 'storage' && creep.memory.amountNeeded) {
-            var loaded = creep.store.getUsedCapacity(RESOURCE_ENERGY);
-            var needed = Math.min(creep.store.getCapacity(RESOURCE_ENERGY),
-                                  creep.memory.amountNeeded);
-            if (loaded >= needed) {
-                creep.memory.working = true;
-                creep.say('📦');
-                _clearExitCache(creep);
-            }
-        }
-
-        if (creep.memory.working) {
-            if (mission === 'storage') {
-                this._fillStorage(creep);
-            } else {
-                this._fillExtensions(creep);
-            }
-        } else {
-            this._loadEnergy(creep, mission);
-        }
-    },
-
-    // ── Load energy from homeRoom ─────────────────────────────────────────────
-    _loadEnergy: function(creep, mission) {
-        var homeRoom = creep.memory.homeRoom;
-
-        if (creep.room.name !== homeRoom) {
-            _followRoute(creep, homeRoom);
-            return;
-        }
-
-        var room   = creep.room;
-        var source = null;
-
-        if (room.storage && room.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-            source = room.storage;
-        } else if (room.terminal &&
-                   room.terminal.store.getUsedCapacity(RESOURCE_ENERGY) > 5000) {
-            source = room.terminal;
-        } else {
-            var containers = room.find(FIND_STRUCTURES, {
-                filter: function(s) {
-                    return s.structureType === STRUCTURE_CONTAINER &&
-                           s.store.getUsedCapacity(RESOURCE_ENERGY) > 0;
-                }
-            });
-            if (containers.length > 0) {
-                source = creep.pos.findClosestByRange(containers);
-            }
-        }
-
-        if (!source) {
-            if (Game.time % 20 === 0) {
-                console.log('[RemoteSupplier] ' + creep.name +
-                            ': No energy source in ' + homeRoom);
-            }
-            return;
-        }
-
-        // Storage mission: only withdraw what's needed
-        var amount = undefined;
-        if (mission === 'storage' && creep.memory.amountNeeded) {
-            var alreadyHave = creep.store.getUsedCapacity(RESOURCE_ENERGY);
-            var stillNeed   = Math.min(
-                creep.store.getFreeCapacity(RESOURCE_ENERGY),
-                creep.memory.amountNeeded - alreadyHave
-            );
-            if (stillNeed <= 0) { creep.memory.working = true; return; }
-            amount = stillNeed;
-        }
-
-        var result = amount !== undefined
-            ? creep.withdraw(source, RESOURCE_ENERGY, amount)
-            : creep.withdraw(source, RESOURCE_ENERGY);
-
-        if (result === ERR_NOT_IN_RANGE) {
-            creep.moveTo(source, { reusePath: 10,
-                                   visualizePathStyle: { stroke: '#aaffaa' } });
-        }
-    },
-
-    // ── Fill extensions + spawns ──────────────────────────────────────────────
-    _fillExtensions: function(creep) {
-        if (creep.room.name !== creep.memory.targetRoom) {
-            _followRoute(creep, creep.memory.targetRoom);
-            return;
-        }
-
-        var extensions = creep.room.find(FIND_STRUCTURES, {
-            filter: function(s) {
-                return s.structureType === STRUCTURE_EXTENSION &&
-                       s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
-            }
-        });
-
-        var target = null;
-        if (extensions.length > 0) {
-            target = creep.pos.findClosestByRange(extensions);
-        } else {
-            var spawns = creep.room.find(FIND_STRUCTURES, {
-                filter: function(s) {
-                    return s.structureType === STRUCTURE_SPAWN &&
-                           s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
-                }
-            });
-            if (spawns.length > 0) target = creep.pos.findClosestByRange(spawns);
-        }
-
-        // Nothing to fill — dump leftovers into storage then finish
-        if (!target) {
-            var storages = creep.room.find(FIND_STRUCTURES, {
-                filter: function(s) {
-                    return s.structureType === STRUCTURE_STORAGE &&
-                           s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
-                }
-            });
-            if (storages.length > 0) {
-                var dump = creep.transfer(storages[0], RESOURCE_ENERGY);
-                if (dump === ERR_NOT_IN_RANGE) creep.moveTo(storages[0], { reusePath: 5 });
-                return;
-            }
-            creep.memory.working = false;
-            creep.say('✅');
-            this._signalComplete(creep, 'extensions');
-            return;
-        }
-
-        var r = creep.transfer(target, RESOURCE_ENERGY);
-        if (r === ERR_NOT_IN_RANGE) {
-            creep.moveTo(target, { reusePath: 5,
-                                   visualizePathStyle: { stroke: '#ffaaaa' } });
-        }
-    },
-
-    // ── Fill storage up to STORAGE_TARGET ────────────────────────────────────
-    _fillStorage: function(creep) {
-        if (creep.room.name !== creep.memory.targetRoom) {
-            _followRoute(creep, creep.memory.targetRoom);
-            return;
-        }
-
-        var storages = creep.room.find(FIND_STRUCTURES, {
-            filter: function(s) {
-                return s.structureType === STRUCTURE_STORAGE &&
-                       s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
-            }
-        });
-
-        if (storages.length === 0) {
-            creep.memory.working = false;
-            creep.say('✅');
-            this._signalComplete(creep, 'storage');
-            return;
-        }
-
-        var storage       = storages[0];
-        var currentEnergy = storage.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-
-        if (currentEnergy >= STORAGE_TARGET) {
-            creep.memory.working = false;
-            creep.say('✅');
-            this._signalComplete(creep, 'storage');
-            return;
-        }
-
-        var deficit    = STORAGE_TARGET - currentEnergy;
-        var carrying   = creep.store.getUsedCapacity(RESOURCE_ENERGY);
-        var toTransfer = Math.min(carrying, deficit);
-
-        if (toTransfer <= 0) {
-            creep.memory.working = false;
-            this._signalComplete(creep, 'storage');
-            return;
-        }
-
-        var result = creep.transfer(storage, RESOURCE_ENERGY, toTransfer);
-        if (result === ERR_NOT_IN_RANGE) {
-            creep.moveTo(storage, { reusePath: 10,
-                                    visualizePathStyle: { stroke: '#aaaaff' } });
-        } else if (result === OK && carrying - toTransfer <= 0) {
-            creep.memory.working = false;
-            creep.say('✅');
-            this._signalComplete(creep, 'storage');
-        } else if (result !== OK) {
-            console.log('[RemoteSupplier] ' + creep.name +
-                        ': transfer to storage returned ' + result);
-        }
-    },
-
-    // ── Completion signal ─────────────────────────────────────────────────────
-    _signalComplete: function(creep, mission) {
-        if (!Memory.remoteSupplyComplete) Memory.remoteSupplyComplete = {};
-        var key = creep.memory.homeRoom + '->' + creep.memory.targetRoom + ':' + mission;
-        Memory.remoteSupplyComplete[key] = {
-            homeRoom:    creep.memory.homeRoom,
-            targetRoom:  creep.memory.targetRoom,
-            mission:     mission,
-            completedAt: Game.time
-        };
+  run: function(e) {
+    var r = e.memory.mission || "extensions";
+    if (e.memory.working && e.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
+      e.memory.working = false;
+      e.say("🏠");
+      _clearExitCache(e);
     }
+    if (!e.memory.working && e.store.getFreeCapacity(RESOURCE_ENERGY) === 0 && e.room.name === e.memory.homeRoom) {
+      e.memory.working = true;
+      e.say(r === "storage" ? "📦" : "🔌");
+      _clearExitCache(e);
+    }
+    if (!e.memory.working && r === "storage" && e.memory.amountNeeded) {
+      var t = e.store.getUsedCapacity(RESOURCE_ENERGY);
+      var o = Math.min(e.store.getCapacity(RESOURCE_ENERGY), e.memory.amountNeeded);
+      if (t >= o) {
+        e.memory.working = true;
+        e.say("📦");
+        _clearExitCache(e);
+      }
+    }
+    if (e.memory.working) {
+      if (r === "storage") {
+        this._fillStorage(e);
+      } else {
+        this._fillExtensions(e);
+      }
+    } else {
+      this._loadEnergy(e, r);
+    }
+  },
+  _loadEnergy: function(e, r) {
+    var t = e.memory.homeRoom;
+    if (e.room.name !== t) {
+      _followRoute(e, t);
+      return;
+    }
+    var o = e.room;
+    var a = null;
+    if (o.storage && o.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+      a = o.storage;
+    } else if (o.terminal && o.terminal.store.getUsedCapacity(RESOURCE_ENERGY) > 5e3) {
+      a = o.terminal;
+    } else {
+      var n = _filterEnergyStore(_structuresByType(o, STRUCTURE_CONTAINER), false);
+      if (n.length > 0) {
+        a = e.pos.findClosestByRange(n);
+      }
+    }
+    if (!a) {
+      if (Game.time % 20 === 0) {
+        console.log("[RemoteSupplier] " + e.name + ": No energy source in " + t);
+      }
+      return;
+    }
+    var i = undefined;
+    if (r === "storage" && e.memory.amountNeeded) {
+      var m = e.store.getUsedCapacity(RESOURCE_ENERGY);
+      var l = Math.min(e.store.getFreeCapacity(RESOURCE_ENERGY), e.memory.amountNeeded - m);
+      if (l <= 0) {
+        e.memory.working = true;
+        return;
+      }
+      i = l;
+    }
+    var s = i !== undefined ? e.withdraw(a, RESOURCE_ENERGY, i) : e.withdraw(a, RESOURCE_ENERGY);
+    if (s === ERR_NOT_IN_RANGE) {
+      e.moveTo(a, {
+        reusePath: 10,
+        visualizePathStyle: {
+          stroke: "#aaffaa"
+        }
+      });
+    }
+  },
+  _fillExtensions: function(e) {
+    if (e.room.name !== e.memory.targetRoom) {
+      _followRoute(e, e.memory.targetRoom);
+      return;
+    }
+    var r = _filterEnergyStore(_structuresByType(e.room, STRUCTURE_EXTENSION), true);
+    var t = null;
+    if (r.length > 0) {
+      t = e.pos.findClosestByRange(r);
+    } else {
+      var o = _filterEnergyStore(_structuresByType(e.room, STRUCTURE_SPAWN), true);
+      if (o.length > 0) t = e.pos.findClosestByRange(o);
+    }
+    if (!t) {
+      var a = _filterEnergyStore(_structuresByType(e.room, STRUCTURE_STORAGE), true);
+      if (a.length > 0) {
+        var n = e.transfer(a[0], RESOURCE_ENERGY);
+        if (n === ERR_NOT_IN_RANGE) e.moveTo(a[0], {
+          reusePath: 5
+        });
+        return;
+      }
+      e.memory.working = false;
+      e.say("✅");
+      this._signalComplete(e, "extensions");
+      return;
+    }
+    var i = e.transfer(t, RESOURCE_ENERGY);
+    if (i === ERR_NOT_IN_RANGE) {
+      e.moveTo(t, {
+        reusePath: 5,
+        visualizePathStyle: {
+          stroke: "#ffaaaa"
+        }
+      });
+    }
+  },
+  _fillStorage: function(e) {
+    if (e.room.name !== e.memory.targetRoom) {
+      _followRoute(e, e.memory.targetRoom);
+      return;
+    }
+    var r = _filterEnergyStore(_structuresByType(e.room, STRUCTURE_STORAGE), true);
+    if (r.length === 0) {
+      e.memory.working = false;
+      e.say("✅");
+      this._signalComplete(e, "storage");
+      return;
+    }
+    var t = r[0];
+    var o = t.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+    if (o >= STORAGE_TARGET) {
+      e.memory.working = false;
+      e.say("✅");
+      this._signalComplete(e, "storage");
+      return;
+    }
+    var a = STORAGE_TARGET - o;
+    var n = e.store.getUsedCapacity(RESOURCE_ENERGY);
+    var i = Math.min(n, a);
+    if (i <= 0) {
+      e.memory.working = false;
+      this._signalComplete(e, "storage");
+      return;
+    }
+    var m = e.transfer(t, RESOURCE_ENERGY, i);
+    if (m === ERR_NOT_IN_RANGE) {
+      e.moveTo(t, {
+        reusePath: 10,
+        visualizePathStyle: {
+          stroke: "#aaaaff"
+        }
+      });
+    } else if (m === OK && n - i <= 0) {
+      e.memory.working = false;
+      e.say("✅");
+      this._signalComplete(e, "storage");
+    } else if (m !== OK) {
+      console.log("[RemoteSupplier] " + e.name + ": transfer to storage returned " + m);
+    }
+  },
+  _signalComplete: function(e, r) {
+    if (!Memory.remoteSupplyComplete) Memory.remoteSupplyComplete = {};
+    var t = e.memory.homeRoom + "->" + e.memory.targetRoom + ":" + r;
+    Memory.remoteSupplyComplete[t] = {
+      homeRoom: e.memory.homeRoom,
+      targetRoom: e.memory.targetRoom,
+      mission: r,
+      completedAt: Game.time
+    };
+  }
 };
-
-// ============================================================================
-// Route state machine
-//
-// creep.memory._rs = {
 //   phase:        'idle' | 'pending' | 'ready' | 'failed'
 //   route:        string[]   homeRoom -> targetRoom
 //   routeBack:    string[]   targetRoom -> homeRoom
@@ -251,532 +216,386 @@ module.exports = {
 //   pending:      { room, requestedTick } | null
 //   blocked:      string[]   rooms confirmed impassable
 //   attempts:     number     recompute count
-// }
-// ============================================================================
-
-/**
- * Top-level entry: initialize state if idle, tick the scanner if pending,
- * then navigate if ready. Called by _followRoute every tick.
- */
-function _tickRouteState(creep) {
-    if (!creep.memory._rs) {
-        creep.memory._rs = {
-            phase:    'idle',
-            route:    null,
-            routeBack: null,
-            toScan:   [],
-            pending:  null,
-            blocked:  [],
-            attempts: 0
-        };
-    }
-
-    var rs = creep.memory._rs;
-
-    if (rs.phase === 'idle') {
-        _initRoute(creep, rs);
-        return;
-    }
-
-    if (rs.phase === 'pending') {
-        _scanTick(creep, rs);
-        return;
-    }
-
-    // 'ready' and 'failed' are terminal — no further ticking needed
+function _routeStateKey(e) {
+  return (e.memory.homeRoom || "?") + "->" + (e.memory.targetRoom || "?") + ":" + (e.memory.mission || "extensions");
 }
 
-/**
- * Compute initial route and build the scan queue.
- * If all intermediate rooms are already owned/visible and passable, jump
- * straight to 'ready'. Otherwise enter 'pending'.
- */
-function _initRoute(creep, rs) {
-    var from = creep.memory.homeRoom;
-    var to   = creep.memory.targetRoom;
-    if (!from || !to) { rs.phase = 'failed'; return; }
-
-    var route = _computeRoute(from, to, rs.blocked);
-    if (!route) {
-        console.log('[RemoteSupplier] ' + creep.name +
-                    ': findRoute failed ' + from + ' -> ' + to + '. Marking failed.');
-        rs.phase = 'failed';
-        return;
-    }
-
-    rs.route    = route;
-    rs.routeBack = route.slice().reverse();
-
-    // Queue intermediate rooms that we don't own for scanning
-    rs.toScan = [];
-    for (var i = 1; i < route.length - 1; i++) {
-        var rn  = route[i];
-        var rm  = Game.rooms[rn];
-        var own = rm && rm.controller && rm.controller.my;
-        if (!own) rs.toScan.push(rn);
-    }
-
-    if (rs.toScan.length === 0) {
-        rs.phase = 'ready';
-        console.log('[RemoteSupplier] ' + creep.name +
-                    ': route ready (all rooms owned): ' + route.join(' -> '));
-        return;
-    }
-
-    rs.phase   = 'pending';
-    rs.pending = null;
-    console.log('[RemoteSupplier] ' + creep.name +
-                ': route computed, scanning ' + rs.toScan.length +
-                ' room(s): ' + route.join(' -> '));
+function _getRouteState(e) {
+  if (!Memory.remoteSupplierRoutes) Memory.remoteSupplierRoutes = {};
+  var r = _routeStateKey(e);
+  var t = e.memory._rs;
+  var o = Memory.remoteSupplierRoutes[r];
+  if (o && o.lastUsed && Game.time - o.lastUsed > ROUTE_CACHE_TTL) {
+    delete Memory.remoteSupplierRoutes[r];
+    o = null;
+  }
+  if (!o) {
+    o = Memory.remoteSupplierRoutes[r] = {
+      phase: "idle",
+      route: null,
+      routeBack: null,
+      toScan: [],
+      pending: null,
+      blocked: [],
+      attempts: 0
+    };
+  }
+  o.lastUsed = Game.time;
+  if (t && t !== o && t.route && !o.route) {
+    o.phase = t.phase || "idle";
+    o.route = t.route || null;
+    o.routeBack = t.routeBack || (t.route ? t.route.slice().reverse() : null);
+    o.toScan = t.toScan || [];
+    o.pending = t.pending || null;
+    o.blocked = t.blocked || [];
+    o.attempts = t.attempts || 0;
+  }
+  e.memory._rs = {
+    key: r
+  };
+  return o;
 }
 
-/**
- * Process one tick of observer scanning / traversal validation.
- *
- * Flow per tick:
- *   A) If a scan was requested last tick, check for vision and validate.
- *   B) If no pending scan, pick the next room and request observation.
- *   C) When toScan is empty, mark route ready.
- */
-function _scanTick(creep, rs) {
-    // ── A: Process result from last tick's observation ────────────────────────
-    if (rs.pending) {
-        var pRoom = rs.pending.room;
-        var room  = Game.rooms[pRoom];
+function _resetRouteState(e) {
+  var r = _routeStateKey(e);
+  if (Memory.remoteSupplierRoutes) delete Memory.remoteSupplierRoutes[r];
+  delete e.memory._rs;
+}
 
-        if (room) {
-            // Vision acquired — run traversal check
-            var routeIdx = rs.route.indexOf(pRoom);
-            var prev     = routeIdx > 0               ? rs.route[routeIdx - 1] : null;
-            var next     = routeIdx < rs.route.length - 1 ? rs.route[routeIdx + 1] : null;
+function _tickRouteState(e) {
+  var r = _getRouteState(e);
+  if (r.phase === "idle") {
+    _initRoute(e, r);
+    return;
+  }
+  if (r.phase === "pending") {
+    _scanTick(e, r);
+    return;
+  }
+}
 
-            var passable = (prev && next)
-                ? _checkRoomTraversal(pRoom, prev, next)
-                : true;  // first/last room — no traversal check needed
+function _initRoute(e, r) {
+  var t = e.memory.homeRoom;
+  var o = e.memory.targetRoom;
+  if (!t || !o) {
+    r.phase = "failed";
+    return;
+  }
+  var a = _computeRoute(t, o, r.blocked);
+  if (!a) {
+    console.log("[RemoteSupplier] " + e.name + ": findRoute failed " + t + " -> " + o + ". Marking failed.");
+    r.phase = "failed";
+    return;
+  }
+  r.route = a;
+  r.routeBack = a.slice().reverse();
+  r.toScan = [];
+  for (var n = 1; n < a.length - 1; n++) {
+    var i = a[n];
+    var m = Game.rooms[i];
+    var l = m && m.controller && m.controller.my;
+    if (!l) r.toScan.push(i);
+  }
+  if (r.toScan.length === 0) {
+    r.phase = "ready";
+    console.log("[RemoteSupplier] " + e.name + ": route ready (all rooms owned): " + a.join(" -> "));
+    return;
+  }
+  r.phase = "pending";
+  r.pending = null;
+  console.log("[RemoteSupplier] " + e.name + ": route computed, scanning " + r.toScan.length + " room(s): " + a.join(" -> "));
+}
 
-            if (passable) {
-                // Remove from scan queue, clear pending
-                var idx = rs.toScan.indexOf(pRoom);
-                if (idx !== -1) rs.toScan.splice(idx, 1);
-                rs.pending = null;
-            } else {
-                // Room is impassable — add to blocked and recompute
-                console.log('[RemoteSupplier] ' + creep.name +
-                            ': room ' + pRoom + ' failed traversal check. Recomputing route.');
-                rs.blocked.push(pRoom);
-                rs.pending   = null;
-                rs.attempts++;
-
-                if (rs.attempts > MAX_RECOMPUTES) {
-                    console.log('[RemoteSupplier] ' + creep.name +
-                                ': exhausted recompute attempts. Route failed.');
-                    rs.phase = 'failed';
-                    return;
-                }
-
-                _recomputeRoute(creep, rs);
-                return;
-            }
-
-        } else if (Game.time - rs.pending.requestedTick >= SCAN_TIMEOUT) {
-            // Observer timed out — assume passable and continue
-            console.log('[RemoteSupplier] ' + creep.name +
-                        ': scan timeout for ' + pRoom + ' — assuming passable.');
-            var tidx = rs.toScan.indexOf(pRoom);
-            if (tidx !== -1) rs.toScan.splice(tidx, 1);
-            rs.pending = null;
-        } else {
-            // Still waiting for vision — do nothing this tick
-            return;
+function _scanTick(e, r) {
+  if (r.pending) {
+    var t = r.pending.room;
+    var o = Game.rooms[t];
+    var a = "remoteSupplier:" + e.name;
+    if (o) {
+      scanner.observe.consume(t, a);
+      var n = r.route.indexOf(t);
+      var i = n > 0 ? r.route[n - 1] : null;
+      var m = n < r.route.length - 1 ? r.route[n + 1] : null;
+      var l = i && m ? _checkRoomTraversal(t, i, m) : true;
+      if (l) {
+        var s = r.toScan.indexOf(t);
+        if (s !== -1) r.toScan.splice(s, 1);
+        r.pending = null;
+      } else {
+        console.log("[RemoteSupplier] " + e.name + ": room " + t + " failed traversal check. Recomputing route.");
+        r.blocked.push(t);
+        r.pending = null;
+        r.attempts++;
+        if (r.attempts > MAX_RECOMPUTES) {
+          console.log("[RemoteSupplier] " + e.name + ": exhausted recompute attempts. Route failed.");
+          r.phase = "failed";
+          return;
         }
-    }
-
-    // ── B: Scan is clear — check if done ─────────────────────────────────────
-    if (rs.toScan.length === 0) {
-        rs.phase = 'ready';
-        console.log('[RemoteSupplier] ' + creep.name +
-                    ': route validated and ready: ' + rs.route.join(' -> '));
+        _recomputeRoute(e, r);
         return;
-    }
-
-    // ── C: Request observation of next room in queue ──────────────────────────
-    // First check if we already have natural vision (owned by us, scout, etc.)
-    var nextRoom = rs.toScan[0];
-    if (Game.rooms[nextRoom]) {
-        // Already visible — validate immediately without observer
-        var nr       = rs.route.indexOf(nextRoom);
-        var nrPrev   = nr > 0               ? rs.route[nr - 1] : null;
-        var nrNext   = nr < rs.route.length - 1 ? rs.route[nr + 1] : null;
-        var nrPass   = (nrPrev && nrNext)
-            ? _checkRoomTraversal(nextRoom, nrPrev, nrNext)
-            : true;
-
-        if (nrPass) {
-            rs.toScan.shift();
-            // Let next call pick the following room
-        } else {
-            console.log('[RemoteSupplier] ' + creep.name +
-                        ': room ' + nextRoom + ' (natural vision) failed traversal. Recomputing.');
-            rs.blocked.push(nextRoom);
-            rs.toScan.shift();
-            rs.attempts++;
-            if (rs.attempts > MAX_RECOMPUTES) {
-                rs.phase = 'failed';
-                return;
-            }
-            _recomputeRoute(creep, rs);
-        }
-        return;
-    }
-
-    // Need observer
-    var observer = _findObserverForRoom(nextRoom);
-    if (!observer) {
-        console.log('[RemoteSupplier] ' + creep.name +
-                    ': no observer in range of ' + nextRoom + ' — skipping (assumed passable).');
-        rs.toScan.shift();
-        return;
-    }
-
-    if (observer.cooldown > 0) {
-        return; // Wait for observer to be free
-    }
-
-    var result = observer.observeRoom(nextRoom);
-    if (result === OK) {
-        rs.pending = { room: nextRoom, requestedTick: Game.time };
+      }
+    } else if (Game.time - r.pending.requestedTick >= SCAN_TIMEOUT) {
+      console.log("[RemoteSupplier] " + e.name + ": scan timeout for " + t + " — route validation failed.");
+      scanner.observe.cancel(t, a);
+      r.pending = null;
+      r.phase = "failed";
+      return;
     } else {
-        console.log('[RemoteSupplier] ' + creep.name +
-                    ': observeRoom(' + nextRoom + ') returned ' + result);
+      scanner.observe.request(t, a, scanner.observe.PRI.MONITOR, {
+        untilConsumed: true,
+        holdTicks: SCAN_HOLD_TICKS
+      });
+      return;
     }
-}
-
-/**
- * Recompute route after a blocked room is discovered.
- * Rebuilds toScan with any new rooms on the new route that haven't been seen.
- */
-function _recomputeRoute(creep, rs) {
-    var from = creep.memory.homeRoom;
-    var to   = creep.memory.targetRoom;
-
-    var newRoute = _computeRoute(from, to, rs.blocked);
-    if (!newRoute) {
-        console.log('[RemoteSupplier] ' + creep.name +
-                    ': no alternative route avoiding ' + rs.blocked.join(', '));
-        rs.phase = 'failed';
+  }
+  if (r.toScan.length === 0) {
+    r.phase = "ready";
+    console.log("[RemoteSupplier] " + e.name + ": route validated and ready: " + r.route.join(" -> "));
+    return;
+  }
+  var u = r.toScan[0];
+  if (Game.rooms[u]) {
+    var f = r.route.indexOf(u);
+    var R = f > 0 ? r.route[f - 1] : null;
+    var c = f < r.route.length - 1 ? r.route[f + 1] : null;
+    var p = R && c ? _checkRoomTraversal(u, R, c) : true;
+    if (p) {
+      r.toScan.shift();
+    } else {
+      console.log("[RemoteSupplier] " + e.name + ": room " + u + " (natural vision) failed traversal. Recomputing.");
+      r.blocked.push(u);
+      r.toScan.shift();
+      r.attempts++;
+      if (r.attempts > MAX_RECOMPUTES) {
+        r.phase = "failed";
         return;
+      }
+      _recomputeRoute(e, r);
     }
-
-    rs.route    = newRoute;
-    rs.routeBack = newRoute.slice().reverse();
-
-    // Build new scan queue — only rooms not yet confirmed passable
-    var alreadyPassed = {};
-    // Rooms that were in old toScan but already processed are no longer there
-    // We track this simply: any room NOT in current toScan was already validated
-    for (var p = 0; p < rs.toScan.length; p++) {
-        alreadyPassed[rs.toScan[p]] = true; // still need scanning
-    }
-
-    rs.toScan = [];
-    for (var i = 1; i < newRoute.length - 1; i++) {
-        var rn  = newRoute[i];
-        var rm  = Game.rooms[rn];
-        var own = rm && rm.controller && rm.controller.my;
-        if (own) continue;
-        // Skip rooms we already confirmed as passable (not in old toScan and not blocked)
-        if (rs.blocked.indexOf(rn) !== -1) continue;
-        rs.toScan.push(rn);
-    }
-
-    rs.pending = null;
-
-    console.log('[RemoteSupplier] ' + creep.name +
-                ': recomputed route (attempt ' + rs.attempts + '): ' + newRoute.join(' -> ') +
-                ' | scan queue: ' + rs.toScan.length + ' room(s)');
-
-    if (rs.toScan.length === 0) {
-        rs.phase = 'ready';
-        console.log('[RemoteSupplier] ' + creep.name + ': recomputed route validated immediately.');
-    }
+    return;
+  }
+  var g = "remoteSupplier:" + e.name;
+  if (!scanner.observe.request(u, g, scanner.observe.PRI.MONITOR, {
+    untilConsumed: true,
+    holdTicks: SCAN_HOLD_TICKS
+  })) {
+    console.log("[RemoteSupplier] " + e.name + ": no observer in range of " + u + " — route validation failed.");
+    r.phase = "failed";
+    return;
+  }
+  r.pending = {
+    room: u,
+    requestedTick: Game.time
+  };
 }
 
-/**
- * Compute a room corridor via Game.map.findRoute, avoiding known blocked rooms.
- * Returns string array [from, ..., to] or null.
- */
-function _computeRoute(from, to, blockedRooms) {
-    var blockedSet = {};
-    if (blockedRooms) {
-        for (var b = 0; b < blockedRooms.length; b++) {
-            blockedSet[blockedRooms[b]] = true;
-        }
-    }
+function _recomputeRoute(e, r) {
+  var t = e.memory.homeRoom;
+  var o = e.memory.targetRoom;
+  var a = _computeRoute(t, o, r.blocked);
+  if (!a) {
+    console.log("[RemoteSupplier] " + e.name + ": no alternative route avoiding " + r.blocked.join(", "));
+    r.phase = "failed";
+    return;
+  }
+  r.route = a;
+  r.routeBack = a.slice().reverse();
+  var n = {};
+  for (var i = 0; i < r.toScan.length; i++) {
+    n[r.toScan[i]] = true;
+  }
+  r.toScan = [];
+  for (var m = 1; m < a.length - 1; m++) {
+    var l = a[m];
+    var s = Game.rooms[l];
+    var u = s && s.controller && s.controller.my;
+    if (u) continue;
+    if (r.blocked.indexOf(l) !== -1) continue;
+    r.toScan.push(l);
+  }
+  r.pending = null;
+  console.log("[RemoteSupplier] " + e.name + ": recomputed route (attempt " + r.attempts + "): " + a.join(" -> ") + " | scan queue: " + r.toScan.length + " room(s)");
+  if (r.toScan.length === 0) {
+    r.phase = "ready";
+    console.log("[RemoteSupplier] " + e.name + ": recomputed route validated immediately.");
+  }
+}
 
-    var result = Game.map.findRoute(from, to, {
-        routeCallback: function(roomName) {
-            if (blockedSet[roomName]) return Infinity;
-            var room = Game.rooms[roomName];
-            if (room && room.controller && room.controller.owner && !room.controller.my) {
-                return Infinity; // Don't transit hostile-owned rooms
-            }
-            return 1;
-        }
+function _computeRoute(e, r, t) {
+  var o = {};
+  if (t) {
+    for (var a = 0; a < t.length; a++) {
+      o[t[a]] = true;
+    }
+  }
+  var n = Game.map.findRoute(e, r, {
+    routeCallback: function(e) {
+      if (o[e]) return Infinity;
+      var r = Game.rooms[e];
+      if (r && r.controller && r.controller.owner && !r.controller.my) {
+        return Infinity;
+      }
+      return 1;
+    }
+  });
+  if (!n || n === ERR_NO_PATH || n.length === 0) {
+    n = Game.map.findRoute(e, r, {
+      routeCallback: function(e) {
+        return o[e] ? Infinity : 1;
+      }
     });
-
-    // Fallback with no restrictions except hard blocks
-    if (!result || result === ERR_NO_PATH || result.length === 0) {
-        result = Game.map.findRoute(from, to, {
-            routeCallback: function(roomName) {
-                return blockedSet[roomName] ? Infinity : 1;
-            }
-        });
-    }
-
-    if (!result || result === ERR_NO_PATH || result.length === 0) return null;
-
-    var route = [from];
-    for (var i = 0; i < result.length; i++) {
-        route.push(result[i].room);
-    }
-    return route;
+  }
+  if (!n || n === ERR_NO_PATH || n.length === 0) return null;
+  var i = [ e ];
+  for (var m = 0; m < n.length; m++) {
+    i.push(n[m].room);
+  }
+  return i;
 }
 
-// ============================================================================
-// Navigation — exit-by-exit room following
-// ============================================================================
-
-/**
- * Navigate the creep toward destRoom (homeRoom or targetRoom).
- * Waits in place if route validation is still in progress.
- */
-function _followRoute(creep, destRoom) {
-    // Tick the route state machine
-    _tickRouteState(creep);
-
-    var rs = creep.memory._rs;
-    if (!rs) return;
-
-    if (rs.phase === 'failed') {
-        if (Game.time % 20 === 0) {
-            console.log('[RemoteSupplier] ' + creep.name +
-                        ': route failed — creep stuck. Consider cancelling order.');
-        }
-        return;
+function _followRoute(e, r) {
+  _tickRouteState(e);
+  var t = _getRouteState(e);
+  if (!t) return;
+  if (t.phase === "failed") {
+    if (Game.time % 20 === 0) {
+      console.log("[RemoteSupplier] " + e.name + ": route failed — creep stuck. Consider cancelling order.");
     }
-
-    if (rs.phase !== 'ready') {
-        // Validation still running — wait in place
-        if (Game.time % 10 === 0) {
-            creep.say('🔍');
-        }
-        return;
+    return;
+  }
+  if (t.phase !== "ready") {
+    if (Game.time % 10 === 0) {
+      e.say("🔍");
     }
-
-    // Route is ready — navigate exit-by-exit
-    var isForward   = (destRoom === creep.memory.targetRoom);
-    var route       = isForward ? rs.route : rs.routeBack;
-    var currentRoom = creep.room.name;
-
-    if (currentRoom === destRoom) return;
-
-    // Bounce prevention: on a room border tile, step inward.
-    // maxRooms:1 is critical — without it PathFinder can route back through the
-    // previous room (e.g. targetRoom) to reach (25,25), causing a return loop.
-    if (creep.pos.x === 0  || creep.pos.x === 49 ||
-        creep.pos.y === 0  || creep.pos.y === 49) {
-        creep.moveTo(new RoomPosition(25, 25, currentRoom),
-                     { reusePath: 3, maxOps: 2000, maxRooms: 1 });
-        return;
-    }
-
-    // Find position in route
-    var idx = -1;
-    for (var i = 0; i < route.length; i++) {
-        if (route[i] === currentRoom) { idx = i; break; }
-    }
-
-    if (idx === -1) {
-        // Off route — invalidate and recompute on next tick
-        console.log('[RemoteSupplier] ' + creep.name +
-                    ': off route in ' + currentRoom + ', resetting route state.');
-        delete creep.memory._rs;
-        delete creep.memory._exitCache;
-        return;
-    }
-
-    var nextIdx = idx + 1;
-    if (nextIdx >= route.length) {
-        creep.moveTo(new RoomPosition(25, 25, destRoom), { reusePath: 5 });
-        return;
-    }
-
-    var nextRoom = route[nextIdx];
-
-    // Cache exit tile to avoid findClosestByRange every tick
-    var cached = creep.memory._exitCache;
-    if (!cached || cached.nextRoom !== nextRoom) {
-        var exitDir = Game.map.findExit(currentRoom, nextRoom);
-        if (exitDir < 0) {
-            console.log('[RemoteSupplier] ' + creep.name +
-                        ': no exit from ' + currentRoom + ' to ' + nextRoom +
-                        ' — resetting route.');
-            delete creep.memory._rs;
-            delete creep.memory._exitCache;
-            return;
-        }
-        var exitPos = creep.pos.findClosestByRange(exitDir);
-        if (!exitPos) {
-            creep.moveTo(new RoomPosition(25, 25, destRoom), { reusePath: 5 });
-            return;
-        }
-        creep.memory._exitCache = { nextRoom: nextRoom, x: exitPos.x, y: exitPos.y };
-        cached = creep.memory._exitCache;
-    }
-
-    // maxRooms:1 keeps pathfinding within currentRoom when navigating to the exit
-    // tile — prevents the creep from accidentally looping through adjacent rooms.
-    creep.moveTo(new RoomPosition(cached.x, cached.y, currentRoom), {
-        reusePath:          20,
-        maxOps:             2000,
-        maxRooms:           1,
-        visualizePathStyle: { stroke: '#ffffff', opacity: 0.2 }
+    return;
+  }
+  var o = r === e.memory.targetRoom;
+  var a = o ? t.route : t.routeBack;
+  var n = e.room.name;
+  if (n === r) return;
+  if (util.isOnRoomEdge(e.pos)) {
+    e.moveTo(new RoomPosition(25, 25, n), {
+      reusePath: 3,
+      maxOps: 2e3,
+      maxRooms: 1
     });
-}
-
-/**
- * Clear only the exit tile cache (called on direction changes).
- * Does NOT reset route validation — that persists for the creep's lifetime.
- */
-function _clearExitCache(creep) {
-    delete creep.memory._exitCache;
-}
-
-// ============================================================================
-// Observer helpers
-// ============================================================================
-
-function _findObserverForRoom(targetRoom) {
-    var best = null;
-    var bestDist = Infinity;
-    for (var roomName in Game.rooms) {
-        var room = Game.rooms[roomName];
-        if (!room.controller || !room.controller.my) continue;
-        var dist = Game.map.getRoomLinearDistance(roomName, targetRoom);
-        if (dist > OBSERVER_RANGE) continue;
-        var obs = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) { return s.structureType === STRUCTURE_OBSERVER; }
-        });
-        if (obs.length > 0 && dist < bestDist) {
-            best     = obs[0];
-            bestDist = dist;
-        }
+    return;
+  }
+  var i = -1;
+  for (var m = 0; m < a.length; m++) {
+    if (a[m] === n) {
+      i = m;
+      break;
     }
-    return best;
-}
-
-// ============================================================================
-// Route traversal validation (modeled after depositObserver.js)
-//
-// Checks that a creep entering roomName from prevRoom can actually reach the
-// exit toward nextRoom using PathFinder — catches player-built walls/ramparts
-// that Game.map.findRoute knows nothing about.
-// ============================================================================
-
-function _getEdgeCoords(exitDir) {
-    switch (exitDir) {
-        case FIND_EXIT_TOP:    return { axis: 'y', value: 0,  range: 'x' };
-        case FIND_EXIT_BOTTOM: return { axis: 'y', value: 49, range: 'x' };
-        case FIND_EXIT_LEFT:   return { axis: 'x', value: 0,  range: 'y' };
-        case FIND_EXIT_RIGHT:  return { axis: 'x', value: 49, range: 'y' };
-    }
-    return null;
-}
-
-function _getEntryDirection(prevRoom, thisRoom) {
-    var exitDir = Game.map.findExit(prevRoom, thisRoom);
-    switch (exitDir) {
-        case FIND_EXIT_TOP:    return FIND_EXIT_BOTTOM;
-        case FIND_EXIT_BOTTOM: return FIND_EXIT_TOP;
-        case FIND_EXIT_LEFT:   return FIND_EXIT_RIGHT;
-        case FIND_EXIT_RIGHT:  return FIND_EXIT_LEFT;
-    }
-    return -1;
-}
-
-function _pickRandomEdgeTile(roomName, edgeDir) {
-    var terrain = Game.map.getRoomTerrain(roomName);
-    if (!terrain) return null;
-    var coords = _getEdgeCoords(edgeDir);
-    if (!coords) return null;
-    var walkable = [];
-    for (var i = 0; i < 50; i++) {
-        var x = coords.axis === 'x' ? coords.value : i;
-        var y = coords.axis === 'y' ? coords.value : i;
-        if (terrain.get(x, y) !== TERRAIN_MASK_WALL) walkable.push({ x: x, y: y });
-    }
-    if (walkable.length === 0) return null;
-    var pick = walkable[Math.floor(walkable.length / 2)]; // middle tile, deterministic
-    return new RoomPosition(pick.x, pick.y, roomName);
-}
-
-function _getEdgeGoals(roomName, edgeDir) {
-    var terrain = Game.map.getRoomTerrain(roomName);
-    if (!terrain) return [];
-    var coords = _getEdgeCoords(edgeDir);
-    if (!coords) return [];
-    var goals = [];
-    for (var i = 0; i < 50; i++) {
-        var x = coords.axis === 'x' ? coords.value : i;
-        var y = coords.axis === 'y' ? coords.value : i;
-        if (terrain.get(x, y) !== TERRAIN_MASK_WALL) {
-            goals.push({ pos: new RoomPosition(x, y, roomName), range: 0 });
-        }
-    }
-    return goals;
-}
-
-function _buildRoomCostMatrix(roomName) {
-    var room   = Game.rooms[roomName];
-    var matrix = new PathFinder.CostMatrix();
-    if (!room) return matrix;
-    var structures = room.find(FIND_STRUCTURES);
-    for (var i = 0; i < structures.length; i++) {
-        var s = structures[i];
-        if (s.structureType === STRUCTURE_WALL) {
-            matrix.set(s.pos.x, s.pos.y, 0xff);
-        } else if (s.structureType === STRUCTURE_RAMPART) {
-            if (!s.my && !s.isPublic) matrix.set(s.pos.x, s.pos.y, 0xff);
-        }
-    }
-    return matrix;
-}
-
-/**
- * Check that a creep can traverse roomName from prevRoom's exit edge to
- * nextRoom's entry edge. Returns true if passable.
- */
-function _checkRoomTraversal(roomName, prevRoom, nextRoom) {
-    var entryDir = _getEntryDirection(prevRoom, roomName);
-    var exitDir  = Game.map.findExit(roomName, nextRoom);
-    if (entryDir < 0 || exitDir < 0) return false;
-
-    var startPos = _pickRandomEdgeTile(roomName, entryDir);
-    if (!startPos) return false;
-
-    var goals = _getEdgeGoals(roomName, exitDir);
-    if (goals.length === 0) return false;
-
-    var result = PathFinder.search(startPos, goals, {
-        plainCost: 2,
-        swampCost: 10,
-        maxOps:    4000,
-        maxRooms:  1,
-        roomCallback: function(rName) {
-            if (rName !== roomName) return false;
-            return _buildRoomCostMatrix(rName);
-        }
+  }
+  if (i === -1) {
+    console.log("[RemoteSupplier] " + e.name + ": off route in " + n + ", resetting route state.");
+    _resetRouteState(e);
+    delete e.memory._exitCache;
+    return;
+  }
+  var l = i + 1;
+  if (l >= a.length) {
+    e.moveTo(new RoomPosition(25, 25, r), {
+      reusePath: 5
     });
+    return;
+  }
+  var s = a[l];
+  var u = e.memory._exitCache;
+  if (!u || u.nextRoom !== s) {
+    var f = Game.map.findExit(n, s);
+    if (f < 0) {
+      console.log("[RemoteSupplier] " + e.name + ": no exit from " + n + " to " + s + " — resetting route.");
+      _resetRouteState(e);
+      delete e.memory._exitCache;
+      return;
+    }
+    var R = e.pos.findClosestByRange(f);
+    if (!R) {
+      e.moveTo(new RoomPosition(25, 25, r), {
+        reusePath: 5
+      });
+      return;
+    }
+    e.memory._exitCache = {
+      nextRoom: s,
+      x: R.x,
+      y: R.y
+    };
+    u = e.memory._exitCache;
+  }
+  e.moveTo(new RoomPosition(u.x, u.y, n), {
+    reusePath: 20,
+    maxOps: 2e3,
+    maxRooms: 1,
+    visualizePathStyle: {
+      stroke: "#ffffff",
+      opacity: .2
+    }
+  });
+}
 
-    return !result.incomplete;
+function _clearExitCache(e) {
+  delete e.memory._exitCache;
+}
+
+var _getEntryDirection = util.getEntryDirection;
+var _getEdgeGoals = util.getEdgeGoals;
+function _pickRandomEdgeTile(e, r) {
+  var t = util.edgeWalkableTiles(e, r);
+  if (t.length === 0) return null;
+  var o = t[Math.floor(t.length / 2)];
+  return new RoomPosition(o.x, o.y, e);
+}
+
+function _buildRoomCostMatrix(e) {
+  var r = new PathFinder.CostMatrix;
+  var t = getRoomState.get(e);
+  var o = t && t.structuresByType;
+  if (!o) {
+    var a = Game.rooms[e];
+    if (!a) return r;
+    var n = a.find(FIND_STRUCTURES);
+    for (var i = 0; i < n.length; i++) {
+      var m = n[i];
+      if (m.structureType === STRUCTURE_WALL) {
+        r.set(m.pos.x, m.pos.y, 255);
+      } else if (m.structureType === STRUCTURE_RAMPART && !m.my && !m.isPublic) {
+        r.set(m.pos.x, m.pos.y, 255);
+      }
+    }
+    return r;
+  }
+  var l = o[STRUCTURE_WALL] || [];
+  for (var s = 0; s < l.length; s++) {
+    if (l[s]) r.set(l[s].pos.x, l[s].pos.y, 255);
+  }
+  var u = o[STRUCTURE_RAMPART] || [];
+  for (var f = 0; f < u.length; f++) {
+    var R = u[f];
+    if (R && !R.my && !R.isPublic) r.set(R.pos.x, R.pos.y, 255);
+  }
+  return r;
+}
+
+function _checkRoomTraversal(e, r, t) {
+  var o = _getEntryDirection(r, e);
+  var a = Game.map.findExit(e, t);
+  if (o < 0 || a < 0) return false;
+  var n = _pickRandomEdgeTile(e, o);
+  if (!n) return false;
+  var i = _getEdgeGoals(e, a);
+  if (i.length === 0) return false;
+  var m = PathFinder.search(n, i, {
+    plainCost: 2,
+    swampCost: 10,
+    maxOps: 4e3,
+    maxRooms: 1,
+    roomCallback: function(r) {
+      if (r !== e) return false;
+      return _buildRoomCostMatrix(r);
+    }
+  });
+  return !m.incomplete;
 }

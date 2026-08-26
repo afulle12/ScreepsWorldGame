@@ -1,134 +1,165 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // marketRefine.js
-// Orchestrates a buy(inputs) -> refine(max) -> sell pipeline for factory products.
-// Supports both simple bar/compressed products AND multi-input COMMODITIES recipes.
-//
-// REQUIRED console API:
+// Console globals: marketRefine, marketRefineStatus, cancelMarketRefine, cancelLastMarketRefine, cancelAllMarketRefine, abortMarketRefine, cancelFactoryOrder, marketRefineOutcomes, marketRefineForceList, marketRefineComputeBidPrice, marketRefineShouldUseMarketBuy, marketRefineDebugBuyDecision, marketRefineDebugOpBuy
+// Example: marketRefine('E1N1', 'XGH2O', 3000) - Execute market-driven commodity refinement
+// Example: marketRefineStatus('E1N1') - View active refinement queues and progress
+// Example: cancelMarketRefine('E1N1', 'opId') - Cancel specific market refinement operation
+// Example: cancelLastMarketRefine('E1N1') - Cancel most recently queued refinement operation
+// Example: cancelAllMarketRefine('E1N1') - Cancel all pending refinement operations
+// Example: abortMarketRefine('E1N1') - Immediately abort active refinement operations
+// Example: cancelFactoryOrder('E1N1', 'orderId') - Cancel linked factory order for refinement
+// Example: marketRefineOutcomes() - Display profit/loss outcomes of past refinements
+// Example: marketRefineForceList() - Print list of forced refinement commodities
+// Example: marketRefineComputeBidPrice('XGH2O') - Calculate target buy bid for refinement input
+// Example: marketRefineShouldUseMarketBuy('XGH2O') - Check if inputs should be bought from market
+// Example: marketRefineDebugBuyDecision('XGH2O') - Trace buy vs produce refinement decision
+// Example: marketRefineDebugOpBuy('E1N1', 'XGH2O') - Trace opportunistic refinement buying
 //   marketRefine('W1N1', 'Zynthium bar')
 //   marketRefine('W1N1', RESOURCE_COMPOSITE)
-//   marketRefine('W1N1', RESOURCE_COMPOSITE, { utrium_bar: 330, zynthium_bar: 79 })  // with max prices
-//
-// Helpers:
-//   marketRefineStatus()            // list ops
-//   marketRefineStatus('op_id')     // details
-//   cancelMarketRefine('op_id')     // cancel op + linked marketBuy orders
-//   cancelLastMarketRefine()        // cancel the most recent op (helper)
-//   abortMarketRefine(room, product) // cancel a still-buying op + sell back acquired inputs
-//   marketRefineDebugOpBuy()         // print detected opportunisticBuy methods (console)
-//   marketRefineOutcomes(n)          // show last n recorded outcomes (default 20)
+//   marketRefine('W1N1', RESOURCE_COMPOSITE, { utrium_bar: 330, zynthium_bar: 79 })  // max prices
+//   marketRefineStatus() / marketRefineStatus('op_id')  List ops / details.
+//   cancelMarketRefine('op_id')  Cancel op + linked marketBuy orders.
+//   cancelLastMarketRefine()     Cancel the most recent op.
+//   abortMarketRefine(room, product)  Cancel a still-buying op and sell back
+//     acquired inputs.
+//   marketRefineDebugOpBuy()     Print detected opportunisticBuy methods.
+//   marketRefineOutcomes(n)      Last n recorded outcomes (default 20).
 //   cancelAllMarketRefine()
-//
-// Constraints per user instructions:
-// - Use getRoomState for room reads.
-// - Wait for buy before refining; call orderFactory(..., 'max'); wait; then sell newly produced output via marketSell.
-// - No optional chaining.
-//
-// SPECIAL CASES:
-// - Battery production uses marketSell to acquire energy (only suitable mechanism for energy).
-// - Biomass always uses marketBuy (deposit resource; standing orders are the only practical source).
-//
-// DISPATCHER (v3):
-// - Per input, chooses marketBuy (standing order) vs opportunisticBuy via marketPricing +
-//   the status-report energy price (marketBuyer.computeBuyPrice(RESOURCE_ENERGY) = bestBid+0.1
-//   or 95% of 2-day avg):
-//     * resource in MARKET_BUY_FORCE_LIST                  -> marketBuy (manual override)
-//     * ENERGY input                                       -> opportunistic
-//     * value > energyBuyPrice AND range7d > RANGE_GATE    -> opportunistic (expensive + volatile)
-//     * trend7d === 'rising' AND takeable ask              -> opportunistic (posted bid won't fill)
-//     * otherwise                                          -> marketBuy (cheap / stable / thin)
-// - Bid pricing for marketBuy uses bestBid + 0.1 (or ceiling, whichever is lower) so the
-//   order is competitive on placement. marketBuy.run() also reprices UP if bestBid climbs
-//   and the ceiling still allows it (capped at MAX_UP_REPRICES per order).
-// - Force list is editable at runtime via global.marketRefineForceList() console command.
-//
-// ORDER LINKAGE (v2):
-// - Order ids CANNOT be captured synchronously (createOrder returns OK; the order
-//   appears in Game.market.orders next tick). The buying loop polls
-//   marketBuyer.getOrderRecordFor(room, resource) until rec.orderId is populated.
-// - Fill progress for marketBuy inputs is read from the managed order record
-//   (tranche-aware, tombstone-aware), NOT from room deltas.
-//
-// EXPIRY (v2):
-// - Acquisition is evaluated BEFORE expiry, so an op whose final fill lands on the
-//   deadline transitions to refining instead of being killed.
-// - On expiry/abort, each marketBuy order is judged against the FLOOR margin ceiling
-//   (marketPricing.inputCeilings(output, FLOOR_MARGIN)): margin dead -> cancel;
-//   margin alive -> passivate (marketBuy.js keeps auditing it).
-//
-// OUTCOMES LEDGER (new):
-// - When an op leaves the active ops array (done OR failed), a small record is
-//   appended to Memory.marketRefine.outcomes (capped at OUTCOMES_HISTORY_CAP).
-// - This lets autoTrader (and marketRefineOutcomes()) distinguish "this job
-//   actually produced output" from "this job failed and was silently dropped",
-//   which previously both looked like the op simply disappearing.
-
-var getRoomState = require('getRoomState');
-var marketBuyer = require('marketBuy');
-var pricing = require('marketPricing');
-
-// ===== opportunisticBuy loader (define BEFORE any use) =====
+// longer break-even -> cancel; margin alive -> passivate (marketBuy.js
+var getRoomState = require("getRoomState");
+var marketBuyer = require("marketBuy");
+var pricing = require("marketPricing");
+var util = require("util");
+var memoryManager = require("memoryManager");
+var storageManager = require("storageManager");
+var factorySlots = require("factorySlots");
+var marketBatchBuy = require("marketBatchBuy");
+var marketEconomics = require("marketEconomics");
+var factoryManager = require("factoryManager");
+var labCommodityPolicy = require("labCommodityPolicy");
+var labCommodityRouter = require("labCommodityRouter");
+var MEMORY_VERSION = 2;
 function getOpBuy() {
-  var opBuy = global.opportunisticBuy;
-  if (!opBuy) {
-    try { opBuy = require('opportunisticBuy'); } catch (e) { opBuy = null; }
+  var e = global.opportunisticBuy;
+  if (!e) {
+    try {
+      e = require("opportunisticBuy");
+    } catch (r) {
+      e = null;
+    }
   }
-  return opBuy;
-}
-function opBuyMethodsString() {
-  var opBuy = getOpBuy();
-  if (!opBuy) return '(not found)';
-  var keys = [];
-  for (var k in opBuy) {
-    if (typeof opBuy[k] === 'function') keys.push(k + '()');
-    else keys.push(k + ':' + typeof opBuy[k]);
-  }
-  if (typeof opBuy === 'function') keys.unshift('(callable export)');
-  return keys.join(', ');
+  return e;
 }
 
-// ===== INTERNAL MEMORY =====
+function opBuyMethodsString() {
+  var e = getOpBuy();
+  if (!e) return "(not found)";
+  var r = [];
+  for (var t in e) {
+    if (typeof e[t] === "function") r.push(t + "()"); else r.push(t + ":" + typeof e[t]);
+  }
+  if (typeof e === "function") r.unshift("(callable export)");
+  return r.join(", ");
+}
+
 function ensureMemory() {
-  if (!Memory.marketRefine) Memory.marketRefine = { ops: [], outcomes: [] };
+  if (!Memory.marketRefine) Memory.marketRefine = {
+    v: MEMORY_VERSION,
+    ops: [],
+    outcomes: []
+  };
   if (!Array.isArray(Memory.marketRefine.ops)) Memory.marketRefine.ops = [];
   if (!Array.isArray(Memory.marketRefine.outcomes)) Memory.marketRefine.outcomes = [];
+  if (!Memory.marketRefine.scheduler || typeof Memory.marketRefine.scheduler !== "object") {
+    Memory.marketRefine.scheduler = {
+      nextOpId: null
+    };
+    memoryManager.requestSave();
+  } else if (!Object.prototype.hasOwnProperty.call(Memory.marketRefine.scheduler, "nextOpId")) {
+    Memory.marketRefine.scheduler.nextOpId = null;
+    memoryManager.requestSave();
+  }
+  if (Memory.marketRefine.v !== MEMORY_VERSION) {
+    for (var e = 0; e < Memory.marketRefine.ops.length; e++) {
+      var r = Memory.marketRefine.ops[e];
+      if (!r) continue;
+      delete r.lastUpdate;
+      delete r.buyRequestCreated;
+      if (r.inputs && r.inputs.length > 0) {
+        delete r.input;
+        delete r.targetBuy;
+        delete r.price;
+      }
+      Memory.marketRefine.ops[e] = memoryManager.compactMarketRefineOperation(r);
+    }
+    Memory.marketRefine.v = MEMORY_VERSION;
+    memoryManager.requestSave();
+  } else {
+    memoryManager.hydrateMarketRefineRoot(Memory.marketRefine);
+  }
 }
 
-// Maximum number of outcome records to retain.
-var OUTCOMES_HISTORY_CAP = 25;
-
-/**
- * Record that an op has left the active ops array, either successfully
- * ('done') or unsuccessfully ('failed'). autoTrader's history renderer uses
- * this to report real status instead of guessing "[done]" for anything that
- * is no longer in Memory.marketRefine.ops.
- */
-function recordOutcome(op, status, reason) {
+var OUTCOMES_HISTORY_CAP = 60;
+var SELL_RETRY_TICKS = 10;
+var STALE_SELLING_TICKS = 1e5;
+function recordOutcome(e, r, t) {
   ensureMemory();
   Memory.marketRefine.outcomes.push({
-    id: op.id,
-    room: op.room,
-    output: op.output,
-    status: status,                 // 'done' | 'failed'
-    reason: reason || op.failReason || null,
-    started: op.started,
-    tick: Game.time
+    id: e.id,
+    room: e.room,
+    output: e.output,
+    status: r,
+    reason: t || e.failReason || null,
+    started: e.started,
+    tick: Game.time,
+    jobId: e.jobId || null
   });
   if (Memory.marketRefine.outcomes.length > OUTCOMES_HISTORY_CAP) {
     Memory.marketRefine.outcomes = Memory.marketRefine.outcomes.slice(-OUTCOMES_HISTORY_CAP);
   }
+  e._outcomeRecorded = true;
+  if (e.handoffReservationProgram && e.handoffResource && r !== "done") {
+    storageManager.unReserve(e.room, e.handoffResource, "terminal", e.handoffReservationProgram);
+    storageManager.unReserve(e.room, e.handoffResource, "storage", e.handoffReservationProgram);
+  }
+  if (e.jobId) {
+    try {
+      var o = require("marketEconomics");
+      if (r === "done") o.phase(e.jobId, "selling");
+      o.finish(e.jobId, r === "done" ? "done" : r, t || e.failReason || null);
+    } catch (e) {}
+  }
+  memoryManager.requestSave();
 }
 
-// ===== OUTPUT NORMALIZATION =====
-function normalizeOutput(p) {
-  if (p && typeof p !== 'string') return p;
-  var s = (p || '').trim().toUpperCase();
-  var map = {
+function releaseProductionState(e) {
+  var r = [ "inputs", "input", "targetBuy", "price", "baseInputCount", "useMarketBuy", "factoryCreated", "factoryStarted", "factoryRetryTick" ];
+  var t = false;
+  for (var o = 0; o < r.length; o++) {
+    if (e[r[o]] !== undefined) {
+      delete e[r[o]];
+      t = true;
+    }
+  }
+  if (t) memoryManager.requestSave();
+}
+
+function normalizeOutput(e) {
+  if (e && typeof e !== "string") return e;
+  var r = (e || "").trim().toUpperCase();
+  var t = {
     OXIDANT: RESOURCE_OXIDANT,
     REDUCTANT: RESOURCE_REDUCTANT,
-    'ZYNTHIUM BAR': RESOURCE_ZYNTHIUM_BAR, ZYNTHIUM_BAR: RESOURCE_ZYNTHIUM_BAR,
-    'LEMERGIUM BAR': RESOURCE_LEMERGIUM_BAR, LEMERGIUM_BAR: RESOURCE_LEMERGIUM_BAR,
-    'UTRIUM BAR': RESOURCE_UTRIUM_BAR, UTRIUM_BAR: RESOURCE_UTRIUM_BAR,
-    'KEANIUM BAR': RESOURCE_KEANIUM_BAR, KEANIUM_BAR: RESOURCE_KEANIUM_BAR,
-    'GHODIUM MELT': RESOURCE_GHODIUM_MELT, GHODIUM_MELT: RESOURCE_GHODIUM_MELT,
+    "ZYNTHIUM BAR": RESOURCE_ZYNTHIUM_BAR,
+    ZYNTHIUM_BAR: RESOURCE_ZYNTHIUM_BAR,
+    "LEMERGIUM BAR": RESOURCE_LEMERGIUM_BAR,
+    LEMERGIUM_BAR: RESOURCE_LEMERGIUM_BAR,
+    "UTRIUM BAR": RESOURCE_UTRIUM_BAR,
+    UTRIUM_BAR: RESOURCE_UTRIUM_BAR,
+    "KEANIUM BAR": RESOURCE_KEANIUM_BAR,
+    KEANIUM_BAR: RESOURCE_KEANIUM_BAR,
+    "GHODIUM MELT": RESOURCE_GHODIUM_MELT,
+    GHODIUM_MELT: RESOURCE_GHODIUM_MELT,
     PURIFIER: RESOURCE_PURIFIER,
     COMPOSITE: RESOURCE_COMPOSITE,
     CRYSTAL: RESOURCE_CRYSTAL,
@@ -166,1040 +197,1543 @@ function normalizeOutput(p) {
     HYDROGEN: RESOURCE_HYDROGEN,
     CATALYST: RESOURCE_CATALYST
   };
-  if (map[s]) return map[s];
-  if (global[s]) return global[s];
+  if (t[r]) return t[r];
+  if (global[r]) return global[r];
+  return e;
+}
+
+var OUTPUT_TO_INPUT = {};
+OUTPUT_TO_INPUT[RESOURCE_OXIDANT] = RESOURCE_OXYGEN;
+OUTPUT_TO_INPUT[RESOURCE_REDUCTANT] = RESOURCE_HYDROGEN;
+OUTPUT_TO_INPUT[RESOURCE_PURIFIER] = RESOURCE_CATALYST;
+OUTPUT_TO_INPUT[RESOURCE_ZYNTHIUM_BAR] = RESOURCE_ZYNTHIUM;
+OUTPUT_TO_INPUT[RESOURCE_LEMERGIUM_BAR] = RESOURCE_LEMERGIUM;
+OUTPUT_TO_INPUT[RESOURCE_UTRIUM_BAR] = RESOURCE_UTRIUM;
+OUTPUT_TO_INPUT[RESOURCE_KEANIUM_BAR] = RESOURCE_KEANIUM;
+OUTPUT_TO_INPUT[RESOURCE_GHODIUM_MELT] = RESOURCE_GHODIUM;
+var DEFAULT_BUY_AMOUNT = 6e3;
+var RECIPE_BATCH_MULTIPLIER = 12;
+var OP_EXPIRY_TICKS = 1e5;
+var RANGE_GATE = .2;
+var MARKET_BUY_FORCE_LIST = {
+  [RESOURCE_BIOMASS]: true,
+  [RESOURCE_METAL]: true,
+  [RESOURCE_SILICON]: true,
+  [RESOURCE_MIST]: true
+};
+function shouldUseMarketSell() {
+  return false;
+}
+
+function isForceMarketBuy(e) {
+  return !!MARKET_BUY_FORCE_LIST[e];
+}
+
+function shouldUseMarketBuy(e, r, t, o) {
+  if (MARKET_BUY_FORCE_LIST[r]) return true;
+  if (r === RESOURCE_ENERGY) return false;
+  var a = pricing.chooseBuyMethod(r, t, {
+    rangeGate: RANGE_GATE,
+    amount: o
+  });
+  return a && a.method === "order";
+}
+
+function computeCompetitiveBid(e, r, t) {
+  var o = pricing.chooseBuyMethod(e, r, {
+    rangeGate: RANGE_GATE,
+    forceOrder: !!MARKET_BUY_FORCE_LIST[e],
+    amount: t
+  });
+  if (!o || o.method !== "order" || !(o.suggestedBid > 0)) return null;
+  if (typeof r === "number" && r > 0 && o.suggestedBid > r + 5e-4) return null;
+  return Math.max(.001, Math.round(o.suggestedBid * 1e3) / 1e3);
+}
+
+function getRecipeInputs(e, r) {
+  if (COMMODITIES && COMMODITIES[e]) {
+    var t = COMMODITIES[e];
+    var o = t.components || {};
+    var a = [];
+    for (var n in o) {
+      if (!o.hasOwnProperty(n)) continue;
+      if (n === RESOURCE_ENERGY && e !== RESOURCE_BATTERY) continue;
+      var u = o[n] * (r || RECIPE_BATCH_MULTIPLIER);
+      a.push({
+        resource: n,
+        amount: u
+      });
+    }
+    if (a.length > 0) return a;
+  }
+  if (OUTPUT_TO_INPUT[e]) {
+    return [ {
+      resource: OUTPUT_TO_INPUT[e],
+      amount: DEFAULT_BUY_AMOUNT
+    } ];
+  }
+  return null;
+}
+
+function failOp(e, r, t) {
+  var o = "[MarketRefine] FAILED: " + e.id + " (" + e.output + " in " + e.room + ") - " + r;
+  if (t) o += " | " + t;
+  console.log(o);
+  e.phase = "failed";
+  e.failReason = r;
+  e.failTick = Game.time;
+  recordOutcome(e, "failed", t ? r + ": " + t : r);
+}
+
+function computeCeiling(e) {
+  var r = pricing.getInputBuyQuote(e, 0);
+  if (r && r.price > 0) return r.price;
+  var t = pricing.getPriceProfile(e);
+  if (t && typeof t.buyPrice === "number" && isFinite(t.buyPrice) && t.buyPrice > 0) {
+    return t.buyPrice;
+  }
+  if (t && typeof t.theoreticalPrice === "number" && isFinite(t.theoreticalPrice) && t.theoreticalPrice > 0) {
+    return t.theoreticalPrice;
+  }
+  return 0;
+}
+
+function factoryOpBuyOpts(e, r, t) {
+  return {
+    queue: "factory",
+    product: e || null,
+    opId: r || null,
+    jobId: t || null
+  };
+}
+
+function findFactoryOpBuyRequestKeys(e, r, t) {
+  var o = [];
+  var a = getOpBuy();
+  var n = a && typeof a.getActiveRequestEntries === "function" ? a.getActiveRequestEntries() : [];
+  for (var u = 0; u < n.length; u++) {
+    var i = n[u].key;
+    var s = n[u].request;
+    if (!s || s.roomName !== e || s.resourceType !== r) continue;
+    if ((s.queue || "default") !== "factory") continue;
+    if (t && s.opId && s.opId !== t) continue;
+    o.push(i);
+  }
+  return o;
+}
+
+function invokeOpportunisticBuy(e, r, t, o, a, n, u) {
+  var i = getOpBuy();
+  if (!i) return "[MarketRefine] ERROR: opportunisticBuy module not available.";
+  var s = factoryOpBuyOpts(a, n, u);
+  memoryManager.requestSave();
+  try {
+    if (typeof i.setup === "function") return i.setup(e, r, t, o, s);
+    if (typeof i.requestBuy === "function") return i.requestBuy(e, r, t, o);
+    if (typeof i.addRequest === "function") return i.addRequest(e, r, t, o);
+    if (typeof i.request === "function") return i.request(e, r, t, o);
+    if (typeof i.enqueue === "function") return i.enqueue(e, r, t, o);
+    if (typeof i.queue === "function") return i.queue(e, r, t, o);
+    if (typeof i.buy === "function") return i.buy(e, r, t, o);
+    if (typeof i === "function") return i(e, r, t, o);
+  } catch (e) {
+    return "[MarketRefine] ERROR invoking opportunisticBuy: " + e;
+  }
+  return "[MarketRefine] ERROR: Unknown opportunisticBuy API; methods: " + opBuyMethodsString();
+}
+
+function cancelOpBuyRequest(e, r, t) {
+  var o = findFactoryOpBuyRequestKeys(e, r, t);
+  if (o.length === 0) return;
+  var a = getOpBuy();
+  for (var n = 0; n < o.length; n++) {
+    if (a && typeof a.cancelRequestByKey === "function") a.cancelRequestByKey(o[n]);
+  }
+  memoryManager.requestSave();
+  console.log("[MarketRefine] Cancelled " + o.length + " opportunisticBuy request(s) for " + r + " in " + e + (t ? " (op " + t + ")" : ""));
+}
+
+function hasActiveOpBuyRequest(e, r, t) {
+  var o = findFactoryOpBuyRequestKeys(e, r, t);
+  var a = getOpBuy();
+  for (var n = 0; n < o.length; n++) {
+    var u = a && typeof a.getRequestByKey === "function" ? a.getRequestByKey(o[n]) : null;
+    if (u && u.remaining > 0) return true;
+  }
+  return false;
+}
+
+function createOpportunisticBuyForInput(e, r, t, o, a, n) {
+  var u = invokeOpportunisticBuy(e, r.resource, t, r.maxPrice, o, a, n);
+  if (hasActiveOpBuyRequest(e, r.resource, a)) return true;
+  console.log("[MarketRefine] Failed to create opportunisticBuy for " + r.resource + " in " + e + " (op " + a + "): " + u);
+  return false;
+}
+
+function cancelInputProcurement(e, r, t, o) {
+  for (var a = 0; a < r.length; a++) {
+    var n = r[a];
+    if (n.useOwned) {
+      if (n.handoffReservationProgram) {
+        storageManager.unReserve(e, n.resource, "terminal", n.handoffReservationProgram);
+        storageManager.unReserve(e, n.resource, "storage", n.handoffReservationProgram);
+      }
+      continue;
+    }
+    if (n.useMarketSell) continue;
+    if (n.useMarketBuy) {
+      marketBuyer.cancelOrderFor(e, n.resource, o, "factory", t);
+    } else if (n.useBatch && n.batchBuyJobId) {
+      var u = marketBatchBuy.find(n.batchBuyJobId);
+      if (u && (u.state === marketBatchBuy.STATE_QUEUED || u.state === marketBatchBuy.STATE_PENDING)) {
+        marketBatchBuy.cancel(n.batchBuyJobId, o || "factory input cancellation");
+      }
+    } else if (hasActiveOpBuyRequest(e, n.resource, t)) {
+      cancelOpBuyRequest(e, n.resource, t);
+    }
+  }
+}
+
+function forEachBatchJob(e, r) {
+  if (!e || !Array.isArray(e.batchBuyIds)) return;
+  for (var t = 0; t < e.batchBuyIds.length; t++) {
+    var o = marketBatchBuy.find(e.batchBuyIds[t]);
+    if (o) r(o);
+  }
+}
+
+function getBatchReservationAmount(e, r) {
+  var t = 0;
+  forEachBatchJob(e, function(e) {
+    if (e.resourceType !== r) return;
+    t += marketBatchBuy.getReservationAmount(e.id) || 0;
+  });
+  return t;
+}
+
+function releaseBatchReservations(e, r) {
+  var t = false;
+  forEachBatchJob(e, function(e) {
+    var o = marketBatchBuy.releaseReservation(e.id, r || "production handoff");
+    if (o && o.removed > 0) t = true;
+  });
+  return t;
+}
+
+function restoreBatchReservations(e) {
+  var r = true;
+  forEachBatchJob(e, function(e) {
+    if (e.state !== marketBatchBuy.STATE_DONE) return;
+    var t = marketBatchBuy.reserve(e.id);
+    if (!t || !t.ok) r = false;
+  });
+  return r;
+}
+
+function callOrderFactory(e, r, t) {
+  if (typeof orderFactory === "function") {
+    return orderFactory(e, r, t);
+  }
+  try {
+    var o = require("factoryManager");
+    if (o && typeof o.orderFactory === "function") {
+      return o.orderFactory(e, r, t);
+    }
+  } catch (e) {}
+  return "[MarketRefine] ERROR: orderFactory not available.";
+}
+
+function callMarketSell(e, r, t, o, a) {
+  if (labCommodityPolicy.isTwoLetterLabProduct(r)) {
+    labCommodityRouter.enqueue(e, r, t, "marketRefine cleanup");
+    return "[MarketRefine] Two-letter lab product conversion queued.";
+  }
+  var n = global.marketSell;
+  if (!n) {
+    try {
+      n = require("marketSell");
+    } catch (e) {
+      n = null;
+    }
+  }
+  if (!n) return "[MarketRefine] ERROR: marketSell not available.";
+  try {
+    if (typeof n.marketSell === "function") return n.marketSell(e, r, t, o, a);
+    if (typeof n.sell === "function") return n.sell(e, r, t, o, a);
+    if (typeof n.run === "function") return n.run(e, r, t, o, a);
+    if (typeof n === "function") return n(e, r, t, o, a);
+  } catch (e) {
+    return "[MarketRefine] ERROR invoking marketSell: " + e;
+  }
+  return "[MarketRefine] ERROR: Unknown marketSell API.";
+}
+
+function hasOwnedSellLot(e) {
+  if (!e || !marketEconomics || typeof marketEconomics.hasSellLotForJob !== "function") return false;
+  try {
+    return !!marketEconomics.hasSellLotForJob(e);
+  } catch (e) {
+    return false;
+  }
+}
+
+function sellOrderBaseline(e, r) {
+  var t = Game.market && Game.market.orders;
+  var o = t && t[e];
+  if (!o) return null;
+  var a = 0;
+  var n = Game.market.outgoingTransactions || [];
+  for (var u = 0; u < n.length; u++) {
+    var i = n[u];
+    if (!i || !i.order || i.order.id !== e) continue;
+    if (typeof i.time === "number" && i.time < (r || 0)) continue;
+    a += i.amount || 0;
+  }
+  return util.getOrderRemaining(o) + a;
+}
+
+function findLegacySellOrder(e, r) {
+  if (!e || !e.room || !e.output || !Game.market || !Game.market.orders) return null;
+  var t = {};
+  var o = Game.market.orders;
+  var a = require("marketSell");
+  var n = a && typeof a.getRequests === "function" ? a.getRequests() : [];
+  var u = e.sellPostedTick || 0;
+  function add(r, a) {
+    if (!r || !o[r]) return;
+    var n = o[r];
+    if (n.type !== ORDER_SELL || n.roomName !== e.room || n.resourceType !== e.output || !(util.getOrderRemaining(n) > 0)) return;
+    if (!t[r] || t[r].score < a) {
+      t[r] = {
+        id: r,
+        score: a
+      };
+    }
+  }
+  var i = marketEconomics && typeof marketEconomics.getOrderLots === "function" ? marketEconomics.getOrderLots() : {};
+  for (var s in i) {
+    var c = i[s];
+    if (!c || !Array.isArray(c.lots)) continue;
+    for (var f = 0; f < c.lots.length; f++) {
+      if (c.lots[f] && c.lots[f].jobId === e.jobId && c.lots[f].remaining > 0) {
+        add(s, 100);
+        break;
+      }
+    }
+  }
+  for (var l = 0; l < n.length; l++) {
+    var d = n[l];
+    if (!d || !d.orderId || d.roomName !== e.room || d.resourceType !== e.output) continue;
+    var m = 0;
+    if (e.jobId && d.jobId === e.jobId) m += 100;
+    if (d.created === u) m += 50; else if (u && Math.abs((d.created || 0) - u) <= 5) m += 20;
+    if (typeof r === "number" && d.amount === r) m += 20; else if (typeof r === "number" && d.amount >= r) m += 5;
+    if (m > 0) add(d.orderId, m);
+  }
+  var p = null;
+  var R = false;
+  for (var y in t) {
+    var O = t[y];
+    if (!p || O.score > p.score) {
+      p = O;
+      R = false;
+    } else if (O.score === p.score) {
+      R = true;
+    }
+  }
+  if (!p || R || p.score < 20) return null;
+  p.baseline = sellOrderBaseline(p.id, u);
   return p;
 }
 
-// Legacy single-input map (still used as fallback for simple products)
-var OUTPUT_TO_INPUT = {};
-OUTPUT_TO_INPUT[RESOURCE_OXIDANT]        = RESOURCE_OXYGEN;
-OUTPUT_TO_INPUT[RESOURCE_REDUCTANT]      = RESOURCE_HYDROGEN;
-OUTPUT_TO_INPUT[RESOURCE_PURIFIER]       = RESOURCE_CATALYST;
-OUTPUT_TO_INPUT[RESOURCE_ZYNTHIUM_BAR]   = RESOURCE_ZYNTHIUM;
-OUTPUT_TO_INPUT[RESOURCE_LEMERGIUM_BAR]  = RESOURCE_LEMERGIUM;
-OUTPUT_TO_INPUT[RESOURCE_UTRIUM_BAR]     = RESOURCE_UTRIUM;
-OUTPUT_TO_INPUT[RESOURCE_KEANIUM_BAR]    = RESOURCE_KEANIUM;
-OUTPUT_TO_INPUT[RESOURCE_GHODIUM_MELT]   = RESOURCE_GHODIUM;
-
-// Default buy amount for simple single-input products (legacy fallback)
-var DEFAULT_BUY_AMOUNT = 6000;
-
-// Buy amount multiplier for multi-input recipes (how many batches to buy for).
-// compression:   500 minerals/batch x 12 = 6,000 minerals bought -> 1,200 bars produced
-// decompression: 100 bars/batch    x 12 = 1,200 bars bought      -> 6,000 minerals produced
-var RECIPE_BATCH_MULTIPLIER = 12;
-
-// How many ticks before a stuck buying op is abandoned and cleaned up.
-// Only applies to the 'buying' phase - once inputs are acquired and a factory
-// order is placed, the op runs until production completes regardless of age.
-var OP_EXPIRY_TICKS = 100000;
-
-// Margin thresholds (coupled to autoTrader's MARGIN_THRESHOLD)
-var MARGIN_THRESHOLD = 40;                            // percent (target margin)
-var FLOOR_MARGIN     = 20;                            // percent (passivate-vs-cancel line)
-var RANGE_GATE       = (MARGIN_THRESHOLD / 2) / 100;  // 0.20 = 20% weekly range
-
-// Manual force-list: resources that should ALWAYS use marketBuy (posted standing
-// orders), bypassing the value+volatility dispatcher. These processed base
-// resources are low-value enough that the energy cost of opportunisticBuy.deal()
-// is a meaningful chunk of the cost, and posted bids accumulate passively.
-var MARKET_BUY_FORCE_LIST = {
-    [RESOURCE_BIOMASS]: true,
-    [RESOURCE_METAL]:   true,
-    [RESOURCE_SILICON]: true,
-    [RESOURCE_MIST]:    true
-};
-
-/**
- * Check if a specific input for a product should be acquired via marketSell
- * instead of buying. Currently only energy for battery production qualifies,
- * since marketSell is currently the only mechanism suitable for buying energy.
- */
-function shouldUseMarketSell(output, inputResource) {
-    return output === RESOURCE_BATTERY && inputResource === RESOURCE_ENERGY;
+function recoverLegacySellOrder(e, r) {
+  if (!e || e.sellOrderId) return false;
+  var t = findLegacySellOrder(e, r);
+  if (!t) return false;
+  e.sellOrderId = t.id;
+  if (t.baseline !== null) e.sellOrderRemainingAtPost = t.baseline; else delete e.sellOrderRemainingAtPost;
+  console.log("[MarketRefine] Recovered legacy sell order " + t.id + " for " + e.id);
+  memoryManager.requestSave();
+  return true;
 }
 
-/**
- * Dispatcher: should this input use a standing marketBuy order instead of
- * opportunisticBuy? Decision is value+volatility based, not spread-based.
- *
- *   1. resource in MARKET_BUY_FORCE_LIST        -> marketBuy (manual override)
- *   2. ENERGY                                   -> opportunistic (marketSell handles battery input)
- *   3. value > energyBuyPrice AND range7d > RANGE_GATE -> opportunistic
- *      (expensive + volatile: posted bid won't fill sanely, deal()'s energy fee
- *       is small in absolute terms so the standing-order alternative is worse)
- *   4. trend7d === 'rising' AND takeable ask    -> opportunistic
- *   5. default -> marketBuy (cheap / stable / thin)
- */
-function shouldUseMarketBuy(output, inputResource, ceilingPrice) {
-    // Hard overrides
-    if (MARKET_BUY_FORCE_LIST[inputResource]) return true;
-    if (inputResource === RESOURCE_ENERGY) return false;
-
-    var book  = pricing.getBook(inputResource);
-    var range = pricing.getRange7d(inputResource);
-    var trend = pricing.getTrend7d(inputResource);
-
-    // Same value the status printout uses for energy.
-    var energyBuyPrice = marketBuyer.computeBuyPrice(RESOURCE_ENERGY);
-
-    var avg = pricing.getAvg48h(inputResource);
-    var value = (typeof avg === 'number' && avg > 0) ? avg : (ceilingPrice || 0);
-
-    var hasCeiling = typeof ceilingPrice === 'number' && ceilingPrice > 0;
-    var takeableAsk = book.bestAsk !== null && (!hasCeiling || book.bestAsk <= ceilingPrice);
-
-    if (value > energyBuyPrice && range !== null && range > RANGE_GATE) return false;
-    if (trend === 'rising' && takeableAsk) return false;
-    return true;
+function callMarketBuy(e, r, t, o, a, n, u, i) {
+  try {
+    var s = marketBuyer.marketBuy(e, r, t, o, {
+      product: n,
+      room: e,
+      ceiling: a,
+      queue: "factory",
+      opId: u || null,
+      jobId: i || null
+    });
+    var c = typeof s === "string" && s.indexOf("Created BUY order") >= 0;
+    if (c) memoryManager.requestSave();
+    return {
+      ok: c,
+      message: s
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      message: "[MarketRefine] ERROR invoking marketBuy: " + e
+    };
+  }
 }
 
-/**
- * Compute a competitive bid for marketBuy: leads the best external bid by 0.1,
- * floored by the volume-weighted ask, and ignores a bestBid that sits above the
- * volume-weighted ask (crossed/manipulated book). Capped by `ceiling`.
- *
- * Returns null when the resulting bid exceeds the ceiling - a starved/unprofitable
- * order would only get a useless fill, so the caller should refuse to start the op
- * (marketRefine callers surface this as a refusal string).
- *
- * Returns at least 0.001 in the normal case.
- */
-function computeCompetitiveBid(resource, ceiling) {
-    return pricing.computePostedBid(resource, ceiling);
+function getOwnBuyRecord(e, r) {
+  var t = marketBuyer.getOrderRecordFor(e.room, r, "factory", e.id || null);
+  if (t) return t;
+  var o = marketBuyer.getOrderRecordFor(e.room, r, "factory");
+  return o && !o.opId ? o : null;
 }
 
-/**
- * Get the recipe inputs for a product.
- */
-function getRecipeInputs(output, batchMultiplier) {
-    if (COMMODITIES && COMMODITIES[output]) {
-        var recipe = COMMODITIES[output];
-        var comps = recipe.components || {};
-        var inputs = [];
-        for (var res in comps) {
-            if (!comps.hasOwnProperty(res)) continue;
-            if (res === RESOURCE_ENERGY && output !== RESOURCE_BATTERY) continue;
-            var amount = comps[res] * (batchMultiplier || RECIPE_BATCH_MULTIPLIER);
-            inputs.push({ resource: res, amount: amount });
-        }
-        if (inputs.length > 0) return inputs;
+function pollMarketBuyOrderId(e, r) {
+  var t = getOwnBuyRecord(e, r.resource);
+  if (t && t.orderId && !r.marketBuyOrderId) {
+    r.marketBuyOrderId = t.orderId;
+  }
+  return t;
+}
+
+function roomOwned(e) {
+  var r = getRoomState.get(e);
+  return !!(r && r.controller && r.controller.my);
+}
+
+function roomHasTerminal(e) {
+  var r = getRoomState.get(e);
+  return !!(r && r.terminal);
+}
+
+function countInRoom(e, r) {
+  var t = getRoomState.get(e);
+  if (!t) return 0;
+  var o = 0;
+  function add(e) {
+    if (e && e.store && e.store[r]) o += e.store[r];
+  }
+  add(t.storage);
+  add(t.terminal);
+  var a = t.structuresByType || {};
+  var n = a[STRUCTURE_FACTORY] || [];
+  if (n.length > 0) add(n[0]);
+  return o;
+}
+
+function countUnreservedInput(e, r) {
+  var t = storageManager.storageFind(e, r);
+  if (t && t.combined && typeof t.combined.available === "number") {
+    return Math.max(0, t.combined.available);
+  }
+  return countInRoom(e, r);
+}
+
+function startFactoryOrder(e, r, t) {
+  var o = callOrderFactory(e, r, t);
+  var a = null;
+  if (typeof o === "string") {
+    var n = o.match(/\[#([^\]]+)\]/);
+    if (n && n[1]) a = n[1];
+  }
+  return {
+    message: o,
+    orderId: a
+  };
+}
+
+function marketSellAccepted(e) {
+  return typeof e === "string" && (e.indexOf("Created SELL order") >= 0 || e.indexOf("extended existing") >= 0);
+}
+
+function targetOutputForInputs(e, r) {
+  if (typeof COMMODITIES === "undefined" || !COMMODITIES[e]) return 0;
+  var t = COMMODITIES[e];
+  var o = Infinity;
+  for (var a = 0; a < r.length; a++) {
+    var n = t.components && t.components[r[a].resource];
+    if (n > 0) o = Math.min(o, Math.floor(r[a].amount / n));
+  }
+  if (o === Infinity || o <= 0) return 0;
+  return o * (t.amount || 1);
+}
+
+function findFactoryOrderById(e) {
+  return factoryManager.getOrderById(e);
+}
+
+function isLiveFactoryOrder(e) {
+  return factoryManager && typeof factoryManager.isLiveOrder === "function" ? factoryManager.isLiveOrder(e) : !!(e && e.status !== "done" && e.status !== "cancelled");
+}
+
+function findCompletedFactoryOrderById(e) {
+  return factoryManager.getCompletedOrderById(e);
+}
+
+function anyFactoryOrderAfter(e, r, t) {
+  return factoryManager.hasOrderAfter(e, r, t);
+}
+
+function reconcileFactoryState(e) {
+  if (!e || e.phase !== "refining" || !e.factoryStarted) return false;
+  var r = e.factoryOrderId ? findFactoryOrderById(e.factoryOrderId) : null;
+  var t = e.factoryOrderId ? isLiveFactoryOrder(r) : anyFactoryOrderAfter(e.room, e.output, e.factoryCreated || e.started);
+  if (r && typeof r.progressOut === "number" && r.progressOut > (e.factoryProgressOut || 0)) {
+    e.factoryProgressOut = r.progressOut;
+  }
+  if (t) return false;
+  if (e.factoryOrderId) {
+    var o = findCompletedFactoryOrderById(e.factoryOrderId);
+    if (o && typeof o.progressOut === "number" && o.progressOut > (e.factoryProgressOut || 0)) {
+      e.factoryProgressOut = o.progressOut;
     }
-    if (OUTPUT_TO_INPUT[output]) {
-        return [{ resource: OUTPUT_TO_INPUT[output], amount: DEFAULT_BUY_AMOUNT }];
+  }
+  if ((!e.factoryProgressOut || e.factoryProgressOut <= 0) && e.outputBaseAtFactoryStart !== undefined && e.outputBaseAtFactoryStart !== null) {
+    var a = Math.max(0, countInRoom(e.room, e.output) - e.outputBaseAtFactoryStart);
+    if (a > 0) {
+      e.factoryProgressOut = a;
+      console.log("[MarketRefine] Inferred production for " + e.id + ": " + a + " " + e.output + " (room stock vs baseline; order history unavailable)");
     }
-    return null;
-}
-
-// ===== FAILURE NOTIFICATION =====
-
-function failOp(op, reason, detail) {
-    var msg = '[MarketRefine] FAILED: ' + op.id + ' (' + op.output + ' in ' + op.room + ') - ' + reason;
-    if (detail) msg += ' | ' + detail;
-    console.log(msg);
-    //Game.notify(msg, 30); // group notifications within 30 minutes
-    op.phase = 'failed';
-    op.failReason = reason;
-    op.failTick = Game.time;
-    recordOutcome(op, 'failed', reason);
-}
-
-// ===== PRICE CEILING (default when caller supplies none) =====
-
-function getMarketPriceStr(resourceType, mode) {
-  var mp = null;
-  if (typeof marketPrice === 'function') mp = marketPrice;
-  if (!mp) {
+  }
+  e.outputBaseAtFactoryStart = countInRoom(e.room, e.output);
+  e.phase = "selling";
+  releaseProductionState(e);
+  if (e.jobId) {
     try {
-      var mq = require('marketQuery');
-      if (mq && typeof mq.marketPrice === 'function') mp = mq.marketPrice;
+      require("marketEconomics").phase(e.jobId, "delivering");
+      e._phase = "delivering";
     } catch (e) {}
   }
-  if (!mp) return null;
-  try { return mp(resourceType, mode); } catch (e) { return null; }
+  memoryManager.requestSave();
+  return true;
 }
 
-function parseAvgPrice(str) {
-  if (typeof str !== 'string') return null;
-  var m = str.match(/avg[^:]*:\s*([0-9]+(?:\.[0-9]+)?)/i);
-  if (m && m[1]) return Number(m[1]);
-  return null;
-}
-
-function parseFirstNumber(str) {
-  if (typeof str !== 'string') return null;
-  var m = str.match(/([0-9]+(?:\.[0-9]+)?)/);
-  if (m && m[1]) return Number(m[1]);
-  return null;
-}
-
-function computeCeiling(resourceType) {
-  var avg = pricing.getAvg48h(resourceType);
-  if (typeof avg === 'number' && avg > 0) return avg;
-  var out = getMarketPriceStr(resourceType, 'avg');
-  if (out == null) out = getMarketPriceStr(resourceType, undefined);
-  if (typeof out === 'number' && out > 0) return out;
-  var n = parseAvgPrice(out);
-  if (typeof n !== 'number' || !(n > 0)) n = parseFirstNumber(out);
-  if (typeof n === 'number' && n > 0) return n;
-  return 1;
-}
-
-// ===== EXTERNAL HELPER WRAPPERS =====
-
-function invokeOpportunisticBuy(roomName, resourceType, amount, maxPrice) {
-  var opBuy = getOpBuy();
-  if (!opBuy) return '[MarketRefine] ERROR: opportunisticBuy module not available.';
-  try {
-    if (typeof opBuy.setup === 'function')      return opBuy.setup(roomName, resourceType, amount, maxPrice);
-    if (typeof opBuy.requestBuy === 'function') return opBuy.requestBuy(roomName, resourceType, amount, maxPrice);
-    if (typeof opBuy.addRequest === 'function') return opBuy.addRequest(roomName, resourceType, amount, maxPrice);
-    if (typeof opBuy.request === 'function')    return opBuy.request(roomName, resourceType, amount, maxPrice);
-    if (typeof opBuy.enqueue === 'function')    return opBuy.enqueue(roomName, resourceType, amount, maxPrice);
-    if (typeof opBuy.queue === 'function')      return opBuy.queue(roomName, resourceType, amount, maxPrice);
-    if (typeof opBuy.buy === 'function')        return opBuy.buy(roomName, resourceType, amount, maxPrice);
-    if (typeof opBuy === 'function')            return opBuy(roomName, resourceType, amount, maxPrice);
-  } catch (e) {
-    return '[MarketRefine] ERROR invoking opportunisticBuy: ' + e;
-  }
-  return '[MarketRefine] ERROR: Unknown opportunisticBuy API; methods: ' + opBuyMethodsString();
-}
-
-function cancelOpBuyRequest(roomName, resourceType) {
-  var opBuy = getOpBuy();
-  if (!opBuy) return;
-  try {
-    if (typeof opBuy.cancelRequest === 'function') { opBuy.cancelRequest(roomName, resourceType); return; }
-    if (typeof opBuy.cancel === 'function')        { opBuy.cancel(roomName, resourceType); return; }
-  } catch (e) {}
-  if (Memory.opportunisticBuy && Memory.opportunisticBuy.requests) {
-    var key = roomName + '_' + resourceType;
-    if (Memory.opportunisticBuy.requests[key]) delete Memory.opportunisticBuy.requests[key];
-  }
-}
-
-function hasActiveOpBuyRequest(roomName, resourceType) {
-  var opBuy = getOpBuy();
-  try {
-    if (opBuy && typeof opBuy.hasActive === 'function') return !!opBuy.hasActive(roomName, resourceType);
-    if (opBuy && typeof opBuy.hasRequest === 'function') return !!opBuy.hasRequest(roomName, resourceType);
-  } catch (e) {}
-  if (!Memory.opportunisticBuy || !Memory.opportunisticBuy.requests) return false;
-  var key = roomName + '_' + resourceType;
-  var req = Memory.opportunisticBuy.requests[key];
-  return !!(req && req.remaining > 0);
-}
-
-function callOrderFactory(roomName, productType) {
-  if (typeof orderFactory === 'function') {
-    return orderFactory(roomName, productType, 'max');
-  }
-  try {
-    var fm = require('factoryManager');
-    if (fm && typeof fm.orderFactory === 'function') {
-      return fm.orderFactory(roomName, productType, 'max');
+function getInputAcquired(e, r) {
+  var t = countInRoom(e.room, r.resource);
+  if (r.useOwned) return Math.max(0, t);
+  t = countUnreservedInput(e.room, r.resource);
+  var o = typeof r.baseAvailable === "number" ? r.baseAvailable : typeof r.baseCount === "number" ? r.baseCount : 0;
+  var a = t - o;
+  a = a > 0 ? a : 0;
+  if (r.useBatch && r.batchBuyJobId) {
+    var n = marketBatchBuy.find(r.batchBuyJobId);
+    var u = e.phase === "buying" || e.phase === "refining" && !e.factoryStarted;
+    if (n && n.state === marketBatchBuy.STATE_DONE && u && !(marketBatchBuy.getReservationAmount(r.batchBuyJobId) > 0)) {
+      marketBatchBuy.reserve(r.batchBuyJobId);
     }
-  } catch (e) {}
-  return '[MarketRefine] ERROR: orderFactory not available.';
-}
-
-function callMarketSell(roomName, resourceType, amount) {
-  var ms = global.marketSell;
-  if (!ms) {
-    try { ms = require('marketSell'); } catch (e) { ms = null; }
+    a = Math.max(a, marketBatchBuy.getReservationAmount(r.batchBuyJobId) || 0);
+    if (n && n.state === marketBatchBuy.STATE_DONE) {
+      a = Math.max(a, n.fulfilled || n.amount || 0);
+    }
   }
-  if (!ms) return '[MarketRefine] ERROR: marketSell not available.';
-  try {
-    if (typeof ms.sell === 'function') return ms.sell(roomName, resourceType, amount);
-    if (typeof ms.run === 'function')  return ms.run(roomName, resourceType, amount);
-    if (typeof ms === 'function')      return ms(roomName, resourceType, amount);
-  } catch (e) {
-    return '[MarketRefine] ERROR invoking marketSell: ' + e;
+  if (r.useMarketBuy) pollMarketBuyOrderId(e, r);
+  return a;
+}
+
+function ensureMarketBuyOrder(e, r) {
+  if (!r.useMarketBuy) return true;
+  var t = getOwnBuyRecord(e, r.resource);
+  var o = false;
+  if (t && !t.done && !t.cancelled) {
+    if (!t.orderId) o = true; else if (Game.market.orders[t.orderId]) o = true;
   }
-  return '[MarketRefine] ERROR: Unknown marketSell API.';
-}
-
-function callMarketBuy(roomName, resourceType, amount, maxPrice, product) {
-  try {
-    var msg = marketBuyer.marketBuy(roomName, resourceType, amount, maxPrice,
-                                    { product: product, room: roomName, ceiling: maxPrice });
-    var ok = typeof msg === 'string' && msg.indexOf('Created BUY order') >= 0;
-    return { ok: ok, message: msg };
-  } catch (e) {
-    return { ok: false, message: '[MarketRefine] ERROR invoking marketBuy: ' + e };
-  }
-}
-
-function pollMarketBuyOrderId(op, inp) {
-  var rec = marketBuyer.getOrderRecordFor(op.room, inp.resource);
-  if (rec && rec.orderId && !inp.marketBuyOrderId) {
-    inp.marketBuyOrderId = rec.orderId;
-  }
-  return rec;
-}
-
-// ===== ROOM HELPERS (getRoomState only) =====
-function roomOwned(roomName) {
-  var state = getRoomState.get(roomName);
-  return !!(state && state.controller && state.controller.my);
-}
-
-function roomHasTerminal(roomName) {
-  var state = getRoomState.get(roomName);
-  return !!(state && state.terminal);
-}
-
-function countInRoom(roomName, resourceType) {
-  var state = getRoomState.get(roomName);
-  if (!state) return 0;
-
-  var total = 0;
-  function add(s) { if (s && s.store && s.store[resourceType]) total += s.store[resourceType]; }
-
-  add(state.storage);
-  add(state.terminal);
-
-  var stMap = state.structuresByType || {};
-
-  var factories = stMap[STRUCTURE_FACTORY] || [];
-  if (factories.length > 0) add(factories[0]);
-
-  var containers = stMap[STRUCTURE_CONTAINER] || [];
-  for (var i = 0; i < containers.length; i++) add(containers[i]);
-
-  return total;
-}
-
-// ===== FACTORY ORDER TRACKING (Memory-based) =====
-function startFactoryMax(roomName, outputResource) {
-  var msg = callOrderFactory(roomName, outputResource);
-  var id = null;
-  if (typeof msg === 'string') {
-    var m = msg.match(/\[#([^\]]+)\]/);
-    if (m && m[1]) id = m[1];
-  }
-  return { message: msg, orderId: id };
-}
-
-function findFactoryOrderById(id) {
-  var list = (Memory.factoryOrders && Array.isArray(Memory.factoryOrders)) ? Memory.factoryOrders : [];
-  for (var i = 0; i < list.length; i++) if (list[i] && list[i].id === id) return list[i];
-  return null;
-}
-
-function findCompletedFactoryOrderById(id) {
-  var list = (Memory.factoryOrderHistory && Array.isArray(Memory.factoryOrderHistory)) ? Memory.factoryOrderHistory : [];
-  for (var i = 0; i < list.length; i++) {
-    if (list[i] && list[i].id === id) return list[i];
-  }
-  return null;
-}
-
-function anyFactoryOrderAfter(roomName, product, createdTick) {
-  var list = (Memory.factoryOrders && Array.isArray(Memory.factoryOrders)) ? Memory.factoryOrders : [];
-  for (var i = 0; i < list.length; i++) {
-    var o = list[i];
-    if (o && o.room === roomName && o.product === product && typeof o.created === 'number' && o.created >= createdTick) return true;
-  }
-  return false;
-}
-
-// ===== ACQUISITION TRACKING =====
-
-function getInputAcquired(op, inp) {
-  var have = countInRoom(op.room, inp.resource);
-  var roomAcquired = have - (typeof inp.baseCount === 'number' ? inp.baseCount : 0);
-  roomAcquired = roomAcquired > 0 ? roomAcquired : 0;
-  if (inp.useMarketBuy) {
-    var rec = pollMarketBuyOrderId(op, inp);
-    if (rec) return Math.max(marketBuyer.getFulfilled(rec), roomAcquired);
-  }
-  return roomAcquired;
-}
-
-// Recreate a marketBuy order if the underlying order has disappeared.
-// Returns true if a live order exists or was successfully recreated.
-// On failure/unprofitability it falls back to opportunisticBuy and returns false.
-function ensureMarketBuyOrder(op, inp) {
-  if (!inp.useMarketBuy) return true;
-
-  var rec = marketBuyer.getOrderRecordFor(op.room, inp.resource);
-  var orderLive = false;
-  if (rec && !rec.done && !rec.cancelled) {
-    if (!rec.orderId) orderLive = true; // pending id capture
-    else if (Game.market.orders[rec.orderId]) orderLive = true;
-  }
-  if (orderLive) return true;
-
-  var acquired = getInputAcquired(op, inp);
-  var remaining = Math.max(0, inp.amount - acquired);
-  if (remaining <= 0) return true;
-
-  console.log('[MarketRefine] marketBuy order for ' + inp.resource + ' in ' + op.room +
-      ' is missing/cancelled (op ' + op.id + '). Recreating for remaining ' + remaining + '.');
-
-  var bidPrice = computeCompetitiveBid(inp.resource, inp.maxPrice);
-  if (bidPrice === null) {
-    console.log('[MarketRefine] Cannot recreate marketBuy for ' + inp.resource + ' in ' + op.room +
-        ': bid would exceed ceiling ' + inp.maxPrice.toFixed(3) + '. Falling back to opportunisticBuy.');
-    inp.useMarketBuy = false;
-    if (rec && rec.orderId) marketBuyer.cancelOrderById(rec.orderId, 'recreate fallback');
-    else marketBuyer.cancelOrderFor(op.room, inp.resource, 'recreate fallback');
-    invokeOpportunisticBuy(op.room, inp.resource, remaining, inp.maxPrice);
+  if (o) return true;
+  var a = getInputAcquired(e, r);
+  var n = Math.max(0, r.amount - a);
+  if (n <= 0) return true;
+  console.log("[MarketRefine] marketBuy order for " + r.resource + " in " + e.room + " is missing/cancelled (op " + e.id + "). Recreating for remaining " + n + ".");
+  var u = computeCompetitiveBid(r.resource, r.maxPrice, n);
+  if (u === null) {
+    console.log("[MarketRefine] Cannot recreate marketBuy for " + r.resource + " in " + e.room + ": no passive bid under ceiling " + r.maxPrice.toFixed(3) + ". Falling back to opportunisticBuy.");
+    r.useMarketBuy = false;
+    if (t && t.orderId) marketBuyer.cancelOrderById(t.orderId, "recreate fallback", t.opId || null); else marketBuyer.cancelOrderFor(e.room, r.resource, "recreate fallback", "factory", e.id || null);
+    createOpportunisticBuyForInput(e.room, r, n, e.output, e.id, e.jobId);
     return false;
   }
-
-  var createRes = callMarketBuy(op.room, inp.resource, remaining, bidPrice, op.output);
-  if (createRes.ok) {
-    console.log('[MarketRefine] Recreated marketBuy for ' + inp.resource + ' in ' + op.room +
-        ': ' + remaining + ' @ ' + bidPrice.toFixed(3) + ' (ceiling ' + inp.maxPrice.toFixed(3) + ')');
-    inp.marketBuyOrderId = null; // will be captured by pollMarketBuyOrderId on next ticks
+  var i = callMarketBuy(e.room, r.resource, n, u, r.maxPrice, e.output, e.id, e.jobId);
+  if (i.ok) {
+    console.log("[MarketRefine] Recreated marketBuy for " + r.resource + " in " + e.room + ": " + n + " @ " + u.toFixed(3) + " (ceiling " + r.maxPrice.toFixed(3) + ")");
+    r.marketBuyOrderId = null;
     return true;
   }
-
-  // Creation failed (order cap, credits, etc.) -> opportunisticBuy fallback.
-  console.log('[MarketRefine] Failed to recreate marketBuy for ' + inp.resource + ' in ' + op.room +
-      ': ' + createRes.message + '. Falling back to opportunisticBuy.');
-  inp.useMarketBuy = false;
-  if (rec && rec.orderId) marketBuyer.cancelOrderById(rec.orderId, 'recreate fallback');
-  else marketBuyer.cancelOrderFor(op.room, inp.resource, 'recreate fallback');
-  invokeOpportunisticBuy(op.room, inp.resource, remaining, inp.maxPrice);
+  console.log("[MarketRefine] Failed to recreate marketBuy for " + r.resource + " in " + e.room + ": " + i.message + ". Falling back to opportunisticBuy.");
+  r.useMarketBuy = false;
+  if (t && t.orderId) marketBuyer.cancelOrderById(t.orderId, "recreate fallback", t.opId || null); else marketBuyer.cancelOrderFor(e.room, r.resource, "recreate fallback", "factory", e.id || null);
+  createOpportunisticBuyForInput(e.room, r, n, e.output, e.id, e.jobId);
   return false;
 }
 
-// ===== EXPIRY HANDLER (margin-aware, per input) =====
+function ensureOpportunisticBuyRequest(e, r) {
+  if (r.useMarketBuy || r.useMarketSell) return true;
+  var t = getInputAcquired(e, r);
+  var o = Math.max(0, r.amount - t);
+  if (o <= 0 || hasActiveOpBuyRequest(e.room, r.resource, e.id)) return true;
+  console.log("[MarketRefine] opportunisticBuy request for " + r.resource + " in " + e.room + " is missing (op " + e.id + "). Recreating for remaining " + o + ".");
+  return createOpportunisticBuyForInput(e.room, r, o, e.output, e.id, e.jobId);
+}
 
-function expireOp(op, reasonOverride) {
-  var age = Game.time - op.started;
-  var reason = reasonOverride || ('Expired after ' + age + ' ticks (phase=' + op.phase + ')');
-
-  var sellParts = [];
-
-  var floorCeilings = pricing.inputCeilings(op.output, FLOOR_MARGIN);
-
-  if (op.inputs && op.inputs.length > 0) {
-    for (var k = 0; k < op.inputs.length; k++) {
-      var inp = op.inputs[k];
-      var useMS = inp.useMarketSell || shouldUseMarketSell(op.output, inp.resource);
-
-      if (useMS) {
-        // marketSell inputs are managed externally; nothing to cancel here.
-      } else if (inp.useMarketBuy) {
-        pollMarketBuyOrderId(op, inp);
-
-        var ceil = floorCeilings ? floorCeilings[inp.resource] : null;
-        var order = inp.marketBuyOrderId ? Game.market.orders[inp.marketBuyOrderId] : null;
-        var marginDead = (typeof ceil !== 'number') || !(ceil > 0) || (order && order.price > ceil);
-
-        if (inp.marketBuyOrderId) {
-          if (marginDead) {
-            marketBuyer.cancelOrderById(inp.marketBuyOrderId, 'op expiry, margin dead');
-            console.log('[MarketRefine] Cancelled marketBuy order ' + inp.marketBuyOrderId +
-                ' (margin dead) for ' + inp.resource + ' in ' + op.room);
+function expireOp(e, r) {
+  var t = Game.time - e.started;
+  var o = r || "Expired after " + t + " ticks (phase=" + e.phase + ")";
+  var a = [];
+  var n = [];
+  var u = pricing.breakEvenInputCeilings(e.output);
+  releaseBatchReservations(e, "marketRefine expiry/sell-back");
+  if (e.inputs && e.inputs.length > 0) {
+    for (var i = 0; i < e.inputs.length; i++) {
+      var s = e.inputs[i];
+      var c = s.useMarketSell || shouldUseMarketSell(e.output, s.resource);
+      if (c) {} else if (s.useMarketBuy) {
+        var f = pollMarketBuyOrderId(e, s);
+        var l = f ? f.opId || null : e.id || null;
+        var d = u ? u[s.resource] : null;
+        var m = s.marketBuyOrderId ? Game.market.orders[s.marketBuyOrderId] : null;
+        var p = typeof d !== "number" || !(d > 0) || m && m.price > d;
+        if (s.marketBuyOrderId) {
+          if (p) {
+            marketBuyer.cancelOrderById(s.marketBuyOrderId, "op expiry, break-even dead", l);
+            console.log("[MarketRefine] Cancelled marketBuy order " + s.marketBuyOrderId + " (break-even dead) for " + s.resource + " in " + e.room);
           } else {
-            marketBuyer.passivateOrder(inp.marketBuyOrderId, op.output);
-            console.log('[MarketRefine] Passivated marketBuy order ' + inp.marketBuyOrderId +
-                ' (margin OK at floor ' + FLOOR_MARGIN + '%) for ' + inp.resource + ' in ' + op.room);
+            marketBuyer.passivateOrder(s.marketBuyOrderId, e.output);
+            console.log("[MarketRefine] Passivated marketBuy order " + s.marketBuyOrderId + " (break-even viable) for " + s.resource + " in " + e.room);
           }
         } else {
-          marketBuyer.cancelOrderFor(op.room, inp.resource, 'op expiry, no captured id');
+          marketBuyer.cancelOrderFor(e.room, s.resource, "op expiry, no captured id", "factory", l);
         }
+      } else if (s.useBatch && s.batchBuyJobId) {
+        marketBatchBuy.cancel(s.batchBuyJobId, "factory operation expired");
       } else {
-        if (hasActiveOpBuyRequest(op.room, inp.resource)) {
-          cancelOpBuyRequest(op.room, inp.resource);
-          console.log('[MarketRefine] Cancelled opportunisticBuy for ' + inp.resource + ' in ' + op.room);
+        if (hasActiveOpBuyRequest(e.room, s.resource, e.id)) {
+          cancelOpBuyRequest(e.room, s.resource, e.id);
         }
       }
-
-      var have = countInRoom(op.room, inp.resource);
-      var baseCount = typeof inp.baseCount === 'number' ? inp.baseCount : 0;
-      var acquired = have - baseCount;
-      if (acquired > 0) {
-        callMarketSell(op.room, inp.resource, acquired);
-        sellParts.push(acquired + ' ' + inp.resource);
+      var R = countInRoom(e.room, s.resource);
+      var y = typeof s.baseCount === "number" ? s.baseCount : 0;
+      var O = R - y;
+      if (O > 0) {
+        var v = callMarketSell(e.room, s.resource, O);
+        if (marketSellAccepted(v)) a.push(O + " " + s.resource); else n.push(s.resource + ": " + v);
       }
     }
   } else {
-    var legacyResource = op.input;
-    if (legacyResource && legacyResource !== '(multi)') {
-      var useLegacyMS = shouldUseMarketSell(op.output, legacyResource);
-      if (!useLegacyMS && !op.useMarketBuy) {
-        if (hasActiveOpBuyRequest(op.room, legacyResource)) {
-          cancelOpBuyRequest(op.room, legacyResource);
-          console.log('[MarketRefine] Cancelled opportunisticBuy for ' + legacyResource + ' in ' + op.room);
+    var g = e.input;
+    if (g && g !== "(multi)") {
+      var E = shouldUseMarketSell(e.output, g);
+      if (!E && !e.useMarketBuy) {
+        if (hasActiveOpBuyRequest(e.room, g, e.id)) {
+          cancelOpBuyRequest(e.room, g, e.id);
         }
-      } else if (op.useMarketBuy) {
-        marketBuyer.cancelOrderFor(op.room, legacyResource, 'legacy op expiry');
+      } else if (e.useMarketBuy) {
+        marketBuyer.cancelOrderFor(e.room, g, "legacy op expiry", "factory", null);
       }
-      var legacyHave = countInRoom(op.room, legacyResource);
-      var legacyBase = typeof op.baseInputCount === 'number' ? op.baseInputCount : 0;
-      var legacyAcquired = legacyHave - legacyBase;
-      if (legacyAcquired > 0) {
-        callMarketSell(op.room, legacyResource, legacyAcquired);
-        sellParts.push(legacyAcquired + ' ' + legacyResource);
+      var h = countInRoom(e.room, g);
+      var I = typeof e.baseInputCount === "number" ? e.baseInputCount : 0;
+      var k = h - I;
+      if (k > 0) {
+        var M = callMarketSell(e.room, g, k);
+        if (marketSellAccepted(M)) a.push(k + " " + g); else n.push(g + ": " + M);
       }
     }
   }
-
-  var detail = sellParts.length > 0
-    ? 'Selling acquired inputs: ' + sellParts.join(', ')
-    : 'No acquired inputs to sell';
-  failOp(op, reason, detail);
+  var B = a.length > 0 ? "Selling acquired inputs: " + a.join(", ") : "No acquired inputs to sell";
+  if (n.length > 0) B += " | marketSell refused: " + n.join("; ");
+  failOp(e, o, B);
 }
 
-// ===== CONSOLE API =====
-
-global.marketRefine = function(roomName, outputLike, maxPrices) {
+var startMarketRefine = global.marketRefine = function(e, r, t, o) {
+  var a = o && o.jobId ? o.jobId : null;
   ensureMemory();
   getRoomState.init();
-
-  if (typeof roomName !== 'string' || !roomName) {
-    return '[MarketRefine] Provide a valid room name.';
+  if (typeof e !== "string" || !e) {
+    return "[MarketRefine] Provide a valid room name.";
   }
-  if (!roomOwned(roomName)) {
-    return '[MarketRefine] Room not owned or not visible: ' + roomName;
+  if (!roomOwned(e)) {
+    return "[MarketRefine] Room not owned or not visible: " + e;
   }
-  if (!roomHasTerminal(roomName)) {
-    return '[MarketRefine] Room ' + roomName + ' has no terminal.';
+  if (!roomHasTerminal(e)) {
+    return "[MarketRefine] Room " + e + " has no terminal.";
   }
-
-  var output = normalizeOutput(outputLike);
-
-  var recipeInputs = getRecipeInputs(output);
-  if (!recipeInputs || recipeInputs.length === 0) {
-    return '[MarketRefine] Unsupported output: ' + outputLike + '. Must be a valid COMMODITIES product or compressed resource.';
-  }
-
-  var plan = [];
-  for (var c = 0; c < recipeInputs.length; c++) {
-    var inpC = recipeInputs[c];
-    var ceilC = (maxPrices && typeof maxPrices[inpC.resource] === 'number')
-      ? maxPrices[inpC.resource] : computeCeiling(inpC.resource);
-    var useMSC = shouldUseMarketSell(output, inpC.resource);
-    var useMBC = !useMSC && shouldUseMarketBuy(output, inpC.resource, ceilC);
-
-    if (!useMSC && !useMBC && hasActiveOpBuyRequest(roomName, inpC.resource)) {
-      return '[MarketRefine] ERROR: Active opportunisticBuy request already exists for ' +
-             inpC.resource + ' in ' + roomName + '. Cancel it first or wait for completion.';
+  var n = normalizeOutput(r);
+  if (Memory.marketRefine && Array.isArray(Memory.marketRefine.ops)) {
+    for (var u = 0; u < Memory.marketRefine.ops.length; u++) {
+      var i = Memory.marketRefine.ops[u];
+      if (i && i.room === e && i.output === n && i.phase !== "selling" && i.phase !== "done" && i.phase !== "error" && i.phase !== "failed") {
+        reconcileFactoryState(i);
+        if (i.phase === "selling") continue;
+        return "[MarketRefine] " + n + " is already active in " + e + " (" + (i.phase || "unknown") + ").";
+      }
     }
-    // NOTE: no pre-flight check for an existing marketBuy order here. marketBuy
-    // owns those records: it reclaims a stale/empty/passive order and creates a
-    // fresh one, or refuses (return string) when a genuinely live order exists.
-    // We act on its return value at call time below.
-    plan.push({ resource: inpC.resource, amount: inpC.amount, ceiling: ceilC, useMS: useMSC, useMB: useMBC });
   }
-
-  var inputs = [];
-  var buyMsgs = [];
-  for (var i = 0; i < plan.length; i++) {
-    var p = plan[i];
-    var baseCount = countInRoom(roomName, p.resource);
-
-    var inputRec = {
-      resource: p.resource,
-      amount: p.amount,
-      maxPrice: p.ceiling,
-      baseCount: baseCount,
-      useMarketSell: p.useMS,
-      useMarketBuy: p.useMB,
+  var s = factorySlots.refusal(e, "MarketRefine");
+  if (s) return s;
+  if (n === RESOURCE_BATTERY) {
+    return "[MarketRefine] Refused battery production: marketRefine does not acquire energy. Use localRefine with local energy.";
+  }
+  var c = getRecipeInputs(n);
+  if (!c || c.length === 0) {
+    return "[MarketRefine] Unsupported output: " + r + ". Must be a valid COMMODITIES product or compressed resource.";
+  }
+  var f = "mref_" + e + "_" + n + "_" + Game.time;
+  var l = !!(o && o.batchMode);
+  var d = o && o.handoff ? o.handoff : null;
+  var m = o && o.handoffInput ? o.handoffInput : null;
+  var p = {};
+  if (l && Array.isArray(o.batchPurchases)) {
+    for (var R = 0; R < o.batchPurchases.length; R++) {
+      var y = o.batchPurchases[R];
+      if (y && y.resource) p[y.resource] = y;
+    }
+  }
+  var O = o && o.batchInputAmounts || {};
+  var v = [];
+  for (var g = 0; g < c.length; g++) {
+    var E = c[g];
+    var h = p[E.resource];
+    var I = l && O[E.resource] > 0 ? Math.floor(O[E.resource]) : E.amount;
+    var k = t && typeof t[E.resource] === "number" ? t[E.resource] : computeCeiling(E.resource);
+    if (!(typeof k === "number" && isFinite(k) && k > 0)) {
+      return "[MarketRefine] No canonical BUY-side price is available for " + E.resource + "; provide an explicit max price or wait for market/theoretical data.";
+    }
+    if (l && !h) {
+      return "[MarketRefine] Batch plan is missing a purchase for " + E.resource + ".";
+    }
+    var M = d || m;
+    var B = !!(m && m.resource === E.resource);
+    var S = !B && shouldUseMarketSell(n, E.resource);
+    var b = !B && !h && !S && shouldUseMarketBuy(n, E.resource, k, I);
+    if (!S && !b && hasActiveOpBuyRequest(e, E.resource)) {
+      return "[MarketRefine] ERROR: Active opportunisticBuy request already exists for " + E.resource + " in " + e + ". Cancel it first or wait for completion.";
+    }
+    v.push({
+      resource: E.resource,
+      amount: I,
+      ceiling: k,
+      useMS: S,
+      useMB: b,
+      useOwned: B,
+      useBatch: !!h,
+      batchPurchase: h || null
+    });
+  }
+  var T = [];
+  var U = [];
+  var _ = [];
+  for (var C = 0; C < v.length; C++) {
+    var A = v[C];
+    var P = countInRoom(e, A.resource);
+    var F = countUnreservedInput(e, A.resource);
+    var L = {
+      resource: A.resource,
+      amount: A.amount,
+      maxPrice: A.ceiling,
+      useOwned: false,
+      baseCount: P,
+      baseAvailable: F,
+      useMarketSell: A.useMS,
+      useMarketBuy: A.useMB,
+      useBatch: A.useBatch,
+      batchBuyJobId: null,
       marketBuyOrderId: null
     };
-
-    if (p.useMS) {
-      callMarketSell(roomName, p.resource, p.amount);
-      buyMsgs.push(p.resource + ' x' + p.amount + ' (via marketSell)');
-    } else if (p.useMB) {
-      var bidPrice = computeCompetitiveBid(p.resource, p.ceiling);
-      inputRec.bidPrice = bidPrice;
-      if (bidPrice === null) {
-        // volume-weighted ask exceeds our margin ceiling: a posted bid would be
-        // starved. Roll back any prior-input buys and refuse the whole op.
-        for (var rbNull = 0; rbNull < inputs.length; rbNull++) {
-          var rbInpN = inputs[rbNull];
-          if (rbInpN.useMarketSell) continue;
-          if (rbInpN.useMarketBuy) marketBuyer.cancelOrderFor(roomName, rbInpN.resource, 'op aborted: ask floor > ceiling');
-          else if (hasActiveOpBuyRequest(roomName, rbInpN.resource)) cancelOpBuyRequest(roomName, rbInpN.resource);
-        }
-        return '[MarketRefine] Refused ' + output + ' in ' + roomName +
-               ': ask floor for ' + p.resource + ' exceeds ceiling ' + p.ceiling.toFixed(3) +
-               ' (no profitable bid available).';
+    if (A.useOwned) {
+      L.useOwned = true;
+      L.handoffReservationProgram = o && o.handoffReservationProgram || null;
+      L.handoffResource = A.resource;
+      L.handoffAmount = A.amount;
+      _.push(A.resource + " x" + A.amount + " (via chained handoff)");
+    } else if (A.useBatch) {
+      var q = A.batchPurchase;
+      if (typeof marketBuyer.cancelOrdersForProduct === "function") {
+        marketBuyer.cancelOrdersForProduct(e, A.resource, n, "direct batch purchase superseded managed buy", "factory");
       }
-      var createRes = callMarketBuy(roomName, p.resource, p.amount, bidPrice, output);
-      if (createRes.ok) {
-        buyMsgs.push(p.resource + ' x' + p.amount + ' @' + bidPrice.toFixed(3) +
-                     ' (via marketBuy, ceiling ' + p.ceiling.toFixed(3) + ', id pending)');
-      } else if (('' + createRes.message).indexOf('already exists') >= 0) {
-        // A genuinely live marketBuy order for this input is still in flight.
-        // Do NOT fall back to opportunisticBuy (that would post a competing buy).
-        // Abort this whole op: roll back any buys already queued for prior inputs,
-        // then bail. The op retries on a later cycle once the live order clears.
-        for (var rb = 0; rb < inputs.length; rb++) {
-          var rbInp = inputs[rb];
-          if (rbInp.useMarketSell) continue;
-          if (rbInp.useMarketBuy) marketBuyer.cancelOrderFor(roomName, rbInp.resource, 'op aborted: input conflict');
-          else if (hasActiveOpBuyRequest(roomName, rbInp.resource)) cancelOpBuyRequest(roomName, rbInp.resource);
-        }
-        return '[MarketRefine] Aborted ' + output + ' in ' + roomName +
-               ': live marketBuy order already exists for ' + p.resource +
-               '. Will retry once it clears. (' + createRes.message + ')';
+      var N = marketBatchBuy.create({
+        roomName: e,
+        resourceType: A.resource,
+        amount: A.amount,
+        orderId: q.orderId,
+        orderRoomName: q.orderRoomName,
+        orderPrice: q.orderPrice,
+        maxPrice: q.maxPrice || q.orderPrice,
+        energyCost: q.energyCost,
+        energyPrice: q.energyPrice,
+        queue: "factory",
+        ownerId: f,
+        economicsJobId: a || null
+      });
+      if (!N.ok) {
+        cancelInputProcurement(e, T, f, "op aborted: batch setup failed");
+        memoryManager.requestSave();
+        return "[MarketRefine] Aborted " + n + " in " + e + ": failed to create batch purchase for " + A.resource + ". " + N.reason;
+      }
+      L.batchBuyJobId = N.id;
+      U.push(N.id);
+      _.push(A.resource + " x" + A.amount + " @" + q.orderPrice.toFixed(3) + " (via batch)");
+    } else if (A.useMS) {
+      cancelInputProcurement(e, T, f, "op aborted: local energy required");
+      memoryManager.requestSave();
+      return "[MarketRefine] Refused energy acquisition for " + n + ". Use localRefine with local energy.";
+    } else if (A.useMB) {
+      var x = computeCompetitiveBid(A.resource, A.ceiling, A.amount);
+      L.bidPrice = x;
+      if (x === null) {
+        cancelInputProcurement(e, T, f, "op aborted: passive bid unavailable");
+        memoryManager.requestSave();
+        return "[MarketRefine] Refused " + n + " in " + e + ": no passive bid for " + A.resource + " under ceiling " + A.ceiling.toFixed(3) + " (no profitable bid available).";
+      }
+      var G = callMarketBuy(e, A.resource, A.amount, x, A.ceiling, n, f, a);
+      if (G.ok) {
+        _.push(A.resource + " x" + A.amount + " @" + x.toFixed(3) + " (via marketBuy, ceiling " + A.ceiling.toFixed(3) + ", id pending)");
+      } else if (("" + G.message).indexOf("already exists") >= 0) {
+        cancelInputProcurement(e, T, f, "op aborted: input conflict");
+        memoryManager.requestSave();
+        return "[MarketRefine] Aborted " + n + " in " + e + ": live marketBuy order already exists for " + A.resource + ". Will retry once it clears. (" + G.message + ")";
       } else {
-        // Other failure (credits, ERR_FULL on order cap, etc.) -> fall back.
-        console.log('[MarketRefine] marketBuy failed for ' + p.resource + ', falling back to opportunisticBuy: ' + createRes.message);
-        inputRec.useMarketBuy = false;
-        invokeOpportunisticBuy(roomName, p.resource, p.amount, p.ceiling);
-        buyMsgs.push(p.resource + ' x' + p.amount + ' @' + p.ceiling.toFixed(3) + ' (fallback opportunistic)');
+        console.log("[MarketRefine] marketBuy failed for " + A.resource + ", falling back to opportunisticBuy: " + G.message);
+        L.useMarketBuy = false;
+        if (!createOpportunisticBuyForInput(e, L, A.amount, n, f, a)) {
+          cancelInputProcurement(e, T, f, "op aborted: opportunistic setup failed");
+          memoryManager.requestSave();
+          return "[MarketRefine] Aborted " + n + " in " + e + ": failed to create opportunisticBuy for " + A.resource + ".";
+        }
+        _.push(A.resource + " x" + A.amount + " @" + A.ceiling.toFixed(3) + " (fallback opportunistic)");
       }
     } else {
-      invokeOpportunisticBuy(roomName, p.resource, p.amount, p.ceiling);
-      buyMsgs.push(p.resource + ' x' + p.amount + ' @' + p.ceiling.toFixed(3));
+      if (!createOpportunisticBuyForInput(e, L, A.amount, n, f, a)) {
+        cancelInputProcurement(e, T, f, "op aborted: opportunistic setup failed");
+        memoryManager.requestSave();
+        return "[MarketRefine] Aborted " + n + " in " + e + ": failed to create opportunisticBuy for " + A.resource + ".";
+      }
+      _.push(A.resource + " x" + A.amount + " @" + A.ceiling.toFixed(3));
     }
-
-    inputs.push(inputRec);
+    T.push(L);
   }
-
-  var baseOutput = countInRoom(roomName, output);
-
-  var id = 'mref_' + roomName + '_' + output + '_' + Game.time;
-  var op = {
-    id: id,
-    room: roomName,
-    output: output,
-    inputs: inputs,
-    input: inputs.length === 1 ? inputs[0].resource : '(multi)',
-    targetBuy: inputs.length === 1 ? inputs[0].amount : 0,
-    price: inputs.length === 1 ? inputs[0].maxPrice : 0,
-    baseOutputCount: baseOutput,
-    phase: 'buying',
+  var Y = countInRoom(e, n);
+  var D = targetOutputForInputs(n, T);
+  if (D <= 0) {
+    cancelInputProcurement(e, T, f, "op aborted: incomplete recipe batch");
+    memoryManager.requestSave();
+    return "[MarketRefine] ERROR: Acquired recipe quantities do not form a complete batch of " + n + ".";
+  }
+  var j = {
+    id: f,
+    room: e,
+    handoff: !!d,
+    handoffResource: M && M.resource || null,
+    handoffAmount: M && M.amount || 0,
+    handoffInput: !!m,
+    handoffReservationProgram: o && o.handoffReservationProgram || null,
+    output: n,
+    inputs: T,
+    baseOutputCount: Y,
+    phase: "buying",
     started: Game.time,
-    lastUpdate: Game.time,
-    buyRequestCreated: true,
-    factoryProgressOut: 0
+    targetOutput: D,
+    jobId: a,
+    batchMode: l,
+    batchBuyIds: U
   };
-
-  Memory.marketRefine.ops.push(op);
-  return '[MarketRefine] Started ' + id + ' | buying: ' + buyMsgs.join(', ') + ' -> refine ' + output + ' (max) -> sell.';
+  Memory.marketRefine.ops.push(memoryManager.compactMarketRefineOperation(j));
+  memoryManager.requestSave();
+  return "[MarketRefine] Started " + f + " | buying: " + _.join(", ") + " -> refine " + D + " " + n + " -> sell.";
 };
-
-global.marketRefineStatus = function(id) {
+global.marketRefineStatus = function(e) {
   ensureMemory();
-  var ops = Memory.marketRefine.ops;
-  if (!ops || ops.length === 0) return '[MarketRefine] No ops.';
-
-  if (id) {
-    for (var i = 0; i < ops.length; i++) {
-      var o = ops[i];
-      if (o && o.id === id) {
-        var s = [];
-        s.push('[' + o.id + '] room=' + o.room + ' phase=' + o.phase);
-        var age = Game.time - (o.started || 0);
-        var expiresIn = OP_EXPIRY_TICKS - age;
-        s.push('  age=' + age + ' ticks' + (o.phase === 'buying' ? ' | expires in ' + (expiresIn > 0 ? expiresIn : 0) + ' ticks' : ' | no expiry (inputs acquired)'));
+  var r = Memory.marketRefine.ops;
+  if (!r || r.length === 0) return "[MarketRefine] No ops.";
+  if (e) {
+    for (var t = 0; t < r.length; t++) {
+      var o = r[t];
+      if (o && o.id === e) {
+        var a = [];
+        a.push("[" + o.id + "] room=" + o.room + " phase=" + o.phase);
+        var n = Game.time - (o.started || 0);
+        var u = OP_EXPIRY_TICKS - n;
+        a.push("  age=" + n + " ticks" + (o.phase === "buying" ? " | expires in " + (u > 0 ? u : 0) + " ticks" : " | no expiry (inputs acquired)"));
         if (o.inputs && o.inputs.length > 0) {
-          for (var k = 0; k < o.inputs.length; k++) {
-            var inp = o.inputs[k];
-            var acquired = getInputAcquired(o, inp);
-
-            var orderFill = '';
-            if (inp.useMarketBuy) {
-              var rec = marketBuyer.getOrderRecordFor(o.room, inp.resource);
-              if (rec && rec.orderId) {
-                var ord = Game.market.orders[rec.orderId];
-                if (rec.done) orderFill = ' [order DONE ' + (rec.fulfilledFinal || 0) + '/' + rec.target + ']';
-                else if (rec.cancelled) orderFill = ' [order CANCELLED ' + (rec.fulfilledFinal || 0) + '/' + rec.target + ']';
-                else if (ord) orderFill = ' [orderFill=' + marketBuyer.getFulfilled(rec) + '/' + rec.target +
-                                          ' rem=' + ord.remainingAmount + ' cap=' + rec.trancheTotal +
-                                          (rec.passive ? ' PASSIVE' : '') + ']';
-                else orderFill = ' [order missing]';
-              } else if (rec) {
-                orderFill = ' [order id pending]';
+          for (var i = 0; i < o.inputs.length; i++) {
+            var s = o.inputs[i];
+            var c = getInputAcquired(o, s);
+            var f = "";
+            if (s.useMarketBuy) {
+              var l = getOwnBuyRecord(o, s.resource);
+              if (l && l.orderId) {
+                var d = Game.market.orders[l.orderId];
+                if (l.done) f = " [order DONE " + (l.fulfilledFinal || 0) + "/" + l.target + "]"; else if (l.cancelled) f = " [order CANCELLED " + (l.fulfilledFinal || 0) + "/" + l.target + "]"; else if (d) f = " [orderFill=" + marketBuyer.getFulfilled(l) + "/" + l.target + " rem=" + util.getOrderRemaining(d) + " cap=" + l.trancheTotal + (l.passive ? " PASSIVE" : "") + "]"; else f = " [order missing]";
+              } else if (l) {
+                f = " [order id pending]";
               } else {
-                orderFill = ' [no managed order]';
+                f = " [no managed order]";
               }
             }
-
-            var viaStr = inp.useMarketSell ? ' (via marketSell)' : (inp.useMarketBuy ? ' (via marketBuy)' : '');
-            s.push('  input: ' + inp.resource + ' target=' + inp.amount + ' price=' + inp.maxPrice +
-                   ' acquired=' + acquired + ' current=' + countInRoom(o.room, inp.resource) + viaStr + orderFill);
+            var m = s.useMarketSell ? " (via marketSell)" : s.useMarketBuy ? " (via marketBuy)" : "";
+            a.push("  input: " + s.resource + " target=" + s.amount + " price=" + s.maxPrice + " acquired=" + c + " current=" + countInRoom(o.room, s.resource) + m + f);
           }
         } else {
-          s.push('  input: ' + o.input + ' target=' + o.targetBuy + ' price=' + o.price);
-          s.push('  baseInput=' + (o.baseInputCount || 0) + ' currentInput=' + countInRoom(o.room, o.input));
+          a.push("  input: " + o.input + " target=" + o.targetBuy + " price=" + o.price);
+          a.push("  baseInput=" + (o.baseInputCount || 0) + " currentInput=" + countInRoom(o.room, o.input));
         }
-        s.push('  output: ' + o.output + (o.factoryOrderId ? (' orderId=' + o.factoryOrderId) : ''));
-        s.push('  baseOutput=' + o.baseOutputCount + ' currentOutput=' + countInRoom(o.room, o.output));
+        a.push("  output: " + o.output + (o.factoryOrderId ? " orderId=" + o.factoryOrderId : ""));
+        a.push("  baseOutput=" + o.baseOutputCount + " currentOutput=" + countInRoom(o.room, o.output));
         if (o.failReason) {
-          s.push('  FAILURE: ' + o.failReason + ' (tick ' + (o.failTick || '?') + ')');
+          a.push("  FAILURE: " + o.failReason + " (tick " + (o.failTick || "?") + ")");
         }
-        return s.join('\n');
+        return a.join("\n");
       }
     }
-    return '[MarketRefine] Op not found: ' + id;
+    return "[MarketRefine] Op not found: " + e;
   }
-
-  var lines = [];
-  for (var j = 0; j < ops.length; j++) {
-    var op = ops[j];
-    if (!op) continue;
-    var age2 = Game.time - (op.started || 0);
-    var expiresIn2 = OP_EXPIRY_TICKS - age2;
-    var ageStr = op.phase === 'buying'
-      ? ' age=' + age2 + (expiresIn2 < 10000 ? ' EXPIRES IN ' + Math.max(0, expiresIn2) : '')
-      : ' age=' + age2;
-    var failStr = op.phase === 'failed' ? ' FAILED: ' + (op.failReason || '?') : '';
-    if (op.inputs && op.inputs.length > 0) {
-      var inputNames = [];
-      for (var m = 0; m < op.inputs.length; m++) {
-        inputNames.push(op.inputs[m].resource + (op.inputs[m].useMarketBuy ? '*' : ''));
+  var p = [];
+  for (var R = 0; R < r.length; R++) {
+    var y = r[R];
+    if (!y) continue;
+    var O = Game.time - (y.started || 0);
+    var v = OP_EXPIRY_TICKS - O;
+    var g = y.phase === "buying" ? " age=" + O + (v < 1e4 ? " EXPIRES IN " + Math.max(0, v) : "") : " age=" + O;
+    var E = y.phase === "failed" ? " FAILED: " + (y.failReason || "?") : "";
+    if (y.inputs && y.inputs.length > 0) {
+      var h = [];
+      for (var I = 0; I < y.inputs.length; I++) {
+        h.push(y.inputs[I].resource + (y.inputs[I].useMarketBuy ? "*" : ""));
       }
-      lines.push('[' + op.id + '] ' + op.room + ' ' + inputNames.join('+') + ' -> ' + op.output + ' | phase=' + op.phase + ageStr + failStr);
+      p.push("[" + y.id + "] " + y.room + " " + h.join("+") + " -> " + y.output + " | phase=" + y.phase + g + E);
     } else {
-      lines.push('[' + op.id + '] ' + op.room + ' ' + op.input + ' -> ' + op.output + ' | phase=' + op.phase + ageStr + failStr);
+      p.push("[" + y.id + "] " + y.room + " " + y.input + " -> " + y.output + " | phase=" + y.phase + g + E);
     }
   }
-  lines.push('(* = via marketBuy standing order)');
-  return lines.join('\n');
+  p.push("(* = via marketBuy standing order)");
+  return p.join("\n");
 };
-
-/**
- * Show recent outcomes (done/failed) from the outcomes ledger.
- * marketRefineOutcomes()       -> last 20
- * marketRefineOutcomes(50)     -> last 50
- * marketRefineOutcomes('W1N1') -> last 20 for that room
- * marketRefineOutcomes('W1N1', 50)
- */
-global.marketRefineOutcomes = function(arg1, arg2) {
+global.marketRefineOutcomes = function(e, r) {
   ensureMemory();
-  var outcomes = Memory.marketRefine.outcomes;
-  if (!outcomes || outcomes.length === 0) return '[MarketRefine] No recorded outcomes yet.';
-
-  var roomFilter = null, n = 20;
-  if (typeof arg1 === 'string') roomFilter = arg1;
-  else if (typeof arg1 === 'number') n = arg1;
-  if (typeof arg2 === 'number') n = arg2;
-
-  var filtered = outcomes;
-  if (roomFilter) filtered = filtered.filter(function(o) { return o.room === roomFilter; });
-  if (filtered.length === 0) return '[MarketRefine] No recorded outcomes' + (roomFilter ? ' for ' + roomFilter : '') + '.';
-
-  var slice = filtered.slice(-n);
-  var lines = ['[MarketRefine] Last ' + slice.length + ' of ' + filtered.length + ' outcome(s):', ''];
-  for (var i = 0; i < slice.length; i++) {
-    var o = slice[i];
-    var age = Game.time - o.tick;
-    var tag = o.status === 'failed' ? 'FAILED' : 'done';
-    var reasonStr = o.reason ? ' - ' + o.reason : '';
-    lines.push('  [' + age + ' ticks ago] ' + tag + ': ' + o.output + ' in ' + o.room + reasonStr);
+  var t = Memory.marketRefine.outcomes;
+  if (!t || t.length === 0) return "[MarketRefine] No recorded outcomes yet.";
+  var o = null, a = 20;
+  if (typeof e === "string") o = e; else if (typeof e === "number") a = e;
+  if (typeof r === "number") a = r;
+  var n = t;
+  if (o) n = n.filter(function(e) {
+    return e.room === o;
+  });
+  if (n.length === 0) return "[MarketRefine] No recorded outcomes" + (o ? " for " + o : "") + ".";
+  var u = n.slice(-a);
+  var i = [ "[MarketRefine] Last " + u.length + " of " + n.length + " outcome(s):", "" ];
+  for (var s = 0; s < u.length; s++) {
+    var c = u[s];
+    var f = Game.time - c.tick;
+    var l = c.status === "failed" ? "FAILED" : c.status === "cancelled" ? "CANCELLED" : "done";
+    var d = c.reason ? " - " + c.reason : "";
+    i.push("  [" + f + " ticks ago] " + l + ": " + c.output + " in " + c.room + d);
   }
-  return lines.join('\n');
+  return i.join("\n");
 };
-
-global.cancelMarketRefine = function(id) {
+global.cancelMarketRefine = function(e) {
   ensureMemory();
-  var ops = Memory.marketRefine.ops;
-  for (var i = 0; i < ops.length; i++) {
-    var op = ops[i];
-    if (op && op.id === id) {
-      if (op.inputs && op.inputs.length > 0) {
-        for (var k = 0; k < op.inputs.length; k++) {
-          var inp = op.inputs[k];
-          if (inp.useMarketBuy) {
-            if (inp.marketBuyOrderId) marketBuyer.cancelOrderById(inp.marketBuyOrderId, 'op cancelled');
-            else marketBuyer.cancelOrderFor(op.room, inp.resource, 'op cancelled');
+  var r = Memory.marketRefine.ops;
+  for (var t = 0; t < r.length; t++) {
+    var o = r[t];
+    if (o && o.id === e) {
+      if (o.phase === "buying") {
+        expireOp(o, "Cancelled by console command");
+        r.splice(t, 1);
+        return "[MarketRefine] Cancelled op " + e + " and listed acquired inputs.";
+      }
+      var a = o.outputBaseAtFactoryStart !== null && o.outputBaseAtFactoryStart !== undefined ? o.outputBaseAtFactoryStart : o.baseOutputCount || 0;
+      var n = countInRoom(o.room, o.output) - a;
+      if (n > 0) {
+        var u = callMarketSell(o.room, o.output, n, undefined, o.jobId ? {
+          jobId: o.jobId
+        } : null);
+        if (!marketSellAccepted(u)) {
+          return "[MarketRefine] Could not safely cancel " + e + ": produced output could not be listed: " + u;
+        }
+      }
+      if (o.factoryOrderId && typeof global.cancelFactoryOrder === "function") {
+        global.cancelFactoryOrder(o.factoryOrderId);
+      }
+      if (o.inputs && o.inputs.length > 0) {
+        for (var i = 0; i < o.inputs.length; i++) {
+          var s = o.inputs[i];
+          if (s.useMarketBuy) {
+            var c = pollMarketBuyOrderId(o, s);
+            var f = c ? c.opId || null : o.id || null;
+            if (s.marketBuyOrderId) marketBuyer.cancelOrderById(s.marketBuyOrderId, "op cancelled", f); else marketBuyer.cancelOrderFor(o.room, s.resource, "op cancelled", "factory", f);
+          } else if (s.useBatch && s.batchBuyJobId) {
+            marketBatchBuy.releaseReservation(s.batchBuyJobId, "marketRefine cancellation");
+          } else if (!s.useMarketSell && hasActiveOpBuyRequest(o.room, s.resource, o.id)) {
+            cancelOpBuyRequest(o.room, s.resource, o.id);
           }
         }
       }
-      ops.splice(i, 1);
-      return '[MarketRefine] Cancelled op ' + id + ' (linked marketBuy orders cancelled; ' +
-             'opportunisticBuy requests, marketSell and factory orders are NOT auto-cancelled).';
+      recordOutcome(o, "cancelled", "Cancelled by console command");
+      r.splice(t, 1);
+      return "[MarketRefine] Cancelled op " + e + " and linked factory/buy work.";
     }
   }
-  return '[MarketRefine] Op not found: ' + id;
+  return "[MarketRefine] Op not found: " + e;
 };
-
 global.cancelLastMarketRefine = function() {
   ensureMemory();
-  var ops = Memory.marketRefine.ops;
-  if (!ops || ops.length === 0) return '[MarketRefine] No ops to cancel.';
-  var last = ops[ops.length - 1];
-  var id = last && last.id ? last.id : null;
-  if (!id) return '[MarketRefine] Last op missing id.';
-  return cancelMarketRefine(id);
+  var e = Memory.marketRefine.ops;
+  if (!e || e.length === 0) return "[MarketRefine] No ops to cancel.";
+  var r = e[e.length - 1];
+  var t = r && r.id ? r.id : null;
+  if (!t) return "[MarketRefine] Last op missing id.";
+  return cancelMarketRefine(t);
 };
-
-global.abortMarketRefine = function(roomOrId, product) {
+var abortMarketRefine = global.abortMarketRefine = function(e, r) {
   ensureMemory();
-  var ops = Memory.marketRefine.ops;
-  for (var i = ops.length - 1; i >= 0; i--) {
-    var op = ops[i];
-    if (!op) continue;
-    var match = (product === undefined) ? (op.id === roomOrId)
-                                        : (op.room === roomOrId && op.output === product);
-    if (!match) continue;
-    if (op.phase !== 'buying') {
-      return '[MarketRefine] ' + op.id + ' not in buying phase (phase=' + op.phase + '); not aborted.';
+  var t = Memory.marketRefine.ops;
+  for (var o = t.length - 1; o >= 0; o--) {
+    var a = t[o];
+    if (!a) continue;
+    var n = r === undefined ? a.id === e : a.room === e && a.output === r;
+    if (!n) continue;
+    if (a.phase !== "buying") {
+      return "[MarketRefine] " + a.id + " not in buying phase (phase=" + a.phase + "); not aborted.";
     }
-    expireOp(op, 'Aborted: no longer profitable (below margin threshold)');
-    ops.splice(i, 1);
-    return '[MarketRefine] Aborted ' + op.id + ' (cancelled/passivated buys, sold back acquired inputs).';
+    expireOp(a, "Aborted: no longer profitable (break-even failed)");
+    t.splice(o, 1);
+    return "[MarketRefine] Aborted " + a.id + " (cancelled/passivated buys, sold back acquired inputs).";
   }
-  return '[MarketRefine] No matching buying op to abort.';
+  return "[MarketRefine] No matching buying op to abort.";
 };
-
 global.marketRefineDebugOpBuy = function() {
-  return '[marketRefine] opportunisticBuy methods: ' + opBuyMethodsString();
+  return "[marketRefine] opportunisticBuy methods: " + opBuyMethodsString();
 };
-
 global.marketRefineShouldUseMarketBuy = shouldUseMarketBuy;
-global.marketRefineComputeBidPrice    = computeCompetitiveBid;
-
-global.marketRefineDebugBuyDecision = function(room, resource, ceiling) {
-  var book = pricing.getBook(resource);
-  var energyBuyPrice = marketBuyer.computeBuyPrice(RESOURCE_ENERGY);
-  var avg = pricing.getAvg48h(resource);
-  var value = (typeof avg === 'number' && avg > 0) ? avg : ceiling;
-  var useMB = shouldUseMarketBuy(null, resource, ceiling);
-  var bid   = computeCompetitiveBid(resource, ceiling);
-  var forced = MARKET_BUY_FORCE_LIST[resource] ? ' [FORCED]' : '';
-  return '[marketRefine debug] ' + resource +
-         ' | energyBuy=' + (typeof energyBuyPrice === 'number' ? energyBuyPrice.toFixed(3) : String(energyBuyPrice)) +
-         ' | value='     + (typeof value === 'number' ? value.toFixed(3) : String(value)) +
-         ' | bestBid='   + (book.bestBid === null ? 'null' : book.bestBid.toFixed(3)) +
-         ' | bestAsk='   + (book.bestAsk === null ? 'null' : book.bestAsk.toFixed(3)) +
-         ' | range7d='   + pricing.getRange7d(resource) +
-         ' | trend7d='   + pricing.getTrend7d(resource) +
-         ' | useMarketBuy=' + useMB + forced +
-         ' | bidPrice='  + (typeof bid === 'number' ? bid.toFixed(3) : String(bid));
+global.marketRefineComputeBidPrice = computeCompetitiveBid;
+global.marketRefineDebugBuyDecision = function(e, r, t) {
+  var o = pricing.getBook(r);
+  var a = pricing.getPriceProfile(r);
+  var n = marketBuyer.computePassiveBuyPrice(RESOURCE_ENERGY);
+  var u = a && a.marketPrice !== null ? a.marketPrice : t;
+  var i = shouldUseMarketBuy(null, r, t);
+  var s = computeCompetitiveBid(r, t);
+  var c = MARKET_BUY_FORCE_LIST[r] ? " [FORCED]" : "";
+  return "[marketRefine debug] " + r + " | energyBuy=" + (typeof n === "number" ? n.toFixed(3) : String(n)) + " | value=" + (typeof u === "number" ? u.toFixed(3) : String(u)) + " | bestBid=" + (o.bestBid === null ? "null" : o.bestBid.toFixed(3)) + " | bestAsk=" + (o.bestAsk === null ? "null" : o.bestAsk.toFixed(3)) + " | range7d=" + pricing.getRange7d(r) + " | trend7d=" + pricing.getTrend7d(r) + " | useMarketBuy=" + i + c + " | bidPrice=" + (typeof s === "number" ? s.toFixed(3) : String(s));
 };
-
-/**
- * View or edit the marketBuy force list.
- *   marketRefineForceList()         -> list current forced resources
- *   marketRefineForceList('add', RESOURCE_X)    -> add resource to force list
- *   marketRefineForceList('remove', RESOURCE_X) -> remove resource from force list
- *   marketRefineForceList('reset')  -> restore defaults (biomass, metal, silicon, mist)
- */
-global.marketRefineForceList = function(action, resource) {
-  if (!action) {
-    var list = [];
-    for (var r in MARKET_BUY_FORCE_LIST) {
-      if (MARKET_BUY_FORCE_LIST.hasOwnProperty(r) && MARKET_BUY_FORCE_LIST[r]) list.push(r);
+global.marketRefineForceList = function(e, r) {
+  if (!e) {
+    var t = [];
+    for (var o in MARKET_BUY_FORCE_LIST) {
+      if (MARKET_BUY_FORCE_LIST.hasOwnProperty(o) && MARKET_BUY_FORCE_LIST[o]) t.push(o);
     }
-    return '[marketRefine forceList] ' + (list.length ? list.join(', ') : '(empty)');
+    return "[marketRefine forceList] " + (t.length ? t.join(", ") : "(empty)");
   }
-  if (action === 'reset') {
+  if (e === "reset") {
     delete MARKET_BUY_FORCE_LIST[RESOURCE_BIOMASS];
     delete MARKET_BUY_FORCE_LIST[RESOURCE_METAL];
     delete MARKET_BUY_FORCE_LIST[RESOURCE_SILICON];
     delete MARKET_BUY_FORCE_LIST[RESOURCE_MIST];
     MARKET_BUY_FORCE_LIST[RESOURCE_BIOMASS] = true;
-    MARKET_BUY_FORCE_LIST[RESOURCE_METAL]   = true;
+    MARKET_BUY_FORCE_LIST[RESOURCE_METAL] = true;
     MARKET_BUY_FORCE_LIST[RESOURCE_SILICON] = true;
-    MARKET_BUY_FORCE_LIST[RESOURCE_MIST]    = true;
-    return '[marketRefine forceList] reset to defaults: biomass, metal, silicon, mist';
+    MARKET_BUY_FORCE_LIST[RESOURCE_MIST] = true;
+    return "[marketRefine forceList] reset to defaults: biomass, metal, silicon, mist";
   }
-  if (!resource) return '[marketRefine forceList] Usage: action="add"|"remove"|"reset", resource=RESOURCE_X';
-  if (action === 'add') {
-    MARKET_BUY_FORCE_LIST[resource] = true;
-    return '[marketRefine forceList] added ' + resource;
+  if (!r) return '[marketRefine forceList] Usage: action="add"|"remove"|"reset", resource=RESOURCE_X';
+  if (e === "add") {
+    MARKET_BUY_FORCE_LIST[r] = true;
+    return "[marketRefine forceList] added " + r;
   }
-  if (action === 'remove') {
-    delete MARKET_BUY_FORCE_LIST[resource];
-    return '[marketRefine forceList] removed ' + resource;
+  if (e === "remove") {
+    delete MARKET_BUY_FORCE_LIST[r];
+    return "[marketRefine forceList] removed " + r;
   }
-  return '[marketRefine forceList] Unknown action: ' + action + '. Use add|remove|reset';
+  return "[marketRefine forceList] Unknown action: " + e + ". Use add|remove|reset";
 };
-
 global.cancelAllMarketRefine = function() {
   if (!Memory.marketRefine || !Array.isArray(Memory.marketRefine.ops)) {
-    return '[MarketRefine] Nothing to cancel.';
+    return "[MarketRefine] Nothing to cancel.";
   }
-  // Snapshot ids first: abort/cancel splice the live array as they go.
-  var ids = Memory.marketRefine.ops.map(function(o) { return o ? o.id : null; });
-  var results = [];
-  for (var i = 0; i < ids.length; i++) {
-    var op = null, phase = null;
-    for (var j = 0; j < Memory.marketRefine.ops.length; j++) {
-      if (Memory.marketRefine.ops[j] && Memory.marketRefine.ops[j].id === ids[i]) {
-        op = Memory.marketRefine.ops[j]; phase = op.phase; break;
+  var e = Memory.marketRefine.ops.map(function(e) {
+    return e ? e.id : null;
+  });
+  var r = [];
+  for (var t = 0; t < e.length; t++) {
+    var o = null, a = null;
+    for (var n = 0; n < Memory.marketRefine.ops.length; n++) {
+      if (Memory.marketRefine.ops[n] && Memory.marketRefine.ops[n].id === e[t]) {
+        o = Memory.marketRefine.ops[n];
+        a = o.phase;
+        break;
       }
     }
-    if (!op) continue;
-    // Buying phase: abort stops opportunisticBuy + marketBuy and sells back inputs.
-    // Other phases: cancel removes the op + its marketBuy orders.
-    if (phase === 'buying') results.push(abortMarketRefine(op.id));
-    else results.push(cancelMarketRefine(op.id));
+    if (!o) continue;
+    if (a === "buying") r.push(abortMarketRefine(o.id)); else r.push(cancelMarketRefine(o.id));
   }
-  return results.length ? results.join('\n') : '[MarketRefine] No ops cancelled.';
+  return r.length ? r.join("\n") : "[MarketRefine] No ops cancelled.";
 };
-
-// ===== TICK RUNNER =====
-function run() {
+function run(e) {
   ensureMemory();
   getRoomState.init();
-
-  var ops = Memory.marketRefine.ops;
-  for (var i = ops.length - 1; i >= 0; i--) {
-    var op = ops[i];
-    if (!op) { ops.splice(i, 1); continue; }
-
-    op.lastUpdate = Game.time;
-
-    // --- AUTO CLEANUP ---
-    // NOTE: outcomes (done/failed) are recorded at the point the phase
-    // transition happens (see 'selling' phase and failOp()), BEFORE the op
-    // reaches this generic cleanup splice. This block just removes the op
-    // from the active list once its outcome has already been logged.
-    if (op.phase === 'done' || op.phase === 'error' || op.phase === 'failed') {
-        if (op.phase === 'error' && !op._outcomeRecorded) {
-            recordOutcome(op, 'failed', op.failReason || 'error');
-        }
-        ops.splice(i, 1);
-        continue;
+  var r = Memory.marketRefine.ops;
+  var t = typeof e === "number" && isFinite(e);
+  var o = t ? Game.cpu.getUsed() + Math.max(0, e) : null;
+  var a = null;
+  var n = t ? 0 : r.length - 1;
+  var u = 0;
+  if (t) {
+    a = [];
+    for (var i = r.length - 1; i >= 0; i--) {
+      if (r[i]) a.push({
+        id: r[i].id || null,
+        ref: r[i]
+      });
     }
-
-    if (op.phase === 'buying') {
-      var allAcquired = true;
-
-      if (op.inputs && op.inputs.length > 0) {
-        for (var k = 0; k < op.inputs.length; k++) {
-          var inp = op.inputs[k];
-          if (inp.useMarketBuy) ensureMarketBuyOrder(op, inp);
-          var acquired = getInputAcquired(op, inp);
-          if (acquired < inp.amount) {
-            allAcquired = false;
-            break;
+    var s = Memory.marketRefine.scheduler;
+    if (s.nextOpId) {
+      for (var c = 0; c < a.length; c++) {
+        if (a[c].id === s.nextOpId) {
+          n = c;
+          break;
+        }
+      }
+    }
+  }
+  while (t ? n < a.length : n >= 0) {
+    if (t && u > 0 && Game.cpu.getUsed() >= o) break;
+    var f = t ? a[n++] : null;
+    var l = t ? r.indexOf(f.ref) : n--;
+    if (t && l < 0) continue;
+    if (t) {
+      var d = a.length > 0 ? a[n % a.length] : null;
+      Memory.marketRefine.scheduler.nextOpId = d && d.id ? d.id : null;
+    }
+    u++;
+    var m = r[l];
+    if (!m) {
+      r.splice(l, 1);
+      continue;
+    }
+    if (m.phase === "done" || m.phase === "error" || m.phase === "failed") {
+      if (m.phase === "error" && !m._outcomeRecorded) {
+        recordOutcome(m, "failed", m.failReason || "error");
+      }
+      r.splice(l, 1);
+      continue;
+    }
+    if (m.phase === "buying") {
+      if (m.jobId && m._phase !== "buying") {
+        try {
+          require("marketEconomics").phase(m.jobId, "buying");
+          m._phase = "buying";
+        } catch (e) {}
+      }
+      var p = true;
+      if (m.inputs && m.inputs.length > 0) {
+        for (var R = 0; R < m.inputs.length; R++) {
+          var y = m.inputs[R];
+          if (y.useOwned) {
+            if (countInRoom(m.room, y.resource) < y.amount) p = false;
+          } else if (y.useBatch) {
+            var O = y.batchBuyJobId ? marketBatchBuy.find(y.batchBuyJobId) : null;
+            if (!O) {
+              failOp(m, "Batch purchase missing", y.resource + " has no batch job");
+              p = false;
+              break;
+            }
+            if (O.state === marketBatchBuy.STATE_FAILED || O.state === marketBatchBuy.STATE_CANCELLED) {
+              failOp(m, "Batch purchase failed", y.resource + ": " + (O.reason || O.state));
+              p = false;
+              break;
+            }
+            if (O.state === marketBatchBuy.STATE_DONE && O.fulfilled > 0 && O.fulfilled < (O.requestedAmount || O.amount)) {
+              ensureOpportunisticBuyRequest(m, y);
+            }
+          } else if (y.useMarketBuy) ensureMarketBuyOrder(m, y); else ensureOpportunisticBuyRequest(m, y);
+          var v = getInputAcquired(m, y);
+          if (v < y.amount) {
+            p = false;
           }
         }
       } else {
-        var have = countInRoom(op.room, op.input);
-        var acquired2 = have - (op.baseInputCount || 0);
-        if (acquired2 < 0) acquired2 = 0;
-        if (acquired2 < op.targetBuy) {
-          allAcquired = false;
+        var g = countUnreservedInput(m.room, m.input);
+        var E = g - (m.baseInputCount || 0);
+        if (E < 0) E = 0;
+        if (E < m.targetBuy) {
+          p = false;
         }
       }
-
-      if (allAcquired) {
-        if (op.inputs && op.inputs.length > 0) {
-          for (var c = 0; c < op.inputs.length; c++) {
-            var cInp = op.inputs[c];
-            if (cInp.useMarketBuy && cInp.marketBuyOrderId) {
-              var cRec = marketBuyer.getManagedOrders()[cInp.marketBuyOrderId];
-              if (cRec && !cRec.done && !cRec.cancelled) {
-                marketBuyer.cancelOrderById(cInp.marketBuyOrderId, 'target acquired');
+      if (p) {
+        if (m.inputs && m.inputs.length > 0) {
+          for (var h = 0; h < m.inputs.length; h++) {
+            var I = m.inputs[h];
+            if (I.useMarketBuy) {
+              marketBuyer.cancelOrderFor(m.room, I.resource, "target acquired", "factory", m.id);
+            } else if (I.useOwned) {
+              if (I.handoffReservationProgram) {
+                storageManager.unReserve(m.room, I.resource, "terminal", I.handoffReservationProgram);
+                storageManager.unReserve(m.room, I.resource, "storage", I.handoffReservationProgram);
               }
+            } else if (I.useBatch) {} else if (hasActiveOpBuyRequest(m.room, I.resource, m.id)) {
+              cancelOpBuyRequest(m.room, I.resource, m.id);
             }
           }
         }
-        op.phase = 'refining';
+        m.phase = "refining";
+        if (m.jobId) try {
+          require("marketEconomics").phase(m.jobId, "producing");
+          m._phase = "producing";
+        } catch (e) {}
+        memoryManager.requestSave();
         continue;
       }
-
-      var age = Game.time - (op.started || 0);
-      if (age > OP_EXPIRY_TICKS) {
-        expireOp(op);
-        ops.splice(i, 1);
+      var k = Game.time - (m.started || 0);
+      if (k > OP_EXPIRY_TICKS) {
+        expireOp(m);
+        r.splice(l, 1);
         continue;
       }
-
       continue;
     }
-
-    if (op.phase === 'refining') {
-      if (!op.factoryStarted) {
-        var ret = startFactoryMax(op.room, op.output);
-        var retMsg = typeof ret.message === 'string' ? ret.message : '';
-
-        if (retMsg.indexOf('REFUSED') >= 0 || retMsg.indexOf('Unknown') >= 0 || retMsg.indexOf('unsupported') >= 0) {
-          failOp(op, 'Factory refused order', retMsg);
-
-          var sellBackParts = [];
-          if (op.inputs && op.inputs.length > 0) {
-            for (var sb = 0; sb < op.inputs.length; sb++) {
-              var sbInp = op.inputs[sb];
-              var sbHave = countInRoom(op.room, sbInp.resource);
-              var sbBase = typeof sbInp.baseCount === 'number' ? sbInp.baseCount : 0;
-              var sbAcquired = sbHave - sbBase;
-              if (sbAcquired > 0) {
-                callMarketSell(op.room, sbInp.resource, sbAcquired);
-                sellBackParts.push(sbAcquired + ' ' + sbInp.resource);
+    if (m.phase === "refining") {
+      if (!m.factoryStarted) {
+        if (m.factoryRetryTick && Game.time < m.factoryRetryTick) continue;
+        if (m.inputs && m.inputs.length > 0) {
+          var M = true;
+          for (var B = 0; B < m.inputs.length; B++) {
+            if (m.inputs[B].useOwned) {
+              if (countInRoom(m.room, m.inputs[B].resource) < m.inputs[B].amount) {
+                M = false;
+                break;
+              }
+              continue;
+            }
+            if (getInputAcquired(m, m.inputs[B]) < m.inputs[B].amount) {
+              M = false;
+              break;
+            }
+          }
+          if (!M) {
+            m.phase = "buying";
+            memoryManager.requestSave();
+            continue;
+          }
+        }
+        if (!(m.targetOutput > 0)) {
+          m.targetOutput = targetOutputForInputs(m.output, m.inputs || []);
+          if (!(m.targetOutput > 0)) {
+            failOp(m, "Cannot determine exact factory target", "Legacy operation has no complete-batch target");
+            continue;
+          }
+        }
+        var S = releaseBatchReservations(m, "factory reservation handoff");
+        if (m.handoffReservationProgram && m.handoffResource) {
+          storageManager.unReserve(m.room, m.handoffResource, "terminal", m.handoffReservationProgram);
+          storageManager.unReserve(m.room, m.handoffResource, "storage", m.handoffReservationProgram);
+        }
+        var b;
+        try {
+          b = startFactoryOrder(m.room, m.output, m.targetOutput);
+        } catch (e) {
+          if (S) restoreBatchReservations(m);
+          throw e;
+        }
+        var T = typeof b.message === "string" ? b.message : "";
+        if (T.indexOf("Insufficient unreserved inputs") >= 0) {
+          if (S) restoreBatchReservations(m);
+          m.phase = "buying";
+          m.factoryRetryTick = Game.time + 10;
+          console.log("[MarketRefine] Factory inputs became reserved for " + m.id + "; returning to buying.");
+          memoryManager.requestSave();
+          continue;
+        }
+        if (T.indexOf("REFUSED") >= 0 || T.indexOf("Unknown") >= 0 || T.indexOf("unsupported") >= 0) {
+          failOp(m, "Factory refused order", T);
+          var U = [];
+          if (m.inputs && m.inputs.length > 0) {
+            for (var _ = 0; _ < m.inputs.length; _++) {
+              var C = m.inputs[_];
+              var A = countInRoom(m.room, C.resource);
+              var P = typeof C.baseCount === "number" ? C.baseCount : 0;
+              var F = A - P;
+              if (F > 0) {
+                var L = callMarketSell(m.room, C.resource, F);
+                if (marketSellAccepted(L)) U.push(F + " " + C.resource); else console.log("[MarketRefine] marketSell refused sell-back for " + C.resource + ": " + L);
               }
             }
           }
-          if (sellBackParts.length > 0) {
-            console.log('[MarketRefine] Selling back inputs for failed op ' + op.id + ': ' + sellBackParts.join(', '));
+          if (U.length > 0) {
+            console.log("[MarketRefine] Selling back inputs for failed op " + m.id + ": " + U.join(", "));
           }
           continue;
         }
-
-        if (retMsg.indexOf('ERROR') >= 0) {
-          failOp(op, 'Factory order error', retMsg);
+        if (T.indexOf("ERROR") >= 0) {
+          failOp(m, "Factory order error", T);
           continue;
         }
-
-        op.factoryOrderId = ret.orderId || null;
-        op.factoryCreated = Game.time;
-        op.factoryStarted = true;
-        op.outputBaseAtFactoryStart = countInRoom(op.room, op.output);
-        op.factoryProgressOut = 0;
+        if (T.indexOf("Order accepted") < 0) {
+          failOp(m, "Factory order was not accepted", T || "Empty factory response");
+          continue;
+        }
+        m.factoryOrderId = b.orderId || null;
+        if (m.jobId && m.factoryOrderId) {
+          factoryManager.annotateOrder(m.factoryOrderId, {
+            jobId: m.jobId
+          });
+        }
+        m.factoryCreated = Game.time;
+        m.factoryStarted = true;
+        delete m.factoryRetryTick;
+        m.outputBaseAtFactoryStart = countInRoom(m.room, m.output);
+        m.factoryProgressOut = 0;
+        if (m.jobId) {
+          try {
+            var q = require("marketEconomics");
+            q.link(m.jobId, "factory", m.factoryOrderId);
+            if (m._phase !== "producing") q.phase(m.jobId, "producing");
+            m._phase = "producing";
+          } catch (e) {}
+        }
+        memoryManager.requestSave();
         continue;
       }
-
-      var liveOrder = null;
-      if (op.factoryOrderId) liveOrder = findFactoryOrderById(op.factoryOrderId);
-      if (liveOrder && typeof liveOrder.progressOut === 'number' && liveOrder.progressOut > (op.factoryProgressOut || 0)) {
-        op.factoryProgressOut = liveOrder.progressOut;
-      }
-
-      var stillPresent = false;
-      if (op.factoryOrderId) {
-        stillPresent = !!liveOrder;
-        if (!stillPresent) {
-          var completedOrder = findCompletedFactoryOrderById(op.factoryOrderId);
-          if (completedOrder && typeof completedOrder.progressOut === 'number' && completedOrder.progressOut > (op.factoryProgressOut || 0)) {
-            op.factoryProgressOut = completedOrder.progressOut;
-          }
-        }
-      }
-      else stillPresent = anyFactoryOrderAfter(op.room, op.output, op.factoryCreated || op.started);
-
-      if (!stillPresent) {
-        op.phase = 'selling';
-      }
+      reconcileFactoryState(m);
       continue;
     }
-
-    if (op.phase === 'selling') {
-      var nowOut = countInRoom(op.room, op.output);
-
-      var baseline = (op.outputBaseAtFactoryStart !== null && op.outputBaseAtFactoryStart !== undefined)
-        ? op.outputBaseAtFactoryStart
-        : op.baseOutputCount;
-      var produced = typeof op.factoryProgressOut === 'number' ? op.factoryProgressOut : 0;
-      if (produced <= 0 && op.factoryOrderId) {
-        var completed = findCompletedFactoryOrderById(op.factoryOrderId);
-        if (completed && typeof completed.progressOut === 'number') produced = completed.progressOut;
-      }
-
-      if (produced <= 0) {
-        var delta = nowOut - baseline;
-        failOp(op, 'No output produced', 'Expected ' + op.output + ' in ' + op.room + ' but produced=' + produced + ' delta=' + delta + ' (current=' + nowOut + ', base=' + baseline + ')');
+    if (m.phase === "selling") {
+      releaseProductionState(m);
+      if (m.handoff && m.handoffResource && m.handoffAmount > 0) {
+        var N = Game.rooms[m.room];
+        if (!N) continue;
+        var x = N && (N.terminal && N.terminal.store[m.handoffResource] || 0) + (N.storage && N.storage.store[m.handoffResource] || 0);
+        if (x < m.handoffAmount) continue;
+        m.phase = "done";
+        recordOutcome(m, "done", "handoff ready: " + m.handoffAmount + " " + m.handoffResource);
         continue;
       }
-
-      var sellAmount = produced;
-      if (sellAmount <= 0) {
-        failOp(op, 'No output produced', 'Expected ' + op.output + ' in ' + op.room + ' but produced=' + produced + ' current=' + nowOut + ' base=' + baseline);
+      if (m.nextSellTick && Game.time < m.nextSellTick) continue;
+      var G = countInRoom(m.room, m.output);
+      var Y = m.outputBaseAtFactoryStart !== null && m.outputBaseAtFactoryStart !== undefined ? m.outputBaseAtFactoryStart : m.baseOutputCount;
+      var D = typeof m.factoryProgressOut === "number" ? m.factoryProgressOut : 0;
+      if (D <= 0 && m.factoryOrderId) {
+        var j = findCompletedFactoryOrderById(m.factoryOrderId);
+        if (j && typeof j.progressOut === "number") D = j.progressOut;
+      }
+      if (D <= 0) {
+        var K = Math.max(0, G - Y);
+        if (K > 0) {
+          D = K;
+          console.log("[MarketRefine] Recovered production for " + m.id + ": " + K + " " + m.output + " (physical stock vs baseline; progress tracking lost)");
+        }
+      }
+      if (D <= 0) {
+        var w = G - Y;
+        failOp(m, "No output produced", "Expected " + m.output + " in " + m.room + " but produced=" + D + " delta=" + w + " (current=" + G + ", base=" + Y + ")");
         continue;
       }
-
-      callMarketSell(op.room, op.output, sellAmount);
-      op.phase = 'done';
-      recordOutcome(op, 'done', sellAmount + ' ' + op.output + ' produced and sold');
+      var H = D;
+      if (H <= 0) {
+        failOp(m, "No output produced", "Expected " + m.output + " in " + m.room + " but produced=" + D + " current=" + G + " base=" + Y);
+        continue;
+      }
+      if (m.sellPosted) {
+        var J = m.sellAmount || H;
+        var X = false;
+        if (!m.sellOrderId) recoverLegacySellOrder(m, J);
+        var Z = Game.time - (m.sellPostedTick || m.started || Game.time);
+        if (Z >= STALE_SELLING_TICKS && !hasOwnedSellLot(m.jobId)) {
+          failOp(m, "Stale selling operation", "no economics-owned sell lot or reliable order link after " + Z + " ticks");
+          continue;
+        }
+        var V = 0;
+        if (m.sellOrderId && Game.market && Game.market.orders && Game.market.orders[m.sellOrderId]) {
+          var W = util.getOrderRemaining(Game.market.orders[m.sellOrderId]);
+          V = Math.max(0, (m.sellOrderRemainingAtPost || 0) - W);
+        } else if (m.sellOrderId) {
+          X = true;
+          var Q = Game.market.outgoingTransactions || [];
+          for (var z = 0; z < Q.length; z++) {
+            var $ = Q[z];
+            if (!$ || !$.order || $.order.id !== m.sellOrderId) continue;
+            if (typeof $.time === "number" && $.time < (m.sellPostedTick || 0)) continue;
+            V += $.amount || 0;
+          }
+        } else {}
+        if (V >= J) {
+          m.phase = "done";
+          recordOutcome(m, "done", J + " " + m.output + " produced and sold");
+        } else if (X) {
+          var ee = Math.max(0, J - V);
+          m.sellPosted = false;
+          m.sellOrderId = null;
+          m.sellOrderRemainingAtPost = null;
+          m.sellAmount = ee;
+          m.nextSellTick = Game.time + SELL_RETRY_TICKS;
+          m.sellRetryCount = (m.sellRetryCount || 0) + 1;
+          if (m.sellRetryCount >= 10) {
+            var re = countInRoom(m.room, m.output);
+            if (re <= 0) {
+              failOp(m, "Sell order persistently missing and no stock remains", "retried " + m.sellRetryCount + " times; order keeps disappearing");
+              continue;
+            }
+            m.sellAmount = re;
+            m.sellRetryCount = 0;
+            console.log("[MarketRefine] Reset retry counter for " + m.id + "; switching to physical stock amount (" + re + " " + m.output + ")");
+          }
+          console.log("[MarketRefine] Sell order disappeared for " + m.id + "; retrying " + ee + " " + m.output + " after " + V + " sold.");
+          memoryManager.requestSave();
+        }
+        continue;
+      }
+      var te = pricing.passiveSellPrice(m.output);
+      if (!(te > 0)) {
+        m.sellAttempts = (m.sellAttempts || 0) + 1;
+        m.nextSellTick = Game.time + SELL_RETRY_TICKS;
+        memoryManager.requestSave();
+        continue;
+      }
+      var oe = {
+        minPrice: te
+      };
+      if (m.jobId) oe.jobId = m.jobId;
+      var ae = callMarketSell(m.room, m.output, H, undefined, oe);
+      if (marketSellAccepted(ae)) {
+        m.sellPosted = true;
+        m.sellAmount = H;
+        m.sellPostedTick = Game.time;
+        if (m.jobId) {
+          try {
+            var ne = require("marketEconomics");
+            if (m._phase !== "selling") ne.phase(m.jobId, "selling");
+            m._phase = "selling";
+          } catch (e) {}
+        }
+        var ue = typeof ae === "string" ? ae.match(/orderId\s+([A-Za-z0-9]+)/) : null;
+        if (!ue && typeof ae === "string" && ae.indexOf("extended existing") >= 0) {
+          var ie = Game.market.orders || {};
+          for (var se in ie) {
+            var ce = ie[se];
+            if (ce && ce.type === ORDER_SELL && ce.roomName === m.room && ce.resourceType === m.output && util.getOrderRemaining(ce) > 0) {
+              ue = [ null, se ];
+              break;
+            }
+          }
+        }
+        m.sellOrderId = ue ? ue[1] : null;
+        if (!m.sellOrderId) {
+          var fe = Game.market.orders || {};
+          for (var le in fe) {
+            var de = fe[le];
+            if (de && de.type === ORDER_SELL && de.roomName === m.room && de.resourceType === m.output && util.getOrderRemaining(de) > 0) {
+              m.sellOrderId = le;
+              break;
+            }
+          }
+        }
+        if (m.sellOrderId && Game.market.orders[m.sellOrderId]) {
+          m.sellOrderRemainingAtPost = util.getOrderRemaining(Game.market.orders[m.sellOrderId]);
+        } else {
+          m.sellOrderRemainingAtPost = null;
+        }
+        memoryManager.requestSave();
+      } else {
+        m.sellAttempts = (m.sellAttempts || 0) + 1;
+        m.nextSellTick = Game.time + SELL_RETRY_TICKS;
+        memoryManager.requestSave();
+      }
       continue;
     }
   }
+  if (t && r.length === 0) Memory.marketRefine.scheduler.nextOpId = null;
+  if (t) memoryManager.requestSave();
 }
 
-module.exports = { run: run };
+function getOperations() {
+  ensureMemory();
+  const e = 5e3;
+  if (Array.isArray(Memory.marketRefine.ops)) {
+    Memory.marketRefine.ops = Memory.marketRefine.ops.filter(function(r) {
+      if (!r) return false;
+      if (r.phase === "selling" && Game.time - (r.started || Game.time) > e) {
+        return false;
+      }
+      return true;
+    });
+  }
+  return Memory.marketRefine.ops.map(function(e) {
+    return e && typeof e === "object" ? Object.create(e) : null;
+  });
+}
+
+function getSoldOutputAmount(e) {
+  if (!e) return 0;
+  var r = 0;
+  if (e.jobId && marketEconomics && typeof marketEconomics.get === "function") {
+    try {
+      var t = marketEconomics.get(e.jobId);
+      var o = t && t.output && t.output[e.output];
+      r = o && o.sold || 0;
+    } catch (e) {}
+  }
+  if (r > 0) return r;
+  if (!e.sellPosted || !(e.sellAmount > 0)) return 0;
+  if (e.sellOrderId && Game.market && Game.market.orders && Game.market.orders[e.sellOrderId]) {
+    var a = util.getOrderRemaining(Game.market.orders[e.sellOrderId]);
+    if (typeof e.sellOrderRemainingAtPost === "number") return Math.max(0, e.sellOrderRemainingAtPost - a);
+  }
+  if (e.sellOrderId) {
+    var n = 0;
+    var u = Game.market && Game.market.outgoingTransactions || [];
+    for (var i = 0; i < u.length; i++) {
+      var s = u[i];
+      if (!s || !s.order || s.order.id !== e.sellOrderId) continue;
+      if (typeof s.time === "number" && s.time < (e.sellPostedTick || 0)) continue;
+      n += s.amount || 0;
+    }
+    return n;
+  }
+  return 0;
+}
+
+function getCommittedSaleOutputs(e) {
+  var r = {};
+  var t = getOperations();
+  for (var o = 0; o < t.length; o++) {
+    var a = t[o];
+    if (!a || a.room !== e || a.phase === "done" || a.phase === "failed" || a.phase === "error" || a.phase === "cancelled") continue;
+    var n = Math.max(0, (a.targetOutput || 0) - getSoldOutputAmount(a));
+    if (a.handoff) n = Math.max(0, n - (a.handoffAmount || 0));
+    if (n > 0) r[a.output] = (r[a.output] || 0) + n;
+  }
+  return r;
+}
+
+function getOperation(e) {
+  if (!e) return null;
+  var r = getOperations();
+  for (var t = 0; t < r.length; t++) {
+    if (r[t] && r[t].id === e) return r[t];
+  }
+  return null;
+}
+
+function getOutcome(e) {
+  if (!e) return null;
+  ensureMemory();
+  var r = Memory.marketRefine.outcomes || [];
+  for (var t = r.length - 1; t >= 0; t--) {
+    if (r[t] && r[t].id === e) return r[t];
+  }
+  return null;
+}
+
+function getOutcomes() {
+  ensureMemory();
+  return (Memory.marketRefine.outcomes || []).map(function(e) {
+    return e ? Object.create(e) : e;
+  });
+}
+
+module.exports = {
+  run: run,
+  start: startMarketRefine,
+  abort: abortMarketRefine,
+  isForceMarketBuy: isForceMarketBuy,
+  getOperations: getOperations,
+  getCommittedSaleOutputs: getCommittedSaleOutputs,
+  getOperation: getOperation,
+  getOutcome: getOutcome,
+  getOutcomes: getOutcomes
+};

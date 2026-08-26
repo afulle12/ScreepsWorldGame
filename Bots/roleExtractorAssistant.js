@@ -1,279 +1,213 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // roleExtractorAssistant.js
-
-'use strict';
-
-const FETCH_THRESHOLD  = 1800;   // container mineral units before hauling
-const WAIT_RANGE       = 3;      // tiles from container while idle
-const IDLE_SLEEP_TICKS = 10;     // ticks to skip while waiting below threshold
-const CONTAINER_RESCAN = 1000;   // re-validate cached container ID every N ticks
-
-var getRoomState = require('getRoomState');
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-function edgeAvoidingOpts(base) {
-    base = base || {};
-    base.costCallback = function(roomName, costMatrix) {
-        var m = costMatrix.clone();
-        var w = 50; // rooms are always 50×50
-        // First and last row — block every column on those rows
-        for (var x = 0; x < w; x++) {
-            m.set(x, 0,     255);
-            m.set(x, w - 1, 255);
-        }
-        // First and last column — block every row on those columns
-        // (corners already set to 255 above, but re-setting is harmless)
-        for (var y = 0; y < w; y++) {
-            m.set(0,     y, 255);
-            m.set(w - 1, y, 255);
-        }
-        return m;
-    };
-    return base;
+// Role dispatch: memory.role === 'extractorAssistant' -> roleExtractorAssistant.run(creep).
+// Example: require('roleExtractorAssistant').run(creep);
+// Example: require('roleExtractorAssistant').run(creep);
+"use strict";
+const FETCH_THRESHOLD = 1800;
+const WAIT_RANGE = 3;
+const IDLE_SLEEP_TICKS = 10;
+const CONTAINER_RESCAN = 1e3;
+var getRoomState = require("getRoomState");
+function edgeAvoidingOpts(e) {
+  e = e || {};
+  e.costCallback = function(e, r) {
+    var t = r.clone();
+    var n = 50;
+    for (var i = 0; i < n; i++) {
+      t.set(i, 0, 255);
+      t.set(i, n - 1, 255);
+    }
+    for (var a = 0; a < n; a++) {
+      t.set(0, a, 255);
+      t.set(n - 1, a, 255);
+    }
+    return t;
+  };
+  return e;
 }
 
-/** Sum of all non-energy resources in a store. Uses for..in to avoid Object.keys() alloc. */
-function mineralAmountInStore(store) {
-    var total = 0;
-    for (var key in store) {
-        if (key !== RESOURCE_ENERGY) total += store[key] || 0;
-    }
-    return total;
+function mineralAmountInStore(e) {
+  var r = 0;
+  for (var t in e) {
+    if (t !== RESOURCE_ENERGY) r += e[t] || 0;
+  }
+  return r;
 }
 
-/** First non-energy resource type with quantity > 0, or null. */
-function firstMineralType(store) {
-    for (var key in store) {
-        if (key !== RESOURCE_ENERGY && store[key] > 0) return key;
-    }
-    return null;
+function firstMineralType(e) {
+  for (var r in e) {
+    if (r !== RESOURCE_ENERGY && e[r] > 0) return r;
+  }
+  return null;
 }
 
-/**
- * Resolve and cache the mineral container ID in creep.memory.containerIdEA.
- * Re-scans every CONTAINER_RESCAN ticks or if the cached object is gone.
- */
-function resolveContainer(creep, rs) {
-    var cached = creep.memory.containerIdEA;
-    var rescanDue = !creep.memory._containerScanTick ||
-                    (Game.time - creep.memory._containerScanTick) >= CONTAINER_RESCAN;
-
-    if (cached && !rescanDue) {
-        var obj = Game.getObjectById(cached);
-        if (obj) return obj;
-        // Object gone — fall through to rescan
+function resolveContainer(e, r) {
+  var t = e.memory.containerIdEA;
+  var n = !e.memory._containerScanTick || Game.time - e.memory._containerScanTick >= CONTAINER_RESCAN;
+  if (t && !n) {
+    var i = Game.getObjectById(t);
+    if (i) return i;
+  }
+  if (!r || !r.structuresByType) return null;
+  var a = r.structuresByType[STRUCTURE_EXTRACTOR] || [];
+  var o = null;
+  for (var s = 0; s < a.length; s++) {
+    if (a[s].my) {
+      o = a[s];
+      break;
     }
-
-    if (!rs || !rs.structuresByType) return null;
-
-    var extractors = rs.structuresByType[STRUCTURE_EXTRACTOR] || [];
-    var extractor = null;
-    for (var i = 0; i < extractors.length; i++) {
-        if (extractors[i].my) { extractor = extractors[i]; break; }
+  }
+  if (!o) return null;
+  var m = r.structuresByType[STRUCTURE_CONTAINER] || [];
+  for (var l = 0; l < m.length; l++) {
+    if (m[l].pos.getRangeTo(o.pos) <= 1) {
+      e.memory.containerIdEA = m[l].id;
+      e.memory._containerScanTick = Game.time;
+      return m[l];
     }
-    if (!extractor) return null;
-
-    var containers = rs.structuresByType[STRUCTURE_CONTAINER] || [];
-    for (var j = 0; j < containers.length; j++) {
-        if (containers[j].pos.getRangeTo(extractor.pos) <= 1) {
-            creep.memory.containerIdEA = containers[j].id;
-            creep.memory._containerScanTick = Game.time;
-            return containers[j];
-        }
-    }
-
-    creep.memory.containerIdEA = null;
-    creep.memory._containerScanTick = Game.time;
-    return null;
+  }
+  e.memory.containerIdEA = null;
+  e.memory._containerScanTick = Game.time;
+  return null;
 }
 
-/** Return the room's owned extractor, or null. */
-function resolveExtractor(rs) {
-    if (!rs || !rs.structuresByType) return null;
-    var extractors = rs.structuresByType[STRUCTURE_EXTRACTOR] || [];
-    for (var i = 0; i < extractors.length; i++) {
-        if (extractors[i].my) return extractors[i];
-    }
-    return null;
+function resolveExtractor(e) {
+  if (!e || !e.structuresByType) return null;
+  var r = e.structuresByType[STRUCTURE_EXTRACTOR] || [];
+  for (var t = 0; t < r.length; t++) {
+    if (r[t].my) return r[t];
+  }
+  return null;
 }
 
-/**
- * Safe moveTo wrapper — skips the call entirely while fatigued.
- * Saves PathFinder CPU on the 3 dead ticks between off-road steps.
- * Also routes around room edges by applying edge-avoiding cost penalties.
- */
-function tryMove(creep, target, opts) {
-    if (creep.fatigue > 0) return false;
-    creep.moveTo(target, edgeAvoidingOpts(opts));
-    return true;
+function tryMove(e, r, t) {
+  if (e.fatigue > 0) return false;
+  e.moveTo(r, edgeAvoidingOpts(t));
+  return true;
 }
-
-// ── Role ────────────────────────────────────────────────────────────────────
 
 var roleExtractorAssistant = {
-    run: function(creep) {
-
-        // ── IDLE SLEEP GATE ────────────────────────────────────────────────
-        if (creep.memory.sleepUntil && Game.time < creep.memory.sleepUntil) {
-            return;
-        }
-        delete creep.memory.sleepUntil;
-
-        // ── LOW TTL SUICIDE ────────────────────────────────────────────────
-        if (creep.ticksToLive < 400 && mineralAmountInStore(creep.store) === 0) {
-            creep.suicide();
-            return;
-        }
-
-        var rs = getRoomState.get(creep.room.name);
-
-        // ── Resolve world state ──────────────────────────────────────────────
-        var container       = resolveContainer(creep, rs);
-        var extractor       = resolveExtractor(rs);
-        var mineral         = (rs && rs.minerals && rs.minerals.length > 0) ? rs.minerals[0] : null;
-        var sourceExhausted = !mineral || mineral.mineralAmount === 0;
-        var containerAmt    = container ? mineralAmountInStore(container.store) : 0;
-        var creepAmt        = mineralAmountInStore(creep.store);
-
-        // ── SUICIDE: source dead, container empty, hands empty ───────────────
-        if (sourceExhausted && containerAmt === 0 && creepAmt === 0) {
-            console.log('[ExtractorAssistant] ' + creep.name + ': work complete — suiciding.');
-            creep.suicide();
-            return;
-        }
-
-        // ── STATE TRANSITIONS ────────────────────────────────────────────────
-        var state = creep.memory.state || 'waiting';
-
-        if (creep.store.getFreeCapacity() === 0) {
-            // Carry is full — must deliver regardless of current state
-            state = 'delivering';
-        } else if (state === 'delivering' && creepAmt === 0) {
-            // Finished delivering all types — back to waiting
-            state = 'waiting';
-        }
-        // NOTE: carrying minerals while NOT full stays in 'fetching' so we
-        // can grab additional mineral types from the container in subsequent ticks.
-
-        if (state === 'waiting') {
-            var shouldFetch = container && (
-                containerAmt >= FETCH_THRESHOLD ||
-                (sourceExhausted && containerAmt > 0)
-            );
-            if (shouldFetch) state = 'fetching';
-        }
-
-        creep.memory.state = state;
-
-        // ── STATE MACHINE ────────────────────────────────────────────────────
-        switch (state) {
-
-            // ── WAITING ───────────────────────────────────────────────────
-            case 'waiting': {
-                // Idle near the extractor so the creep is already close when
-                // fetching starts. Fall back to the container if the extractor
-                // isn't visible yet (e.g. still under construction).
-                var idleAnchor = extractor || container;
-                if (!idleAnchor) {
-                    creep.memory.sleepUntil = Game.time + IDLE_SLEEP_TICKS * 3;
-                    return;
-                }
-                if (creep.pos.getRangeTo(idleAnchor.pos) > WAIT_RANGE) {
-                    tryMove(creep, idleAnchor.pos, { reusePath: 20, range: WAIT_RANGE });
-                    // Still in transit — don't sleep, we need to move every tick
-                    return;
-                }
-                // In position — safe to sleep until threshold check is needed
-                creep.memory.sleepUntil = Game.time + IDLE_SLEEP_TICKS;
-                return;
-            }
-
-            // ── FETCHING ──────────────────────────────────────────────────
-            case 'fetching': {
-                if (!container) { creep.memory.state = 'waiting'; return; }
-
-                var free = creep.store.getFreeCapacity();
-                if (free === 0) { creep.memory.state = 'delivering'; return; }
-
-                // Find any mineral type still in the container.
-                // Using for..in avoids an Object.keys() allocation.
-                var resType = null;
-                for (var key in container.store) {
-                    if (key !== RESOURCE_ENERGY && (container.store[key] || 0) > 0) {
-                        resType = key;
-                        break;
-                    }
-                }
-
-                if (!resType) {
-                    // Container is empty of minerals — deliver what we have, or wait
-                    creep.memory.state = creepAmt > 0 ? 'delivering' : 'waiting';
-                    return;
-                }
-
-                if (!creep.pos.isNearTo(container.pos)) {
-                    tryMove(creep, container.pos, { reusePath: 10 });
-                    return;
-                }
-
-                // withdraw() without an amount takes as much as fits in free capacity
-                var wRes = creep.withdraw(container, resType);
-                if (wRes === OK) {
-                    // Stay in 'fetching' — there may be more types next tick.
-                    // The top-level transition will flip to 'delivering' once full.
-                } else if (wRes === ERR_FULL) {
-                    creep.memory.state = 'delivering';
-                } else if (wRes === ERR_NOT_ENOUGH_RESOURCES) {
-                    // That type was already gone — will pick a different one next tick
-                } else if (wRes !== ERR_BUSY && wRes !== ERR_NOT_IN_RANGE) {
-                    console.log('[ExtractorAssistant] ' + creep.name + ': withdraw err ' + wRes);
-                    creep.memory.state = 'waiting';
-                }
-                break;
-            }
-
-            // ── DELIVERING ────────────────────────────────────────────────
-            case 'delivering': {
-                var storage = creep.room.storage;
-                if (!storage) {
-                    var dropType = firstMineralType(creep.store);
-                    if (dropType) creep.drop(dropType);
-                    creep.memory.state = 'waiting';
-                    return;
-                }
-
-                // Find whichever mineral type we're still carrying this tick.
-                // Iterates naturally as types are emptied one-per-tick.
-                var carryType = firstMineralType(creep.store);
-                if (!carryType) {
-                    creep.memory.state = 'waiting';
-                    return;
-                }
-
-                if (!creep.pos.isNearTo(storage.pos)) {
-                    tryMove(creep, storage.pos, { reusePath: 10 });
-                    return;
-                }
-
-                var tRes = creep.transfer(storage, carryType);
-                if (tRes === OK) {
-                    // Stay in 'delivering' — may have more types to deposit next tick.
-                    // The top-level transition to 'waiting' fires when creepAmt hits 0.
-                } else if (tRes === ERR_FULL) {
-                    creep.drop(carryType);
-                    // Don't give up — try remaining types next tick
-                } else if (tRes !== ERR_BUSY && tRes !== ERR_NOT_IN_RANGE) {
-                    console.log('[ExtractorAssistant] ' + creep.name + ': transfer err ' + tRes);
-                    creep.memory.state = 'waiting';
-                }
-                break;
-            }
-
-            default:
-                creep.memory.state = 'waiting';
-                break;
-        }
+  run: function(e) {
+    if (e.memory.sleepUntil && Game.time < e.memory.sleepUntil) {
+      return;
     }
+    delete e.memory.sleepUntil;
+    if (e.ticksToLive < 400 && mineralAmountInStore(e.store) === 0) {
+      e.suicide();
+      return;
+    }
+    var r = getRoomState.get(e.room.name);
+    var t = resolveContainer(e, r);
+    var n = resolveExtractor(r);
+    var i = r && r.minerals && r.minerals.length > 0 ? r.minerals[0] : null;
+    var a = !i || i.mineralAmount === 0;
+    var o = t ? mineralAmountInStore(t.store) : 0;
+    var s = mineralAmountInStore(e.store);
+    if (a && o === 0 && s === 0) {
+      console.log("[ExtractorAssistant] " + e.name + ": work complete — suiciding.");
+      e.suicide();
+      return;
+    }
+    var m = e.memory.state || "waiting";
+    if (e.store.getFreeCapacity() === 0) {
+      m = "delivering";
+    } else if (m === "delivering" && s === 0) {
+      m = "waiting";
+    }
+    if (m === "waiting") {
+      var l = t && (o >= FETCH_THRESHOLD || a && o > 0);
+      if (l) m = "fetching";
+    }
+    e.memory.state = m;
+    switch (m) {
+     case "waiting":
+      {
+        var u = n || t;
+        if (!u) {
+          e.memory.sleepUntil = Game.time + IDLE_SLEEP_TICKS * 3;
+          return;
+        }
+        if (e.pos.getRangeTo(u.pos) > WAIT_RANGE) {
+          tryMove(e, u.pos, {
+            reusePath: 20,
+            range: WAIT_RANGE
+          });
+          return;
+        }
+        e.memory.sleepUntil = Game.time + IDLE_SLEEP_TICKS;
+        return;
+      }
+     case "fetching":
+      {
+        if (!t) {
+          e.memory.state = "waiting";
+          return;
+        }
+        var f = e.store.getFreeCapacity();
+        if (f === 0) {
+          e.memory.state = "delivering";
+          return;
+        }
+        var c = null;
+        for (var E in t.store) {
+          if (E !== RESOURCE_ENERGY && (t.store[E] || 0) > 0) {
+            c = E;
+            break;
+          }
+        }
+        if (!c) {
+          e.memory.state = s > 0 ? "delivering" : "waiting";
+          return;
+        }
+        if (!e.pos.isNearTo(t.pos)) {
+          tryMove(e, t.pos, {
+            reusePath: 10
+          });
+          return;
+        }
+        var v = e.withdraw(t, c);
+        if (v === OK) {} else if (v === ERR_FULL) {
+          e.memory.state = "delivering";
+        } else if (v === ERR_NOT_ENOUGH_RESOURCES) {} else if (v !== ERR_BUSY && v !== ERR_NOT_IN_RANGE) {
+          console.log("[ExtractorAssistant] " + e.name + ": withdraw err " + v);
+          e.memory.state = "waiting";
+        }
+        break;
+      }
+     case "delivering":
+      {
+        var R = e.room.storage;
+        if (!R) {
+          var g = firstMineralType(e.store);
+          if (g) e.drop(g);
+          e.memory.state = "waiting";
+          return;
+        }
+        var y = firstMineralType(e.store);
+        if (!y) {
+          e.memory.state = "waiting";
+          return;
+        }
+        if (!e.pos.isNearTo(R.pos)) {
+          tryMove(e, R.pos, {
+            reusePath: 10
+          });
+          return;
+        }
+        var T = e.transfer(R, y);
+        if (T === OK) {} else if (T === ERR_FULL) {
+          e.drop(y);
+        } else if (T !== ERR_BUSY && T !== ERR_NOT_IN_RANGE) {
+          console.log("[ExtractorAssistant] " + e.name + ": transfer err " + T);
+          e.memory.state = "waiting";
+        }
+        break;
+      }
+     default:
+      e.memory.state = "waiting";
+      break;
+    }
+  }
 };
-
 module.exports = roleExtractorAssistant;

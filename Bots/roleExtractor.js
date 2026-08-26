@@ -1,61 +1,71 @@
-const getRoomState = require('getRoomState');
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// roleExtractor.js
+// Role dispatch: memory.role === 'extractor' -> roleExtractor.run(creep).
+// Example: require('roleExtractor').run(creep);
+// Example: require('roleExtractor').run(creep);
+const getRoomState = require("getRoomState");
 module.exports = {
-  run(creep) {
-    // 1) Cache IDs (extractor, mineral, container)
-    if (!creep.memory.extractorId) {
-      var state = getRoomState.get(creep.room.name);
-      if (!state) return creep.say('no state');
-      var exts = state.structuresByType[STRUCTURE_EXTRACTOR] || [];
-      var ext = null;
-      for (var i = 0; i < exts.length; i++) {
-        var s = exts[i];
-        if (s.my) { ext = s; break; }
+  run(e) {
+    if (!e.memory.extractorId) {
+      var r = getRoomState.get(e.room.name);
+      if (!r) return e.say("no state");
+      var t = r.structuresByType[STRUCTURE_EXTRACTOR] || [];
+      var o = null;
+      for (var a = 0; a < t.length; a++) {
+        var n = t[a];
+        if (n.my) {
+          o = n;
+          break;
+        }
       }
-      if (!ext) return creep.say('no ext');
-      var mins = state.minerals || [];
-      var min = null;
-      for (var j = 0; j < mins.length; j++) {
-        var m = mins[j];
-        if (ext.pos.isNearTo(m.pos)) { min = m; break; }
+      if (!o) return e.say("no ext");
+      var m = r.minerals || [];
+      var i = null;
+      for (var s = 0; s < m.length; s++) {
+        var y = m[s];
+        if (o.pos.isNearTo(y.pos)) {
+          i = y;
+          break;
+        }
       }
-      if (!min) return creep.say('no min');
-      var conts = state.structuresByType[STRUCTURE_CONTAINER] || [];
-      var cont = null;
-      for (var k = 0; k < conts.length; k++) {
-        var c = conts[k];
-        if (ext.pos.isNearTo(c.pos)) { cont = c; break; }
+      if (!i) return e.say("no min");
+      var l = r.structuresByType[STRUCTURE_CONTAINER] || [];
+      var u = null;
+      for (var d = 0; d < l.length; d++) {
+        var c = l[d];
+        if (o.pos.isNearTo(c.pos)) {
+          u = c;
+          break;
+        }
       }
-      if (!cont) return creep.say('no cont');
-      creep.memory.extractorId = ext.id;
-      creep.memory.mineralId = min.id;
-      creep.memory.containerId = cont.id;
+      if (!u) return e.say("no cont");
+      e.memory.extractorId = o.id;
+      e.memory.mineralId = i.id;
+      e.memory.containerId = u.id;
     }
-    const extractor = Game.getObjectById(creep.memory.extractorId);
-    const mineral   = Game.getObjectById(creep.memory.mineralId);
-    const container = Game.getObjectById(creep.memory.containerId);
-    // 2) Reset if any object is gone
-    if (!extractor || !mineral || !container) {
-      delete creep.memory.extractorId;
-      delete creep.memory.mineralId;
-      delete creep.memory.containerId;
+    const f = Game.getObjectById(e.memory.extractorId);
+    const v = Game.getObjectById(e.memory.mineralId);
+    const I = Game.getObjectById(e.memory.containerId);
+    if (!f || !v || !I) {
+      delete e.memory.extractorId;
+      delete e.memory.mineralId;
+      delete e.memory.containerId;
       return;
     }
-    // 3) Move onto container tile (always, even if full)
-    if (!creep.pos.isEqualTo(container.pos)) {
-      if (creep.fatigue > 0) return;
-      return creep.moveTo(container.pos, {
-        visualizePathStyle: { stroke: '#ffaa00' }
+    if (!e.pos.isEqualTo(I.pos)) {
+      if (e.fatigue > 0) return;
+      return e.moveTo(I.pos, {
+        visualizePathStyle: {
+          stroke: "#ffaa00"
+        }
       });
     }
-    // 4) Stop if the container is full (creep is already in position)
-    if (container.store.getFreeCapacity() === 0) {
-      creep.say('full');
+    if (I.store.getFreeCapacity() === 0) {
+      e.say("full");
       return;
     }
-    // 5) Harvest the mineral
-    creep.harvest(mineral);
-    // 6) Drop harvested minerals (only needed if creep has CARRY parts)
-    const type = mineral.mineralType;
-    creep.drop(type);
+    e.harvest(v);
+    const T = v.mineralType;
+    e.drop(T);
   }
 };

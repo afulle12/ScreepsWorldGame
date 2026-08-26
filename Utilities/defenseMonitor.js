@@ -1,853 +1,626 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // defenseMonitor.js
-// ============================================================================
-// Defense Monitor
-// Detects enemy creep entry and wall/rampart damage using getRoomState +
-// room.getEventLog(). Sends Game.notify() alerts and triggers defense
-// repair bot spawns when damage threshold is reached AND the damaged
-// cluster is the weakest section of wall in the room.
-//
-// Also detects incoming nukes via FIND_NUKES and sends Game.notify()
-// alerts with impact position, source room, ETA, and threatened structures
-//
-//
-// API:
 //   defenseMonitor.run()  -> call once per tick from main loop
-// ============================================================================
-
-var getRoomState = require('getRoomState');
-
-var DAMAGE_THRESHOLD    = 5;     // damage events before considering spawn
-var MAX_DEFENSE_REPAIRS = 2;     // max defense repair creeps per room
-var NOTIFY_COOLDOWN     = 200;   // ticks between Game.notify calls per room
-var CLUSTER_RANGE       = 1;     // range to consider walls/ramparts contiguous
-var EVENT_MEMORY_TTL    = 300;   // ticks before stale damage tracking is cleared
-
-var NUKE_SCAN_INTERVAL  = 100;   // ticks between nuke scans
-var NUKE_BLAST_RADIUS   = 2;     // nuke deals damage in a 5x5 area (range 2)
-var NUKE_MILESTONE_TICKS = [10000, 1000]; // warn at these remaining-tick thresholds
-
-// ============================================================================
-// Initialization
-// ============================================================================
-
+var getRoomState = require("getRoomState");
+var iff = require("iff");
+var DAMAGE_THRESHOLD = 5;
+var MAX_DEFENSE_REPAIRS = 2;
+var NOTIFY_COOLDOWN = 200;
+var CLUSTER_RANGE = 1;
+var EVENT_MEMORY_TTL = 300;
+var NUKE_SCAN_INTERVAL = 100;
+var NUKE_BLAST_RADIUS = 2;
+var NUKE_MILESTONE_TICKS = [ 1e4, 1e3 ];
 function ensureMemory() {
   if (!Memory.defense) Memory.defense = {};
-  if (!Memory.defense.knownHostiles)  Memory.defense.knownHostiles  = {};
-  if (!Memory.defense.damageEvents)   Memory.defense.damageEvents   = {};
-  if (!Memory.defense.repairOrders)   Memory.defense.repairOrders   = {};
+  if (!Memory.defense.knownHostiles) Memory.defense.knownHostiles = {};
+  if (!Memory.defense.damageEvents) Memory.defense.damageEvents = {};
+  if (!Memory.defense.repairOrders) Memory.defense.repairOrders = {};
   if (!Memory.defense.notifyCooldown) Memory.defense.notifyCooldown = {};
-  if (!Memory.defense.clusterCache)   Memory.defense.clusterCache   = {};
-  if (!Memory.defense.trackedNukes)   Memory.defense.trackedNukes   = {};
+  if (!Memory.defense.clusterCache) Memory.defense.clusterCache = {};
+  if (!Memory.defense.trackedNukes) Memory.defense.trackedNukes = {};
 }
 
-// ============================================================================
-// Enemy Detection — notify via Game.notify (sends email)
-// ============================================================================
-
-function detectEnemyEntry(roomName, rs) {
-  var room = Game.rooms[roomName];
-  if (!room) return;
-
-  // Filter out NPCs
-  var hostiles = rs.hostiles || [];
-  var filteredHostiles = [];
-  for (var i = 0; i < hostiles.length; i++) {
-    var owner = hostiles[i].owner ? hostiles[i].owner.username : null;
-    if (owner === 'Invader' || owner === 'Source Keeper') continue;
-    filteredHostiles.push(hostiles[i]);
+function detectEnemyEntry(e, r) {
+  var t = Game.rooms[e];
+  if (!t) return;
+  var n = r.hostiles || [];
+  var a = [];
+  for (var o = 0; o < n.length; o++) {
+    var i = n[o].owner ? n[o].owner.username : null;
+    if (i === "Invader" || i === "Source Keeper") continue;
+    if (!iff.isHostileCreep(n[o])) continue;
+    a.push(n[o]);
   }
-  hostiles = filteredHostiles;
-
-  var currentIds = {};
-  for (var ci = 0; ci < hostiles.length; ci++) {
-    currentIds[hostiles[ci].id] = hostiles[ci];
+  n = a;
+  var s = {};
+  for (var u = 0; u < n.length; u++) {
+    s[n[u].id] = n[u];
   }
-
-  var previousIds = Memory.defense.knownHostiles[roomName] || [];
-  var previousSet = {};
-  for (var p = 0; p < previousIds.length; p++) {
-    previousSet[previousIds[p]] = true;
+  var f = Memory.defense.knownHostiles[e] || [];
+  var l = {};
+  for (var m = 0; m < f.length; m++) {
+    l[f[m]] = true;
   }
-
-  // Find new arrivals
-  var newArrivals = [];
-  for (var id in currentIds) {
-    if (!currentIds.hasOwnProperty(id)) continue;
-    if (!previousSet[id]) {
-      newArrivals.push(currentIds[id]);
+  var v = [];
+  for (var d in s) {
+    if (!s.hasOwnProperty(d)) continue;
+    if (!l[d]) {
+      v.push(s[d]);
     }
   }
-
-  // Update known hostiles for next tick
-  var idList = [];
-  for (var cid in currentIds) {
-    if (currentIds.hasOwnProperty(cid)) idList.push(cid);
+  var c = [];
+  for (var g in s) {
+    if (s.hasOwnProperty(g)) c.push(g);
   }
-  Memory.defense.knownHostiles[roomName] = idList;
-
-  // Notify on new arrivals
-  if (newArrivals.length > 0) {
-    var cooldownUntil = Memory.defense.notifyCooldown[roomName] || 0;
-    if (Game.time >= cooldownUntil) {
-      var bodyReport = [];
-      var hasNonTrivial = false;
-
-      for (var n = 0; n < newArrivals.length; n++) {
-        var hostile = newArrivals[n];
-        var hOwner = (hostile.owner && hostile.owner.username) ? hostile.owner.username : 'unknown';
-        var bodyParts = [];
-        if (hostile.body) {
-          var partCounts = {};
-          for (var b = 0; b < hostile.body.length; b++) {
-            var pType = hostile.body[b].type;
-            if (!partCounts[pType]) partCounts[pType] = 0;
-            partCounts[pType]++;
+  Memory.defense.knownHostiles[e] = c;
+  if (v.length > 0) {
+    var y = Memory.defense.notifyCooldown[e] || 0;
+    if (Game.time >= y) {
+      var h = [];
+      var E = false;
+      for (var p = 0; p < v.length; p++) {
+        var R = v[p];
+        var T = R.owner && R.owner.username ? R.owner.username : "unknown";
+        var C = [];
+        if (R.body) {
+          var S = {};
+          for (var N = 0; N < R.body.length; N++) {
+            var A = R.body[N].type;
+            if (!S[A]) S[A] = 0;
+            S[A]++;
           }
-          for (var pt in partCounts) {
-            if (partCounts.hasOwnProperty(pt)) {
-              bodyParts.push(partCounts[pt] + 'x' + pt);
+          for (var M in S) {
+            if (S.hasOwnProperty(M)) {
+              C.push(S[M] + "x" + M);
             }
           }
-          if (!(hostile.body.length === 1 && hostile.body[0].type === MOVE)) {
-            hasNonTrivial = true;
+          if (!(R.body.length === 1 && R.body[0].type === MOVE)) {
+            E = true;
           }
         }
-        bodyReport.push(hOwner + ' (' + bodyParts.join(', ') + ') at ' + hostile.pos);
+        h.push(T + " (" + C.join(", ") + ") at " + R.pos);
       }
-
-      var msg = '[DEFENSE] Enemy creep(s) entered ' + roomName + ': ' + bodyReport.join(' | ');
-      console.log(msg);
-      if (hasNonTrivial) {
-        Game.notify(msg, 0);
-        Memory.defense.notifyCooldown[roomName] = Game.time + NOTIFY_COOLDOWN;
+      var _ = "[DEFENSE] Enemy creep(s) entered " + e + ": " + h.join(" | ");
+      console.log(_);
+      if (E) {
+        Game.notify(_, 0);
+        Memory.defense.notifyCooldown[e] = Game.time + NOTIFY_COOLDOWN;
       }
     }
   }
-
-  // Dismantler warning
-  for (var di = 0; di < hostiles.length; di++) {
-    var h = hostiles[di];
-    if (!h.body) continue;
-    var hasWork = false;
-    for (var bi = 0; bi < h.body.length; bi++) {
-      if (h.body[bi].type === WORK) { hasWork = true; break; }
+  for (var U = 0; U < n.length; U++) {
+    var O = n[U];
+    if (!O.body) continue;
+    var L = false;
+    for (var G = 0; G < O.body.length; G++) {
+      if (O.body[G].type === WORK) {
+        L = true;
+        break;
+      }
     }
-    if (hasWork) {
-      var workCooldownUntil = Memory.defense.notifyCooldown[roomName + '_dismantle'] || 0;
-      if (Game.time >= workCooldownUntil) {
-        var dOwner = (h.owner && h.owner.username) ? h.owner.username : 'unknown';
-        var dMsg = '[DEFENSE] WARNING: Dismantler detected in ' + roomName + ' owned by ' + dOwner + ' at ' + h.pos;
-        console.log(dMsg);
-        Game.notify(dMsg, 0);
-        Memory.defense.notifyCooldown[roomName + '_dismantle'] = Game.time + NOTIFY_COOLDOWN;
+    if (L) {
+      var k = Memory.defense.notifyCooldown[e + "_dismantle"] || 0;
+      if (Game.time >= k) {
+        var I = O.owner && O.owner.username ? O.owner.username : "unknown";
+        var w = "[DEFENSE] WARNING: Dismantler detected in " + e + " owned by " + I + " at " + O.pos;
+        console.log(w);
+        Game.notify(w, 0);
+        Memory.defense.notifyCooldown[e + "_dismantle"] = Game.time + NOTIFY_COOLDOWN;
       }
       break;
     }
   }
 }
 
-// ============================================================================
-// Wall / Rampart Damage Tracking via getEventLog (player-caused only)
-// ============================================================================
-
-function trackDamageEvents(roomName) {
-  var room = Game.rooms[roomName];
-  if (!room) return;
-
-  var events;
+function trackDamageEvents(e) {
+  var r = Game.rooms[e];
+  if (!r) return;
+  var t;
   try {
-    events = room.getEventLog();
+    t = r.getEventLog();
   } catch (e) {
     return;
   }
-
-  if (!events || events.length === 0) return;
-
-  if (!Memory.defense.damageEvents[roomName]) {
-    Memory.defense.damageEvents[roomName] = {};
+  if (!t || t.length === 0) return;
+  if (!Memory.defense.damageEvents[e]) {
+    Memory.defense.damageEvents[e] = {};
   }
-  var roomDamage = Memory.defense.damageEvents[roomName];
-
-  for (var i = 0; i < events.length; i++) {
-    var evt = events[i];
-    if (evt.event !== EVENT_ATTACK) continue;
-
-    var targetId = evt.data.targetId;
-    if (!targetId) continue;
-
-    var target = Game.getObjectById(targetId);
-    if (!target) continue;
-    if (target.structureType !== STRUCTURE_WALL && target.structureType !== STRUCTURE_RAMPART) continue;
-
-    var attackerId = evt.objectId;
-    var attacker = Game.getObjectById(attackerId);
-    if (!attacker) continue;
-    if (attacker.my) continue;
-
-    // Skip NPC attackers
-    var attackerOwner = attacker.owner ? attacker.owner.username : null;
-    if (attackerOwner === 'Invader' || attackerOwner === 'Source Keeper') continue;
-
-    if (!roomDamage[targetId]) {
-      roomDamage[targetId] = { count: 0, firstTick: Game.time, lastTick: Game.time, damage: 0 };
+  var n = Memory.defense.damageEvents[e];
+  for (var a = 0; a < t.length; a++) {
+    var o = t[a];
+    if (o.event !== EVENT_ATTACK) continue;
+    var i = o.data.targetId;
+    if (!i) continue;
+    var s = Game.getObjectById(i);
+    if (!s) continue;
+    if (s.structureType !== STRUCTURE_WALL && s.structureType !== STRUCTURE_RAMPART) continue;
+    var u = o.objectId;
+    var f = Game.getObjectById(u);
+    if (!f) continue;
+    if (f.my) continue;
+    var l = f.owner ? f.owner.username : null;
+    if (l === "Invader" || l === "Source Keeper") continue;
+    if (!iff.isHostileCreep(f)) continue;
+    if (!n[i]) {
+      n[i] = {
+        count: 0,
+        firstTick: Game.time,
+        lastTick: Game.time,
+        damage: 0
+      };
     }
-
-    roomDamage[targetId].count++;
-    roomDamage[targetId].lastTick = Game.time;
-    roomDamage[targetId].damage += (evt.data.damage || 0);
-
-    // First hit notification
-    if (roomDamage[targetId].count === 1) {
-      var firstMsg = '[DEFENSE] ' + target.structureType + ' at ' + target.pos +
-        ' in ' + roomName + ' is under attack by ' + attackerOwner +
-        ' (damage: ' + (evt.data.damage || 0) + ')';
-      console.log(firstMsg);
-      Game.notify(firstMsg, 5);
+    n[i].count++;
+    n[i].lastTick = Game.time;
+    n[i].damage += o.data.damage || 0;
+    if (n[i].count === 1) {
+      var m = "[DEFENSE] " + s.structureType + " at " + s.pos + " in " + e + " is under attack by " + l + " (damage: " + (o.data.damage || 0) + ")";
+      console.log(m);
+      Game.notify(m, 5);
     }
   }
-
-  // Clean up stale entries
-  for (var sid in roomDamage) {
-    if (!roomDamage.hasOwnProperty(sid)) continue;
-    if (Game.time - roomDamage[sid].lastTick > EVENT_MEMORY_TTL) {
-      delete roomDamage[sid];
+  for (var v in n) {
+    if (!n.hasOwnProperty(v)) continue;
+    if (Game.time - n[v].lastTick > EVENT_MEMORY_TTL) {
+      delete n[v];
     }
   }
 }
 
-// ============================================================================
-// Nuke Detection
-// ============================================================================
-
-/**
- * Identify structures within blast radius of a nuke impact point.
- * Nuke deals 10M damage at ground zero and 5M within range 2.
- * Returns a summary object: { groundZero: [...], splash: [...] }
- */
-function analyzeNukeImpact(room, nukePos) {
-  var groundZero = [];
-  var splash = [];
-
-  // Look at ground zero
-  var gzStructs = room.lookForAt(LOOK_STRUCTURES, nukePos.x, nukePos.y);
-  for (var g = 0; g < gzStructs.length; g++) {
-    groundZero.push({
-      type: gzStructs[g].structureType,
-      hits: gzStructs[g].hits,
-      id: gzStructs[g].id
+function analyzeNukeImpact(e, r) {
+  var t = [];
+  var n = [];
+  var a = e.lookForAt(LOOK_STRUCTURES, r.x, r.y);
+  for (var o = 0; o < a.length; o++) {
+    t.push({
+      type: a[o].structureType,
+      hits: a[o].hits,
+      id: a[o].id
     });
   }
-
-  // Look at splash zone (range 1-2)
-  for (var dx = -NUKE_BLAST_RADIUS; dx <= NUKE_BLAST_RADIUS; dx++) {
-    for (var dy = -NUKE_BLAST_RADIUS; dy <= NUKE_BLAST_RADIUS; dy++) {
-      if (dx === 0 && dy === 0) continue;
-      var nx = nukePos.x + dx;
-      var ny = nukePos.y + dy;
-      if (nx < 0 || nx > 49 || ny < 0 || ny > 49) continue;
-
-      var structs = room.lookForAt(LOOK_STRUCTURES, nx, ny);
-      for (var s = 0; s < structs.length; s++) {
-        splash.push({
-          type: structs[s].structureType,
-          hits: structs[s].hits,
-          id: structs[s].id
+  for (var i = -NUKE_BLAST_RADIUS; i <= NUKE_BLAST_RADIUS; i++) {
+    for (var s = -NUKE_BLAST_RADIUS; s <= NUKE_BLAST_RADIUS; s++) {
+      if (i === 0 && s === 0) continue;
+      var u = r.x + i;
+      var f = r.y + s;
+      if (u < 0 || u > 49 || f < 0 || f > 49) continue;
+      var l = e.lookForAt(LOOK_STRUCTURES, u, f);
+      for (var m = 0; m < l.length; m++) {
+        n.push({
+          type: l[m].structureType,
+          hits: l[m].hits,
+          id: l[m].id
         });
       }
     }
   }
-
-  return { groundZero: groundZero, splash: splash };
+  return {
+    groundZero: t,
+    splash: n
+  };
 }
 
-/**
- * Format an ETA from ticks into a human-readable string.
- */
-function formatEta(ticks) {
-  var totalSec = ticks * 4; // ~4 seconds per tick on average
-  var hours = Math.floor(totalSec / 3600);
-  var minutes = Math.floor((totalSec % 3600) / 60);
-  if (hours > 0) {
-    return hours + 'h ' + minutes + 'm (~' + ticks + ' ticks)';
+function formatEta(e) {
+  var r = e * 4;
+  var t = Math.floor(r / 3600);
+  var n = Math.floor(r % 3600 / 60);
+  if (t > 0) {
+    return t + "h " + n + "m (~" + e + " ticks)";
   }
-  return minutes + 'm (~' + ticks + ' ticks)';
+  return n + "m (~" + e + " ticks)";
 }
 
-/**
- * Build a compact summary of threatened structures for notification.
- */
-function buildImpactSummary(impact) {
-  var typeCounts = {};
-
-  function countList(list, label) {
-    for (var i = 0; i < list.length; i++) {
-      var key = list[i].type;
-      if (!typeCounts[key]) typeCounts[key] = { gz: 0, splash: 0 };
-      typeCounts[key][label]++;
+function buildImpactSummary(e) {
+  var r = {};
+  function countList(e, t) {
+    for (var n = 0; n < e.length; n++) {
+      var a = e[n].type;
+      if (!r[a]) r[a] = {
+        gz: 0,
+        splash: 0
+      };
+      r[a][t]++;
     }
   }
-
-  countList(impact.groundZero, 'gz');
-  countList(impact.splash, 'splash');
-
-  var parts = [];
-  for (var t in typeCounts) {
-    if (!typeCounts.hasOwnProperty(t)) continue;
-    var entry = typeCounts[t];
-    var desc = t;
-    if (entry.gz > 0 && entry.splash > 0) {
-      desc += ' (' + entry.gz + ' direct, ' + entry.splash + ' splash)';
-    } else if (entry.gz > 0) {
-      desc += ' (' + entry.gz + ' direct hit)';
+  countList(e.groundZero, "gz");
+  countList(e.splash, "splash");
+  var t = [];
+  for (var n in r) {
+    if (!r.hasOwnProperty(n)) continue;
+    var a = r[n];
+    var o = n;
+    if (a.gz > 0 && a.splash > 0) {
+      o += " (" + a.gz + " direct, " + a.splash + " splash)";
+    } else if (a.gz > 0) {
+      o += " (" + a.gz + " direct hit)";
     } else {
-      desc += ' (' + entry.splash + ' splash)';
+      o += " (" + a.splash + " splash)";
     }
-    parts.push(desc);
+    t.push(o);
   }
-
-  if (parts.length === 0) return 'No structures in blast zone';
-  return parts.join(', ');
+  if (t.length === 0) return "No structures in blast zone";
+  return t.join(", ");
 }
 
-/**
- * Scan for incoming nukes in all owned rooms.
- * Sends notifications on first detection and at milestone thresholds.
- */
 function detectNukes() {
-  var tracked = Memory.defense.trackedNukes;
-
-  // Mark all tracked nukes as unseen this scan — we'll confirm them below
-  for (var tid in tracked) {
-    if (tracked.hasOwnProperty(tid)) {
-      tracked[tid]._seen = false;
+  var e = Memory.defense.trackedNukes;
+  for (var r in e) {
+    if (e.hasOwnProperty(r)) {
+      e[r]._seen = false;
     }
   }
-
-  var allRooms = getRoomState.all();
-  for (var roomName in allRooms) {
-    if (!allRooms.hasOwnProperty(roomName)) continue;
-
-    var room = Game.rooms[roomName];
-    if (!room) continue;
-    if (!room.controller || !room.controller.my) continue;
-
-    var nukes = room.find(FIND_NUKES);
-    if (!nukes || nukes.length === 0) continue;
-
-    for (var ni = 0; ni < nukes.length; ni++) {
-      var nuke = nukes[ni];
-      var nukeId = nuke.id;
-
-      if (tracked[nukeId]) {
-        // Already tracking — check milestones
-        tracked[nukeId]._seen = true;
-        var remaining = nuke.timeToLand;
-        var milestones = tracked[nukeId].milestones || {};
-
-        for (var mi = 0; mi < NUKE_MILESTONE_TICKS.length; mi++) {
-          var milestone = NUKE_MILESTONE_TICKS[mi];
-          if (remaining <= milestone && !milestones[milestone]) {
-            milestones[milestone] = Game.time;
-
-            var mileMsg = '[NUKE WARNING] Nuke inbound to ' + roomName +
-              ' at (' + nuke.pos.x + ',' + nuke.pos.y + ')' +
-              ' — ' + formatEta(remaining) + ' remaining!' +
-              ' Launched from: ' + nuke.launchRoomName;
-            console.log(mileMsg);
-            Game.notify(mileMsg, 0);
+  var t = getRoomState.ownedNames();
+  for (var n = 0; n < t.length; n++) {
+    var a = t[n];
+    var o = Game.rooms[a];
+    if (!o) continue;
+    var i = o.find(FIND_NUKES);
+    if (!i || i.length === 0) continue;
+    for (var s = 0; s < i.length; s++) {
+      var u = i[s];
+      var f = u.id;
+      if (e[f]) {
+        e[f]._seen = true;
+        var l = u.timeToLand;
+        var m = e[f].milestones || {};
+        for (var v = 0; v < NUKE_MILESTONE_TICKS.length; v++) {
+          var d = NUKE_MILESTONE_TICKS[v];
+          if (l <= d && !m[d]) {
+            m[d] = Game.time;
+            var c = "[NUKE WARNING] Nuke inbound to " + a + " at (" + u.pos.x + "," + u.pos.y + ")" + " — " + formatEta(l) + " remaining!" + " Launched from: " + u.launchRoomName;
+            console.log(c);
+            Game.notify(c, 0);
           }
         }
-
-        tracked[nukeId].milestones = milestones;
+        e[f].milestones = m;
         continue;
       }
-
-      // New nuke — first detection
-      var impact = analyzeNukeImpact(room, nuke.pos);
-      var summary = buildImpactSummary(impact);
-
-      tracked[nukeId] = {
-        roomName: roomName,
-        pos: { x: nuke.pos.x, y: nuke.pos.y },
-        launchRoom: nuke.launchRoomName,
-        landTick: Game.time + nuke.timeToLand,
+      var g = analyzeNukeImpact(o, u.pos);
+      var y = buildImpactSummary(g);
+      e[f] = {
+        roomName: a,
+        pos: {
+          x: u.pos.x,
+          y: u.pos.y
+        },
+        launchRoom: u.launchRoomName,
+        landTick: Game.time + u.timeToLand,
         notifiedAt: Game.time,
         milestones: {},
         _seen: true
       };
-
-      var nukeMsg = '[NUKE ALERT] Incoming nuke detected in ' + roomName + '!\n' +
-        '  Impact: (' + nuke.pos.x + ',' + nuke.pos.y + ')\n' +
-        '  Launched from: ' + nuke.launchRoomName + '\n' +
-        '  ETA: ' + formatEta(nuke.timeToLand) + '\n' +
-        '  Threatened structures: ' + summary;
-      console.log(nukeMsg);
-      Game.notify(nukeMsg, 0);
+      var h = "[NUKE ALERT] Incoming nuke detected in " + a + "!\n" + "  Impact: (" + u.pos.x + "," + u.pos.y + ")\n" + "  Launched from: " + u.launchRoomName + "\n" + "  ETA: " + formatEta(u.timeToLand) + "\n" + "  Threatened structures: " + y;
+      console.log(h);
+      Game.notify(h, 0);
     }
   }
-
-  // Clean up nukes that have landed or disappeared
-  for (var cid in tracked) {
-    if (!tracked.hasOwnProperty(cid)) continue;
-    if (!tracked[cid]._seen) {
-      // Nuke has landed or been removed
-      var landed = tracked[cid];
-      var landMsg = '[NUKE] Nuke in ' + landed.roomName +
-        ' at (' + landed.pos.x + ',' + landed.pos.y + ')' +
-        ' from ' + landed.launchRoom + ' has landed or expired.';
-      console.log(landMsg);
-      Game.notify(landMsg, 0);
-      delete tracked[cid];
+  for (var E in e) {
+    if (!e.hasOwnProperty(E)) continue;
+    if (!e[E]._seen) {
+      var p = e[E];
+      var R = "[NUKE] Nuke in " + p.roomName + " at (" + p.pos.x + "," + p.pos.y + ")" + " from " + p.launchRoom + " has landed or expired.";
+      console.log(R);
+      Game.notify(R, 0);
+      delete e[E];
     } else {
-      // Clean up internal flag
-      delete tracked[cid]._seen;
+      delete e[E]._seen;
     }
   }
 }
 
-// ============================================================================
-// BFS: Find contiguous cluster from a single starting structure
-// ============================================================================
-
-function findContiguousCluster(startId, room) {
-  var start = Game.getObjectById(startId);
-  if (!start) return [];
-
-  var visited = {};
-  var cluster = [];
-  var queue = [start];
-  visited[start.id] = true;
-
-  while (queue.length > 0) {
-    var current = queue.shift();
-    cluster.push(current.id);
-
-    var cx = current.pos.x;
-    var cy = current.pos.y;
-
-    for (var dx = -CLUSTER_RANGE; dx <= CLUSTER_RANGE; dx++) {
-      for (var dy = -CLUSTER_RANGE; dy <= CLUSTER_RANGE; dy++) {
-        if (dx === 0 && dy === 0) continue;
-        var nx = cx + dx;
-        var ny = cy + dy;
-        if (nx < 0 || nx > 49 || ny < 0 || ny > 49) continue;
-
-        var structs = room.lookForAt(LOOK_STRUCTURES, nx, ny);
-        for (var s = 0; s < structs.length; s++) {
-          var st = structs[s];
-          if (visited[st.id]) continue;
-          if (st.structureType !== STRUCTURE_WALL && st.structureType !== STRUCTURE_RAMPART) continue;
-          visited[st.id] = true;
-          queue.push(st);
+function findContiguousCluster(e, r) {
+  var t = Game.getObjectById(e);
+  if (!t) return [];
+  var n = {};
+  var a = [];
+  var o = [ t ];
+  n[t.id] = true;
+  while (o.length > 0) {
+    var i = o.shift();
+    a.push(i.id);
+    var s = i.pos.x;
+    var u = i.pos.y;
+    for (var f = -CLUSTER_RANGE; f <= CLUSTER_RANGE; f++) {
+      for (var l = -CLUSTER_RANGE; l <= CLUSTER_RANGE; l++) {
+        if (f === 0 && l === 0) continue;
+        var m = s + f;
+        var v = u + l;
+        if (m < 0 || m > 49 || v < 0 || v > 49) continue;
+        var d = r.lookForAt(LOOK_STRUCTURES, m, v);
+        for (var c = 0; c < d.length; c++) {
+          var g = d[c];
+          if (n[g.id]) continue;
+          if (g.structureType !== STRUCTURE_WALL && g.structureType !== STRUCTURE_RAMPART) continue;
+          n[g.id] = true;
+          o.push(g);
         }
       }
     }
   }
-
-  return cluster;
+  return a;
 }
 
-// ============================================================================
-// Build ALL wall/rampart clusters in a room (topology only, cached)
-// Cache is created on first need after an attack and explicitly cleared
-// when all repair orders for the room are resolved. No TTL — the caller
-// is responsible for cache lifecycle via clearClusterCache().
-// ============================================================================
-
-function getAllClusters(roomName) {
-  var cached = Memory.defense.clusterCache[roomName];
-  if (cached) {
-    return cached.clusters;
+function getAllClusters(e) {
+  var r = Memory.defense.clusterCache[e];
+  if (r) {
+    return r.clusters;
   }
-
-  var room = Game.rooms[roomName];
-  if (!room) return [];
-
-  var rs = getRoomState.get(roomName);
-  if (!rs || !rs.structuresByType) return [];
-
-  var allBarriers = [];
-  var walls = rs.structuresByType[STRUCTURE_WALL] || [];
-  var ramps = rs.structuresByType[STRUCTURE_RAMPART] || [];
-  for (var w = 0; w < walls.length; w++) allBarriers.push(walls[w]);
-  for (var r = 0; r < ramps.length; r++) allBarriers.push(ramps[r]);
-
-  if (allBarriers.length === 0) return [];
-
-  var visited = {};
-  var clusters = [];
-
-  for (var bi = 0; bi < allBarriers.length; bi++) {
-    var barrier = allBarriers[bi];
-    if (visited[barrier.id]) continue;
-
-    var clusterIds = [];
-    var queue = [barrier];
-    visited[barrier.id] = true;
-
-    while (queue.length > 0) {
-      var current = queue.shift();
-      clusterIds.push(current.id);
-
-      var cx = current.pos.x;
-      var cy = current.pos.y;
-
-      for (var dx = -CLUSTER_RANGE; dx <= CLUSTER_RANGE; dx++) {
-        for (var dy = -CLUSTER_RANGE; dy <= CLUSTER_RANGE; dy++) {
-          if (dx === 0 && dy === 0) continue;
-          var nx = cx + dx;
-          var ny = cy + dy;
-          if (nx < 0 || nx > 49 || ny < 0 || ny > 49) continue;
-
-          var structs = room.lookForAt(LOOK_STRUCTURES, nx, ny);
-          for (var si = 0; si < structs.length; si++) {
-            var st = structs[si];
-            if (visited[st.id]) continue;
-            if (st.structureType !== STRUCTURE_WALL && st.structureType !== STRUCTURE_RAMPART) continue;
-            visited[st.id] = true;
-            queue.push(st);
+  var t = Game.rooms[e];
+  if (!t) return [];
+  var n = getRoomState.get(e);
+  if (!n || !n.structuresByType) return [];
+  var a = [];
+  var o = n.structuresByType[STRUCTURE_WALL] || [];
+  var i = n.structuresByType[STRUCTURE_RAMPART] || [];
+  for (var s = 0; s < o.length; s++) a.push(o[s]);
+  for (var u = 0; u < i.length; u++) a.push(i[u]);
+  if (a.length === 0) return [];
+  var f = {};
+  var l = [];
+  for (var m = 0; m < a.length; m++) {
+    var v = a[m];
+    if (f[v.id]) continue;
+    var d = [];
+    var c = [ v ];
+    f[v.id] = true;
+    while (c.length > 0) {
+      var g = c.shift();
+      d.push(g.id);
+      var y = g.pos.x;
+      var h = g.pos.y;
+      for (var E = -CLUSTER_RANGE; E <= CLUSTER_RANGE; E++) {
+        for (var p = -CLUSTER_RANGE; p <= CLUSTER_RANGE; p++) {
+          if (E === 0 && p === 0) continue;
+          var R = y + E;
+          var T = h + p;
+          if (R < 0 || R > 49 || T < 0 || T > 49) continue;
+          var C = t.lookForAt(LOOK_STRUCTURES, R, T);
+          for (var S = 0; S < C.length; S++) {
+            var N = C[S];
+            if (f[N.id]) continue;
+            if (N.structureType !== STRUCTURE_WALL && N.structureType !== STRUCTURE_RAMPART) continue;
+            f[N.id] = true;
+            c.push(N);
           }
         }
       }
     }
-
-    // Topology only — no hits stored in cache
-    clusters.push({ ids: clusterIds });
+    l.push({
+      ids: d
+    });
   }
-
-  Memory.defense.clusterCache[roomName] = {
-    clusters: clusters
+  Memory.defense.clusterCache[e] = {
+    clusters: l
   };
-
-  return clusters;
+  return l;
 }
 
-/**
- * Explicitly clear the cluster topology cache for a room.
- * Called when all repair orders are resolved — the cache only exists
- * while repairs are active.
- */
-function clearClusterCache(roomName) {
-  delete Memory.defense.clusterCache[roomName];
+function clearClusterCache(e) {
+  delete Memory.defense.clusterCache[e];
 }
 
-// ============================================================================
-// Get the minimum hits and corresponding structure ID from a cluster
-// (live query — never cached)
-// ============================================================================
-
-function getClusterMinHits(ids) {
-  var minHits = Infinity;
-  var minId = null;
-
-  for (var i = 0; i < ids.length; i++) {
-    var s = Game.getObjectById(ids[i]);
-    if (!s) continue;
-    if (typeof s.hits !== 'number') continue;
-    if (s.hits < minHits) {
-      minHits = s.hits;
-      minId = s.id;
+function getClusterMinHits(e) {
+  var r = Infinity;
+  var t = null;
+  for (var n = 0; n < e.length; n++) {
+    var a = Game.getObjectById(e[n]);
+    if (!a) continue;
+    if (typeof a.hits !== "number") continue;
+    if (a.hits < r) {
+      r = a.hits;
+      t = a.id;
     }
   }
-
-  return { minHits: minHits, minId: minId };
+  return {
+    minHits: r,
+    minId: t
+  };
 }
 
-// ============================================================================
-// Calculate the median HP of all walls and ramparts in a room
-// ============================================================================
-
-function getRoomMedianHits(roomName) {
-  var rs = getRoomState.get(roomName);
-  if (!rs || !rs.structuresByType) return 0;
-
-  var hitsArr = [];
-  var walls = rs.structuresByType[STRUCTURE_WALL] || [];
-  var ramps = rs.structuresByType[STRUCTURE_RAMPART] || [];
-
-  for (var w = 0; w < walls.length; w++) {
-    if (typeof walls[w].hits === 'number') {
-      hitsArr.push(walls[w].hits);
+function getRoomMedianHits(e) {
+  var r = getRoomState.get(e);
+  if (!r || !r.structuresByType) return 0;
+  var t = [];
+  var n = r.structuresByType[STRUCTURE_WALL] || [];
+  var a = r.structuresByType[STRUCTURE_RAMPART] || [];
+  for (var o = 0; o < n.length; o++) {
+    if (typeof n[o].hits === "number") {
+      t.push(n[o].hits);
     }
   }
-  for (var r = 0; r < ramps.length; r++) {
-    if (typeof ramps[r].hits === 'number') {
-      hitsArr.push(ramps[r].hits);
+  for (var i = 0; i < a.length; i++) {
+    if (typeof a[i].hits === "number") {
+      t.push(a[i].hits);
     }
   }
-
-  if (hitsArr.length === 0) return 0;
-  if (hitsArr.length === 1) return hitsArr[0];
-
-  hitsArr.sort(function(a, b) { return a - b; });
-
-  var mid = Math.floor(hitsArr.length / 2);
-  if (hitsArr.length % 2 === 0) {
-    return Math.floor((hitsArr[mid - 1] + hitsArr[mid]) / 2);
+  if (t.length === 0) return 0;
+  if (t.length === 1) return t[0];
+  t.sort(function(e, r) {
+    return e - r;
+  });
+  var s = Math.floor(t.length / 2);
+  if (t.length % 2 === 0) {
+    return Math.floor((t[s - 1] + t[s]) / 2);
   } else {
-    return hitsArr[mid];
+    return t[s];
   }
 }
 
-// ============================================================================
-// Find which cluster a structure belongs to
-// ============================================================================
-
-function findClusterContaining(structureId, clusters) {
-  for (var i = 0; i < clusters.length; i++) {
-    if (clusters[i].ids.indexOf(structureId) !== -1) {
-      return clusters[i];
+function findClusterContaining(e, r) {
+  for (var t = 0; t < r.length; t++) {
+    if (r[t].ids.indexOf(e) !== -1) {
+      return r[t];
     }
   }
   return null;
 }
 
-// ============================================================================
-// Determine if a cluster is the weakest in the room
-// Queries hits live for only the clusters being compared.
-// ============================================================================
-
-function isWeakestCluster(clusterIds, allClusters) {
-  if (!clusterIds || !allClusters || allClusters.length === 0) return false;
-  if (allClusters.length === 1) return true;
-
-  var myStats = getClusterMinHits(clusterIds);
-
-  for (var i = 0; i < allClusters.length; i++) {
-    var other = allClusters[i];
-    if (other.ids[0] === clusterIds[0]) continue;
-    var otherStats = getClusterMinHits(other.ids);
-    if (otherStats.minHits < myStats.minHits) return false;
+function isWeakestCluster(e, r) {
+  if (!e || !r || r.length === 0) return false;
+  if (r.length === 1) return true;
+  var t = getClusterMinHits(e);
+  for (var n = 0; n < r.length; n++) {
+    var a = r[n];
+    if (a.ids[0] === e[0]) continue;
+    var o = getClusterMinHits(a.ids);
+    if (o.minHits < t.minHits) return false;
   }
-
   return true;
 }
 
-// ============================================================================
-// Evaluate damage events and create repair orders
-// Only builds cluster map when there's a damage event at threshold or
-// active repair orders needing re-evaluation.
-// ============================================================================
-
-function evaluateRepairOrders(roomName) {
-  var roomDamage = Memory.defense.damageEvents[roomName];
-  if (!Memory.defense.repairOrders[roomName]) {
-    Memory.defense.repairOrders[roomName] = [];
+function evaluateRepairOrders(e) {
+  var r = Memory.defense.damageEvents[e];
+  if (!Memory.defense.repairOrders[e]) {
+    Memory.defense.repairOrders[e] = [];
   }
-  var orders = Memory.defense.repairOrders[roomName];
-
-  var room = Game.rooms[roomName];
-  if (!room) return;
-
-  // ---- Early exit: check if we actually need cluster computation ----
-  var hasThresholdDamage = false;
-  if (roomDamage) {
-    for (var checkSid in roomDamage) {
-      if (roomDamage.hasOwnProperty(checkSid) && roomDamage[checkSid].count >= DAMAGE_THRESHOLD) {
-        hasThresholdDamage = true;
+  var t = Memory.defense.repairOrders[e];
+  var n = Game.rooms[e];
+  if (!n) return;
+  var a = false;
+  if (r) {
+    for (var o in r) {
+      if (r.hasOwnProperty(o) && r[o].count >= DAMAGE_THRESHOLD) {
+        a = true;
         break;
       }
     }
   }
-
-  var hasActiveOrders = orders.length > 0;
-
-  if (!hasThresholdDamage && !hasActiveOrders) {
-    clearClusterCache(roomName);
+  var i = t.length > 0;
+  if (!a && !i) {
+    clearClusterCache(e);
     return;
   }
-
-  // Count existing defense repair creeps (alive + spawning)
-  var existingCount = 0;
-  for (var cname in Game.creeps) {
-    var c = Game.creeps[cname];
-    if (!c.memory) continue;
-    if (c.memory.role === 'defenseRepair' && c.memory.homeRoom === roomName) {
-      existingCount++;
+  var s = 0;
+  var u = getRoomState.creepIndex();
+  var f = u && u.all ? u.all : [];
+  for (var l = 0; l < f.length; l++) {
+    var m = f[l];
+    if (!m.memory) continue;
+    if (m.memory.role === "defenseRepair" && m.memory.homeRoom === e) {
+      s++;
     }
   }
-  var rs = getRoomState.get(roomName);
-  if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_SPAWN]) {
-    for (var si = 0; si < rs.structuresByType[STRUCTURE_SPAWN].length; si++) {
-      var sp = rs.structuresByType[STRUCTURE_SPAWN][si];
-      if (sp.my && sp.spawning) {
-        var mem = Memory.creeps[sp.spawning.name];
-        if (mem && mem.role === 'defenseRepair' && mem.homeRoom === roomName) {
-          existingCount++;
+  var v = getRoomState.get(e);
+  if (v && v.structuresByType && v.structuresByType[STRUCTURE_SPAWN]) {
+    for (var d = 0; d < v.structuresByType[STRUCTURE_SPAWN].length; d++) {
+      var c = v.structuresByType[STRUCTURE_SPAWN][d];
+      if (c.my && c.spawning) {
+        var g = Memory.creeps[c.spawning.name];
+        if (g && g.role === "defenseRepair" && g.homeRoom === e) {
+          s++;
         }
       }
     }
   }
-
-  // Build cluster topology (cached, no hits stored)
-  var allClusters = getAllClusters(roomName);
-  if (allClusters.length === 0) return;
-
-  // Check each damaged structure that has hit the threshold
-  if (roomDamage) {
-    for (var sid in roomDamage) {
-      if (!roomDamage.hasOwnProperty(sid)) continue;
-      var entry = roomDamage[sid];
-
-      if (entry.count < DAMAGE_THRESHOLD) continue;
-
-      // Don't exceed max
-      if (existingCount >= MAX_DEFENSE_REPAIRS) continue;
-
-      // Check if already covered by an existing order
-      var alreadyCovered = false;
-      for (var oi = 0; oi < orders.length; oi++) {
-        if (orders[oi].clusterIds && orders[oi].clusterIds.indexOf(sid) !== -1) {
-          alreadyCovered = true;
+  var y = getAllClusters(e);
+  if (y.length === 0) return;
+  if (r) {
+    for (var h in r) {
+      if (!r.hasOwnProperty(h)) continue;
+      var E = r[h];
+      if (E.count < DAMAGE_THRESHOLD) continue;
+      if (s >= MAX_DEFENSE_REPAIRS) continue;
+      var p = false;
+      for (var R = 0; R < t.length; R++) {
+        if (t[R].clusterIds && t[R].clusterIds.indexOf(h) !== -1) {
+          p = true;
           break;
         }
       }
-      if (alreadyCovered) continue;
-
-      // Find which cluster this damaged structure belongs to
-      var damagedCluster = findClusterContaining(sid, allClusters);
-      if (!damagedCluster) {
-        var bfsIds = findContiguousCluster(sid, room);
-        if (bfsIds.length === 0) continue;
-        damagedCluster = { ids: bfsIds };
+      if (p) continue;
+      var T = findClusterContaining(h, y);
+      if (!T) {
+        var C = findContiguousCluster(h, n);
+        if (C.length === 0) continue;
+        T = {
+          ids: C
+        };
       }
-
-      var isSolo = (damagedCluster.ids.length === 1);
-
-      // Query hits live only for the clusters we're comparing
-      var damagedStats = getClusterMinHits(damagedCluster.ids);
-
-      if (isSolo) {
-        // Solo structure: spawn if below room median
-        var median = getRoomMedianHits(roomName);
-        if (damagedStats.minHits >= median) {
-          console.log('[DefenseMonitor] Solo structure in ' + roomName + ' (hits: ' +
-            damagedStats.minHits + ') is at or above median (' + median + '). Clearing alert.');
-          delete roomDamage[sid];
+      var S = T.ids.length === 1;
+      var N = getClusterMinHits(T.ids);
+      if (S) {
+        var A = getRoomMedianHits(e);
+        if (N.minHits >= A) {
+          console.log("[DefenseMonitor] Solo structure in " + e + " (hits: " + N.minHits + ") is at or above median (" + A + "). Clearing alert.");
+          delete r[h];
           continue;
         }
       } else {
-        // Multi-structure cluster: only spawn if it's the weakest section
-        if (!isWeakestCluster(damagedCluster.ids, allClusters)) {
-          console.log('[DefenseMonitor] Damaged cluster in ' + roomName + ' (minHits: ' +
-            damagedStats.minHits + ') is NOT the weakest section. Clearing alert.');
-          delete roomDamage[sid];
+        if (!isWeakestCluster(T.ids, y)) {
+          console.log("[DefenseMonitor] Damaged cluster in " + e + " (minHits: " + N.minHits + ") is NOT the weakest section. Clearing alert.");
+          delete r[h];
           continue;
         }
       }
-
-      // Create repair order
-      var order = {
-        clusterId: damagedCluster.ids[0],
-        clusterIds: damagedCluster.ids,
-        solo: isSolo,
+      var M = {
+        clusterId: T.ids[0],
+        clusterIds: T.ids,
+        solo: S,
         assignedCreep: null,
         createdAt: Game.time
       };
-
-      orders.push(order);
-      existingCount++;
-
-      var modeStr = isSolo ? 'solo (target: median)' : 'weakest cluster';
-      var notifyMsg = '[DEFENSE] Repair order created in ' + roomName +
-        ' — ' + modeStr + ' (minHits: ' + damagedStats.minHits + ', ' +
-        damagedCluster.ids.length + ' structures). ' +
-        'Damage events: ' + entry.count + ', total damage: ' + entry.damage;
-      console.log(notifyMsg);
-      Game.notify(notifyMsg, 5);
-
-      // Clear damage counter so we don't re-trigger from the same burst
-      delete roomDamage[sid];
+      t.push(M);
+      s++;
+      var _ = S ? "solo (target: median)" : "weakest cluster";
+      var U = "[DEFENSE] Repair order created in " + e + " — " + _ + " (minHits: " + N.minHits + ", " + T.ids.length + " structures). " + "Damage events: " + E.count + ", total damage: " + E.damage;
+      console.log(U);
+      Game.notify(U, 5);
+      delete r[h];
     }
   }
-
-  // Clean up orders
-  for (var ri = orders.length - 1; ri >= 0; ri--) {
-    var ord = orders[ri];
-
-    // If creep was assigned but is now dead
-    if (ord.assignedCreep && !Game.creeps[ord.assignedCreep]) {
-      ord.assignedCreep = null;
-
-      // Re-evaluate: does this order still need a bot?
-      var stillNeeded = false;
-
-      if (ord.solo) {
-        var soloStruct = Game.getObjectById(ord.clusterId);
-        var currentMedian = getRoomMedianHits(roomName);
-        if (soloStruct && typeof soloStruct.hits === 'number' && soloStruct.hits < currentMedian) {
-          stillNeeded = true;
+  for (var O = t.length - 1; O >= 0; O--) {
+    var L = t[O];
+    if (L.assignedCreep && !Game.creeps[L.assignedCreep]) {
+      L.assignedCreep = null;
+      var G = false;
+      if (L.solo) {
+        var k = Game.getObjectById(L.clusterId);
+        var I = getRoomMedianHits(e);
+        if (k && typeof k.hits === "number" && k.hits < I) {
+          G = true;
         }
       } else {
-        if (isWeakestCluster(ord.clusterIds, allClusters)) {
-          stillNeeded = true;
+        if (isWeakestCluster(L.clusterIds, y)) {
+          G = true;
         }
       }
-
-      if (!stillNeeded) {
-        console.log('[DefenseMonitor] Repair order in ' + roomName +
-          ' no longer needed. Removing.');
-        orders.splice(ri, 1);
+      if (!G) {
+        console.log("[DefenseMonitor] Repair order in " + e + " no longer needed. Removing.");
+        t.splice(O, 1);
         continue;
       }
     }
-
-    // Stale order cleanup (no creep assigned after 500 ticks)
-    if (!ord.assignedCreep && Game.time - ord.createdAt > 500) {
-      orders.splice(ri, 1);
+    if (!L.assignedCreep && Game.time - L.createdAt > 500) {
+      t.splice(O, 1);
     }
   }
-
-  // All repairs resolved — clear cluster cache, back to peacetime
-  if (orders.length === 0) {
-    clearClusterCache(roomName);
+  if (t.length === 0) {
+    clearClusterCache(e);
   }
 }
 
-// ============================================================================
-// Main run function — called once per tick
-// ============================================================================
-
 function run() {
   ensureMemory();
-
-  var allRooms = getRoomState.all();
-  for (var roomName in allRooms) {
-    if (!allRooms.hasOwnProperty(roomName)) continue;
-
-    var rs = allRooms[roomName];
-    var room = Game.rooms[roomName];
-    if (!room) continue;
-
-    // Only monitor owned rooms
-    if (!room.controller || !room.controller.my) continue;
-
-    // 1. Detect enemy creep entry → Game.notify (skip NPCs)
-    var hostileCount = rs.hostiles ? rs.hostiles.length : 0;
-    var hadHostiles = Memory.defense.knownHostiles[roomName] &&
-                      Memory.defense.knownHostiles[roomName].length > 0;
-    if (hostileCount > 0 || hadHostiles || Game.time % 7 === 0) {
-      detectEnemyEntry(roomName, rs);
+  var e = getRoomState.ownedNames();
+  for (var r = 0; r < e.length; r++) {
+    var t = e[r];
+    var n = getRoomState.get(t);
+    var a = Game.rooms[t];
+    if (!a || !n) continue;
+    var o = n.hostiles ? n.hostiles.length : 0;
+    var i = Memory.defense.knownHostiles[t] && Memory.defense.knownHostiles[t].length > 0;
+    if (o > 0 || i || Game.time % 7 === 0) {
+      detectEnemyEntry(t, n);
     }
-
-    // 2. Track wall/rampart damage via event log (every tick)
-    trackDamageEvents(roomName);
-
-    // 3. Evaluate repair orders with cluster comparison
+    trackDamageEvents(t);
     if (Game.time % 3 === 0) {
-      evaluateRepairOrders(roomName);
+      evaluateRepairOrders(t);
     }
   }
-
-  // 4. Nuke detection (runs across all rooms, throttled)
   if (Game.time % NUKE_SCAN_INTERVAL === 0) {
     detectNukes();
   }
 }
-
-// ============================================================================
-// Exports
-// ============================================================================
 
 module.exports = {
   run: run,

@@ -1,2724 +1,2458 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // terminalManager.js
-//
-// Usage Examples:
-//
-// Transfer 3000 energy from E1S1 to E3S3 (robust partial sends; respects cooldown and energy cost)
-// transferStuff('E1S1', 'E3S3', 'energy', 3000)
-//
-// Check status of all transfer operations and active terminal bots
-// terminalStatus()
-//
-// broadcastEnergy('E5N10')           // sends 10k energy from all rooms
-// broadcastEnergy('E5N10', 5000)     // sends a custom amount instead
-//
-// Debug why a terminal in a room is waiting / not sending
-// whyTerminal('E3N46')
-//
-// Cancel a specific transfer operation
-// cancelTerminalOperation('transfer_12345_abc123def')
-//
-// NEW (local, intra-room moves):
-// Move 2000 XGH2O from Storage/containers/labs into the Terminal
-// storageToTerminal('E1S1', RESOURCE_CATALYZED_GHODIUM_ACID, 2000)
-//
-// Move 5000 energy from Terminal into Storage (or a container fallback)
-// terminalToStorage('E1S1', RESOURCE_ENERGY, 5000)
-
-const getRoomState = require('getRoomState'); // use room state cache instead of room.find
-var singleSourceRoom = require('singleSourceRoom');
-var storageManager = require('storageManager');
-
-// Local terminal moves (storage <-> terminal) under this amount are handed off
-// to the room's supplier instead of spawning a dedicated terminalBot.
-const SUPPLIER_TASK_THRESHOLD = 20000;
-
+// Console globals: transferStuff, terminalStatus, whyTerminal, cancelTerminalOperation, isRoomBusy, broadcastEnergy, storageToTerminal, terminalToStorage
+// Example: transferStuff('E1S1', 'E3S3', 'energy', 3000) - Queue inter-room terminal transfer
+// Example: terminalStatus('E1S1') - Display terminal inventory, energy, and cooldown
+// Example: whyTerminal('E1S1') - Explain current routing or idle state for room terminal
+// Example: cancelTerminalOperation('E1S1') - Cancel queued terminal transfer for room
+// Example: isRoomBusy('E1S1') - Check if terminal is actively transferring or on cooldown
+// Example: broadcastEnergy('E1S1', 50000) - Distribute excess energy to rooms needing supply
+// Example: storageToTerminal('E1S1', 'energy', 10000) - Move resources from storage to terminal
+// Example: terminalToStorage('E1S1', 'energy', 10000) - Move resources from terminal to storage
+const getRoomState = require("getRoomState");
+var singleSourceRoom = require("singleSourceRoom");
+var storageManager = require("storageManager");
+var spawnManager = require("spawnManager");
+var roomSuspender = require("roomSuspender");
+var util = require("util");
+var memoryManager = require("memoryManager");
+const TERMINAL_BOT_ENERGY_THRESHOLD = 1e5;
+const LOCAL_NO_PROGRESS_TIMEOUT = 1e3;
 const terminalManager = {
-
-    // ===== INITIALIZATION =====
-    init: function() {
-        if (!Memory.terminalManager) {
-            Memory.terminalManager = {
-                operations: [],
-                bots: [],
-                settings: {
-                    emailNotifications: true,
-                    // Set true only if you do NOT run terminalBots from your main loop by role
-                    runBotsFromManager: false,
-                    energyHighThreshold: 100000,
-                    energyTargetLevel: 20000
-                }
-            };
-        } else {
-            if (!Memory.terminalManager.settings) Memory.terminalManager.settings = {};
-            if (typeof Memory.terminalManager.settings.emailNotifications !== 'boolean') Memory.terminalManager.settings.emailNotifications = true;
-            if (typeof Memory.terminalManager.settings.runBotsFromManager !== 'boolean') Memory.terminalManager.settings.runBotsFromManager = false;
-            if (typeof Memory.terminalManager.settings.energyHighThreshold !== 'number') Memory.terminalManager.settings.energyHighThreshold = 100000;
-            if (typeof Memory.terminalManager.settings.energyTargetLevel !== 'number') Memory.terminalManager.settings.energyTargetLevel = 20000;
-            if (typeof Memory.terminalManager.settings.useSupplierForSmallLocalOps !== 'boolean') Memory.terminalManager.settings.useSupplierForSmallLocalOps = true;
-            if (!Array.isArray(Memory.terminalManager.operations)) Memory.terminalManager.operations = [];
-            if (!Array.isArray(Memory.terminalManager.bots)) Memory.terminalManager.bots = [];
-        }
-    },
-
-    // ===== storageManager v2 HELPERS =====
-    // V2 is enabled for all owned rooms.
-    // `building` is 'terminal' for transfer ops and toStorage ops; 'storage' for
-    // toTerminal ops (the resource lives in storage/containers before being moved).
-    v2Enabled: function(roomName) {
-        var room = Game.rooms[roomName];
-        return !!(room && room.controller && room.controller.my);
-    },
-
-    // Release the v2 reservation associated with an op, if any.
-    releaseOpReservation: function(operation) {
-        if (!operation) return;
-
-        if (Array.isArray(operation.reservationEntries) && operation.reservationEntries.length > 0) {
-            for (var i = 0; i < operation.reservationEntries.length; i++) {
-                var entry = operation.reservationEntries[i];
-                if (!entry || !entry.roomName || !entry.building || !entry.program) continue;
-                storageManager.unReserve(entry.roomName, operation.resourceType, entry.building, entry.program);
-            }
-        } else if (operation.reservationProgram && operation.reservationBuilding) {
-            storageManager.unReserve(
-                operation.reservationRoom,
-                operation.resourceType,
-                operation.reservationBuilding,
-                operation.reservationProgram
-            );
-        }
-
-        // Clear so we don't double-release
-        delete operation.reservationProgram;
-        delete operation.reservationBuilding;
-        delete operation.reservationRoom;
-        delete operation.reservationEntries;
-    },
-
-    ensureReservationEntries: function(operation) {
-        if (!operation.reservationEntries) operation.reservationEntries = [];
-        return operation.reservationEntries;
-    },
-
-    addReservationEntry: function(operation, roomName, building, program) {
-        if (!operation || !roomName || !building || !program) return;
-        var entries = this.ensureReservationEntries(operation);
-        for (var i = 0; i < entries.length; i++) {
-            if (entries[i] && entries[i].roomName === roomName && entries[i].building === building && entries[i].program === program) {
-                return;
-            }
-        }
-        entries.push({ roomName: roomName, building: building, program: program });
-    },
-
-    reserveOperationStock: function(operation, roomName, resourceType, building, amount, program) {
-        if (!operation || !roomName || !resourceType || !building || !program || !amount) return { ok: false, reason: 'Missing required parameter' };
-        var rv = storageManager.reserve(roomName, resourceType, building, program, amount);
-        if (rv.ok) {
-            this.addReservationEntry(operation, roomName, building, program);
-            operation.reservationProgram = program;
-            operation.reservationRoom = roomName;
-            if (!operation.reservationBuilding) operation.reservationBuilding = building;
-        }
-        return rv;
-    },
-
-    consumeOperationStock: function(operation, roomName, resourceType, building, amount, program) {
-        if (!operation || !roomName || !resourceType || !building || !program || !amount) return { ok: false, consumed: 0, remaining: 0 };
-        return storageManager.consume(roomName, resourceType, building, program, amount);
-    },
-
-    // ===== SUPPLIER TASK QUEUE (small local moves) =====
-    shouldUseSupplierForOp: function(operation) {
-        if (!operation) return false;
-        if (operation.type !== 'toTerminal' && operation.type !== 'toStorage') return false;
-        if (!Memory.terminalManager.settings || !Memory.terminalManager.settings.useSupplierForSmallLocalOps) return false;
-        // Single-source rooms use ComboBot for terminal duties; keep that path.
-        if (singleSourceRoom && typeof singleSourceRoom.isSingleSourceActive === 'function' &&
-            singleSourceRoom.isSingleSourceActive(operation.roomName)) {
-            return false;
-        }
-        return (operation.amount || 0) <= SUPPLIER_TASK_THRESHOLD;
-    },
-
-    addSupplierTask: function(roomName, operation) {
-        if (!roomName || !operation || !operation.id) return;
-        if (!Memory.terminalManager.supplierTasks) Memory.terminalManager.supplierTasks = {};
-        if (!Memory.terminalManager.supplierTasks[roomName]) Memory.terminalManager.supplierTasks[roomName] = [];
-        var list = Memory.terminalManager.supplierTasks[roomName];
-        for (var i = 0; i < list.length; i++) {
-            if (list[i] && list[i].opId === operation.id) return; // already queued
-        }
-        list.push({
-            opId: operation.id,
-            type: operation.type,
-            resourceType: operation.resourceType,
-            amount: operation.amount,
-            reservationProgram: operation.reservationProgram || null
-        });
-    },
-
-    getSupplierTasks: function(roomName) {
-        return (Memory.terminalManager && Memory.terminalManager.supplierTasks && Memory.terminalManager.supplierTasks[roomName]) || [];
-    },
-
-    cleanupSupplierTasks: function() {
-        if (!Memory.terminalManager || !Memory.terminalManager.supplierTasks) return;
-        var activeIds = {};
-        var ops = Memory.terminalManager.operations || [];
-        for (var i = 0; i < ops.length; i++) {
-            if (ops[i] && ops[i].id) activeIds[ops[i].id] = true;
-        }
-        for (var roomName in Memory.terminalManager.supplierTasks) {
-            var list = Memory.terminalManager.supplierTasks[roomName];
-            if (!Array.isArray(list)) continue;
-            for (var j = list.length - 1; j >= 0; j--) {
-                if (!list[j] || !activeIds[list[j].opId]) {
-                    list.splice(j, 1);
-                }
-            }
-        }
-    },
-
-    // ===== MAIN LOOP FUNCTION =====
-    run: function() {
-        this.init();
-
-        // Initialize room state cache once per tick
-        getRoomState.init();
-
-        // Auto-cancel 'waiting' ops that are stuck > 5000 ticks (runs every 50 ticks)
-        // Local ops with no supply are cancelled after 1000 ticks
-        if (Game.time % 50 === 0) {
-            this.checkAndCancelStuckWaits(5000);
-        }
-
-        // Auto-balance: drain terminals with too much energy (runs every 50 ticks)
-        if (Game.time % 50 === 0) {
-            this.autoBalanceTerminalEnergy();
-        }
-
-        this.processOperations();
-        this.manageBots();
-        this.cleanupSupplierTasks();
-        this.cleanupCompletedOperations();
-    },
-
-    // ===== CONSOLE COMMANDS =====
-    transferStuff: function(fromRoom, toRoom, resourceType, amount) {
-        if (!this.validateResource(resourceType)) {
-            return '[Terminal] Invalid resource type: ' + resourceType;
-        }
-
-        if (amount === 'max') {
-            if (resourceType === RESOURCE_ENERGY) {
-                return '[Terminal] Cannot use \'max\' for energy.';
-            }
-            amount = this.getRoomTotalAvailable(fromRoom, resourceType);
-            if (amount <= 0) {
-                return '[Terminal] No ' + resourceType + ' available in ' + fromRoom;
-            }
-        }
-
-        if (!amount || amount <= 0) {
-            return '[Terminal] Invalid amount: ' + amount + '. Must be positive.';
-        }
-
-        if (!Game.rooms[fromRoom] || !Game.rooms[fromRoom].controller || !Game.rooms[fromRoom].controller.my) {
-            return '[Terminal] Invalid source room: ' + fromRoom + '. Must be a room you own.';
-        }
-
-        var sourceTerminal = Game.rooms[fromRoom].terminal;
-        if (!sourceTerminal) {
-            return '[Terminal] No terminal in source room: ' + fromRoom;
-        }
-
-        var have = (sourceTerminal.store && sourceTerminal.store[resourceType]) ? sourceTerminal.store[resourceType] : 0;
-        if (have < amount) {
-            console.log('[Terminal] Scheduling transfer with short terminal stock in ' + fromRoom + ': have ' + have + '/' + amount + ' ' + resourceType + '. A bot will be requested as needed.');
-        }
-
-        var destRoom = Game.rooms[toRoom];
-        var destHasTerminal = false;
-        if (destRoom) destHasTerminal = !!destRoom.terminal;
-        else destHasTerminal = true;
-
-        if (!destHasTerminal) {
-            return '[Terminal] No terminal visible in destination room: ' + toRoom;
-        }
-
-        var operation = {
-            id: 'transfer_' + Game.time + '_' + Math.random().toString(36).substr(2, 9),
-            type: 'transfer',
-            fromRoom: fromRoom,
-            toRoom: toRoom,
-            resourceType: resourceType,
-            amount: amount,
-            status: 'pending',
-            created: Game.time,
-            amountTransferred: 0
-        };
-
-        // ── storageManager v2: reserve the source-side terminal stock ──────
-        // TODO(storageManager-v2): when the terminal is short and a bot must bring
-        // the payload from storage, the storage portion is not reserved here.
-        // Reserve the shortfall in storage and hand it off to terminal as the bot
-        // moves it, to prevent other systems from claiming that storage stock.
-        if (this.v2Enabled(fromRoom)) {
-            var info = storageManager.storageFind(fromRoom, resourceType);
-            var termFree = info.terminal.total - info.terminal.reserved;
-            var storFree = info.storage.total - info.storage.reserved;
-            if (termFree < amount) {
-                console.log('[Terminal] v2 reserve warning: only ' + termFree + ' free of ' + amount + ' ' + resourceType + ' in ' + fromRoom + ' terminal. Op will queue and wait.');
-            }
-            var program = 'terminalManager_transfer_' + operation.id;
-            var reserveAmt = Math.min(amount, Math.max(0, termFree));
-            if (reserveAmt > 0) {
-                var rv = this.reserveOperationStock(operation, fromRoom, resourceType, 'terminal', reserveAmt, program);
-                if (rv.ok) {
-                    operation.reservationProgram = program;
-                    operation.reservationBuilding = 'terminal';
-                    operation.reservationRoom = fromRoom;
-                }
-            }
-            var shortfall = Math.max(0, amount - reserveAmt);
-            if (shortfall > 0 && storFree > 0) {
-                var storReserve = Math.min(shortfall, storFree);
-                this.reserveOperationStock(operation, fromRoom, resourceType, 'storage', storReserve, program);
-            }
-        }
-
-        Memory.terminalManager.operations.push(operation);
-
-        console.log('[Terminal] Transfer order created: ' + amount + ' ' + resourceType + ' from ' + fromRoom + ' to ' + toRoom);
-        return '[Terminal] Transfer order created: ' + amount + ' ' + resourceType + ' from ' + fromRoom + ' to ' + toRoom;
-    },
-
-    // NEW: Local, intra-room move: Storage/containers/labs -> Terminal
-    storageToTerminal: function(roomName, resourceType, amount) {
-        if (typeof roomName !== 'string' || !Game.rooms[roomName]) {
-            return '[Terminal] Invalid room: ' + roomName;
-        }
-        if (!this.validateResource(resourceType)) {
-            return '[Terminal] Invalid resource type: ' + resourceType;
-        }
-        var room = Game.rooms[roomName];
-        if (!room.controller || !room.controller.my) {
-            return '[Terminal] Room must be owned: ' + roomName;
-        }
-        var term = room.terminal;
-        if (!term) {
-            return '[Terminal] No terminal in ' + roomName;
-        }
-
-        if (amount === 'max') {
-            amount = this.getRoomAvailableOutsideTerminal(roomName, resourceType);
-        }
-
-        if (typeof amount !== 'number' || amount <= 0) {
-            return '[Terminal] Invalid amount: ' + amount + '. Must be positive.';
-        }
-
-        var op = {
-            id: 'local_' + Game.time + '_' + Math.random().toString(36).substr(2, 9),
-            type: 'toTerminal',
-            roomName: roomName,
-            resourceType: resourceType,
-            amount: amount,
-            amountMoved: 0,
-            status: 'pending',
-            created: Game.time
-        };
-
-        // ── storageManager v2: reserve the source-side (storage) stock ──────
-        if (this.v2Enabled(roomName)) {
-            var info = storageManager.storageFind(roomName, resourceType);
-            var storFree = info.storage.total - info.storage.reserved;
-            if (storFree < amount) {
-                console.log('[Terminal] v2 reserve warning: only ' + storFree + ' free of ' + amount + ' ' + resourceType + ' in ' + roomName + ' storage. Op will queue and wait.');
-            }
-            var reserveAmt = Math.min(amount, Math.max(0, storFree));
-            if (reserveAmt > 0) {
-                var rv = this.reserveOperationStock(op, roomName, resourceType, 'storage', reserveAmt, 'terminalManager_toTerm_' + op.id);
-                if (rv.ok) {
-                    op.reservationProgram = 'terminalManager_toTerm_' + op.id;
-                    op.reservationBuilding = 'storage';
-                    op.reservationRoom = roomName;
-                }
-            }
-        }
-
-        Memory.terminalManager.operations.push(op);
-
-        // Small local moves go to the room supplier; larger moves still use a terminalBot.
-        if (this.shouldUseSupplierForOp(op)) {
-            op.useSupplier = true;
-            this.addSupplierTask(roomName, op);
-            console.log('[Terminal] Local order queued for supplier: move ' + amount + ' ' + resourceType + ' to Terminal in ' + roomName);
-            return '[Terminal] Local order queued for supplier: move ' + amount + ' ' + resourceType + ' to Terminal in ' + roomName;
-        }
-
-        // Assign or request a bot to collect the resource into terminal
-        this.assignTerminalBot(roomName, 'collect', resourceType, op.id);
-
-        console.log('[Terminal] Local order created: move ' + amount + ' ' + resourceType + ' to Terminal in ' + roomName);
-        return '[Terminal] Local order created: move ' + amount + ' ' + resourceType + ' to Terminal in ' + roomName;
-    },
-
-    // NEW: Local, intra-room move: Terminal -> Storage (or container fallback)
-    terminalToStorage: function(roomName, resourceType, amount) {
-        if (typeof roomName !== 'string' || !Game.rooms[roomName]) {
-            return '[Terminal] Invalid room: ' + roomName;
-        }
-        if (!this.validateResource(resourceType)) {
-            return '[Terminal] Invalid resource type: ' + resourceType;
-        }
-        var room = Game.rooms[roomName];
-        if (!room.controller || !room.controller.my) {
-            return '[Terminal] Room must be owned: ' + roomName;
-        }
-        var term = room.terminal;
-        if (!term) {
-            return '[Terminal] No terminal in ' + roomName;
-        }
-
-        if (amount === 'max') {
-            amount = (term.store && term.store[resourceType]) ? term.store[resourceType] : 0;
-        }
-
-        if (typeof amount !== 'number' || amount <= 0) {
-            return '[Terminal] Invalid amount: ' + amount + '. Must be positive.';
-        }
-
-        var op = {
-            id: 'local_' + Game.time + '_' + Math.random().toString(36).substr(2, 9),
-            type: 'toStorage',
-            roomName: roomName,
-            resourceType: resourceType,
-            amount: amount,
-            amountMoved: 0,
-            status: 'pending',
-            created: Game.time
-        };
-
-        // ── storageManager v2: reserve the source-side (terminal) stock ────
-        if (this.v2Enabled(roomName)) {
-            var info = storageManager.storageFind(roomName, resourceType);
-            var termFree = info.terminal.total - info.terminal.reserved;
-            if (termFree < amount) {
-                console.log('[Terminal] v2 reserve warning: only ' + termFree + ' free of ' + amount + ' ' + resourceType + ' in ' + roomName + ' terminal. Op will queue and wait.');
-            }
-            var reserveAmt = Math.min(amount, Math.max(0, termFree));
-            if (reserveAmt > 0) {
-                var rv = this.reserveOperationStock(op, roomName, resourceType, 'terminal', reserveAmt, 'terminalManager_toStor_' + op.id);
-                if (rv.ok) {
-                    op.reservationProgram = 'terminalManager_toStor_' + op.id;
-                    op.reservationBuilding = 'terminal';
-                    op.reservationRoom = roomName;
-                }
-            }
-        }
-
-        Memory.terminalManager.operations.push(op);
-
-        // Small local moves go to the room supplier; larger moves still use a terminalBot.
-        if (this.shouldUseSupplierForOp(op)) {
-            op.useSupplier = true;
-            this.addSupplierTask(roomName, op);
-            console.log('[Terminal] Local order queued for supplier: move ' + amount + ' ' + resourceType + ' from Terminal to Storage in ' + roomName);
-            return '[Terminal] Local order queued for supplier: move ' + amount + ' ' + resourceType + ' from Terminal to Storage in ' + roomName;
-        }
-
-        // Assign or request a bot to drain the terminal into storage
-        this.assignTerminalBot(roomName, 'drain', resourceType, op.id);
-
-        console.log('[Terminal] Local order created: move ' + amount + ' ' + resourceType + ' from Terminal to Storage in ' + roomName);
-        return '[Terminal] Local order created: move ' + amount + ' ' + resourceType + ' from Terminal to Storage in ' + roomName;
-    },
-
-    status: function() {
-        var operations = Memory.terminalManager.operations;
-
-        if (operations.length === 0) {
-            return '[Terminal] No active operations.';
-        }
-
-        console.log('=== TERMINAL MANAGER STATUS ===');
-        console.log('Active operations: ' + operations.length);
-
-        for (var idx = 0; idx < operations.length; idx++) {
-            var op = operations[idx];
-            var statusText = '';
-            if (op.type === 'transfer') {
-                var tr = op.amountTransferred || 0;
-                if (tr < 0) tr = 0;
-                if (tr > op.amount) tr = op.amount;
-                statusText = 'TRANSFER: ' + op.amount + ' ' + op.resourceType + ' from ' + op.fromRoom + ' to ' + op.toRoom + ' (' + tr + '/' + op.amount + ' transferred)';
-            } else if (op.type === 'toTerminal') {
-                var mv1 = op.amountMoved || 0;
-                if (mv1 < 0) mv1 = 0;
-                if (mv1 > op.amount) mv1 = op.amount;
-                statusText = 'TO TERMINAL: ' + op.amount + ' ' + op.resourceType + ' in ' + op.roomName + ' (' + mv1 + '/' + op.amount + ' moved)';
-            } else if (op.type === 'toStorage') {
-                var mv2 = op.amountMoved || 0;
-                if (mv2 < 0) mv2 = 0;
-                if (mv2 > op.amount) mv2 = op.amount;
-                statusText = 'TO STORAGE: ' + op.amount + ' ' + op.resourceType + ' from terminal in ' + op.roomName + ' (' + mv2 + '/' + op.amount + ' moved)';
-            } else {
-                statusText = '[unknown op type]';
-            }
-            console.log('  ' + op.id + ': ' + statusText + ' [' + op.status + ']');
-        }
-
-        var bots = this.getAllTerminalBots();
-        console.log('Active terminal bots: ' + bots.length);
-        for (var b = 0; b < bots.length; b++) {
-            var bot = bots[b];
-            var roomName = (bot.room && bot.room.name) ? bot.room.name : bot.memory.terminalRoom;
-            console.log('  ' + bot.name + ': ' + (bot.memory.terminalTask || 'idle') + ' ' + (bot.memory.terminalResource || 'energy') + ' in ' + roomName + (bot.memory.terminalOperationId ? (' (op ' + bot.memory.terminalOperationId + ')') : ''));
-        }
-
-        return '[Terminal] Status displayed in console.';
-    },
-
-    // Detailed per-room terminal debug helper
-    whyTerminal: function(roomName) {
-        if (typeof roomName !== 'string' || roomName.length === 0) {
-            return '[Terminal] Provide a valid room name.';
-        }
-
-        var room = Game.rooms[roomName];
-        if (!room) return '[Terminal] Room not visible: ' + roomName;
-
-        var term = room.terminal;
-        if (!term) return '[Terminal] No terminal in ' + roomName;
-
-        var lines = [];
-        lines.push('=== TERMINAL DEBUG ' + roomName + ' ===');
-
-        var termEnergy = (term.store && term.store[RESOURCE_ENERGY]) ? term.store[RESOURCE_ENERGY] : 0;
-        lines.push('Terminal cooldown: ' + (term.cooldown || 0));
-        lines.push('Terminal energy: ' + termEnergy);
-
-        // Show operations relevant to this room
-        var ops = (Memory.terminalManager && Array.isArray(Memory.terminalManager.operations)) ? Memory.terminalManager.operations : [];
-        var foundAny = false;
-        for (var i = 0; i < ops.length; i++) {
-            var op = ops[i];
-            if (!op) continue;
-
-            // Inter-room transfer originating here
-            if (op.type === 'transfer' && op.fromRoom === roomName) {
-                foundAny = true;
-
-                var sent = op.amountTransferred || 0;
-                var remaining = Math.max(0, op.amount - sent);
-
-                var havePayload = (term.store && term.store[op.resourceType]) ? term.store[op.resourceType] : 0;
-                var cost = Game.market.calcTransactionCost(remaining, op.fromRoom, op.toRoom);
-                var energyNeeded = (op.resourceType === RESOURCE_ENERGY ? remaining : 0) + cost;
-
-                var payloadDeficit = Math.max(0, remaining - havePayload);
-                var energyDeficit = Math.max(0, energyNeeded - termEnergy);
-
-                var waitedTicks = 0;
-                if (typeof op._waitingSince === 'number') waitedTicks = Game.time - op._waitingSince;
-                else if (typeof op.created === 'number') waitedTicks = (op.status === 'waiting') ? (Game.time - op.created) : 0;
-
-                var reason = '';
-                if (op.status === 'waiting') {
-                    if (term.cooldown && term.cooldown > 0) reason = 'terminal cooldown';
-                    else if (payloadDeficit > 0) reason = 'waiting for payload';
-                    else if (energyDeficit > 0) reason = 'waiting for energy';
-                    else if (op.error) reason = op.error;
-                    else reason = 'unknown';
-                }
-
-                lines.push('- ' + op.id + ' [' + op.status + ']: ' +
-                           remaining + ' ' + op.resourceType + ' remaining; ' +
-                           'cost ' + cost + '; ' +
-                           'terminal has ' + havePayload + ' ' + op.resourceType + ', ' + termEnergy + ' energy' +
-                           (op.status === 'waiting' ? ('; reason: ' + reason + '; waited: ' + waitedTicks + ' ticks') : '') +
-                           (sent > 0 ? ('; sent so far: ' + sent) : '')
-                          );
-
-                lines.push('  energyNeededNow: ' + energyNeeded + ' (deficit: ' + energyDeficit + '), payloadDeficit: ' + payloadDeficit);
-            }
-
-            // Local: toTerminal in this room
-            if (op.type === 'toTerminal' && op.roomName === roomName) {
-                foundAny = true;
-                var moved = op.amountMoved || 0;
-                var remainingToMove = Math.max(0, op.amount - moved);
-                var haveOutside = this.getRoomAvailableOutsideTerminal(roomName, op.resourceType);
-                var termHave = (term.store && term.store[op.resourceType]) ? term.store[op.resourceType] : 0;
-
-                var reason2 = '';
-                if (op.status === 'waiting') {
-                    if (haveOutside <= 0) reason2 = 'no supply outside terminal';
-                    else if (op.error) reason2 = op.error;
-                    else reason2 = 'unknown';
-                }
-
-                lines.push('- ' + op.id + ' [toTerminal ' + op.status + ']: ' +
-                           remainingToMove + '/' + op.amount + ' ' + op.resourceType + ' remaining; ' +
-                           'outside supply: ' + haveOutside + '; terminal has: ' + termHave +
-                           (reason2 ? ('; reason: ' + reason2) : ''));
-            }
-
-            // Local: toStorage in this room
-            if (op.type === 'toStorage' && op.roomName === roomName) {
-                foundAny = true;
-                var moved2 = op.amountMoved || 0;
-                var remainingToMove2 = Math.max(0, op.amount - moved2);
-                var termHave2 = (term.store && term.store[op.resourceType]) ? term.store[op.resourceType] : 0;
-
-                var reason3 = '';
-                if (op.status === 'waiting') {
-                    if (termHave2 <= 0) reason3 = 'no payload in terminal';
-                    else if (op.error) reason3 = op.error;
-                    else reason3 = 'unknown';
-                }
-
-                lines.push('- ' + op.id + ' [toStorage ' + op.status + ']: ' +
-                           remainingToMove2 + '/' + op.amount + ' ' + op.resourceType + ' remaining; ' +
-                           'terminal has: ' + termHave2 +
-                           (reason3 ? ('; reason: ' + reason3) : ''));
-            }
-        }
-        if (!foundAny) {
-            lines.push('No transfer operations originating from ' + roomName + '.');
-        }
-
-        // Show bot requests for this room
-        var reqs = Memory.terminalManager && Array.isArray(Memory.terminalManager.bots) ? Memory.terminalManager.bots : [];
-        for (var r = 0; r < reqs.length; r++) {
-            var req = reqs[r];
-            if (!req) continue;
-            if (req.roomName !== roomName) continue;
-
-            lines.push('- bot request ' + req.id + ': ' + req.status + ' ' + req.task + ' ' + req.resourceType + (req.operationId ? (' (op ' + req.operationId + ')') : ''));
-        }
-
-        // Show active bot status (if any)
-        var bot = null;
-        var creeps = Game.creeps;
-        for (var name in creeps) {
-            var c = creeps[name];
-            if (!c || !c.memory) continue;
-            if (c.memory.role === 'terminalBot' && c.memory.terminalRoom === roomName) { bot = c; break; }
-        }
-
-        if (bot) {
-            var ws = (bot.memory.waitingState && bot.memory.waitingState.isWaiting) ? ('waiting since ' + bot.memory.waitingState.waitStartTime) : 'active';
-            var src = bot.memory.sourceId || 'none';
-            var res = bot.memory.terminalResource || RESOURCE_ENERGY;
-            lines.push('- bot ' + bot.name + ': task ' + (bot.memory.terminalTask || 'collect') + ' ' + res + '; ' + ws + '; source ' + src);
-
-            // Resource context for the bot's current target
-            var outside = this.getRoomAvailableOutsideTerminal(roomName, res);
-            var haveTerm = (term.store && term.store[res]) ? term.store[res] : 0;
-            var need = this.getResourceNeeded(roomName, res);
-            lines.push('- resource ' + res + ': needed ' + need + ', in terminal ' + haveTerm + ', outside ' + outside);
-        } else {
-            lines.push('No active terminal bot in ' + roomName + '.');
-        }
-
-        for (var li = 0; li < lines.length; li++) console.log(lines[li]);
-        return '[Terminal] Debug printed for ' + roomName;
-    },
-
-    cancelOperation: function(operationId) {
-        var operations = Memory.terminalManager.operations;
-        var index = -1;
-        for (var i = 0; i < operations.length; i++) {
-            if (operations[i] && operations[i].id === operationId) { index = i; break; }
-        }
-
-        if (index === -1) {
-            return '[Terminal] Operation not found: ' + operationId;
-        }
-
-        // Remove any pending bot requests tied to this operation
-        if (Memory.terminalManager && Array.isArray(Memory.terminalManager.bots)) {
-            for (var j = Memory.terminalManager.bots.length - 1; j >= 0; j--) {
-                var req = Memory.terminalManager.bots[j];
-                if (req && req.operationId === operationId) {
-                    console.log('[Terminal] Removing bot request linked to cancelled op: ' + req.id);
-                    Memory.terminalManager.bots.splice(j, 1);
-                }
-            }
-        }
-
-        // Clear any live bot's memory referencing this operation
-        var creeps = Game.creeps;
-        for (var cname in creeps) {
-            var c = creeps[cname];
-            if (c && c.memory && c.memory.terminalOperationId === operationId) {
-                delete c.memory.terminalOperationId;
-                delete c.memory.sourceId;
-                console.log('[Terminal] Cleared operation link from bot: ' + cname);
-            }
-        }
-
-        // Remove any supplier task linked to this operation
-        if (Memory.terminalManager && Memory.terminalManager.supplierTasks) {
-            for (var stRoom in Memory.terminalManager.supplierTasks) {
-                var stList = Memory.terminalManager.supplierTasks[stRoom];
-                if (!Array.isArray(stList)) continue;
-                for (var k = stList.length - 1; k >= 0; k--) {
-                    if (stList[k] && stList[k].opId === operationId) {
-                        stList.splice(k, 1);
-                    }
-                }
-            }
-        }
-
-        // Release v2 reservation before removing the op from the array
-        this.releaseOpReservation(operations[index]);
-
-        operations.splice(index, 1);
-        console.log('[Terminal] Cancelled operation: ' + operationId);
-        return '[Terminal] Cancelled operation: ' + operationId;
-    },
-
-    // ===== OPERATION PROCESSING =====
-    processOperations: function() {
-        var operations = Memory.terminalManager.operations;
-
-        for (var i = 0; i < operations.length; i++) {
-            var operation = operations[i];
-            if (!operation) continue;
-
-            if (operation.type === 'transfer') {
-                this.processTransfer(operation);
-            } else if (operation.type === 'toTerminal') {
-                this.processToTerminal(operation);
-            } else if (operation.type === 'toStorage') {
-                this.processToStorage(operation);
-            }
-        }
-    },
-
-    // ROBUST transfer with cost/cooldown checks and partial sends.
-    processTransfer: function(operation) {
-        var sourceRoom = Game.rooms[operation.fromRoom];
-
-        if (!sourceRoom) {
-            operation.status = 'failed';
-            operation.error = 'Source room not accessible';
-            this.releaseOpReservation(operation);
-            return;
-        }
-
-        var sourceTerminal = sourceRoom.terminal;
-        if (!sourceTerminal) {
-            operation.status = 'failed';
-            operation.error = 'No terminal in source room';
-            this.releaseOpReservation(operation);
-            return;
-        }
-
-        var transferredSoFar = operation.amountTransferred || 0;
-        var remaining = operation.amount - transferredSoFar;
-
-        if (remaining <= 0) {
-            if (operation.status !== 'completed') {
-                operation.status = 'completed';
-                console.log('[Terminal] Transfer completed: ' + operation.amount + ' ' + operation.resourceType + ' from ' + operation.fromRoom + ' to ' + operation.toRoom);
-                this.sendNotification('Transfer completed: ' + operation.amount + ' ' + operation.resourceType + ' from ' + operation.fromRoom + ' to ' + operation.toRoom);
-            }
-            // Release v2 reservation on completion
-            this.releaseOpReservation(operation);
-            return;
-        }
-
-        // Respect terminal cooldown: cannot send if > 0
-        if (sourceTerminal.cooldown && sourceTerminal.cooldown > 0) {
-            if (operation.status !== 'active') operation.status = 'waiting';
-            if (typeof operation._waitingSince !== 'number') operation._waitingSince = Game.time;
-            return;
-        }
-
-        // Current terminal stocks
-        var payloadAvail = (sourceTerminal.store && sourceTerminal.store[operation.resourceType]) ? sourceTerminal.store[operation.resourceType] : 0;
-        var energyAvail  = (sourceTerminal.store && sourceTerminal.store[RESOURCE_ENERGY]) ? sourceTerminal.store[RESOURCE_ENERGY] : 0;
-
-        function costFor(x) {
-            return Game.market.calcTransactionCost(x, operation.fromRoom, operation.toRoom);
-        }
-
-        // Decide maximum candidate amount based on payload in terminal
-        var maxCandidate = Math.min(remaining, payloadAvail);
-
-        // Request bots if we're short (preserves behavior)
-        if (operation.resourceType === RESOURCE_ENERGY) {
-            var reqCost = costFor(Math.min(remaining, payloadAvail));
-            var requiredTotal = Math.min(remaining, payloadAvail) + reqCost;
-            if (energyAvail < requiredTotal) {
-                terminalManager.requestBot(operation.fromRoom, 'collect', RESOURCE_ENERGY, operation.id);
-            }
-        } else {
-            if (payloadAvail < remaining) {
-                terminalManager.requestBot(operation.fromRoom, 'collect', operation.resourceType, operation.id);
-            }
-            var costNeed = costFor(Math.min(remaining, payloadAvail));
-            if (energyAvail < costNeed) {
-                terminalManager.requestBot(operation.fromRoom, 'collect', RESOURCE_ENERGY, operation.id);
-            }
-        }
-
-        if (maxCandidate <= 0) {
-            operation.status = 'waiting';
-            operation.error = 'Waiting for resources';
-            if (typeof operation._waitingSince !== 'number') operation._waitingSince = Game.time;
-            return;
-        }
-
-        function fits(amount) {
-            var cost = costFor(amount);
-            var energyNeeded = (operation.resourceType === RESOURCE_ENERGY ? amount : 0) + cost;
-            return energyAvail >= energyNeeded;
-        }
-
-        var sendAmount = maxCandidate;
-        if (!fits(sendAmount)) {
-            // Binary search for largest affordable amount
-            var low = 0, high = maxCandidate;
-            while (low < high) {
-                var mid = Math.floor((low + high + 1) / 2);
-                if (fits(mid)) low = mid;
-                else high = mid - 1;
-            }
-            sendAmount = low;
-        }
-
-        if (sendAmount <= 0) {
-            operation.status = 'waiting';
-            operation.error = 'Waiting for energy';
-            if (typeof operation._waitingSince !== 'number') operation._waitingSince = Game.time;
-            return;
-        }
-
-        var transferCost = costFor(sendAmount);
-
-        var result = sourceTerminal.send(operation.resourceType, sendAmount, operation.toRoom);
-        if (result === OK) {
-            if (operation.reservationProgram) {
-                this.consumeOperationStock(operation, operation.fromRoom, operation.resourceType, 'terminal', sendAmount, operation.reservationProgram);
-            }
-            operation.amountTransferred = (operation.amountTransferred || 0) + sendAmount;
-            if (operation.amountTransferred >= operation.amount) {
-                operation.status = 'completed';
-                console.log('[Terminal] Transferred ' + operation.amount + ' ' + operation.resourceType + ' from ' + operation.fromRoom + ' to ' + operation.toRoom + ' (final chunk cost: ' + transferCost + ' energy)');
-                this.sendNotification('Transfer completed: ' + operation.amount + ' ' + operation.resourceType + ' from ' + operation.fromRoom + ' to ' + operation.toRoom);
-            } else {
-                operation.status = 'active';
-            }
-            if (typeof operation._waitingSince === 'number') delete operation._waitingSince;
-        } else {
-            if (operation.amountTransferred > 0) operation.status = 'active';
-            else operation.status = 'waiting';
-            if (typeof operation._waitingSince !== 'number') operation._waitingSince = Game.time;
-        }
-    },
-
-    // Local: move resources into the terminal (no early complete by existing stock)
-    processToTerminal: function(operation) {
-        if (operation.status === 'completed' || operation.status === 'failed') {
-            return;
-        }
-        var room = Game.rooms[operation.roomName];
-        if (!room || !room.controller || !room.controller.my) {
-            operation.status = 'failed';
-            operation.error = 'Room not accessible or not owned';
-            this.releaseOpReservation(operation);
-            return;
-        }
-        var terminal = room.terminal;
-        if (!terminal) {
-            operation.status = 'failed';
-            operation.error = 'No terminal in room';
-            this.releaseOpReservation(operation);
-            return;
-        }
-
-        // Respect terminal capacity (do not complete by stock)
-        var termFree = 0;
-        if (terminal.store && typeof terminal.store.getFreeCapacity === 'function') {
-            termFree = terminal.store.getFreeCapacity(operation.resourceType);
-        } else {
-            termFree = 1; // conservative fallback
-        }
-        if (termFree <= 0) {
-            operation.status = 'waiting';
-            operation.error = 'Terminal full';
-            if (typeof operation._waitingSince !== 'number') operation._waitingSince = Game.time;
-            if (!operation.useSupplier) {
-                this.assignTerminalBot(operation.roomName, 'collect', operation.resourceType, operation.id);
-            }
-            return;
-        }
-
-        var moved = operation.amountMoved || 0;
-        var remaining = operation.amount - moved;
-        if (remaining <= 0) {
-            if (operation.status !== 'completed') {
-                operation.status = 'completed';
-                console.log('[Terminal] Local toTerminal completed: ' + operation.amount + ' ' + operation.resourceType + ' in ' + operation.roomName);
-                this.sendNotification('Local toTerminal completed: ' + operation.amount + ' ' + operation.resourceType + ' in ' + operation.roomName);
-            }
-            this.releaseOpReservation(operation);
-            return;
-        }
-
-        var outside = this.getRoomAvailableOutsideTerminal(operation.roomName, operation.resourceType);
-        if (outside <= 0) {
-            operation.status = 'waiting';
-            operation.error = 'No supply outside terminal';
-            if (typeof operation._waitingSince !== 'number') operation._waitingSince = Game.time;
-            // still try to assign bot (will idle) unless supplier is handling it
-            if (!operation.useSupplier) {
-                this.assignTerminalBot(operation.roomName, 'collect', operation.resourceType, operation.id);
-            }
-            return;
-        }
-
-        // Assign/retask a bot to collect this resource, unless a supplier task is queued.
-        if (!operation.useSupplier) {
-            this.assignTerminalBot(operation.roomName, 'collect', operation.resourceType, operation.id);
-        }
-        operation.status = 'active';
-        if (typeof operation._waitingSince === 'number') delete operation._waitingSince;
-    },
-
-    // Local: drain resources from the terminal into storage/container
-    processToStorage: function(operation) {
-        var room = Game.rooms[operation.roomName];
-        if (!room || !room.controller || !room.controller.my) {
-            operation.status = 'failed';
-            operation.error = 'Room not accessible or not owned';
-            this.releaseOpReservation(operation);
-            return;
-        }
-        var terminal = room.terminal;
-        if (!terminal) {
-            operation.status = 'failed';
-            operation.error = 'No terminal in room';
-            this.releaseOpReservation(operation);
-            return;
-        }
-
-        // FIX: For auto-balance energy drain ops, complete early if terminal energy
-        // is already at or below the target level (e.g. supplier drained it first).
-        if (operation.autoBalance && operation.resourceType === RESOURCE_ENERGY) {
-            var targetLevel = (Memory.terminalManager.settings && typeof Memory.terminalManager.settings.energyTargetLevel === 'number')
-                ? Memory.terminalManager.settings.energyTargetLevel : 20000;
-            var currentEnergy = (terminal.store && terminal.store[RESOURCE_ENERGY]) ? terminal.store[RESOURCE_ENERGY] : 0;
-            if (currentEnergy <= targetLevel) {
-                if (operation.status !== 'completed') {
-                    operation.status = 'completed';
-                    console.log('[Terminal] Auto-balance completed early: terminal energy in ' + operation.roomName + ' is ' + currentEnergy + ' (target: ' + targetLevel + ')');
-                }
-                this.releaseOpReservation(operation);
-                return;
-            }
-        }
-
-        var moved = operation.amountMoved || 0;
-        var remaining = operation.amount - moved;
-        if (remaining <= 0) {
-            if (operation.status !== 'completed') {
-                operation.status = 'completed';
-                console.log('[Terminal] Local toStorage completed: ' + operation.amount + ' ' + operation.resourceType + ' in ' + operation.roomName);
-                this.sendNotification('Local toStorage completed: ' + operation.amount + ' ' + operation.resourceType + ' in ' + operation.roomName);
-            }
-            this.releaseOpReservation(operation);
-            return;
-        }
-
-        var inTerm = (terminal.store && terminal.store[operation.resourceType]) ? terminal.store[operation.resourceType] : 0;
-        if (inTerm <= 0) {
-            operation.status = 'waiting';
-            operation.error = 'No payload in terminal';
-            if (typeof operation._waitingSince !== 'number') operation._waitingSince = Game.time;
-            // still try to assign bot (will idle) unless supplier is handling it
-            if (!operation.useSupplier) {
-                this.assignTerminalBot(operation.roomName, 'drain', operation.resourceType, operation.id);
-            }
-            return;
-        }
-
-        if (!operation.useSupplier) {
-            this.assignTerminalBot(operation.roomName, 'drain', operation.resourceType, operation.id);
-        }
-        operation.status = 'active';
-        if (typeof operation._waitingSince === 'number') delete operation._waitingSince;
-    },
-
-    // ===== BOT MANAGEMENT =====
-    manageBots: function() {
-        // Remove dead bot requests pointing to dead creeps
-        var bots = Memory.terminalManager.bots;
-        for (var i = bots.length - 1; i >= 0; i--) {
-            if (bots[i].botName && !Game.creeps[bots[i].botName]) {
-                bots.splice(i, 1);
-            }
-        }
-
-        this.cleanupStaleRequests();
-
-        // NEW: proactively request bots for marketSell deficits (no energy consideration)
-        this.ensureBotsForMarketSellNeeds();
-
-        this.processSpawnRequests();
-
-        if (Memory.terminalManager.settings.runBotsFromManager) {
-            var activeBots = this.getAllTerminalBots();
-            for (var b = 0; b < activeBots.length; b++) this.runTerminalBot(activeBots[b]);
-        }
-    },
-
-    cleanupStaleRequests: function() {
-        var requests = Memory.terminalManager.bots;
-
-        for (var i = requests.length - 1; i >= 0; i--) {
-            var request = requests[i];
-
-            // If a live bot exists in that room, drop extra requests (hard cap 1)
-            var aliveInRoom = false;
-            var allBots = this.getAllTerminalBots();
-            for (var ab = 0; ab < allBots.length; ab++) {
-                if (allBots[ab].memory && allBots[ab].memory.terminalRoom === request.roomName) { aliveInRoom = true; break; }
-            }
-            if (aliveInRoom && (request.status === 'requested' || request.status === 'spawning')) {
-                requests.splice(i, 1);
-                continue;
-            }
-
-            // Fast remove if no longer needed OR no supply outside the terminal
-            if (request.status === 'requested' || request.status === 'spawning') {
-                var room = Game.rooms[request.roomName];
-                var term = room && room.terminal ? room.terminal : null;
-
-                // For collect tasks, check need/outside supply; for drain tasks, check terminal payload
-                if (request.task === 'collect') {
-                    var outside = this.getRoomAvailableOutsideTerminal(request.roomName, request.resourceType);
-
-                    var handledByLocalOp = false;
-                    if (request.operationId) {
-                        var opsC = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-                        for (var kc = 0; kc < opsC.length; kc++) {
-                            var oc = opsC[kc];
-                            if (!oc) continue;
-                            if (oc.id === request.operationId &&
-                                oc.type === 'toTerminal' &&
-                                oc.roomName === request.roomName &&
-                                oc.resourceType === request.resourceType) {
-                                handledByLocalOp = true;
-                                var movedC = oc.amountMoved || 0;
-                                var remC = Math.max(0, oc.amount - movedC);
-                                if (remC <= 0 || outside <= 0) {
-                                    requests.splice(i, 1);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if (!handledByLocalOp) {
-                        var have = (term && term.store && term.store[request.resourceType]) ? term.store[request.resourceType] : 0;
-                        var need = Math.max(0, this.getResourceNeeded(request.roomName, request.resourceType) - have);
-                        if (need <= 0 || outside <= 0) {
-                            requests.splice(i, 1);
-                        }
-                    }
-                    continue;
-                } else if (request.task === 'drain') {
-                    var inTerm = (term && term.store && term.store[request.resourceType]) ? term.store[request.resourceType] : 0;
-                    if (inTerm <= 0) {
-                        requests.splice(i, 1);
-                        continue;
-                    }
-                }
-            }
-
-            if (request.status === 'completed' && (Game.time - request.created) > 100) {
-                requests.splice(i, 1);
-                continue;
-            }
-
-            if (request.status === 'spawning' && request.botName && !Game.creeps[request.botName]) {
-                console.log('[Terminal] Cleaning up failed spawn request: ' + request.id);
-                requests.splice(i, 1);
-                continue;
-            }
-
-            if ((Game.time - request.created) > 500) {
-                console.log('[Terminal] Cleaning up stale request: ' + request.id + ' (age: ' + (Game.time - request.created) + ' ticks)');
-                requests.splice(i, 1);
-                continue;
-            }
-
-            if (request.status === 'spawning' && request.botName && Game.creeps[request.botName]) {
-                request.status = 'completed';
-            }
-        }
-    },
-
-    // Hard cap: exactly one bot per room, counting alive + spawning + requested
-    getInFlightTerminalBotCount: function(roomName) {
-        var count = 0;
-
-        // Alive
-        var creeps = Game.creeps;
-        for (var name in creeps) {
-            var c = creeps[name];
-            if (!c || !c.memory) continue;
-            if (c.memory.role === 'terminalBot' && c.memory.terminalRoom === roomName) count++;
-        }
-
-        // Spawning + requested
-        var requests = Memory.terminalManager.bots || [];
-        for (var i = 0; i < requests.length; i++) {
-            var r = requests[i];
-            if (r.roomName !== roomName) continue;
-            if (r.status === 'spawning' || r.status === 'requested') count++;
-        }
-
-        return count;
-    },
-
-    // requestBot always honors automatic spawning. operationId remains for linking. (collect tasks)
-    requestBot: function(roomName, task, resourceType, operationId) {
-        var room = Game.rooms[roomName];
-        if (singleSourceRoom.isSingleSourceActive(roomName)) return false;
-        if (!room || !room.controller || !room.controller.my) return false;
-
-        // 1) Calculate net need and bail if nothing is needed
-        var needed = this.getResourceNeeded(roomName, resourceType);
-        var have = (room.terminal && room.terminal.store && room.terminal.store[resourceType]) ? room.terminal.store[resourceType] : 0;
-        var netNeeded = Math.max(0, needed - have);
-        if (netNeeded <= 0) {
-            return false;
-        }
-
-        // 1b) Ensure there is some supply in-room (outside the terminal) to move
-        var outside = this.getRoomAvailableOutsideTerminal(roomName, resourceType);
-        if (outside <= 0) {
-            return false;
-        }
-
-        // 2) Hard cap: exactly one per room
-        var maxBots = 1;
-        var inFlight = this.getInFlightTerminalBotCount(roomName);
-        if (inFlight >= maxBots) {
-            return false;
-        }
-
-        // 3) If a request already exists for the room, skip
-        var existingRequest = null;
-        var reqs = Memory.terminalManager.bots || [];
-        for (var i = 0; i < reqs.length; i++) {
-            var r = reqs[i];
-            if (r.roomName === roomName && (r.status === 'requested' || r.status === 'spawning')) { existingRequest = r; break; }
-        }
-        if (existingRequest) {
-            return false;
-        }
-
-        var newRequest = {
-            id: 'bot_' + Game.time + '_' + Math.random().toString(36).substr(2, 9),
-            roomName: roomName,
-            task: task,
-            resourceType: resourceType,
-            status: 'requested',
-            created: Game.time
-        };
-        if (operationId) newRequest.operationId = operationId;
-
-        Memory.terminalManager.bots.push(newRequest);
-        console.log('[Terminal] Requested bot for ' + task + ' ' + resourceType + ' in ' + roomName + ' (needed: ' + netNeeded + ', outside: ' + outside + (operationId ? (', op: ' + operationId) : '') + ')');
-        return true;
-    },
-
-    // Assign an existing bot if present; otherwise create/adjust a spawn request (works for collect or drain).
-    // FIX: Will NOT retask a bot that is currently carrying cargo (mid-delivery).
-    assignTerminalBot: function(roomName, task, resourceType, operationId) {
-        var room = Game.rooms[roomName];
-        // In single-source rooms, ComboBot handles terminal duties — don't spawn bots
-        if (singleSourceRoom.isSingleSourceActive(roomName)) return false;
-        if (!room || !room.controller || !room.controller.my) return false;
-
-        // 0) Try to retask an alive terminalBot in this room
-        var creeps = Game.creeps;
-        for (var name in creeps) {
-            var c = creeps[name];
-            if (!c || !c.memory) continue;
-            if (c.memory.role === 'terminalBot' && c.memory.terminalRoom === roomName) {
-                // FIX: Don't retask a bot that is carrying cargo — let it finish
-                // its current delivery so progress is credited to the correct op.
-                if (c.store && c.store.getUsedCapacity() > 0) {
-                    return true; // bot exists and is busy; no new spawn needed
-                }
-                c.memory.terminalTask = task;
-                c.memory.terminalResource = resourceType;
-                c.memory.terminalRoom = roomName;
-                c.memory.terminalOperationId = operationId;
-                // Link op to this bot
-                var ops = Memory.terminalManager.operations;
-                for (var i = 0; i < ops.length; i++) {
-                    var op = ops[i];
-                    if (op && op.id === operationId) { op.botId = c.name; break; }
-                }
-                return true;
-            }
-        }
-
-        // 1) Check existing pending request for this room; update it to our needs
-        var reqs = Memory.terminalManager.bots || [];
-        for (var r = 0; r < reqs.length; r++) {
-            var req = reqs[r];
-            if (!req) continue;
-            if (req.roomName === roomName && (req.status === 'requested' || req.status === 'spawning')) {
-                req.task = task;
-                req.resourceType = resourceType;
-                if (operationId) req.operationId = operationId;
-                return true;
-            }
-        }
-
-        // 2) Otherwise create a new request (hard cap and logic handled elsewhere)
-        var newRequest = {
-            id: 'bot_' + Game.time + '_' + Math.random().toString(36).substr(2, 9),
-            roomName: roomName,
-            task: task,
-            resourceType: resourceType,
-            status: 'requested',
-            created: Game.time
-        };
-        if (operationId) newRequest.operationId = operationId;
-
-        Memory.terminalManager.bots.push(newRequest);
-        console.log('[Terminal] Requested bot (assign) for ' + task + ' ' + resourceType + ' in ' + roomName + (operationId ? (' (op: ' + operationId + ')') : ''));
-        return true;
-    },
-
-    processSpawnRequests: function() {
-        var all = Memory.terminalManager.bots || [];
-        var requests = [];
-        for (var i = 0; i < all.length; i++) if (all[i].status === 'requested') requests.push(all[i]);
-
-        for (var idx = 0; idx < requests.length; idx++) {
-            var request = requests[idx];
-            var room = Game.rooms[request.roomName];
-            if (!room) continue;
-
-            // If an alive bot exists now, drop this request (hard cap)
-            var aliveBot = null;
-            var creeps = Game.creeps;
-            for (var name in creeps) {
-                var c = creeps[name];
-                if (c && c.memory && c.memory.role === 'terminalBot' && c.memory.terminalRoom === request.roomName) { aliveBot = c; break; }
-            }
-            if (aliveBot) {
-                request.status = 'completed';
-                continue;
-            }
-
-            // Re-check viability before committing to spawn
-            var terminal = room.terminal;
-
-            if (request.task === 'collect') {
-                // FIX: consider transfer ops when operationId is present, not only local toTerminal
-                var outsideP = this.getRoomAvailableOutsideTerminal(request.roomName, request.resourceType);
-                var haveP = (terminal && terminal.store && terminal.store[request.resourceType]) ? terminal.store[request.resourceType] : 0;
-
-                var netNeed = 0;
-                var handledByOpId = false;
-
-                if (request.operationId) {
-                    var opsP = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-                    for (var kp = 0; kp < opsP.length; kp++) {
-                        var opP = opsP[kp];
-                        if (!opP) continue;
-                        if (opP.id !== request.operationId) continue;
-
-                        // Local toTerminal op: need is remaining to move (do not subtract terminal stock)
-                        if (opP.type === 'toTerminal' &&
-                            opP.roomName === request.roomName &&
-                            opP.resourceType === request.resourceType) {
-                            handledByOpId = true;
-                            var movedP = opP.amountMoved || 0;
-                            var remainLocal = Math.max(0, opP.amount - movedP);
-                            netNeed = remainLocal;
-                            break;
-                        }
-
-                        // Transfer op: need depends on requested resource (payload vs energy)
-                        if (opP.type === 'transfer' &&
-                            opP.fromRoom === request.roomName) {
-                            handledByOpId = true;
-
-                            if (request.resourceType === RESOURCE_ENERGY) {
-                                var remainingT = Math.max(0, opP.amount - (opP.amountTransferred || 0));
-                                if (remainingT > 0) {
-                                    var costT = Game.market.calcTransactionCost(remainingT, opP.fromRoom, opP.toRoom);
-                                    if (opP.resourceType === RESOURCE_ENERGY) {
-                                        netNeed = Math.max(0, (remainingT + costT) - haveP);
-                                    } else {
-                                        netNeed = Math.max(0, costT - haveP);
-                                    }
-                                } else {
-                                    netNeed = 0;
-                                }
-                            } else if (request.resourceType === opP.resourceType) {
-                                var remainingPayload = Math.max(0, opP.amount - (opP.amountTransferred || 0));
-                                netNeed = Math.max(0, remainingPayload - haveP);
-                            } else {
-                                netNeed = 0;
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                if (!handledByOpId) {
-                    // Aggregated fallback (transfer + local needs)
-                    var totalNeed = this.getResourceNeeded(request.roomName, request.resourceType);
-                    netNeed = Math.max(0, totalNeed - haveP);
-                }
-
-                if (netNeed <= 0 || outsideP <= 0) {
-                    request.status = 'completed';
-                    continue;
-                }
-
-            } else if (request.task === 'drain') {
-                var inTerm = (terminal && terminal.store && terminal.store[request.resourceType]) ? terminal.store[request.resourceType] : 0;
-                if (inTerm <= 0) {
-                    request.status = 'completed';
-                    continue;
-                }
-            }
-
-            // Hard cap check again
-            var maxBots = 1;
-            var inFlight = this.getInFlightTerminalBotCount(request.roomName);
-            if (inFlight > maxBots) {
-                continue;
-            }
-
-            // Find available spawn using getRoomState instead of room.find
-            var state = getRoomState.get(request.roomName);
-            if (!state) continue;
-            var stMap = state.structuresByType || {};
-            var spawnList = stMap[STRUCTURE_SPAWN] || [];
-            var spawns = [];
-            for (var si = 0; si < spawnList.length; si++) {
-                var s = spawnList[si];
-                if (s.my && !s.spawning) spawns.push(s);
-            }
-            var spawn = spawns.length > 0 ? spawns[0] : null;
-            if (!spawn) continue;
-
-            var body = this.getCreepBody('supplier', spawn.room.energyAvailable);
-            var cost = this.bodyCost(body);
-            if (cost > spawn.room.energyAvailable) continue;
-
-            var name = 'TerminalBot_' + request.roomName + '_' + Game.time;
-            var memory = {
-                role: 'terminalBot',
-                terminalTask: request.task,
-                terminalRoom: request.roomName,
-                terminalResource: request.resourceType,
-                terminalRequestId: request.id
-            };
-            if (request.operationId) memory.terminalOperationId = request.operationId;
-
-            var result = spawn.spawnCreep(body, name, { memory: memory });
-            if (result === OK) {
-                request.status = 'spawning';
-                request.botName = name;
-
-                // Link to a relevant operation if any
-                var operations = Memory.terminalManager.operations;
-                if (request.operationId) {
-                    for (var i2 = 0; i2 < operations.length; i2++) {
-                        if (operations[i2].id === request.operationId) {
-                            operations[i2].botId = name;
-                            console.log('[Terminal] Linked bot ' + name + ' to operation ' + operations[i2].id);
-                            break;
-                        }
-                    }
-                } else {
-                    for (var j = 0; j < operations.length; j++) {
-                        var op = operations[j];
-                        var matchesRoom = (op.roomName === request.roomName || op.fromRoom === request.roomName);
-                        var matchesRes = (op.resourceType === request.resourceType);
-                        var statusOk = (op.status === 'waiting' || op.status === 'pending' || op.status === 'active' || op.status === 'dealing');
-                        if (matchesRoom && matchesRes && !op.botId && statusOk) {
-                            op.botId = name;
-                            console.log('[Terminal] Linked bot ' + name + ' to operation ' + op.id);
-                            break;
-                        }
-                    }
-                }
-
-                console.log('[Terminal] Spawning terminal bot: ' + name + ' for ' + request.task + ' ' + request.resourceType);
-            }
-        }
-    },
-
-    // SAFE BOT RUNNER WRAPPER (use this if your main loop calls runTerminalBot)
-    runTerminalBot: function(creep) {
-        var roomName = creep.memory.terminalRoom || (creep.room && creep.room.name ? creep.room.name : null);
-        if (!roomName) {
-            creep.say('no room');
-            return;
-        }
-        if (!creep.memory.terminalRoom) {
-            creep.memory.terminalRoom = roomName;
-        }
-
-        var room = Game.rooms[roomName];
-        if (!room) {
-            creep.moveTo(new RoomPosition(25, 25, roomName), { reusePath: 20 });
-            creep.say('home');
-            return;
-        }
-
-        var terminal = room.terminal;
-        if (!terminal) {
-            creep.say('no term');
-            return;
-        }
-
-        if (creep.memory.role !== 'terminalBot') {
-            creep.memory.role = 'terminalBot';
-        }
-
-        var task = creep.memory.terminalTask || 'collect';
-        var resourceType = creep.memory.terminalResource || RESOURCE_ENERGY;
-
-        switch (task) {
-            case 'drain':
-                this.runDrainBot(creep, room.name, resourceType);
-                break;
-            case 'collect':
-            default:
-                this.runCollectBot(creep, room.name, resourceType);
-                break;
-        }
-    },
-
-    // Returns next needed resource for the room based on active transfer operations (non-energy prioritized)
-    // Extended to include marketSell gather operations (no energy considered for marketSell).
-    findNextNeededResourceForRoom: function(roomName) {
-        var room = Game.rooms[roomName];
-        var terminal = room && room.terminal ? room.terminal : null;
-        if (!terminal) return null;
-
-        var bestResource = null;
-        var bestDeficit = 0;
-        var energyNeeded = 0;
-
-        // Existing: consider transfer operations
-        var ops = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-
-        for (var i = 0; i < ops.length; i++) {
-            var op = ops[i];
-            if (!op) continue;
-            if (op.status === 'completed' || op.status === 'failed') continue;
-
-            if (op.type === 'transfer' && op.fromRoom === roomName) {
-                var remaining = Math.max(0, op.amount - (op.amountTransferred || 0));
-                if (remaining <= 0) continue;
-
-                if (op.resourceType === RESOURCE_ENERGY) {
-                    // Energy consideration remains only for transfer operations
-                    var costE = Game.market.calcTransactionCost(remaining, op.fromRoom, op.toRoom);
-                    var required = remaining + costE;
-                    var termE = (terminal.store && terminal.store[RESOURCE_ENERGY]) ? terminal.store[RESOURCE_ENERGY] : 0;
-                    var deficitE = Math.max(0, required - termE);
-                    if (deficitE > 0) energyNeeded += deficitE;
-                } else {
-                    var termHave = (terminal.store && terminal.store[op.resourceType]) ? terminal.store[op.resourceType] : 0;
-                    var deficit = Math.max(0, remaining - termHave);
-                    if (deficit > bestDeficit) {
-                        bestDeficit = deficit;
-                        bestResource = op.resourceType;
-                    }
-                    var cost = Game.market.calcTransactionCost(remaining, op.fromRoom, op.toRoom);
-                    var termE2 = (terminal.store && terminal.store[RESOURCE_ENERGY]) ? terminal.store[RESOURCE_ENERGY] : 0;
-                    var eDef = Math.max(0, cost - termE2);
-                    if (eDef > 0) energyNeeded += eDef;
-                }
-            }
-
-            // NEW: include local toTerminal ops as "need inside terminal"
-            if (op.type === 'toTerminal' && op.roomName === roomName) {
-                var moved = op.amountMoved || 0;
-                var remainLocal = Math.max(0, op.amount - moved);
-                if (remainLocal > bestDeficit) {
-                    bestDeficit = remainLocal;
-                    bestResource = op.resourceType;
-                }
-            }
-        }
-
-        // NEW: consider marketSell gather operations for this room (no energy)
-        var msOps = (Memory.marketSell && Array.isArray(Memory.marketSell.operations)) ? Memory.marketSell.operations : [];
-        for (var j = 0; j < msOps.length; j++) {
-            var m = msOps[j];
-            if (!m) continue;
-            if (m.roomName !== roomName) continue;
-            if (m.status === 'completed' || m.status === 'cancelled') continue;
-            if (typeof m.expires === 'number' && Game.time > m.expires) continue;
-            if (typeof m.target !== 'number' || m.target <= 0) continue;
-
-            var have = (terminal.store && terminal.store[m.resourceType]) ? terminal.store[m.resourceType] : 0;
-            var deficitMs = Math.max(0, m.target - have);
-            if (deficitMs > bestDeficit) {
-                bestDeficit = deficitMs;
-                bestResource = m.resourceType;
-            }
-        }
-
-        if (bestResource) return bestResource;
-        // If nothing else, consider energy needed for transfer ops only
-        if (energyNeeded > 0) return RESOURCE_ENERGY;
-        return null;
-    },
-
-    // Idle helper: choose a non-road tile within range 2 of the controller, cache it, and park there.
-    idleNearController: function(creep, room) {
-        var controller = room.controller;
-        if (!controller) return false;
-
-        if (creep.pos.getRangeTo(controller) <= 2) {
-            var onRoad = false;
-            var structsHere = creep.pos.lookFor(LOOK_STRUCTURES);
-            for (var i = 0; i < structsHere.length; i++) {
-                if (structsHere[i].structureType === STRUCTURE_ROAD) { onRoad = true; break; }
-            }
-            if (!onRoad) {
-                creep.memory.idlePos = { x: creep.pos.x, y: creep.pos.y, room: room.name };
-                return true;
-            }
-        }
-
-        if (creep.memory.idlePos && creep.memory.idlePos.room === room.name) {
-            if (creep.pos.x === creep.memory.idlePos.x && creep.pos.y === creep.memory.idlePos.y && room.name === creep.memory.idlePos.room) {
-                return true;
-            } else {
-                var targetPosCached = room.getPositionAt(creep.memory.idlePos.x, creep.memory.idlePos.y);
-                if (targetPosCached) {
-                    creep.moveTo(targetPosCached, { reusePath: 30, visualizePathStyle: { stroke: '#8888ff' } });
-                    return true;
-                }
-                delete creep.memory.idlePos;
-            }
-        }
-
-        var idlePos = this.findIdleSpotNearController(room, creep);
-        if (idlePos) {
-            creep.memory.idlePos = { x: idlePos.x, y: idlePos.y, room: room.name };
-            if (!(creep.pos.x === idlePos.x && creep.pos.y === idlePos.y && room.name === idlePos.roomName)) {
-                creep.moveTo(idlePos, { reusePath: 30, visualizePathStyle: { stroke: '#8888ff' } });
-            }
-            return true;
-        }
-
-        return false;
-    },
-
-    findIdleSpotNearController: function(room, creep) {
-        var controller = room.controller;
-        if (!controller) return null;
-
-        var nonRoad = [];
-        var withRoad = [];
-
-        var cx = controller.pos.x;
-        var cy = controller.pos.y;
-
-        for (var dx = -2; dx <= 2; dx++) {
-            for (var dy = -2; dy <= 2; dy++) {
-                var x = cx + dx;
-                var y = cy + dy;
-                if (x < 1 || x > 48 || y < 1 || y > 48) continue;
-                if (dx*dx + dy*dy > 4) continue;
-                var pos = room.getPositionAt(x, y);
-                if (!pos) continue;
-
-                var creepsHere = pos.lookFor(LOOK_CREEPS);
-                if (creepsHere && creepsHere.length > 0) continue;
-
-                var terrain = room.getTerrain().get(x, y);
-                if (terrain === TERRAIN_MASK_WALL) continue;
-
-                var hasRoad = false;
-                var structs = pos.lookFor(LOOK_STRUCTURES);
-                var blocked = false;
-                for (var s = 0; s < structs.length; s++) {
-                    var st = structs[s].structureType;
-                    if (st === STRUCTURE_ROAD) { hasRoad = true; continue; }
-                    if (st === STRUCTURE_CONTAINER) continue;
-                    if (st === STRUCTURE_RAMPART) {
-                        var r = structs[s];
-                        if (r.my || r.isPublic) continue;
-                        blocked = true; break;
-                    }
-                    blocked = true; break;
-                }
-                if (blocked) continue;
-
-                if (hasRoad) withRoad.push(pos);
-                else nonRoad.push(pos);
-            }
-        }
-
-        function pickClosest(list) {
-            if (list.length === 0) return null;
-            var best = list[0];
-            var bestRange = creep.pos.getRangeTo(best);
-            for (var i = 1; i < list.length; i++) {
-                var r = creep.pos.getRangeTo(list[i]);
-                if (r < bestRange) { best = list[i]; bestRange = r; }
-            }
-            return best;
-        }
-
-        var chosen = pickClosest(nonRoad);
-        if (chosen) return chosen;
-
-        return pickClosest(withRoad);
-    },
-
-    // Collect into terminal
-    runCollectBot: function(creep, roomName, resourceType) {
-        var room = Game.rooms[roomName];
-        if (!room) {
-            creep.moveTo(new RoomPosition(25, 25, roomName), { reusePath: 20 });
-            creep.say('home');
-            return;
-        }
-
-        var terminal = room.terminal;
-        if (!terminal) {
-            creep.say('no term');
-            return;
-        }
-
-        if (!creep.memory.waitingState) {
-            creep.memory.waitingState = { isWaiting: false, lastResourceCheck: 0, waitStartTime: 0 };
-        }
-
-        // 0) If carrying anything at all, deliver to terminal first
-        var used = creep.store.getUsedCapacity();
-        if (used > 0) {
-            if (creep.pos.isNearTo(terminal)) {
-                for (var res in creep.store) {
-                    var amt = creep.store[res] || 0;
-                    if (amt > 0) {
-                        var depositRes = res;
-                        var depositAmt = amt;
-                        var tr = creep.transfer(terminal, depositRes);
-                        if (tr === OK) {
-                            // If linked to a local toTerminal operation, record progress
-                            var opIdD = creep.memory.terminalOperationId;
-                            var opsD = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-                            var credited = false;
-
-                            // First try: credit the linked operation (fast path)
-                            if (opIdD) {
-                                for (var oiD = 0; oiD < opsD.length; oiD++) {
-                                    var opD = opsD[oiD];
-                                    if (!opD || opD.id !== opIdD) continue;
-                                    if (opD.type === 'toTerminal' && opD.roomName === roomName && opD.resourceType === depositRes) {
-                                        if (typeof opD.amountMoved !== 'number') opD.amountMoved = 0;
-                                        opD.amountMoved += depositAmt;
-                                        if (opD.reservationProgram) {
-                                            this.reserveOperationStock(opD, roomName, depositRes, 'terminal', opD.amountMoved, opD.reservationProgram);
-                                        }
-                                        if (Memory.marketSell && Array.isArray(Memory.marketSell.requests)) {
-                                            for (var ms = 0; ms < Memory.marketSell.requests.length; ms++) {
-                                                var req = Memory.marketSell.requests[ms];
-                                                if (!req || req.tmOpId !== opD.id || req.roomName !== roomName || req.resourceType !== depositRes) continue;
-                                                if (opD.reservationProgram) {
-                                                    storageManager.transfer(roomName, depositRes, 'terminal', opD.reservationProgram, 'marketSell', depositAmt);
-                                                }
-                                                break;
-                                            }
-                                        }
-                                        credited = true;
-                                    } else if (opD.type === 'transfer' && opD.fromRoom === roomName && opD.resourceType === depositRes && opD.reservationProgram) {
-                                        var remainingToSend = Math.max(0, opD.amount - (opD.amountTransferred || 0));
-                                        if (remainingToSend > 0) {
-                                            this.reserveOperationStock(opD, roomName, depositRes, 'terminal', remainingToSend, opD.reservationProgram);
-                                        }
-                                    }
-                                    break; // found the linked op either way
-                                }
-                            }
-
-                            // FIX: Fallback — if linked op didn't match (bot was retasked
-                            // mid-carry), credit any active toTerminal op for this room+resource.
-                            if (!credited) {
-                                for (var oiF = 0; oiF < opsD.length; oiF++) {
-                                    var opF = opsD[oiF];
-                                    if (!opF) continue;
-                                    if (opF.type === 'toTerminal' &&
-                                        opF.roomName === roomName &&
-                                        opF.resourceType === depositRes &&
-                                        opF.status !== 'completed' &&
-                                        opF.status !== 'failed') {
-                                        if (typeof opF.amountMoved !== 'number') opF.amountMoved = 0;
-                                        opF.amountMoved += depositAmt;
-                                        if (opF.reservationProgram) {
-                                            this.reserveOperationStock(opF, roomName, depositRes, 'terminal', opF.amountMoved, opF.reservationProgram);
-                                        }
-                                        if (Memory.marketSell && Array.isArray(Memory.marketSell.requests)) {
-                                            for (var msF = 0; msF < Memory.marketSell.requests.length; msF++) {
-                                                var reqF = Memory.marketSell.requests[msF];
-                                                if (!reqF || reqF.tmOpId !== opF.id || reqF.roomName !== roomName || reqF.resourceType !== depositRes) continue;
-                                                if (opF.reservationProgram) {
-                                                    storageManager.transfer(roomName, depositRes, 'terminal', opF.reservationProgram, 'marketSell', depositAmt);
-                                                }
-                                                break;
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            } else {
-                creep.moveTo(terminal, { reusePath: 10, visualizePathStyle: { stroke: '#00ff00' } });
-            }
-            return;
-        }
-
-        // 1) Determine need for current resource (prefer op-specific remaining when linked)
-        var opId = creep.memory.terminalOperationId;
-        var opRemain = null;
-        if (opId) {
-            var opsList = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-            for (var oi0 = 0; oi0 < opsList.length; oi0++) {
-                var o0 = opsList[oi0];
-                if (!o0) continue;
-                if (o0.id === opId && o0.type === 'toTerminal' && o0.roomName === roomName && o0.resourceType === resourceType) {
-                    var moved0 = o0.amountMoved || 0;
-                    opRemain = Math.max(0, o0.amount - moved0);
-                    break;
-                }
-            }
-        }
-        var totalNeeded = (opRemain !== null) ? opRemain : this.getResourceNeeded(roomName, resourceType);
-        var inTerminal = 0;
-        if (opRemain === null) {
-            inTerminal = (terminal.store && terminal.store[resourceType]) ? terminal.store[resourceType] : 0;
-        }
-        var actuallyNeeded = (opRemain !== null) ? opRemain : Math.max(0, totalNeeded - inTerminal);
-
-        // 2) If current resource not needed, pick the next best needed resource (marketSell/transfer-aware)
-        if (actuallyNeeded <= 0) {
-            var nextRes = this.findNextNeededResourceForRoom(roomName);
-            if (nextRes) {
-                if (creep.memory.terminalResource !== nextRes) {
-                    creep.memory.terminalResource = nextRes;
-                    delete creep.memory.sourceId;
-                    creep.say(nextRes === RESOURCE_ENERGY ? 'E' : nextRes);
-                }
-            } else {
-                if (!this.idleNearController(creep, room)) {
-                    var spot = this.getWaitingSpot(room);
-                    if (spot && !creep.pos.isEqualTo(spot)) {
-                        creep.moveTo(spot, { reusePath: 20 });
-                    }
-                }
-                if (Game.time % 10 === 0) creep.say('Idle');
-                return;
-            }
-        }
-
-        // Update resourceType in case we just switched
-        resourceType = creep.memory.terminalResource || resourceType;
-
-        var opRefCollect = null;
-        if (opId) {
-            var opsLookup = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-            for (var opi = 0; opi < opsLookup.length; opi++) {
-                if (opsLookup[opi] && opsLookup[opi].id === opId) { opRefCollect = opsLookup[opi]; break; }
-            }
-        }
-
-        // 3) Use cached source if available
-        var source = null;
-        if (creep.memory.sourceId) {
-            source = Game.getObjectById(creep.memory.sourceId);
-            if (!source) delete creep.memory.sourceId;
-        }
-
-        // 4) Periodically refresh/choose source
-        var shouldCheck = (Game.time - creep.memory.waitingState.lastResourceCheck >= 10) || !source;
-        if (shouldCheck) {
-            creep.memory.waitingState.lastResourceCheck = Game.time;
-
-            var reservedSource = null;
-            if (opRefCollect && opRefCollect.reservationProgram) {
-                var reservationInfo = storageManager.storageFind(room.name, resourceType);
-                var reservedBuildings = [
-                    { structure: room.storage, bucket: reservationInfo.storage },
-                    { structure: room.terminal, bucket: reservationInfo.terminal }
-                ];
-                for (var rb = 0; rb < reservedBuildings.length; rb++) {
-                    var slot = reservedBuildings[rb];
-                    if (!slot.structure || !slot.bucket || !Array.isArray(slot.bucket.reservations)) continue;
-                    for (var ri = 0; ri < slot.bucket.reservations.length; ri++) {
-                        var resv = slot.bucket.reservations[ri];
-                        if (resv && resv.program === opRefCollect.reservationProgram && resv.amount > 0) {
-                            reservedSource = slot.structure;
-                            break;
-                        }
-                    }
-                    if (reservedSource) break;
-                }
-            }
-
-            if (reservedSource) {
-                creep.memory.sourceId = reservedSource.id;
-                source = reservedSource;
-                creep.memory.waitingState.isWaiting = false;
-            } else {
-                var sources = this.findResourceSources(room, resourceType);
-                if (sources.length > 0) {
-                    var best = sources[0];
-                    creep.memory.sourceId = best.structure.id;
-                    source = best.structure;
-                    creep.memory.waitingState.isWaiting = false;
-                } else {
-                    if (!creep.memory.waitingState.isWaiting) {
-                        creep.memory.waitingState.isWaiting = true;
-                        creep.memory.waitingState.waitStartTime = Game.time;
-                    }
-                }
-            }
-        }
-
-        // 5) Act on the source every tick
-        if (source) {
-        if (creep.pos.isNearTo(source)) {
-                // Compute op-specific remaining need if available
-                var needNow = 0;
-                var opRemainNow = null;
-                if (opId) {
-                    var opsNow = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-                    for (var oi1 = 0; oi1 < opsNow.length; oi1++) {
-                        var o1 = opsNow[oi1];
-                        if (!o1) continue;
-                        if (o1.id === opId && o1.type === 'toTerminal' && o1.roomName === roomName && o1.resourceType === resourceType) {
-                            var moved1 = o1.amountMoved || 0;
-                            opRemainNow = Math.max(0, o1.amount - moved1);
-                            break;
-                        }
-                    }
-                }
-                if (opRemainNow !== null) {
-                    needNow = opRemainNow;
-                } else {
-                    var totalNeededNow = this.getResourceNeeded(roomName, resourceType);
-                    var inTermNow = (terminal.store && terminal.store[resourceType]) ? terminal.store[resourceType] : 0;
-                    needNow = Math.max(0, totalNeededNow - inTermNow);
-                }
-
-                // Also respect terminal free capacity to avoid over-withdraw
-                var termFreeNow = 0;
-                if (terminal.store && typeof terminal.store.getFreeCapacity === 'function') {
-                    termFreeNow = terminal.store.getFreeCapacity(resourceType);
-                } else {
-                    termFreeNow = needNow;
-                }
-
-                var availableAtSource = (source.store && (source.store[resourceType] || 0)) || 0;
-                var withdrawAmount = Math.min(creep.store.getFreeCapacity(), availableAtSource, needNow, termFreeNow);
-
-                if (withdrawAmount > 0) {
-                    var res = creep.withdraw(source, resourceType, withdrawAmount);
-                    if (res !== OK && res !== ERR_FULL && res !== ERR_NOT_ENOUGH_RESOURCES) {
-                        delete creep.memory.sourceId;
-                    } else if (res === OK) {
-                        var opRef = null;
-                        if (opId) {
-                            var opsNow2 = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-                            for (var oi2 = 0; oi2 < opsNow2.length; oi2++) {
-                                if (opsNow2[oi2] && opsNow2[oi2].id === opId) { opRef = opsNow2[oi2]; break; }
-                            }
-                        }
-                        if (opRef && opRef.reservationProgram) {
-                            var building = (source.structureType === STRUCTURE_STORAGE) ? 'storage' :
-                                           (source.structureType === STRUCTURE_TERMINAL ? 'terminal' : null);
-                            if (building) {
-                                this.consumeOperationStock(opRef, roomName, resourceType, building, withdrawAmount, opRef.reservationProgram);
-                            }
-                        }
-                    }
-                } else {
-                    delete creep.memory.sourceId;
-                }
-            } else {
-                creep.moveTo(source, { reusePath: 10, visualizePathStyle: { stroke: '#ffaa00' } });
-                creep.say('get');
-            }
-        } else {
-            if (!this.idleNearController(creep, room)) {
-                var waitingSpot = this.getWaitingSpot(room);
-                if (waitingSpot && !creep.pos.isEqualTo(waitingSpot)) {
-                    creep.moveTo(waitingSpot, { reusePath: 20 });
-                }
-            }
-            if (Game.time % 10 === 0) creep.say('wait');
-        }
-    },
-
-    // Drain terminal into storage/container
-    runDrainBot: function(creep, roomName, resourceType) {
-        var room = Game.rooms[roomName];
-        if (!room) {
-            creep.moveTo(new RoomPosition(25, 25, roomName), { reusePath: 20 });
-            creep.say('home');
-            return;
-        }
-        var terminal = room.terminal;
-        if (!terminal) {
-            creep.say('no term');
-            return;
-        }
-        if (!creep.memory.waitingState) {
-            creep.memory.waitingState = { isWaiting: false, lastResourceCheck: 0, waitStartTime: 0 };
-        }
-
-        // Target deposit structure: Storage preferred, else any container with free capacity
-        var target = this.findStorageTarget(room, resourceType);
-
-        // If carrying anything, deliver to target first
-        var used = creep.store.getUsedCapacity();
-        if (used > 0) {
-            if (!target) {
-                // No target to deposit => idle
-                if (!this.idleNearController(creep, room)) {
-                    var spot = this.getWaitingSpot(room);
-                    if (spot && !creep.pos.isEqualTo(spot)) creep.moveTo(spot, { reusePath: 20 });
-                }
-                if (Game.time % 10 === 0) creep.say('no tgt');
-                return;
-            }
-            if (creep.pos.isNearTo(target)) {
-                // Prioritize depositing the requested resource type
-                var did = false;
-                var keys = [];
-                for (var k in creep.store) keys.push(k);
-                // Sort to put resourceType first
-                for (var a = 0; a < keys.length; a++) {
-                    if (keys[a] === resourceType) { var tmp = keys[0]; keys[0] = keys[a]; keys[a] = tmp; break; }
-                }
-                for (var i = 0; i < keys.length; i++) {
-                    var res = keys[i];
-                    var amt = creep.store[res] || 0;
-                    if (amt <= 0) continue;
-                    var depositAmt = amt;
-                    var tr = creep.transfer(target, res);
-                    if (tr === OK) {
-                        // Record progress for toStorage operations if this was the target resource
-                        if (res === resourceType) {
-                            var opId = creep.memory.terminalOperationId;
-                            var ops = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-                            var credited = false;
-
-                            // First try: credit the linked operation (fast path)
-                            if (opId) {
-                                for (var oi = 0; oi < ops.length; oi++) {
-                                    var op = ops[oi];
-                                    if (!op || op.id !== opId) continue;
-                                    if (op.type === 'toStorage' && op.roomName === roomName && op.resourceType === res) {
-                                        if (typeof op.amountMoved !== 'number') op.amountMoved = 0;
-                                        op.amountMoved += depositAmt;
-                                        if (op.reservationProgram) {
-                                            this.reserveOperationStock(op, roomName, res, 'storage', op.amountMoved, op.reservationProgram);
-                                        }
-                                        credited = true;
-                                    }
-                                    break; // found the linked op either way
-                                }
-                            }
-
-                            // FIX: Fallback — if linked op didn't match (bot was retasked),
-                            // credit any active toStorage op for this room+resource.
-                            if (!credited) {
-                                for (var oiF = 0; oiF < ops.length; oiF++) {
-                                    var opF = ops[oiF];
-                                    if (!opF) continue;
-                                    if (opF.type === 'toStorage' &&
-                                        opF.roomName === roomName &&
-                                        opF.resourceType === res &&
-                                        opF.status !== 'completed' &&
-                                        opF.status !== 'failed') {
-                                        if (typeof opF.amountMoved !== 'number') opF.amountMoved = 0;
-                                        opF.amountMoved += depositAmt;
-                                        if (opF.reservationProgram) {
-                                            this.reserveOperationStock(opF, roomName, res, 'storage', opF.amountMoved, opF.reservationProgram);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        did = true;
-                        break;
-                    } else if (tr === ERR_FULL) {
-                        // Try alternate target
-                        target = this.findStorageTarget(room, resourceType, true);
-                        if (target && !creep.pos.isNearTo(target)) creep.moveTo(target, { reusePath: 10, visualizePathStyle: { stroke: '#00aaff' } });
-                        break;
-                    } else {
-                        // Try another resource
-                        continue;
-                    }
-                }
-                if (!did) {
-                    // nothing transferred; try moving to target again
-                    creep.moveTo(target, { reusePath: 10, visualizePathStyle: { stroke: '#00aaff' } });
-                }
-            } else {
-                creep.moveTo(target, { reusePath: 10, visualizePathStyle: { stroke: '#00aaff' } });
-                creep.say('drop');
-            }
-            return;
-        }
-
-        // If empty: withdraw from terminal the requested resource
-        var opId = creep.memory.terminalOperationId;
-        var remaining = null;
-        if (opId) {
-            var ops = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-            for (var oi2 = 0; oi2 < ops.length; oi2++) {
-                var op2 = ops[oi2];
-                if (!op2 || op2.id !== opId) continue;
-                if (op2.type === 'toStorage' && op2.roomName === roomName && op2.resourceType === resourceType) {
-                    var moved = op2.amountMoved || 0;
-                    remaining = Math.max(0, op2.amount - moved);
-                    break;
-                }
-            }
-        }
-        if (remaining === null) remaining = creep.store.getCapacity ? creep.store.getCapacity() : creep.store.getFreeCapacity();
-
-        var available = (terminal.store && terminal.store[resourceType]) ? terminal.store[resourceType] : 0;
-        if (available <= 0 || !target) {
-            // No work possible; idle
-            if (!this.idleNearController(creep, room)) {
-                var w = this.getWaitingSpot(room);
-                if (w && !creep.pos.isEqualTo(w)) creep.moveTo(w, { reusePath: 20 });
-            }
-            if (Game.time % 10 === 0) creep.say('wait');
-            return;
-        }
-
-        var amtToWithdraw = Math.min(available, creep.store.getFreeCapacity(), remaining);
-
-        // FIX: When draining energy, never withdraw below the target energy level.
-        // This prevents the terminalBot from fighting with the supplier over energy.
-        if (resourceType === RESOURCE_ENERGY) {
-            var targetLevel = (Memory.terminalManager && Memory.terminalManager.settings && typeof Memory.terminalManager.settings.energyTargetLevel === 'number')
-                ? Memory.terminalManager.settings.energyTargetLevel : 20000;
-            var drainableEnergy = Math.max(0, available - targetLevel);
-            amtToWithdraw = Math.min(amtToWithdraw, drainableEnergy);
-        }
-
-        if (amtToWithdraw <= 0) {
-            if (!this.idleNearController(creep, room)) {
-                var w = this.getWaitingSpot(room);
-                if (w && !creep.pos.isEqualTo(w)) creep.moveTo(w, { reusePath: 20 });
-            }
-            if (Game.time % 10 === 0) creep.say('idle');
-            return;
-        }
-
-        if (creep.pos.isNearTo(terminal)) {
-            var resW = creep.withdraw(terminal, resourceType, amtToWithdraw);
-            if (resW !== OK && resW !== ERR_FULL && resW !== ERR_NOT_ENOUGH_RESOURCES) {
-                creep.say('w err');
-            } else {
-                if (resW === OK && opId) {
-                    var opsW = Memory.terminalManager && Array.isArray(Memory.terminalManager.operations) ? Memory.terminalManager.operations : [];
-                    for (var oiW = 0; oiW < opsW.length; oiW++) {
-                        var opW = opsW[oiW];
-                        if (!opW || opW.id !== opId) continue;
-                        if (opW.reservationProgram) {
-                            this.consumeOperationStock(opW, roomName, resourceType, 'terminal', amtToWithdraw, opW.reservationProgram);
-                        }
-                        break;
-                    }
-                }
-                //creep.say('take');
-            }
-        } else {
-            creep.moveTo(terminal, { reusePath: 10, visualizePathStyle: { stroke: '#ffaa00' } });
-            //creep.say('get');
-        }
-    },
-
-    findResourceSources: function(room, resourceType) {
-        var sources = [];
-
-        if (room.storage && room.storage.store && (room.storage.store[resourceType] || 0) > 0) {
-            sources.push({
-                structure: room.storage,
-                amount: room.storage.store[resourceType],
-                type: 'storage',
-                priority: 1
-            });
-        }
-
-        // Use getRoomState for factories, containers, labs
-        var state = getRoomState.get(room.name);
-        var stMap = state && state.structuresByType ? state.structuresByType : {};
-
-        // Factories (owned)
-        var factories = stMap[STRUCTURE_FACTORY] || [];
-        for (var f = 0; f < factories.length; f++) {
-            var fac = factories[f];
-            if (!fac.my) continue;
-            if (!fac.store || !(fac.store[resourceType] || 0)) continue;
-            sources.push({
-                structure: fac,
-                amount: fac.store[resourceType],
-                type: 'factory',
-                priority: 2
-            });
-        }
-
-        // Containers (all)
-        var containers = stMap[STRUCTURE_CONTAINER] || [];
-        for (var i = 0; i < containers.length; i++) {
-            var container = containers[i];
-            if (!container.store || !(container.store[resourceType] || 0)) continue;
-            sources.push({
-                structure: container,
-                amount: container.store[resourceType],
-                type: 'container',
-                priority: 2
-            });
-        }
-
-        // Labs (owned)
-        var labs = stMap[STRUCTURE_LAB] || [];
-        for (var i2 = 0; i2 < labs.length; i2++) {
-            var lab = labs[i2];
-            if (!lab.my) continue;
-            if (!lab.store || !(lab.store[resourceType] || 0)) continue;
-            sources.push({
-                structure: lab,
-                amount: lab.store[resourceType],
-                type: 'lab',
-                priority: 3
-            });
-        }
-
-        sources.sort(function(a, b) {
-            if (a.priority !== b.priority) return a.priority - b.priority;
-            return b.amount - a.amount;
-        });
-
-        return sources;
-    },
-
-    getWaitingSpot: function(room) {
-        var terrain = room.getTerrain();
-
-        var corners = [
-            { x: 2, y: 2 },
-            { x: 47, y: 2 },
-            { x: 2, y: 47 },
-            { x: 47, y: 47 }
-        ];
-
-        for (var i = 0; i < corners.length; i++) {
-            var corner = corners[i];
-            if (terrain.get(corner.x, corner.y) !== TERRAIN_MASK_WALL) {
-                var pos = room.getPositionAt(corner.x, corner.y);
-                if (pos) {
-                    var creeps = pos.lookFor(LOOK_CREEPS);
-                    if (creeps.length === 0) {
-                        return pos;
-                    }
-                }
-            }
-        }
-
-        return null;
-    },
-
-    cleanupCompletedOperations: function() {
-        if (Game.time % 100 === 0) {
-            var operations = Memory.terminalManager.operations;
-
-            for (var i = operations.length - 1; i >= 0; i--) {
-                var operation = operations[i];
-                var shouldRemove = false;
-
-                if ((operation.type === 'transfer' ||
-                     operation.type === 'toTerminal' ||
-                     operation.type === 'toStorage') &&
-                    (operation.status === 'completed' || operation.status === 'failed') &&
-                    (Game.time - operation.created) > 1000) {
-                    shouldRemove = true;
-                }
-
-                if (shouldRemove) {
-                    operations.splice(i, 1);
-                }
-            }
-        }
-    },
-    broadcastEnergy: function(toRoom, amount) {
-        amount = amount || 10000;
-    
-        if (!toRoom || typeof toRoom !== 'string') {
-            return '[Terminal] broadcastEnergy requires a destination room name.';
-        }
-    
-        var destRoom = Game.rooms[toRoom];
-        if (destRoom && !destRoom.terminal) {
-            return '[Terminal] No terminal visible in destination room: ' + toRoom;
-        }
-    
-        var queued = [];
-        var skipped = [];
-    
-        for (var rn in Game.rooms) {
-            var room = Game.rooms[rn];
-            if (!room || !room.controller || !room.controller.my) continue;
-            if (rn === toRoom) continue;
-    
-            var terminal = room.terminal;
-            if (!terminal) { skipped.push(rn + ' (no terminal)'); continue; }
-    
-            var termEnergy = (terminal.store && terminal.store[RESOURCE_ENERGY]) ? terminal.store[RESOURCE_ENERGY] : 0;
-            var cost = Game.market.calcTransactionCost(amount, rn, toRoom);
-            var required = amount + cost;
-    
-            if (termEnergy < required) {
-                skipped.push(rn + ' (have ' + termEnergy + ', need ' + required + ' incl. cost ' + cost + ')');
-                continue;
-            }
-    
-            var result = this.transferStuff(rn, toRoom, RESOURCE_ENERGY, amount);
-            queued.push(rn + ' -> cost ' + cost);
-        }
-    
-        console.log('[Terminal] broadcastEnergy: queued ' + queued.length + ' transfer(s) of ' + amount + ' energy to ' + toRoom);
-        for (var i = 0; i < queued.length; i++) console.log('  [OK] ' + queued[i]);
-        for (var j = 0; j < skipped.length; j++) console.log('  [SKIP] ' + skipped[j]);
-    
-        return '[Terminal] Done. ' + queued.length + ' queued, ' + skipped.length + ' skipped.';
-    },
-
-    // ===== UTILITY FUNCTIONS =====
-    // Check if a room is involved in any active transfer operations
-    isRoomBusyWithTransfer: function(roomName) {
-        const ops = (Memory.terminalManager && Memory.terminalManager.operations) ? Memory.terminalManager.operations : [];
-        for (let i = 0; i < ops.length; i++) {
-            const op = ops[i];
-            if (op.type === 'transfer' &&
-                op.status !== 'completed' &&
-                op.status !== 'failed' &&
-                (op.fromRoom === roomName || op.toRoom === roomName)) return true;
-        }
-        return false;
-    },
-
-    // Auto-balance: if a terminal has more energy than the high threshold,
-    // create a toStorage operation to drain down to the target level.
-    // Skips rooms that already have an active energy drain operation or
-    // an active outbound energy transfer (which will naturally consume the energy).
-    autoBalanceTerminalEnergy: function() {
-        var threshold = Memory.terminalManager.settings.energyHighThreshold || 100000;
-        var target    = Memory.terminalManager.settings.energyTargetLevel   || 20000;
-
-        var rooms = Game.rooms;
-        for (var rn in rooms) {
-            var room = rooms[rn];
-            if (!room || !room.controller || !room.controller.my) continue;
-            var terminal = room.terminal;
-            if (!terminal) continue;
-
-            var termEnergy = (terminal.store && terminal.store[RESOURCE_ENERGY])
-                ? terminal.store[RESOURCE_ENERGY] : 0;
-
-            if (termEnergy <= threshold) continue;
-
-            // Skip if there is already an active energy drain (toStorage) op for this room
-            var ops = Memory.terminalManager.operations;
-            var alreadyDraining = false;
-            for (var i = 0; i < ops.length; i++) {
-                var op = ops[i];
-                if (!op) continue;
-                if (op.type === 'toStorage' &&
-                    op.roomName === rn &&
-                    op.resourceType === RESOURCE_ENERGY &&
-                    op.status !== 'completed' &&
-                    op.status !== 'failed') {
-                    alreadyDraining = true;
-                    break;
-                }
-            }
-            if (alreadyDraining) continue;
-
-            // Skip if an outbound energy transfer exists (it will consume the surplus)
-            var outboundTransfer = false;
-            for (var j = 0; j < ops.length; j++) {
-                var op2 = ops[j];
-                if (!op2) continue;
-                if (op2.type === 'transfer' &&
-                    op2.fromRoom === rn &&
-                    op2.resourceType === RESOURCE_ENERGY &&
-                    op2.status !== 'completed' &&
-                    op2.status !== 'failed') {
-                    outboundTransfer = true;
-                    break;
-                }
-            }
-            if (outboundTransfer) continue;
-
-            var excess = termEnergy - target;
-            if (excess <= 0) continue;
-
-            // Create a toStorage operation to drain the excess
-            var drainOp = {
-                id: 'autobalance_' + Game.time + '_' + Math.random().toString(36).substr(2, 9),
-                type: 'toStorage',
-                roomName: rn,
-                resourceType: RESOURCE_ENERGY,
-                amount: excess,
-                amountMoved: 0,
-                status: 'pending',
-                created: Game.time,
-                autoBalance: true
-            };
-
-            // ── storageManager v2: reserve the terminal energy we're about to drain ──
-            // Prevents auto-balance from draining energy that factory/lab/transfer
-            // ops have reserved in the terminal.
-            if (this.v2Enabled(rn)) {
-                var abInfo = storageManager.storageFind(rn, RESOURCE_ENERGY);
-                var abTermFree = abInfo.terminal.total - abInfo.terminal.reserved;
-                var abReserve = Math.min(excess, Math.max(0, abTermFree));
-                if (abReserve > 0) {
-                    var abRv = this.reserveOperationStock(drainOp, rn, RESOURCE_ENERGY, 'terminal', abReserve, 'terminalManager_toStor_' + drainOp.id);
-                    if (abRv.ok) {
-                        drainOp.reservationProgram = 'terminalManager_toStor_' + drainOp.id;
-                        drainOp.reservationBuilding = 'terminal';
-                        drainOp.reservationRoom = rn;
-                    }
-                }
-            }
-
-            Memory.terminalManager.operations.push(drainOp);
-            this.assignTerminalBot(rn, 'drain', RESOURCE_ENERGY, drainOp.id);
-            console.log('[Terminal] Auto-balance: draining ' + excess + ' energy from terminal in ' + rn + ' (have ' + termEnergy + ', target ' + target + ')');
-        }
-    },
-
-    // Auto-cancel operations stuck in 'waiting' longer than threshold.
-    // Local ops (toTerminal/toStorage) with no supply are cancelled after 1000 ticks.
-    // Legacy waiting ops without _waitingSince start from their created tick.
-    checkAndCancelStuckWaits: function(maxTicksWaiting) {
-        if (typeof maxTicksWaiting !== 'number' || maxTicksWaiting <= 0) maxTicksWaiting = 5000;
-
-        var LOCAL_NO_SUPPLY_TIMEOUT = 1000;
-
-        var ops = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-        for (var i = ops.length - 1; i >= 0; i--) {
-            var op = ops[i];
-            if (!op) continue;
-
-            if (op.status !== 'waiting') {
-                if (op._waitingSince) delete op._waitingSince;
-                continue;
-            }
-
-            var start = (typeof op._waitingSince === 'number') ?
-                op._waitingSince :
-                (typeof op.created === 'number' ? op.created : Game.time);
-
-            op._waitingSince = start;
-
-            var waited = Game.time - start;
-
-            // Shorter timeout for local ops where supply is exhausted
-            if (op.type === 'toTerminal' && op.roomName) {
-                var outsideSupply = this.getRoomAvailableOutsideTerminal(op.roomName, op.resourceType);
-                if (outsideSupply <= 0 && waited >= LOCAL_NO_SUPPLY_TIMEOUT) {
-                    console.log('[Terminal] Auto-cancelling local toTerminal op (no supply for ' + waited + ' ticks): ' + op.id);
-                    this.cancelOperation(op.id);
-                    continue;
-                }
-            } else if (op.type === 'toStorage' && op.roomName) {
-                var room = Game.rooms[op.roomName];
-                var terminal = room && room.terminal ? room.terminal : null;
-                var inTerm = (terminal && terminal.store && terminal.store[op.resourceType]) ? terminal.store[op.resourceType] : 0;
-                if (inTerm <= 0 && waited >= LOCAL_NO_SUPPLY_TIMEOUT) {
-                    console.log('[Terminal] Auto-cancelling local toStorage op (no payload for ' + waited + ' ticks): ' + op.id);
-                    this.cancelOperation(op.id);
-                    continue;
-                }
-            }
-
-            // Default timeout for all other waiting ops
-            if (waited >= maxTicksWaiting) {
-                this.cancelOperation(op.id);
-            }
-        }
-    },
-
-    validateResource: function(resourceType) {
-        var validResources = [
-            RESOURCE_ENERGY, RESOURCE_POWER,
-            RESOURCE_HYDROGEN, RESOURCE_OXYGEN, RESOURCE_UTRIUM, RESOURCE_LEMERGIUM,
-            RESOURCE_KEANIUM, RESOURCE_ZYNTHIUM, RESOURCE_CATALYST,
-            RESOURCE_HYDROXIDE, RESOURCE_ZYNTHIUM_KEANITE, RESOURCE_UTRIUM_LEMERGITE,
-            RESOURCE_UTRIUM_HYDRIDE, RESOURCE_UTRIUM_OXIDE, RESOURCE_KEANIUM_HYDRIDE,
-            RESOURCE_KEANIUM_OXIDE, RESOURCE_LEMERGIUM_HYDRIDE, RESOURCE_LEMERGIUM_OXIDE,
-            RESOURCE_ZYNTHIUM_HYDRIDE, RESOURCE_ZYNTHIUM_OXIDE, RESOURCE_GHODIUM_HYDRIDE,
-            RESOURCE_GHODIUM_OXIDE, RESOURCE_CATALYZED_UTRIUM_ACID, RESOURCE_CATALYZED_UTRIUM_ALKALIDE,
-            RESOURCE_CATALYZED_KEANIUM_ACID, RESOURCE_CATALYZED_KEANIUM_ALKALIDE,
-            RESOURCE_CATALYZED_LEMERGIUM_ACID, RESOURCE_CATALYZED_LEMERGIUM_ALKALIDE,
-            RESOURCE_CATALYZED_ZYNTHIUM_ACID, RESOURCE_CATALYZED_ZYNTHIUM_ALKALIDE,
-            RESOURCE_CATALYZED_GHODIUM_ACID, RESOURCE_CATALYZED_GHODIUM_ALKALIDE,
-            RESOURCE_UTRIUM_BAR, RESOURCE_LEMERGIUM_BAR, RESOURCE_ZYNTHIUM_BAR,
-            RESOURCE_KEANIUM_BAR, RESOURCE_GHODIUM_MELT, RESOURCE_OXIDANT,
-            RESOURCE_REDUCTANT, RESOURCE_PURIFIER, RESOURCE_BATTERY,
-            RESOURCE_COMPOSITE, RESOURCE_CRYSTAL, RESOURCE_LIQUID,
-            RESOURCE_WIRE, RESOURCE_SWITCH, RESOURCE_TRANSISTOR,
-            RESOURCE_MICROCHIP, RESOURCE_CIRCUIT, RESOURCE_DEVICE,
-            RESOURCE_CELL, RESOURCE_PHLEGM, RESOURCE_TISSUE,
-            RESOURCE_MUSCLE, RESOURCE_ORGANOID, RESOURCE_ORGANISM,
-            RESOURCE_ALLOY, RESOURCE_TUBE, RESOURCE_FIXTURES,
-            RESOURCE_FRAME, RESOURCE_HYDRAULICS, RESOURCE_MACHINE,
-            RESOURCE_CONDENSATE, RESOURCE_CONCENTRATE, RESOURCE_EXTRACT,
-            RESOURCE_SPIRIT, RESOURCE_EMANATION, RESOURCE_ESSENCE,
-            RESOURCE_UTRIUM_ACID, RESOURCE_UTRIUM_ALKALIDE,
-            RESOURCE_KEANIUM_ACID, RESOURCE_KEANIUM_ALKALIDE,
-            RESOURCE_LEMERGIUM_ACID, RESOURCE_LEMERGIUM_ALKALIDE,
-            RESOURCE_ZYNTHIUM_ACID, RESOURCE_ZYNTHIUM_ALKALIDE,
-            RESOURCE_GHODIUM_ACID, RESOURCE_GHODIUM_ALKALIDE,
-            RESOURCE_GHODIUM, RESOURCE_BIOMASS,
-            RESOURCE_METAL, RESOURCE_MIST,
-            RESOURCE_SILICON, RESOURCE_OPS
-        ];
-        for (var i = 0; i < validResources.length; i++) {
-            if (validResources[i] === resourceType) return true;
-        }
-        return false;
-    },
-
-    getAllTerminalBots: function() {
-        var list = [];
-        var creeps = Game.creeps;
-        for (var name in creeps) {
-            var creep = creeps[name];
-            if (!creep || !creep.memory) continue;
-            if (creep.memory.role === 'terminalBot' &&
-                typeof creep.memory.terminalRoom === 'string' &&
-                typeof creep.memory.terminalTask === 'string') {
-                list.push(creep);
-            }
-        }
-        return list;
-    },
-
-    // Returns how much of resourceType is needed in roomName's terminal across active transfer operations
-    getResourceNeeded: function(roomName, resourceType) {
-        var needed = 0;
-        var ops = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
-
-        for (var i = 0; i < ops.length; i++) {
-            var op = ops[i];
-            if (!op) continue;
-            if (op.status === 'completed' || op.status === 'failed') continue;
-
-            if (op.type === 'transfer' && op.fromRoom === roomName) {
-                var remaining = Math.max(0, op.amount - (op.amountTransferred || 0));
-                if (remaining <= 0) continue;
-
-                if (op.resourceType === resourceType) {
-                    needed += remaining;
-                }
-
-                if (resourceType === RESOURCE_ENERGY && remaining > 0) {
-                    // Energy required to pay transfer cost, plus payload if sending energy
-                    var cost = Game.market.calcTransactionCost(remaining, op.fromRoom, op.toRoom);
-                    if (op.resourceType === RESOURCE_ENERGY) {
-                        needed += remaining + cost;
-                    } else {
-                        needed += cost;
-                    }
-                }
-            }
-
-            // Include local toTerminal operations (only the target resource)
-            if (op.type === 'toTerminal' && op.roomName === roomName && op.resourceType === resourceType) {
-                var moved = op.amountMoved || 0;
-                var remainLocal = Math.max(0, op.amount - moved);
-                needed += remainLocal;
-            }
-        }
-
-        return needed;
-    },
-
-    sendNotification: function(message) {
-        if (Memory.terminalManager.settings.emailNotifications) {
-            //Game.notify(message);
-        }
-        console.log('[Terminal Notification] ' + message);
-    },
-
-    bodyCost: function(body) {
-        var BODYPART_COST = {
-            move: 50, work: 100, attack: 80, carry: 50, heal: 250,
-            ranged_attack: 150, tough: 10, claim: 600
-        };
-        var total = 0;
-        for (var i = 0; i < body.length; i++) total += BODYPART_COST[body[i]];
-        return total;
-    },
-
-    getCreepBody: function(role, energy) {
-        var bodyConfigs = {
-            supplier: {
-                200:  [CARRY, CARRY, MOVE, MOVE],
-                300:  [CARRY, CARRY, CARRY, MOVE, MOVE, MOVE],
-                400:  [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE],
-                600:  [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-                800:  [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-                1000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-                1200: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-                1500: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-                1800: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-                2000: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE],
-                2500: [CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE]
-            }
-        };
-    
-        var configs = bodyConfigs[role] || bodyConfigs.supplier;
-        var tiers = [];
-        for (var key in configs) tiers.push(Number(key));
-        tiers.sort(function(a, b){ return a - b; });
-    
-        var bestTier = tiers[0];
-        for (var i = 0; i < tiers.length; i++) {
-            var tier = tiers[i];
-            if (energy >= tier) bestTier = tier;
-            else break;
-        }
-    
-        return configs[bestTier];
-    },
-
-    // Amount available in-room outside the terminal
-    getRoomAvailableOutsideTerminal: function(roomName, resourceType) {
-        var room = Game.rooms[roomName];
-        if (!room) return 0;
-
-        var total = 0;
-
-        var storage = room.storage;
-        if (storage && storage.store && storage.store[resourceType]) {
-            total += storage.store[resourceType];
-        }
-
-        // Use getRoomState for containers, labs, factory
-        var state = getRoomState.get(roomName);
-        var stMap = state && state.structuresByType ? state.structuresByType : {};
-
-        // Containers (all)
-        var containers = stMap[STRUCTURE_CONTAINER] || [];
-        for (var i = 0; i < containers.length; i++) {
-            var cont = containers[i];
-            if (cont.store && (cont.store[resourceType] || 0) > 0) {
-                total += cont.store[resourceType];
-            }
-        }
-
-        // Labs (owned)
-        var labs = stMap[STRUCTURE_LAB] || [];
-        for (var j = 0; j < labs.length; j++) {
-            var lab = labs[j];
-            if (!lab.my) continue;
-            if (lab.store && (lab.store[resourceType] || 0) > 0) {
-                total += lab.store[resourceType];
-            }
-        }
-
-        // Factory (owned; at most 1)
-        var factories = stMap[STRUCTURE_FACTORY] || [];
-        for (var k = 0; k < factories.length; k++) {
-            var fac = factories[k];
-            if (!fac.my) continue;
-            if (fac.store && (fac.store[resourceType] || 0) > 0) {
-                total += fac.store[resourceType];
-                break;
-            }
-        }
-
-        return total;
-    },
-
-    // Choose a deposit target for draining: Storage preferred, else any container with free capacity
-    findStorageTarget: function(room, resourceType, preferAlternate) {
-        // preferAlternate indicates we are looking for non-storage fallback (after storage full)
-        if (!preferAlternate) {
-            if (room.storage && room.storage.store) {
-                // If it has space (best-effort check), prefer it
-                var canUse = true;
-                if (room.storage.store.getFreeCapacity && typeof room.storage.store.getFreeCapacity === 'function') {
-                    canUse = room.storage.store.getFreeCapacity(resourceType) > 0;
-                }
-                if (canUse) return room.storage;
-            }
-        }
-
-        // Containers fallback
-        var state = getRoomState.get(room.name);
-        var stMap = state && state.structuresByType ? state.structuresByType : {};
-        var containers = stMap[STRUCTURE_CONTAINER] || [];
-        var best = null;
-        for (var i = 0; i < containers.length; i++) {
-            var cont = containers[i];
-            if (!cont || !cont.store) continue;
-            var freeOk = true;
-            if (cont.store.getFreeCapacity && typeof cont.store.getFreeCapacity === 'function') {
-                freeOk = cont.store.getFreeCapacity(resourceType) > 0;
-            }
-            if (!freeOk) continue;
-            // Pick the first usable
-            best = cont;
-            break;
-        }
-        if (best) return best;
-
-        // As last resort, try storage anyway (even if full check failed)
-        if (room.storage && room.storage.store) return room.storage;
-
-        return null;
-    },
-
-    // ===== MARKETSELL SUPPORT =====
-    // Proactively request a bot whenever a marketSell deficit exists and outside supply is available.
-    // Does not consider energy and respects the one-bot cap + existing requests.
-    ensureBotsForMarketSellNeeds: function() {
-        var rooms = Game.rooms;
-        for (var rn in rooms) {
-            var room = rooms[rn];
-            if (!room || !room.controller || !room.controller.my) continue;
-            if (!room.terminal) continue;
-
-            // Determine the next needed resource considering marketSell and transfers
-            var nextRes = this.findNextNeededResourceForRoom(rn);
-            if (!nextRes) continue;
-
-            // Do not auto-request for energy here (you asked not to consider energy)
-            if (nextRes === RESOURCE_ENERGY) continue;
-
-            // Confirm net need exists
-            var need = this.getResourceNeeded(rn, nextRes);
-            var have = (room.terminal.store && room.terminal.store[nextRes]) ? room.terminal.store[nextRes] : 0;
-            var netNeeded = Math.max(0, need - have);
-            if (netNeeded <= 0) continue;
-
-            // Confirm there is something to collect in-room
-            var outside = this.getRoomAvailableOutsideTerminal(rn, nextRes);
-            if (outside <= 0) continue;
-
-            // Request a bot; requestBot enforces single-bot cap and avoids duplicates
-            this.requestBot(rn, 'collect', nextRes, null);
-        }
-    },
-
-    // ====== INTERNAL HELPERS (not exposed as globals) ======
-
-    // Sum of a resource in room.storage, containers, labs, factory (already provided for transfer 'max')
-    getRoomTotalAvailable: function(roomName, resourceType) {
-        var total = 0;
-        var room = Game.rooms[roomName];
-        if (!room) return 0;
-
-        if (room.storage && room.storage.store && room.storage.store[resourceType]) {
-            total += room.storage.store[resourceType];
-        }
-        // Use getRoomState
-        var state = getRoomState.get(roomName);
-        var stMap = state && state.structuresByType ? state.structuresByType : {};
-
-        var containers = stMap[STRUCTURE_CONTAINER] || [];
-        for (var i = 0; i < containers.length; i++) {
-            var c = containers[i];
-            if (c.store && c.store[resourceType]) total += c.store[resourceType];
-        }
-
-        var labs = stMap[STRUCTURE_LAB] || [];
-        for (var j = 0; j < labs.length; j++) {
-            var l = labs[j];
-            if (l.my && l.store && l.store[resourceType]) total += l.store[resourceType];
-        }
-
-        var factories = stMap[STRUCTURE_FACTORY] || [];
-        for (var k = 0; k < factories.length; k++) {
-            var f = factories[k];
-            if (f.my && f.store && f.store[resourceType]) { total += f.store[resourceType]; break; }
-        }
-
-        return total;
+  init: function() {
+    if (!Memory.terminalManager) {
+      Memory.terminalManager = {
+        operations: [],
+        bots: [],
+        lastMaintenanceTick: null,
+        lastCompletedCleanupTick: null,
+        settings: {
+          emailNotifications: true,
+          runBotsFromManager: false,
+          energyHighThreshold: 1e5,
+          energyTargetLevel: 2e4
+        }
+      };
+    } else {
+      if (!Memory.terminalManager.settings) Memory.terminalManager.settings = {};
+      if (typeof Memory.terminalManager.settings.emailNotifications !== "boolean") Memory.terminalManager.settings.emailNotifications = true;
+      if (typeof Memory.terminalManager.settings.runBotsFromManager !== "boolean") Memory.terminalManager.settings.runBotsFromManager = false;
+      if (typeof Memory.terminalManager.settings.energyHighThreshold !== "number") Memory.terminalManager.settings.energyHighThreshold = 1e5;
+      if (typeof Memory.terminalManager.settings.energyTargetLevel !== "number") Memory.terminalManager.settings.energyTargetLevel = 2e4;
+      if (!Array.isArray(Memory.terminalManager.operations)) Memory.terminalManager.operations = [];
+      if (!Array.isArray(Memory.terminalManager.bots)) Memory.terminalManager.bots = [];
+      if (typeof Memory.terminalManager.lastMaintenanceTick !== "number") Memory.terminalManager.lastMaintenanceTick = null;
+      if (typeof Memory.terminalManager.lastCompletedCleanupTick !== "number") Memory.terminalManager.lastCompletedCleanupTick = null;
     }
+  },
+  v2Enabled: function(e) {
+    var r = Game.rooms[e];
+    return !!(r && r.controller && r.controller.my);
+  },
+  releaseOpReservation: function(e) {
+    if (!e) return;
+    if (Array.isArray(e.reservationEntries) && e.reservationEntries.length > 0) {
+      for (var r = 0; r < e.reservationEntries.length; r++) {
+        var a = e.reservationEntries[r];
+        if (!a || !a.roomName || !a.building || !a.program) continue;
+        storageManager.unReserve(a.roomName, e.resourceType, a.building, a.program);
+      }
+    } else if (e.reservationProgram && e.reservationBuilding) {
+      storageManager.unReserve(e.reservationRoom, e.resourceType, e.reservationBuilding, e.reservationProgram);
+    }
+    delete e.reservationProgram;
+    delete e.reservationBuilding;
+    delete e.reservationRoom;
+    delete e.reservationEntries;
+  },
+  ensureReservationEntries: function(e) {
+    if (!e.reservationEntries) e.reservationEntries = [];
+    return e.reservationEntries;
+  },
+  addReservationEntry: function(e, r, a, t) {
+    if (!e || !r || !a || !t) return;
+    var o = this.ensureReservationEntries(e);
+    for (var i = 0; i < o.length; i++) {
+      if (o[i] && o[i].roomName === r && o[i].building === a && o[i].program === t) {
+        return;
+      }
+    }
+    o.push({
+      roomName: r,
+      building: a,
+      program: t
+    });
+  },
+  reserveOperationStock: function(e, r, a, t, o, i) {
+    if (!e || !r || !a || !t || !i || !o) return {
+      ok: false,
+      reason: "Missing required parameter"
+    };
+    var n = storageManager.reserve(r, a, t, i, o);
+    if (n.ok) {
+      this.addReservationEntry(e, r, t, i);
+      e.reservationProgram = i;
+      e.reservationRoom = r;
+      if (!e.reservationBuilding) e.reservationBuilding = t;
+    }
+    return n;
+  },
+  consumeOperationStock: function(e, r, a, t, o, i) {
+    if (!e || !r || !a || !t || !i || !o) return {
+      ok: false,
+      consumed: 0,
+      remaining: 0
+    };
+    return storageManager.consume(r, a, t, i, o);
+  },
+  observeOperationProgress: function(e) {
+    if (!e || e.type !== "toTerminal") return;
+    var r = typeof e.amountMoved === "number" && e.amountMoved > 0 ? e.amountMoved : 0;
+    if (typeof e._lastObservedAmountMoved !== "number") {
+      e._lastObservedAmountMoved = r;
+      e._lastProgressTick = r > 0 ? Game.time : typeof e.created === "number" ? e.created : Game.time;
+      return;
+    }
+    if (r !== e._lastObservedAmountMoved) {
+      e._lastObservedAmountMoved = r;
+      e._lastProgressTick = Game.time;
+    }
+  },
+  isOperationStale: function(e, r) {
+    if (!e || e.type !== "toTerminal" || e.status === "completed" || e.status === "failed") return false;
+    this.observeOperationProgress(e);
+    var a = typeof r === "number" && r > 0 ? r : LOCAL_NO_PROGRESS_TIMEOUT;
+    var t = typeof e._lastProgressTick === "number" ? e._lastProgressTick : typeof e.created === "number" ? e.created : Game.time;
+    return Game.time - t >= a;
+  },
+  shouldUseTerminalBotForOp: function(e) {
+    return !!(e && e.type === "toStorage" && e.resourceType === RESOURCE_ENERGY && (e.amount || 0) >= TERMINAL_BOT_ENERGY_THRESHOLD);
+  },
+  shouldUseSupplierForOp: function(e) {
+    if (!e) return false;
+    if (e.type !== "toTerminal" && e.type !== "toStorage") return false;
+    if (singleSourceRoom && typeof singleSourceRoom.isSingleSourceActive === "function" && singleSourceRoom.isSingleSourceActive(e.roomName)) {
+      return false;
+    }
+    return !this.shouldUseTerminalBotForOp(e);
+  },
+  addSupplierTask: function(e, r) {
+    if (!e || !r || !r.id) return;
+    if (!Memory.terminalManager.supplierTasks) Memory.terminalManager.supplierTasks = {};
+    if (!Memory.terminalManager.supplierTasks[e]) Memory.terminalManager.supplierTasks[e] = [];
+    var a = Memory.terminalManager.supplierTasks[e];
+    for (var t = 0; t < a.length; t++) {
+      if (a[t] && a[t].opId === r.id) return;
+    }
+    a.push({
+      opId: r.id,
+      type: r.type,
+      resourceType: r.resourceType,
+      amount: r.amount,
+      reservationProgram: r.reservationProgram || null
+    });
+  },
+  getSupplierTasks: function(e) {
+    return Memory.terminalManager && Memory.terminalManager.supplierTasks && Memory.terminalManager.supplierTasks[e] || [];
+  },
+  cleanupSupplierTasks: function() {
+    if (!Memory.terminalManager || !Memory.terminalManager.supplierTasks) return;
+    var e = {};
+    var r = Memory.terminalManager.operations || [];
+    for (var a = 0; a < r.length; a++) {
+      if (r[a] && r[a].id) e[r[a].id] = true;
+    }
+    for (var t in Memory.terminalManager.supplierTasks) {
+      var o = Memory.terminalManager.supplierTasks[t];
+      if (!Array.isArray(o)) continue;
+      for (var i = o.length - 1; i >= 0; i--) {
+        if (!o[i] || !e[o[i].opId]) {
+          o.splice(i, 1);
+        }
+      }
+    }
+  },
+  run: function() {
+    this.init();
+    var e = Memory.terminalManager;
+    var r = e.lastMaintenanceTick === null || e.lastMaintenanceTick > Game.time || Game.time - e.lastMaintenanceTick >= 50;
+    var a = e.lastCompletedCleanupTick === null || e.lastCompletedCleanupTick > Game.time || Game.time - e.lastCompletedCleanupTick >= 100;
+    getRoomState.init();
+    if (r) {
+      this.checkAndCancelStuckWaits(5e3);
+      this.autoBalanceTerminalEnergy();
+      e.lastMaintenanceTick = Game.time;
+      memoryManager.requestSave();
+    }
+    this.processOperations();
+    this.manageBots();
+    this.cleanupSupplierTasks();
+    if (a) {
+      this.cleanupCompletedOperations();
+      e.lastCompletedCleanupTick = Game.time;
+      memoryManager.requestSave();
+    }
+  },
+  transferStuff: function(e, r, a, t, o) {
+    if (!this.validateResource(a)) {
+      return "[Terminal] Invalid resource type: " + a;
+    }
+    if (t === "max") {
+      if (a === RESOURCE_ENERGY) {
+        return "[Terminal] Cannot use 'max' for energy.";
+      }
+      t = this.getRoomTotalAvailable(e, a);
+      if (t <= 0) {
+        return "[Terminal] No " + a + " available in " + e;
+      }
+    }
+    if (!t || t <= 0) {
+      return "[Terminal] Invalid amount: " + t + ". Must be positive.";
+    }
+    if (!Game.rooms[e] || !Game.rooms[e].controller || !Game.rooms[e].controller.my) {
+      return "[Terminal] Invalid source room: " + e + ". Must be a room you own.";
+    }
+    var i = Game.rooms[e].terminal;
+    if (!i) {
+      return "[Terminal] No terminal in source room: " + e;
+    }
+    var n = this.getOperationTerminalAvailable({
+      fromRoom: e
+    }, a);
+    var s = this.getTransferableStorageAvailable(e, a);
+    var m = n + s;
+    if (n < t) {
+      console.log("[Terminal] Scheduling transfer with short terminal stock in " + e + ": have " + n + "/" + t + " " + a + ". A feeder op will stage the shortfall from storage.");
+    }
+    var l = Game.rooms[r];
+    var u = false;
+    if (l) u = !!l.terminal; else u = true;
+    if (!u) {
+      return "[Terminal] No terminal visible in destination room: " + r;
+    }
+    if (m < t) {
+      return "[Terminal] Insufficient " + a + " in " + e + ": room has " + m + ", requested " + t + " (terminal: " + n + ", outside: " + s + ").";
+    }
+    var f = Memory.terminalManager.operations || [];
+    for (var v = 0; v < f.length; v++) {
+      var R = f[v];
+      if (!R || R.type !== "transfer") continue;
+      if (R.fromRoom !== e || R.toRoom !== r) continue;
+      if (R.resourceType !== a) continue;
+      if (R.status === "completed" || R.status === "failed") continue;
+      var g = R.amountTransferred || 0;
+      var c = Math.max(0, R.amount - g);
+      if (c <= 0) continue;
+      if (c + t > m) {
+        return "[Terminal] Cannot merge: room has " + m + " " + a + ", existing op still needs " + c + ", new request " + t + ".";
+      }
+      var p = R.amount + t;
+      if (R.reservationProgram && R.reservationBuilding === "terminal" && R.reservationRoom === e) {
+        var M = storageManager.storageFind(e, a);
+        var y = 0;
+        var E = M.terminal.reservations || [];
+        for (var d = 0; d < E.length; d++) {
+          if (E[d].program === R.reservationProgram) {
+            y = E[d].amount || 0;
+            break;
+          }
+        }
+        var T = y + t;
+        var O = this.reserveOperationStock(R, e, a, "terminal", T, R.reservationProgram);
+        if (!O.ok) {
+          return "[Terminal] Cannot merge: failed to extend terminal reservation by " + t + " " + a + " in " + e + ": " + (O.reason || "unknown");
+        }
+      }
+      R.amount = p;
+      memoryManager.requestImmediateSave("terminalManager.mergeTransfer");
+      console.log("[Terminal] Merged into existing transfer op " + R.id + ": new total " + R.amount + " " + a + " from " + e + " to " + r);
+      return "[Terminal] Merged into existing transfer op " + R.id + ": new total " + R.amount + " " + a + " from " + e + " to " + r;
+    }
+    var S = {
+      id: "transfer_" + Game.time + "_" + Math.random().toString(36).substr(2, 9),
+      type: "transfer",
+      fromRoom: e,
+      toRoom: r,
+      resourceType: a,
+      amount: t,
+      status: "pending",
+      created: Game.time,
+      amountTransferred: 0,
+      accountingSource: o || null
+    };
+    var C = null;
+    if (this.v2Enabled(e)) {
+      var M = storageManager.storageFind(e, a);
+      var h = M.terminal.total - M.terminal.reserved;
+      var A = M.storage.total - M.storage.reserved;
+      var _ = this.getTransferableStorageAvailable(e, a);
+      if (h < t) {
+        console.log("[Terminal] v2 reserve warning: only " + h + " free of " + t + " " + a + " in " + e + " terminal. Op will queue and wait.");
+      }
+      var U = "terminalManager_transfer_" + S.id;
+      var N = Math.min(t, Math.max(0, h));
+      if (N > 0) {
+        var O = this.reserveOperationStock(S, e, a, "terminal", N, U);
+        if (O.ok) {
+          S.reservationProgram = U;
+          S.reservationBuilding = "terminal";
+          S.reservationRoom = e;
+        }
+      }
+      var b = Math.max(0, t - N);
+      if (b > 0 && singleSourceRoom.isSingleSourceActive(e)) {
+        this.releaseOpReservation(S);
+        return "[Terminal] Source room feeder unavailable while single-source protection is active in " + e;
+      }
+      if (b > 0 && _ > 0) {
+        var I = Math.min(b, _);
+        var Y = Math.min(I, A);
+        C = {
+          id: "feeder_" + Game.time + "_" + Math.random().toString(36).substr(2, 9),
+          type: "toTerminal",
+          roomName: e,
+          resourceType: a,
+          amount: I,
+          amountMoved: 0,
+          status: "pending",
+          created: Game.time,
+          feederFor: S.id,
+          useSupplier: true
+        };
+        var k = "terminalManager_feeder_" + C.id;
+        var G = this.reserveOperationStock(C, e, a, "storage", Y, k);
+        if (G.ok) {
+          C.reservationProgram = k;
+          C.reservationBuilding = "storage";
+          C.reservationRoom = e;
+        } else if (Y > 0) {
+          this.releaseOpReservation(S);
+          return "[Terminal] Failed to reserve feeder stock in " + e;
+        }
+        S.feederOpId = C.id;
+      } else if (b > 0 && A > 0) {
+        var w = Math.min(b, A);
+        var fallbackReservation = this.reserveOperationStock(S, e, a, "storage", w, U);
+        if (!fallbackReservation.ok) {
+          this.releaseOpReservation(S);
+          return "[Terminal] Failed to reserve source stock in " + e;
+        }
+      }
+    }
+    Memory.terminalManager.operations.push(S);
+    if (C) {
+      Memory.terminalManager.operations.push(C);
+      this.addSupplierTask(e, C);
+      console.log("[Terminal] Feeder op " + C.id + " queued: stage " + C.amount + " " + a + " from storage to terminal in " + e);
+    }
+    memoryManager.requestImmediateSave("terminalManager.createTransfer");
+    console.log("[Terminal] Transfer order created: " + t + " " + a + " from " + e + " to " + r);
+    return "[Terminal] Transfer order created: " + t + " " + a + " from " + e + " to " + r;
+  },
+  storageToTerminal: function(e, r, a) {
+    if (typeof e !== "string" || !Game.rooms[e]) {
+      return "[Terminal] Invalid room: " + e;
+    }
+    if (!this.validateResource(r)) {
+      return "[Terminal] Invalid resource type: " + r;
+    }
+    var t = Game.rooms[e];
+    if (!t.controller || !t.controller.my) {
+      return "[Terminal] Room must be owned: " + e;
+    }
+    var o = t.terminal;
+    if (!o) {
+      return "[Terminal] No terminal in " + e;
+    }
+    if (a === "max") {
+      a = this.getRoomAvailableOutsideTerminal(e, r);
+    }
+    if (typeof a !== "number" || a <= 0) {
+      return "[Terminal] Invalid amount: " + a + ". Must be positive.";
+    }
+    var i = {
+      id: "local_" + Game.time + "_" + Math.random().toString(36).substr(2, 9),
+      type: "toTerminal",
+      roomName: e,
+      resourceType: r,
+      amount: a,
+      amountMoved: 0,
+      status: "pending",
+      created: Game.time
+    };
+    if (this.v2Enabled(e)) {
+      var n = storageManager.storageFind(e, r);
+      var s = n.storage.total - n.storage.reserved;
+      if (s < a) {
+        console.log("[Terminal] v2 reserve warning: only " + s + " free of " + a + " " + r + " in " + e + " storage. Op will queue and wait.");
+      }
+      var m = Math.min(a, Math.max(0, s));
+      if (m > 0) {
+        var l = this.reserveOperationStock(i, e, r, "storage", m, "terminalManager_toTerm_" + i.id);
+        if (l.ok) {
+          i.reservationProgram = "terminalManager_toTerm_" + i.id;
+          i.reservationBuilding = "storage";
+          i.reservationRoom = e;
+        }
+      }
+    }
+    Memory.terminalManager.operations.push(i);
+    memoryManager.requestImmediateSave("terminalManager.createToTerminal");
+    if (this.shouldUseSupplierForOp(i)) {
+      i.useSupplier = true;
+      var u = new String("[Terminal] Local order queued for supplier: move " + a + " " + r + " to Terminal in " + e);
+      u.opId = i.id;
+      return u;
+    }
+    this.assignTerminalBot(e, "collect", r, i.id);
+    var f = new String("[Terminal] Local order created: move " + a + " " + r + " to Terminal in " + e);
+    f.opId = i.id;
+    return f;
+  },
+  terminalToStorage: function(e, r, a) {
+    if (typeof e !== "string" || !Game.rooms[e]) {
+      return "[Terminal] Invalid room: " + e;
+    }
+    if (!this.validateResource(r)) {
+      return "[Terminal] Invalid resource type: " + r;
+    }
+    var t = Game.rooms[e];
+    if (!t.controller || !t.controller.my) {
+      return "[Terminal] Room must be owned: " + e;
+    }
+    var o = t.terminal;
+    if (!o) {
+      return "[Terminal] No terminal in " + e;
+    }
+    if (a === "max") {
+      a = o.store && o.store[r] ? o.store[r] : 0;
+    }
+    if (typeof a !== "number" || a <= 0) {
+      return "[Terminal] Invalid amount: " + a + ". Must be positive.";
+    }
+    var i = {
+      id: "local_" + Game.time + "_" + Math.random().toString(36).substr(2, 9),
+      type: "toStorage",
+      roomName: e,
+      resourceType: r,
+      amount: a,
+      amountMoved: 0,
+      status: "pending",
+      created: Game.time
+    };
+    if (this.v2Enabled(e)) {
+      var n = storageManager.storageFind(e, r);
+      var s = n.terminal.total - n.terminal.reserved;
+      if (s < a) {
+        console.log("[Terminal] v2 reserve warning: only " + s + " free of " + a + " " + r + " in " + e + " terminal. Op will queue and wait.");
+      }
+      var m = Math.min(a, Math.max(0, s));
+      if (m > 0) {
+        var l = this.reserveOperationStock(i, e, r, "terminal", m, "terminalManager_toStor_" + i.id);
+        if (l.ok) {
+          i.reservationProgram = "terminalManager_toStor_" + i.id;
+          i.reservationBuilding = "terminal";
+          i.reservationRoom = e;
+        }
+      }
+    }
+    Memory.terminalManager.operations.push(i);
+    memoryManager.requestImmediateSave("terminalManager.createToStorage");
+    if (this.shouldUseSupplierForOp(i)) {
+      i.useSupplier = true;
+      this.addSupplierTask(e, i);
+      console.log("[Terminal] Local order queued for supplier: move " + a + " " + r + " from Terminal to Storage in " + e);
+      return "[Terminal] Local order queued for supplier: move " + a + " " + r + " from Terminal to Storage in " + e;
+    }
+    this.assignTerminalBot(e, "drain", r, i.id);
+    console.log("[Terminal] Local order created: move " + a + " " + r + " from Terminal to Storage in " + e);
+    return "[Terminal] Local order created: move " + a + " " + r + " from Terminal to Storage in " + e;
+  },
+  status: function() {
+    var e = Memory.terminalManager.operations;
+    if (e.length === 0) {
+      return "[Terminal] No active operations.";
+    }
+    console.log("=== TERMINAL MANAGER STATUS ===");
+    console.log("Active operations: " + e.length);
+    for (var r = 0; r < e.length; r++) {
+      var a = e[r];
+      var t = "";
+      if (a.type === "transfer") {
+        var o = a.amountTransferred || 0;
+        if (o < 0) o = 0;
+        if (o > a.amount) o = a.amount;
+        t = "TRANSFER: " + a.amount + " " + a.resourceType + " from " + a.fromRoom + " to " + a.toRoom + " (" + o + "/" + a.amount + " transferred)";
+        if (a.feederOpId) t += " [feeder: " + a.feederOpId + "]";
+      } else if (a.type === "toTerminal") {
+        var i = a.amountMoved || 0;
+        if (i < 0) i = 0;
+        if (i > a.amount) i = a.amount;
+        t = "TO TERMINAL: " + a.amount + " " + a.resourceType + " in " + a.roomName + " (" + i + "/" + a.amount + " moved)";
+        if (a.feederFor) t += " [feeder for " + a.feederFor + "]";
+      } else if (a.type === "toStorage") {
+        var n = a.amountMoved || 0;
+        if (n < 0) n = 0;
+        if (n > a.amount) n = a.amount;
+        t = "TO STORAGE: " + a.amount + " " + a.resourceType + " from terminal in " + a.roomName + " (" + n + "/" + a.amount + " moved)";
+      } else {
+        t = "[unknown op type]";
+      }
+      console.log("  " + a.id + ": " + t + " [" + a.status + "]");
+    }
+    var s = this.getAllTerminalBots();
+    console.log("Active terminal bots: " + s.length);
+    for (var m = 0; m < s.length; m++) {
+      var l = s[m];
+      var u = l.room && l.room.name ? l.room.name : l.memory.terminalRoom;
+      console.log("  " + l.name + ": " + (l.memory.terminalTask || "idle") + " " + (l.memory.terminalResource || "energy") + " in " + u + (l.memory.terminalOperationId ? " (op " + l.memory.terminalOperationId + ")" : ""));
+    }
+    return "[Terminal] Status displayed in console.";
+  },
+  whyTerminal: function(e) {
+    if (typeof e !== "string" || e.length === 0) {
+      return "[Terminal] Provide a valid room name.";
+    }
+    var r = Game.rooms[e];
+    if (!r) return "[Terminal] Room not visible: " + e;
+    var a = r.terminal;
+    if (!a) return "[Terminal] No terminal in " + e;
+    var t = [];
+    t.push("=== TERMINAL DEBUG " + e + " ===");
+    var o = a.store && a.store[RESOURCE_ENERGY] ? a.store[RESOURCE_ENERGY] : 0;
+    t.push("Terminal cooldown: " + (a.cooldown || 0));
+    t.push("Terminal energy: " + o);
+    var i = Memory.terminalManager && Array.isArray(Memory.terminalManager.operations) ? Memory.terminalManager.operations : [];
+    var n = false;
+    for (var s = 0; s < i.length; s++) {
+      var m = i[s];
+      if (!m) continue;
+      if (m.type === "transfer" && m.fromRoom === e) {
+        n = true;
+        var l = m.amountTransferred || 0;
+        var u = Math.max(0, m.amount - l);
+        var f = a.store && a.store[m.resourceType] ? a.store[m.resourceType] : 0;
+        var v = util.calcTransactionCost(u, m.fromRoom, m.toRoom);
+        var R = (m.resourceType === RESOURCE_ENERGY ? u : 0) + v;
+        var g = Math.max(0, u - f);
+        var c = Math.max(0, R - o);
+        var p = 0;
+        if (typeof m._waitingSince === "number") p = Game.time - m._waitingSince; else if (typeof m.created === "number") p = m.status === "waiting" ? Game.time - m.created : 0;
+        var M = "";
+        if (m.status === "waiting") {
+          if (a.cooldown && a.cooldown > 0) M = "terminal cooldown"; else if (g > 0) M = "waiting for payload"; else if (c > 0) M = "waiting for energy"; else if (m.error) M = m.error; else M = "unknown";
+        }
+        t.push("- " + m.id + " [" + m.status + "]: " + u + " " + m.resourceType + " remaining; " + "cost " + v + "; " + "terminal has " + f + " " + m.resourceType + ", " + o + " energy" + (m.status === "waiting" ? "; reason: " + M + "; waited: " + p + " ticks" : "") + (l > 0 ? "; sent so far: " + l : ""));
+        t.push("  energyNeededNow: " + R + " (deficit: " + c + "), payloadDeficit: " + g);
+      }
+      if (m.type === "toTerminal" && m.roomName === e) {
+        n = true;
+        var y = m.amountMoved || 0;
+        var E = Math.max(0, m.amount - y);
+        var d = this.getRoomAvailableOutsideTerminal(e, m.resourceType);
+        var T = a.store && a.store[m.resourceType] ? a.store[m.resourceType] : 0;
+        var O = "";
+        if (m.status === "waiting") {
+          if (d <= 0) O = "no supply outside terminal"; else if (m.error) O = m.error; else O = "unknown";
+        }
+        t.push("- " + m.id + " [toTerminal " + m.status + "]: " + E + "/" + m.amount + " " + m.resourceType + " remaining; " + "outside supply: " + d + "; terminal has: " + T + (O ? "; reason: " + O : ""));
+      }
+      if (m.type === "toStorage" && m.roomName === e) {
+        n = true;
+        var S = m.amountMoved || 0;
+        var C = Math.max(0, m.amount - S);
+        var h = a.store && a.store[m.resourceType] ? a.store[m.resourceType] : 0;
+        var A = "";
+        if (m.status === "waiting") {
+          if (h <= 0) A = "no payload in terminal"; else if (m.error) A = m.error; else A = "unknown";
+        }
+        t.push("- " + m.id + " [toStorage " + m.status + "]: " + C + "/" + m.amount + " " + m.resourceType + " remaining; " + "terminal has: " + h + (A ? "; reason: " + A : ""));
+      }
+    }
+    if (!n) {
+      t.push("No transfer operations originating from " + e + ".");
+    }
+    var _ = Memory.terminalManager && Array.isArray(Memory.terminalManager.bots) ? Memory.terminalManager.bots : [];
+    for (var U = 0; U < _.length; U++) {
+      var N = _[U];
+      if (!N) continue;
+      if (N.roomName !== e) continue;
+      t.push("- bot request " + N.id + ": " + N.status + " " + N.task + " " + N.resourceType + (N.operationId ? " (op " + N.operationId + ")" : ""));
+    }
+    var b = null;
+    var I = getRoomState.creepIndex();
+    var Y = I && I.all ? I.all : [];
+    for (var k = 0; k < Y.length; k++) {
+      var G = Y[k];
+      if (!G || !G.memory) continue;
+      if (G.memory.role === "terminalBot" && G.memory.terminalRoom === e) {
+        b = G;
+        break;
+      }
+    }
+    if (b) {
+      var w = b.memory.waitingState && b.memory.waitingState.isWaiting ? "waiting since " + b.memory.waitingState.waitStartTime : "active";
+      var V = b.memory.sourceId || "none";
+      var P = b.memory.terminalResource || RESOURCE_ENERGY;
+      t.push("- bot " + b.name + ": task " + (b.memory.terminalTask || "collect") + " " + P + "; " + w + "; source " + V);
+      var L = this.getRoomAvailableOutsideTerminal(e, P);
+      var B = a.store && a.store[P] ? a.store[P] : 0;
+      var D = this.getResourceNeeded(e, P);
+      t.push("- resource " + P + ": needed " + D + ", in terminal " + B + ", outside " + L);
+    } else {
+      t.push("No active terminal bot in " + e + ".");
+    }
+    for (var x = 0; x < t.length; x++) console.log(t[x]);
+    return "[Terminal] Debug printed for " + e;
+  },
+  cancelOperation: function(e) {
+    var r = Memory.terminalManager.operations;
+    var a = -1;
+    for (var t = 0; t < r.length; t++) {
+      if (r[t] && r[t].id === e) {
+        a = t;
+        break;
+      }
+    }
+    if (a === -1) {
+      return "[Terminal] Operation not found: " + e;
+    }
+    if (Memory.terminalManager && Array.isArray(Memory.terminalManager.bots)) {
+      for (var o = Memory.terminalManager.bots.length - 1; o >= 0; o--) {
+        var i = Memory.terminalManager.bots[o];
+        if (i && i.operationId === e) {
+          console.log("[Terminal] Removing bot request linked to cancelled op: " + i.id);
+          Memory.terminalManager.bots.splice(o, 1);
+        }
+      }
+    }
+    var n = getRoomState.creepIndex();
+    var s = n && n.all ? n.all : [];
+    for (var m = 0; m < s.length; m++) {
+      var l = s[m];
+      if (l && l.memory && l.memory.terminalOperationId === e) {
+        delete l.memory.terminalOperationId;
+        delete l.memory.sourceId;
+        delete l.memory.terminalTask;
+        delete l.memory.terminalResource;
+        delete l.memory.waitingState;
+        console.log("[Terminal] Cleared operation link from bot: " + l.name);
+      }
+    }
+    if (Memory.terminalManager && Memory.terminalManager.supplierTasks) {
+      for (var u in Memory.terminalManager.supplierTasks) {
+        var f = Memory.terminalManager.supplierTasks[u];
+        if (!Array.isArray(f)) continue;
+        for (var v = f.length - 1; v >= 0; v--) {
+          if (f[v] && f[v].opId === e) {
+            f.splice(v, 1);
+          }
+        }
+      }
+    }
+    this.releaseOpReservation(r[a]);
+    var R = r[a].feederOpId || r[a].feederFor;
+    r.splice(a, 1);
+    if (R) {
+      var g = -1;
+      for (var c = 0; c < r.length; c++) {
+        if (r[c] && r[c].id === R) {
+          g = c;
+          break;
+        }
+      }
+      if (g >= 0) {
+        if (r[g].feederOpId === e) delete r[g].feederOpId;
+        if (r[g].feederFor === e) delete r[g].feederFor;
+        this.releaseOpReservation(r[g]);
+        if (Memory.terminalManager && Array.isArray(Memory.terminalManager.bots)) {
+          for (var p = Memory.terminalManager.bots.length - 1; p >= 0; p--) {
+            if (Memory.terminalManager.bots[p] && Memory.terminalManager.bots[p].operationId === R) {
+              Memory.terminalManager.bots.splice(p, 1);
+            }
+          }
+        }
+        var M = getRoomState.creepIndex();
+        var y = M && M.all ? M.all : [];
+        for (var E = 0; E < y.length; E++) {
+          var d = y[E];
+          if (!d || !d.memory || d.memory.terminalOperationId !== R) continue;
+          delete d.memory.terminalOperationId;
+          delete d.memory.sourceId;
+          delete d.memory.terminalTask;
+          delete d.memory.terminalResource;
+          delete d.memory.waitingState;
+        }
+        if (Memory.terminalManager && Memory.terminalManager.supplierTasks) {
+          for (var T in Memory.terminalManager.supplierTasks) {
+            var O = Memory.terminalManager.supplierTasks[T];
+            if (!Array.isArray(O)) continue;
+            for (var S = O.length - 1; S >= 0; S--) {
+              if (O[S] && O[S].opId === R) O.splice(S, 1);
+            }
+          }
+        }
+        r.splice(g, 1);
+        console.log("[Terminal] Cascade-cancelled linked op: " + R);
+      }
+    }
+    memoryManager.requestImmediateSave("terminalManager.cancelOperation");
+    console.log("[Terminal] Cancelled operation: " + e);
+    return "[Terminal] Cancelled operation: " + e;
+  },
+  getOperationTerminalAvailable: function(e, r) {
+    var a = storageManager.storageFind(e.fromRoom, r);
+    if (!a || !a.terminal) return 0;
+    var t = e.reservationBuilding === "terminal" && e.reservationRoom === e.fromRoom ? e.reservationProgram : null;
+    var o = 0;
+    var i = a.terminal.reservations || [];
+    for (var n = 0; n < i.length; n++) {
+      if (!t || i[n].program !== t) {
+        o += i[n].amount || 0;
+      }
+    }
+    return Math.max(0, (a.terminal.total || 0) - o);
+  },
+  processOperations: function() {
+    var e = Memory.terminalManager.operations;
+    for (var r = 0; r < e.length; r++) {
+      var a = e[r];
+      if (!a) continue;
+      var t = a.roomName || a.fromRoom;
+      if (t && roomSuspender.shouldAvoidRoomWork(t)) continue;
+      if (a.type === "transfer") {
+        this.processTransfer(a);
+      } else if (a.type === "toTerminal") {
+        this.processToTerminal(a);
+      } else if (a.type === "toStorage") {
+        this.processToStorage(a);
+      }
+    }
+  },
+  processTransfer: function(e) {
+    var r = Game.rooms[e.fromRoom];
+    if (!r) {
+      e.status = "failed";
+      e.error = "Source room not accessible";
+      this.releaseOpReservation(e);
+      return;
+    }
+    var a = r.terminal;
+    if (!a) {
+      e.status = "failed";
+      e.error = "No terminal in source room";
+      this.releaseOpReservation(e);
+      return;
+    }
+    if (util.wasTerminalUsed(e.fromRoom)) return;
+    var t = e.amountTransferred || 0;
+    var o = e.amount - t;
+    if (o <= 0) {
+      if (e.status !== "completed") {
+        e.status = "completed";
+        console.log("[Terminal] Transfer completed: " + e.amount + " " + e.resourceType + " from " + e.fromRoom + " to " + e.toRoom);
+      }
+      this.releaseOpReservation(e);
+      return;
+    }
+    if (a.cooldown && a.cooldown > 0) {
+      if (e.status !== "active") e.status = "waiting";
+      if (typeof e._waitingSince !== "number") e._waitingSince = Game.time;
+      return;
+    }
+    var i = this.getOperationTerminalAvailable(e, e.resourceType);
+    var n = this.getOperationTerminalAvailable(e, RESOURCE_ENERGY);
+    function costFor(r) {
+      return util.calcTransactionCost(r, e.fromRoom, e.toRoom);
+    }
+    var s = Math.min(o, i);
+    if (s <= 0) {
+      e.status = "waiting";
+      e.error = "Waiting for resources";
+      if (typeof e._waitingSince !== "number") e._waitingSince = Game.time;
+      return;
+    }
+    function fits(r) {
+      var a = costFor(r);
+      var t = (e.resourceType === RESOURCE_ENERGY ? r : 0) + a;
+      return n >= t;
+    }
+    var m = s;
+    if (!fits(m)) {
+      var l = 0, u = s;
+      while (l < u) {
+        var f = Math.floor((l + u + 1) / 2);
+        if (fits(f)) l = f; else u = f - 1;
+      }
+      m = l;
+    }
+    if (m <= 0) {
+      e.status = "waiting";
+      e.error = "Waiting for energy";
+      if (typeof e._waitingSince !== "number") e._waitingSince = Game.time;
+      return;
+    }
+    var v = costFor(m);
+    var sourceState = null;
+    var destinationState = null;
+    try {
+      sourceState = getRoomState.get(e.fromRoom);
+      destinationState = getRoomState.get(e.toRoom);
+    } catch (g) {}
+    if (sourceState && Array.isArray(sourceState.hostiles) && sourceState.hostiles.length > 0) {
+      e.status = "waiting";
+      e.error = "Transfer paused while source room has hostiles";
+      if (typeof e._waitingSince !== "number") e._waitingSince = Game.time;
+      return;
+    }
+    if (destinationState && Array.isArray(destinationState.hostiles) && destinationState.hostiles.length > 0) {
+      e.status = "waiting";
+      e.error = "Transfer paused while destination room has hostiles";
+      if (typeof e._waitingSince !== "number") e._waitingSince = Game.time;
+      return;
+    }
+    var destinationRoom = Game.rooms[e.toRoom];
+    if (destinationRoom && destinationRoom.terminal && destinationRoom.terminal.store && typeof destinationRoom.terminal.store.getFreeCapacity === "function" && destinationRoom.terminal.store.getFreeCapacity(e.resourceType) < m) {
+      e.status = "waiting";
+      e.error = "Waiting for destination terminal capacity";
+      if (typeof e._waitingSince !== "number") e._waitingSince = Game.time;
+      return;
+    }
+    var R = a.send(e.resourceType, m, e.toRoom);
+    if (R === OK) {
+      util.markTerminalUsed(e.fromRoom);
+      if (e.accountingSource) {
+        var g = require("economics");
+        g.record(e.accountingSource, e.fromRoom, e.resourceType, {
+          energy: g.value(RESOURCE_ENERGY, v)
+        });
+      }
+      if (e.reservationProgram) {
+        this.consumeOperationStock(e, e.fromRoom, e.resourceType, "terminal", m, e.reservationProgram);
+      }
+      e.amountTransferred = (e.amountTransferred || 0) + m;
+      if (e.amountTransferred >= e.amount) {
+        e.status = "completed";
+        console.log("[Terminal] Transferred " + e.amount + " " + e.resourceType + " from " + e.fromRoom + " to " + e.toRoom + " (final chunk cost: " + v + " energy)");
+      } else {
+        e.status = "active";
+      }
+      if (typeof e._waitingSince === "number") delete e._waitingSince;
+      memoryManager.requestImmediateSave("terminalManager.send");
+    } else {
+      if (e.amountTransferred > 0) e.status = "active"; else e.status = "waiting";
+      if (typeof e._waitingSince !== "number") e._waitingSince = Game.time;
+    }
+  },
+  processToTerminal: function(e) {
+    if (e.status === "completed" || e.status === "failed") {
+      return;
+    }
+    var r = Game.rooms[e.roomName];
+    if (!r || !r.controller || !r.controller.my) {
+      e.status = "failed";
+      e.error = "Room not accessible or not owned";
+      this.releaseOpReservation(e);
+      return;
+    }
+    var a = r.terminal;
+    if (!a) {
+      e.status = "failed";
+      e.error = "No terminal in room";
+      this.releaseOpReservation(e);
+      return;
+    }
+    if (!e.useSupplier && this.shouldUseSupplierForOp(e)) {
+      e.useSupplier = true;
+      this.addSupplierTask(e.roomName, e);
+    }
+    if (e.useSupplier) this.addSupplierTask(e.roomName, e);
+    this.observeOperationProgress(e);
+    var t = 0;
+    if (a.store && typeof a.store.getFreeCapacity === "function") {
+      t = a.store.getFreeCapacity(e.resourceType);
+    } else {
+      t = 1;
+    }
+    if (t <= 0) {
+      e.status = "waiting";
+      e.error = "Terminal full";
+      if (typeof e._waitingSince !== "number") e._waitingSince = Game.time;
+      if (!e.useSupplier) {
+        this.assignTerminalBot(e.roomName, "collect", e.resourceType, e.id);
+      }
+      return;
+    }
+    var o = e.amountMoved || 0;
+    var i = e.amount - o;
+    if (i <= 0) {
+      if (e.status !== "completed") {
+        e.status = "completed";
+        console.log("[Terminal] Local toTerminal completed: " + e.amount + " " + e.resourceType + " in " + e.roomName);
+      }
+      this.releaseOpReservation(e);
+      return;
+    }
+    var n = this.getRoomAvailableOutsideTerminal(e.roomName, e.resourceType, e.reservationBuilding === "storage" ? e.reservationProgram : null);
+    if (n <= 0) {
+      e.status = "waiting";
+      e.error = "No supply outside terminal";
+      if (typeof e._waitingSince !== "number") e._waitingSince = Game.time;
+      if (!e.useSupplier) {
+        this.assignTerminalBot(e.roomName, "collect", e.resourceType, e.id);
+      }
+      return;
+    }
+    if (!e.useSupplier) {
+      this.assignTerminalBot(e.roomName, "collect", e.resourceType, e.id);
+    }
+    e.status = "active";
+    if (typeof e._waitingSince === "number") delete e._waitingSince;
+  },
+  processToStorage: function(e) {
+    var r = Game.rooms[e.roomName];
+    if (!r || !r.controller || !r.controller.my) {
+      e.status = "failed";
+      e.error = "Room not accessible or not owned";
+      this.releaseOpReservation(e);
+      return;
+    }
+    var a = r.terminal;
+    if (!a) {
+      e.status = "failed";
+      e.error = "No terminal in room";
+      this.releaseOpReservation(e);
+      return;
+    }
+    if (!e.useSupplier && this.shouldUseSupplierForOp(e)) {
+      e.useSupplier = true;
+      this.addSupplierTask(e.roomName, e);
+    }
+    if (e.autoBalance && e.resourceType === RESOURCE_ENERGY) {
+      var t = Memory.terminalManager.settings && typeof Memory.terminalManager.settings.energyTargetLevel === "number" ? Memory.terminalManager.settings.energyTargetLevel : 2e4;
+      var o = a.store && a.store[RESOURCE_ENERGY] ? a.store[RESOURCE_ENERGY] : 0;
+      if (o <= t) {
+        if (e.status !== "completed") {
+          e.status = "completed";
+          console.log("[Terminal] Auto-balance completed early: terminal energy in " + e.roomName + " is " + o + " (target: " + t + ")");
+        }
+        this.releaseOpReservation(e);
+        return;
+      }
+    }
+    var i = e.amountMoved || 0;
+    var n = e.amount - i;
+    if (n <= 0) {
+      if (e.status !== "completed") {
+        e.status = "completed";
+        console.log("[Terminal] Local toStorage completed: " + e.amount + " " + e.resourceType + " in " + e.roomName);
+        this.sendNotification("Local toStorage completed: " + e.amount + " " + e.resourceType + " in " + e.roomName);
+      }
+      this.releaseOpReservation(e);
+      return;
+    }
+    var s = a.store && a.store[e.resourceType] ? a.store[e.resourceType] : 0;
+    if (s <= 0) {
+      e.status = "waiting";
+      e.error = "No payload in terminal";
+      if (typeof e._waitingSince !== "number") e._waitingSince = Game.time;
+      if (!e.useSupplier) {
+        this.assignTerminalBot(e.roomName, "drain", e.resourceType, e.id);
+      }
+      return;
+    }
+    if (!e.useSupplier) {
+      this.assignTerminalBot(e.roomName, "drain", e.resourceType, e.id);
+    }
+    e.status = "active";
+    if (typeof e._waitingSince === "number") delete e._waitingSince;
+  },
+  manageBots: function() {
+    var e = Memory.terminalManager.bots;
+    for (var r = e.length - 1; r >= 0; r--) {
+      if (e[r].botName && !Game.creeps[e[r].botName]) {
+        e.splice(r, 1);
+      }
+    }
+    this.cleanupStaleRequests();
+    this.processSpawnRequests();
+    if (Memory.terminalManager.settings.runBotsFromManager) {
+      var a = this.getAllTerminalBots();
+      for (var t = 0; t < a.length; t++) this.runTerminalBot(a[t]);
+    }
+  },
+  cleanupStaleRequests: function() {
+    var e = Memory.terminalManager.bots;
+    for (var r = e.length - 1; r >= 0; r--) {
+      var a = e[r];
+      var t = false;
+      var o = this.getAllTerminalBots();
+      for (var i = 0; i < o.length; i++) {
+        if (o[i].memory && o[i].memory.terminalRoom === a.roomName) {
+          t = true;
+          break;
+        }
+      }
+      if (t && (a.status === "requested" || a.status === "spawning")) {
+        e.splice(r, 1);
+        continue;
+      }
+      if (a.status === "requested" || a.status === "spawning") {
+        var n = Game.rooms[a.roomName];
+        var s = n && n.terminal ? n.terminal : null;
+        if (a.task === "collect") {
+          var m = this.getRoomAvailableOutsideTerminal(a.roomName, a.resourceType);
+          var l = false;
+          if (a.operationId) {
+            var u = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+            for (var f = 0; f < u.length; f++) {
+              var v = u[f];
+              if (!v) continue;
+              if (v.id === a.operationId && v.type === "toTerminal" && v.roomName === a.roomName && v.resourceType === a.resourceType) {
+                l = true;
+                var R = v.amountMoved || 0;
+                var g = Math.max(0, v.amount - R);
+                if (g <= 0 || m <= 0) {
+                  e.splice(r, 1);
+                }
+                break;
+              }
+            }
+          }
+          if (!l) {
+            var c = s && s.store && s.store[a.resourceType] ? s.store[a.resourceType] : 0;
+            var p = Math.max(0, this.getResourceNeeded(a.roomName, a.resourceType) - c);
+            if (p <= 0 || m <= 0) {
+              e.splice(r, 1);
+            }
+          }
+          continue;
+        } else if (a.task === "drain") {
+          var M = s && s.store && s.store[a.resourceType] ? s.store[a.resourceType] : 0;
+          if (M <= 0) {
+            e.splice(r, 1);
+            continue;
+          }
+        }
+      }
+      if (a.status === "completed" && Game.time - a.created > 100) {
+        e.splice(r, 1);
+        continue;
+      }
+      if (a.status === "spawning" && a.botName && !Game.creeps[a.botName]) {
+        console.log("[Terminal] Cleaning up failed spawn request: " + a.id);
+        e.splice(r, 1);
+        continue;
+      }
+      if (Game.time - a.created > 500) {
+        console.log("[Terminal] Cleaning up stale request: " + a.id + " (age: " + (Game.time - a.created) + " ticks)");
+        e.splice(r, 1);
+        continue;
+      }
+      if (a.status === "spawning" && a.botName && Game.creeps[a.botName]) {
+        a.status = "completed";
+      }
+    }
+  },
+  getInFlightTerminalBotCount: function(e) {
+    var r = 0;
+    var a = getRoomState.creepIndex();
+    var t = a && a.all ? a.all : [];
+    for (var o = 0; o < t.length; o++) {
+      var i = t[o];
+      if (!i || !i.memory) continue;
+      if (i.memory.role === "terminalBot" && i.memory.terminalRoom === e) r++;
+    }
+    var n = Memory.terminalManager.bots || [];
+    for (var s = 0; s < n.length; s++) {
+      var m = n[s];
+      if (m.roomName !== e) continue;
+      if (m.status === "spawning" || m.status === "requested") r++;
+    }
+    return r;
+  },
+  assignTerminalBot: function(e, r, a, t) {
+    var o = Game.rooms[e];
+    if (singleSourceRoom.isSingleSourceActive(e)) return false;
+    if (!o || !o.controller || !o.controller.my) return false;
+    var i = 0;
+    if (t && Memory.terminalManager && Array.isArray(Memory.terminalManager.operations)) {
+      for (var n = 0; n < Memory.terminalManager.operations.length; n++) {
+        var s = Memory.terminalManager.operations[n];
+        if (s && s.id === t && typeof s.amount === "number") {
+          i = s.amount;
+          break;
+        }
+      }
+    }
+    var m = null;
+    if (t && Memory.terminalManager && Array.isArray(Memory.terminalManager.operations)) {
+      for (var l = 0; l < Memory.terminalManager.operations.length; l++) {
+        var u = Memory.terminalManager.operations[l];
+        if (u && u.id === t) {
+          m = u;
+          break;
+        }
+      }
+    }
+    if (r !== "drain" || a !== RESOURCE_ENERGY || !this.shouldUseTerminalBotForOp(m)) {
+      return false;
+    }
+    var f = getRoomState.creepIndex();
+    var v = f && f.all ? f.all : [];
+    for (var R = 0; R < v.length; R++) {
+      var g = v[R];
+      if (!g || !g.memory) continue;
+      if (g.memory.role === "terminalBot" && g.memory.terminalRoom === e) {
+        if (g.store && g.store.getUsedCapacity() > 0) {
+          return true;
+        }
+        g.memory.terminalTask = r;
+        g.memory.terminalResource = a;
+        g.memory.terminalRoom = e;
+        g.memory.terminalOperationId = t;
+        var c = Memory.terminalManager.operations;
+        for (var p = 0; p < c.length; p++) {
+          var s = c[p];
+          if (s && s.id === t) {
+            s.botId = g.name;
+            break;
+          }
+        }
+        return true;
+      }
+    }
+    var M = Memory.terminalManager.bots || [];
+    for (var y = 0; y < M.length; y++) {
+      var E = M[y];
+      if (!E) continue;
+      if (E.roomName === e && (E.status === "requested" || E.status === "spawning")) {
+        E.task = r;
+        E.resourceType = a;
+        if (i > 0) E.amount = i;
+        if (t) E.operationId = t;
+        return true;
+      }
+    }
+    var d = {
+      id: "bot_" + Game.time + "_" + Math.random().toString(36).substr(2, 9),
+      roomName: e,
+      task: r,
+      resourceType: a,
+      amount: i,
+      status: "requested",
+      created: Game.time
+    };
+    if (t) d.operationId = t;
+    Memory.terminalManager.bots.push(d);
+    console.log("[Terminal] Requested bot (assign) for " + r + " " + a + " in " + e + (t ? " (op: " + t + ")" : ""));
+    return true;
+  },
+  processSpawnRequests: function() {
+    var e = Memory.terminalManager.bots || [];
+    var r = [];
+    for (var a = 0; a < e.length; a++) if (e[a].status === "requested") r.push(e[a]);
+    for (var t = 0; t < r.length; t++) {
+      var o = r[t];
+      var i = Game.rooms[o.roomName];
+      if (!i) continue;
+      var n = null;
+      var s = Memory.terminalManager.operations || [];
+      for (var m = 0; m < s.length; m++) {
+        if (s[m] && s[m].id === o.operationId) {
+          n = s[m];
+          break;
+        }
+      }
+      if (o.task !== "drain" || o.resourceType !== RESOURCE_ENERGY || !this.shouldUseTerminalBotForOp(n)) {
+        o.status = "completed";
+        continue;
+      }
+      var l = typeof o.amount === "number" && o.amount > 0 ? o.amount : 0;
+      var u = null;
+      var t = getRoomState.creepIndex();
+      var f = t && t.all ? t.all : [];
+      for (var v = 0; v < f.length; v++) {
+        var R = f[v];
+        if (R && R.memory && R.memory.role === "terminalBot" && R.memory.terminalRoom === o.roomName) {
+          u = R;
+          break;
+        }
+      }
+      if (u) {
+        o.status = "completed";
+        continue;
+      }
+      var g = i.terminal;
+      if (o.task === "collect") {
+        var c = this.getRoomAvailableOutsideTerminal(o.roomName, o.resourceType);
+        var p = g && g.store && g.store[o.resourceType] ? g.store[o.resourceType] : 0;
+        var M = 0;
+        var y = false;
+        if (o.operationId) {
+          var E = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+          for (var d = 0; d < E.length; d++) {
+            var T = E[d];
+            if (!T) continue;
+            if (T.id !== o.operationId) continue;
+            if (T.type === "toTerminal" && T.roomName === o.roomName && T.resourceType === o.resourceType) {
+              y = true;
+              var O = T.amountMoved || 0;
+              var S = Math.max(0, T.amount - O);
+              M = S;
+              break;
+            }
+            if (T.type === "transfer" && T.fromRoom === o.roomName) {
+              y = true;
+              if (o.resourceType === RESOURCE_ENERGY) {
+                var C = Math.max(0, T.amount - (T.amountTransferred || 0));
+                if (C > 0) {
+                  var h = util.calcTransactionCost(C, T.fromRoom, T.toRoom);
+                  if (T.resourceType === RESOURCE_ENERGY) {
+                    M = Math.max(0, C + h - p);
+                  } else {
+                    M = Math.max(0, h - p);
+                  }
+                } else {
+                  M = 0;
+                }
+              } else if (o.resourceType === T.resourceType) {
+                var A = Math.max(0, T.amount - (T.amountTransferred || 0));
+                M = Math.max(0, A - p);
+              } else {
+                M = 0;
+              }
+              break;
+            }
+          }
+        }
+        if (!y) {
+          var _ = this.getResourceNeeded(o.roomName, o.resourceType);
+          M = Math.max(0, _ - p);
+        }
+        if (M <= 0 || c <= 0) {
+          o.status = "completed";
+          continue;
+        }
+      } else if (o.task === "drain") {
+        var U = g && g.store && g.store[o.resourceType] ? g.store[o.resourceType] : 0;
+        if (U <= 0) {
+          o.status = "completed";
+          continue;
+        }
+      }
+      var N = 1;
+      var b = this.getInFlightTerminalBotCount(o.roomName);
+      if (b > N) {
+        continue;
+      }
+      var I = getRoomState.get(o.roomName);
+      if (!I) continue;
+      var Y = I.structuresByType || {};
+      var k = Y[STRUCTURE_SPAWN] || [];
+      var G = [];
+      for (var w = 0; w < k.length; w++) {
+        var V = k[w];
+        if (V.my && !V.spawning) G.push(V);
+      }
+      var P = G.length > 0 ? G[0] : null;
+      if (!P) continue;
+      var L = this.getCreepBody("supplier", P.room.energyAvailable);
+      if (!L) continue;
+      var B = this.bodyCost(L);
+      if (B > P.room.energyAvailable) continue;
+      var D = "TerminalBot_" + o.roomName + "_" + Game.time;
+      var x = {
+        role: "terminalBot",
+        terminalTask: o.task,
+        terminalRoom: o.roomName,
+        terminalResource: o.resourceType,
+        terminalRequestId: o.id
+      };
+      if (o.operationId) x.terminalOperationId = o.operationId;
+      var F = spawnManager.spawnCustomCreep(P, L, D, x);
+      if (F === OK) {
+        o.status = "spawning";
+        o.botName = D;
+        var q = Memory.terminalManager.operations;
+        if (o.operationId) {
+          for (var H = 0; H < q.length; H++) {
+            if (q[H].id === o.operationId) {
+              q[H].botId = D;
+              console.log("[Terminal] Linked bot " + D + " to operation " + q[H].id);
+              break;
+            }
+          }
+        } else {
+          for (var K = 0; K < q.length; K++) {
+            var W = q[K];
+            var Z = W.roomName === o.roomName || W.fromRoom === o.roomName;
+            var X = W.resourceType === o.resourceType;
+            var z = W.status === "waiting" || W.status === "pending" || W.status === "active" || W.status === "dealing";
+            if (Z && X && !W.botId && z) {
+              W.botId = D;
+              console.log("[Terminal] Linked bot " + D + " to operation " + W.id);
+              break;
+            }
+          }
+        }
+        console.log("[Terminal] Spawning terminal bot: " + D + " for " + o.task + " " + o.resourceType);
+      }
+    }
+  },
+  runTerminalBot: function(e) {
+    var r = e.memory.terminalRoom || (e.room && e.room.name ? e.room.name : null);
+    if (!r) {
+      e.say("no room");
+      return;
+    }
+    if (!e.memory.terminalRoom) {
+      e.memory.terminalRoom = r;
+    }
+    var a = Game.rooms[r];
+    if (!a) {
+      e.moveTo(new RoomPosition(25, 25, r), {
+        reusePath: 20
+      });
+      e.say("home");
+      return;
+    }
+    var t = a.terminal;
+    if (!t) {
+      e.say("no term");
+      return;
+    }
+    if (e.memory.role !== "terminalBot") {
+      e.memory.role = "terminalBot";
+    }
+    var o = e.memory.terminalTask || "collect";
+    var i = e.memory.terminalResource || RESOURCE_ENERGY;
+    switch (o) {
+     case "drain":
+      this.runDrainBot(e, a.name, i);
+      break;
+     case "collect":
+     default:
+      this.runCollectBot(e, a.name, i);
+      break;
+    }
+  },
+  findNextNeededResourceForRoom: function(e) {
+    var r = Game.rooms[e];
+    var a = r && r.terminal ? r.terminal : null;
+    if (!a) return null;
+    var t = null;
+    var o = 0;
+    var i = 0;
+    var n = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+    for (var s = 0; s < n.length; s++) {
+      var m = n[s];
+      if (!m) continue;
+      if (m.status === "completed" || m.status === "failed") continue;
+      if (m.type === "transfer" && m.fromRoom === e) {
+        var l = Math.max(0, m.amount - (m.amountTransferred || 0));
+        if (l <= 0) continue;
+        if (m.resourceType === RESOURCE_ENERGY) {
+          var u = util.calcTransactionCost(l, m.fromRoom, m.toRoom);
+          var f = l + u;
+          var v = a.store && a.store[RESOURCE_ENERGY] ? a.store[RESOURCE_ENERGY] : 0;
+          var R = Math.max(0, f - v);
+          if (R > 0) i += R;
+        } else {
+          var g = a.store && a.store[m.resourceType] ? a.store[m.resourceType] : 0;
+          var c = Math.max(0, l - g);
+          if (c > o) {
+            o = c;
+            t = m.resourceType;
+          }
+          var p = util.calcTransactionCost(l, m.fromRoom, m.toRoom);
+          var M = a.store && a.store[RESOURCE_ENERGY] ? a.store[RESOURCE_ENERGY] : 0;
+          var y = Math.max(0, p - M);
+          if (y > 0) i += y;
+        }
+      }
+      if (m.type === "toTerminal" && m.roomName === e) {
+        var E = m.amountMoved || 0;
+        var d = Math.max(0, m.amount - E);
+        if (d > o) {
+          o = d;
+          t = m.resourceType;
+        }
+      }
+    }
+    if (t) return t;
+    if (i > 0) return RESOURCE_ENERGY;
+    return null;
+  },
+  idleNearController: function(e, r) {
+    var a = r.controller;
+    if (!a) return false;
+    if (e.pos.getRangeTo(a) <= 2) {
+      var t = false;
+      var o = e.pos.lookFor(LOOK_STRUCTURES);
+      for (var i = 0; i < o.length; i++) {
+        if (o[i].structureType === STRUCTURE_ROAD) {
+          t = true;
+          break;
+        }
+      }
+      if (!t) {
+        e.memory.idlePos = {
+          x: e.pos.x,
+          y: e.pos.y,
+          room: r.name
+        };
+        return true;
+      }
+    }
+    if (e.memory.idlePos && e.memory.idlePos.room === r.name) {
+      if (e.pos.x === e.memory.idlePos.x && e.pos.y === e.memory.idlePos.y && r.name === e.memory.idlePos.room) {
+        return true;
+      } else {
+        var n = r.getPositionAt(e.memory.idlePos.x, e.memory.idlePos.y);
+        if (n) {
+          e.moveTo(n, {
+            reusePath: 30,
+            visualizePathStyle: {
+              stroke: "#8888ff"
+            }
+          });
+          return true;
+        }
+        delete e.memory.idlePos;
+      }
+    }
+    var s = this.findIdleSpotNearController(r, e);
+    if (s) {
+      e.memory.idlePos = {
+        x: s.x,
+        y: s.y,
+        room: r.name
+      };
+      if (!(e.pos.x === s.x && e.pos.y === s.y && r.name === s.roomName)) {
+        e.moveTo(s, {
+          reusePath: 30,
+          visualizePathStyle: {
+            stroke: "#8888ff"
+          }
+        });
+      }
+      return true;
+    }
+    return false;
+  },
+  findIdleSpotNearController: function(e, r) {
+    var a = e.controller;
+    if (!a) return null;
+    var t = [];
+    var o = [];
+    var i = a.pos.x;
+    var n = a.pos.y;
+    for (var s = -2; s <= 2; s++) {
+      for (var m = -2; m <= 2; m++) {
+        var l = i + s;
+        var u = n + m;
+        if (l < 1 || l > 48 || u < 1 || u > 48) continue;
+        if (s * s + m * m > 4) continue;
+        var f = e.getPositionAt(l, u);
+        if (!f) continue;
+        var v = f.lookFor(LOOK_CREEPS);
+        if (v && v.length > 0) continue;
+        var R = e.getTerrain().get(l, u);
+        if (R === TERRAIN_MASK_WALL) continue;
+        var g = false;
+        var c = f.lookFor(LOOK_STRUCTURES);
+        var p = false;
+        for (var M = 0; M < c.length; M++) {
+          var y = c[M].structureType;
+          if (y === STRUCTURE_ROAD) {
+            g = true;
+            continue;
+          }
+          if (y === STRUCTURE_CONTAINER) continue;
+          if (y === STRUCTURE_RAMPART) {
+            var E = c[M];
+            if (E.my || E.isPublic) continue;
+            p = true;
+            break;
+          }
+          p = true;
+          break;
+        }
+        if (p) continue;
+        if (g) o.push(f); else t.push(f);
+      }
+    }
+    function pickClosest(e) {
+      if (e.length === 0) return null;
+      var a = e[0];
+      var t = r.pos.getRangeTo(a);
+      for (var o = 1; o < e.length; o++) {
+        var i = r.pos.getRangeTo(e[o]);
+        if (i < t) {
+          a = e[o];
+          t = i;
+        }
+      }
+      return a;
+    }
+    var d = pickClosest(t);
+    if (d) return d;
+    return pickClosest(o);
+  },
+  runCollectBot: function(e, r, a) {
+    var t = Game.rooms[r];
+    if (!t) {
+      e.moveTo(new RoomPosition(25, 25, r), {
+        reusePath: 20
+      });
+      e.say("home");
+      return;
+    }
+    var o = t.terminal;
+    if (!o) {
+      e.say("no term");
+      return;
+    }
+    if (!e.memory.waitingState) {
+      e.memory.waitingState = {
+        isWaiting: false,
+        lastResourceCheck: 0,
+        waitStartTime: 0
+      };
+    }
+    var i = e.store.getUsedCapacity();
+    if (i > 0) {
+      if (e.pos.isNearTo(o)) {
+        for (var n in e.store) {
+          var s = e.store[n] || 0;
+          if (s > 0) {
+            var m = n;
+            var l = s;
+            var u = e.transfer(o, m);
+            if (u === OK) {
+              var f = e.memory.terminalOperationId;
+              var v = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+              var R = require("marketSell");
+              var g = R && typeof R.getRequests === "function" ? R.getRequests() : [];
+              var c = false;
+              if (f) {
+                for (var p = 0; p < v.length; p++) {
+                  var M = v[p];
+                  if (!M || M.id !== f) continue;
+                  if (M.type === "toTerminal" && M.roomName === r && M.resourceType === m) {
+                    if (typeof M.amountMoved !== "number") M.amountMoved = 0;
+                    M.amountMoved += l;
+                    if (M.reservationProgram) {
+                      this.reserveOperationStock(M, r, m, "terminal", M.amountMoved, M.reservationProgram);
+                    }
+                    if (g.length > 0) {
+                      for (var y = 0; y < g.length; y++) {
+                        var E = g[y];
+                        if (!E || E.tmOpId !== M.id || E.roomName !== r || E.resourceType !== m) continue;
+                        if (M.reservationProgram) {
+                          storageManager.transfer(r, m, "terminal", M.reservationProgram, "marketSell", l);
+                        }
+                        break;
+                      }
+                    }
+                    c = true;
+                  } else if (M.type === "transfer" && M.fromRoom === r && M.resourceType === m && M.reservationProgram) {
+                    var d = Math.max(0, M.amount - (M.amountTransferred || 0));
+                    if (d > 0) {
+                      this.reserveOperationStock(M, r, m, "terminal", d, M.reservationProgram);
+                    }
+                  }
+                  break;
+                }
+              }
+              if (!c) {
+                for (var T = 0; T < v.length; T++) {
+                  var O = v[T];
+                  if (!O) continue;
+                  if (O.type === "toTerminal" && O.roomName === r && O.resourceType === m && O.status !== "completed" && O.status !== "failed") {
+                    if (typeof O.amountMoved !== "number") O.amountMoved = 0;
+                    O.amountMoved += l;
+                    if (O.reservationProgram) {
+                      this.reserveOperationStock(O, r, m, "terminal", O.amountMoved, O.reservationProgram);
+                    }
+                    if (g.length > 0) {
+                      for (var S = 0; S < g.length; S++) {
+                        var C = g[S];
+                        if (!C || C.tmOpId !== O.id || C.roomName !== r || C.resourceType !== m) continue;
+                        if (O.reservationProgram) {
+                          storageManager.transfer(r, m, "terminal", O.reservationProgram, "marketSell", l);
+                        }
+                        break;
+                      }
+                    }
+                    break;
+                  }
+                }
+              }
+            }
+            break;
+          }
+        }
+      } else {
+        e.moveTo(o, {
+          reusePath: 10,
+          visualizePathStyle: {
+            stroke: "#00ff00"
+          }
+        });
+      }
+      return;
+    }
+    var h = e.memory.terminalOperationId;
+    var A = null;
+    if (h) {
+      var _ = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+      for (var U = 0; U < _.length; U++) {
+        var N = _[U];
+        if (!N) continue;
+        if (N.id === h && N.type === "toTerminal" && N.roomName === r && N.resourceType === a) {
+          var b = N.amountMoved || 0;
+          A = Math.max(0, N.amount - b);
+          break;
+        }
+      }
+    }
+    var I = A !== null ? A : this.getResourceNeeded(r, a);
+    var Y = 0;
+    if (A === null) {
+      Y = o.store && o.store[a] ? o.store[a] : 0;
+    }
+    var k = A !== null ? A : Math.max(0, I - Y);
+    if (k <= 0) {
+      var G = this.findNextNeededResourceForRoom(r);
+      if (G) {
+        if (e.memory.terminalResource !== G) {
+          e.memory.terminalResource = G;
+          delete e.memory.sourceId;
+          e.say(G === RESOURCE_ENERGY ? "E" : G);
+        }
+      } else {
+        if (!this.idleNearController(e, t)) {
+          var w = this.getWaitingSpot(t);
+          if (w && !e.pos.isEqualTo(w)) {
+            e.moveTo(w, {
+              reusePath: 20
+            });
+          }
+        }
+        if (Game.time % 10 === 0) e.say("Idle");
+        return;
+      }
+    }
+    a = e.memory.terminalResource || a;
+    var V = null;
+    if (h) {
+      var P = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+      for (var L = 0; L < P.length; L++) {
+        if (P[L] && P[L].id === h) {
+          V = P[L];
+          break;
+        }
+      }
+    }
+    var B = null;
+    if (e.memory.sourceId) {
+      B = Game.getObjectById(e.memory.sourceId);
+      if (!B) delete e.memory.sourceId;
+    }
+    var D = Game.time - e.memory.waitingState.lastResourceCheck >= 10 || !B;
+    if (D) {
+      e.memory.waitingState.lastResourceCheck = Game.time;
+      var x = null;
+      if (V && V.reservationProgram) {
+        var F = storageManager.storageFind(t.name, a);
+        var q = [ {
+          structure: t.storage,
+          bucket: F.storage
+        }, {
+          structure: t.terminal,
+          bucket: F.terminal
+        } ];
+        for (var H = 0; H < q.length; H++) {
+          var K = q[H];
+          if (!K.structure || !K.bucket || !Array.isArray(K.bucket.reservations)) continue;
+          for (var W = 0; W < K.bucket.reservations.length; W++) {
+            var Z = K.bucket.reservations[W];
+            if (Z && Z.program === V.reservationProgram && Z.amount > 0) {
+              x = K.structure;
+              break;
+            }
+          }
+          if (x) break;
+        }
+      }
+      if (x) {
+        e.memory.sourceId = x.id;
+        B = x;
+        e.memory.waitingState.isWaiting = false;
+      } else {
+        var X = this.findResourceSources(t, a);
+        if (X.length > 0) {
+          var z = X[0];
+          e.memory.sourceId = z.structure.id;
+          B = z.structure;
+          e.memory.waitingState.isWaiting = false;
+        } else {
+          if (!e.memory.waitingState.isWaiting) {
+            e.memory.waitingState.isWaiting = true;
+            e.memory.waitingState.waitStartTime = Game.time;
+          }
+        }
+      }
+    }
+    if (B) {
+      if (e.pos.isNearTo(B)) {
+        var j = 0;
+        var Q = null;
+        if (h) {
+          var J = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+          for (var $ = 0; $ < J.length; $++) {
+            var ee = J[$];
+            if (!ee) continue;
+            if (ee.id === h && ee.type === "toTerminal" && ee.roomName === r && ee.resourceType === a) {
+              var re = ee.amountMoved || 0;
+              Q = Math.max(0, ee.amount - re);
+              break;
+            }
+          }
+        }
+        if (Q !== null) {
+          j = Q;
+        } else {
+          var ae = this.getResourceNeeded(r, a);
+          var te = o.store && o.store[a] ? o.store[a] : 0;
+          j = Math.max(0, ae - te);
+        }
+        var oe = 0;
+        if (o.store && typeof o.store.getFreeCapacity === "function") {
+          oe = o.store.getFreeCapacity(a);
+        } else {
+          oe = j;
+        }
+        var ie = B.store && (B.store[a] || 0) || 0;
+        var ne = Math.min(e.store.getFreeCapacity(), ie, j, oe);
+        if (ne > 0) {
+          var n = e.withdraw(B, a, ne);
+          if (n !== OK && n !== ERR_FULL && n !== ERR_NOT_ENOUGH_RESOURCES) {
+            delete e.memory.sourceId;
+          } else if (n === OK) {
+            var se = null;
+            if (h) {
+              var me = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+              for (var le = 0; le < me.length; le++) {
+                if (me[le] && me[le].id === h) {
+                  se = me[le];
+                  break;
+                }
+              }
+            }
+            if (se && se.reservationProgram) {
+              var ue = B.structureType === STRUCTURE_STORAGE ? "storage" : B.structureType === STRUCTURE_TERMINAL ? "terminal" : null;
+              if (ue) {
+                this.consumeOperationStock(se, r, a, ue, ne, se.reservationProgram);
+              }
+            }
+          }
+        } else {
+          delete e.memory.sourceId;
+        }
+      } else {
+        e.moveTo(B, {
+          reusePath: 10,
+          visualizePathStyle: {
+            stroke: "#ffaa00"
+          }
+        });
+        e.say("get");
+      }
+    } else {
+      if (!this.idleNearController(e, t)) {
+        var fe = this.getWaitingSpot(t);
+        if (fe && !e.pos.isEqualTo(fe)) {
+          e.moveTo(fe, {
+            reusePath: 20
+          });
+        }
+      }
+      if (Game.time % 10 === 0) e.say("wait");
+    }
+  },
+  runDrainBot: function(e, r, a) {
+    var t = Game.rooms[r];
+    if (!t) {
+      e.moveTo(new RoomPosition(25, 25, r), {
+        reusePath: 20
+      });
+      e.say("home");
+      return;
+    }
+    var o = t.terminal;
+    if (!o) {
+      e.say("no term");
+      return;
+    }
+    if (!e.memory.waitingState) {
+      e.memory.waitingState = {
+        isWaiting: false,
+        lastResourceCheck: 0,
+        waitStartTime: 0
+      };
+    }
+    var i = this.findStorageTarget(t, a);
+    var n = e.store.getUsedCapacity();
+    if (n > 0) {
+      if (!i) {
+        if (!this.idleNearController(e, t)) {
+          var s = this.getWaitingSpot(t);
+          if (s && !e.pos.isEqualTo(s)) e.moveTo(s, {
+            reusePath: 20
+          });
+        }
+        if (Game.time % 10 === 0) e.say("no tgt");
+        return;
+      }
+      if (e.pos.isNearTo(i)) {
+        var m = false;
+        var l = [];
+        for (var u in e.store) l.push(u);
+        for (var f = 0; f < l.length; f++) {
+          if (l[f] === a) {
+            var v = l[0];
+            l[0] = l[f];
+            l[f] = v;
+            break;
+          }
+        }
+        for (var R = 0; R < l.length; R++) {
+          var g = l[R];
+          var c = e.store[g] || 0;
+          if (c <= 0) continue;
+          var p = c;
+          var M = e.transfer(i, g);
+          if (M === OK) {
+            if (g === a) {
+              var y = e.memory.terminalOperationId;
+              var E = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+              var d = false;
+              if (y) {
+                for (var T = 0; T < E.length; T++) {
+                  var O = E[T];
+                  if (!O || O.id !== y) continue;
+                  if (O.type === "toStorage" && O.roomName === r && O.resourceType === g) {
+                    if (typeof O.amountMoved !== "number") O.amountMoved = 0;
+                    O.amountMoved += p;
+                    if (O.reservationProgram) {
+                      this.reserveOperationStock(O, r, g, "storage", O.amountMoved, O.reservationProgram);
+                    }
+                    d = true;
+                  }
+                  break;
+                }
+              }
+              if (!d) {
+                for (var S = 0; S < E.length; S++) {
+                  var C = E[S];
+                  if (!C) continue;
+                  if (C.type === "toStorage" && C.roomName === r && C.resourceType === g && C.status !== "completed" && C.status !== "failed") {
+                    if (typeof C.amountMoved !== "number") C.amountMoved = 0;
+                    C.amountMoved += p;
+                    if (C.reservationProgram) {
+                      this.reserveOperationStock(C, r, g, "storage", C.amountMoved, C.reservationProgram);
+                    }
+                    break;
+                  }
+                }
+              }
+            }
+            m = true;
+            break;
+          } else if (M === ERR_FULL) {
+            i = this.findStorageTarget(t, a, true);
+            if (i && !e.pos.isNearTo(i)) e.moveTo(i, {
+              reusePath: 10,
+              visualizePathStyle: {
+                stroke: "#00aaff"
+              }
+            });
+            break;
+          } else {
+            continue;
+          }
+        }
+        if (!m) {
+          e.moveTo(i, {
+            reusePath: 10,
+            visualizePathStyle: {
+              stroke: "#00aaff"
+            }
+          });
+        }
+      } else {
+        e.moveTo(i, {
+          reusePath: 10,
+          visualizePathStyle: {
+            stroke: "#00aaff"
+          }
+        });
+        e.say("drop");
+      }
+      return;
+    }
+    var y = e.memory.terminalOperationId;
+    var h = null;
+    if (y) {
+      var E = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+      for (var A = 0; A < E.length; A++) {
+        var _ = E[A];
+        if (!_ || _.id !== y) continue;
+        if (_.type === "toStorage" && _.roomName === r && _.resourceType === a) {
+          var U = _.amountMoved || 0;
+          h = Math.max(0, _.amount - U);
+          break;
+        }
+      }
+    }
+    if (h === null) h = e.store.getCapacity ? e.store.getCapacity() : e.store.getFreeCapacity();
+    var N = o.store && o.store[a] ? o.store[a] : 0;
+    if (N <= 0 || !i) {
+      if (!this.idleNearController(e, t)) {
+        var b = this.getWaitingSpot(t);
+        if (b && !e.pos.isEqualTo(b)) e.moveTo(b, {
+          reusePath: 20
+        });
+      }
+      if (Game.time % 10 === 0) e.say("wait");
+      return;
+    }
+    var I = Math.min(N, e.store.getFreeCapacity(), h);
+    if (a === RESOURCE_ENERGY) {
+      var Y = Memory.terminalManager && Memory.terminalManager.settings && typeof Memory.terminalManager.settings.energyTargetLevel === "number" ? Memory.terminalManager.settings.energyTargetLevel : 2e4;
+      var k = Math.max(0, N - Y);
+      I = Math.min(I, k);
+    }
+    if (I <= 0) {
+      if (!this.idleNearController(e, t)) {
+        var b = this.getWaitingSpot(t);
+        if (b && !e.pos.isEqualTo(b)) e.moveTo(b, {
+          reusePath: 20
+        });
+      }
+      if (Game.time % 10 === 0) e.say("idle");
+      return;
+    }
+    if (e.pos.isNearTo(o)) {
+      var G = e.withdraw(o, a, I);
+      if (G !== OK && G !== ERR_FULL && G !== ERR_NOT_ENOUGH_RESOURCES) {
+        e.say("w err");
+      } else {
+        if (G === OK && y) {
+          var w = Memory.terminalManager && Array.isArray(Memory.terminalManager.operations) ? Memory.terminalManager.operations : [];
+          for (var V = 0; V < w.length; V++) {
+            var P = w[V];
+            if (!P || P.id !== y) continue;
+            if (P.reservationProgram) {
+              this.consumeOperationStock(P, r, a, "terminal", I, P.reservationProgram);
+            }
+            break;
+          }
+        }
+      }
+    } else {
+      e.moveTo(o, {
+        reusePath: 10,
+        visualizePathStyle: {
+          stroke: "#ffaa00"
+        }
+      });
+    }
+  },
+  findResourceSources: function(e, r) {
+    var a = [];
+    if (e.storage && e.storage.store && (e.storage.store[r] || 0) > 0) {
+      a.push({
+        structure: e.storage,
+        amount: e.storage.store[r],
+        type: "storage",
+        priority: 1
+      });
+    }
+    var t = getRoomState.get(e.name);
+    var o = t && t.structuresByType ? t.structuresByType : {};
+    var i = o[STRUCTURE_FACTORY] || [];
+    for (var n = 0; n < i.length; n++) {
+      var s = i[n];
+      if (!s.my) continue;
+      if (!s.store || !(s.store[r] || 0)) continue;
+      a.push({
+        structure: s,
+        amount: s.store[r],
+        type: "factory",
+        priority: 2
+      });
+    }
+    var m = o[STRUCTURE_CONTAINER] || [];
+    for (var l = 0; l < m.length; l++) {
+      var u = m[l];
+      if (!u.store || !(u.store[r] || 0)) continue;
+      a.push({
+        structure: u,
+        amount: u.store[r],
+        type: "container",
+        priority: 2
+      });
+    }
+    var f = o[STRUCTURE_LAB] || [];
+    for (var v = 0; v < f.length; v++) {
+      var R = f[v];
+      if (!R.my) continue;
+      if (!R.store || !(R.store[r] || 0)) continue;
+      a.push({
+        structure: R,
+        amount: R.store[r],
+        type: "lab",
+        priority: 3
+      });
+    }
+    a.sort(function(e, r) {
+      if (e.priority !== r.priority) return e.priority - r.priority;
+      return r.amount - e.amount;
+    });
+    return a;
+  },
+  getWaitingSpot: function(e) {
+    var r = e.getTerrain();
+    var a = [ {
+      x: 2,
+      y: 2
+    }, {
+      x: 47,
+      y: 2
+    }, {
+      x: 2,
+      y: 47
+    }, {
+      x: 47,
+      y: 47
+    } ];
+    for (var t = 0; t < a.length; t++) {
+      var o = a[t];
+      if (r.get(o.x, o.y) !== TERRAIN_MASK_WALL) {
+        var i = e.getPositionAt(o.x, o.y);
+        if (i) {
+          var n = i.lookFor(LOOK_CREEPS);
+          if (n.length === 0) {
+            return i;
+          }
+        }
+      }
+    }
+    return null;
+  },
+  cleanupCompletedOperations: function() {
+    var e = Memory.terminalManager.operations;
+    for (var r = e.length - 1; r >= 0; r--) {
+      var a = e[r];
+      var t = false;
+      if ((a.type === "transfer" || a.type === "toTerminal" || a.type === "toStorage") && (a.status === "completed" || a.status === "failed") && Game.time - a.created > 1e3) {
+        t = true;
+      }
+      if (t) {
+        e.splice(r, 1);
+      }
+    }
+  },
+  broadcastEnergy: function(e, r) {
+    r = r || 1e4;
+    if (!e || typeof e !== "string") {
+      return "[Terminal] broadcastEnergy requires a destination room name.";
+    }
+    var a = Game.rooms[e];
+    if (a && !a.terminal) {
+      return "[Terminal] No terminal visible in destination room: " + e;
+    }
+    var t = [];
+    var o = [];
+    for (var i in Game.rooms) {
+      var n = Game.rooms[i];
+      if (!n || !n.controller || !n.controller.my) continue;
+      if (i === e) continue;
+      var s = n.terminal;
+      if (!s) {
+        o.push(i + " (no terminal)");
+        continue;
+      }
+      var m = s.store && s.store[RESOURCE_ENERGY] ? s.store[RESOURCE_ENERGY] : 0;
+      var l = util.calcTransactionCost(r, i, e);
+      var u = r + l;
+      if (m < u) {
+        o.push(i + " (have " + m + ", need " + u + " incl. cost " + l + ")");
+        continue;
+      }
+      var f = this.transferStuff(i, e, RESOURCE_ENERGY, r);
+      t.push(i + " -> cost " + l);
+    }
+    console.log("[Terminal] broadcastEnergy: queued " + t.length + " transfer(s) of " + r + " energy to " + e);
+    for (var v = 0; v < t.length; v++) console.log("  [OK] " + t[v]);
+    for (var R = 0; R < o.length; R++) console.log("  [SKIP] " + o[R]);
+    return "[Terminal] Done. " + t.length + " queued, " + o.length + " skipped.";
+  },
+  isRoomBusyWithTransfer: function(e) {
+    const r = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+    for (let a = 0; a < r.length; a++) {
+      const t = r[a];
+      if (t.type === "transfer" && t.status !== "completed" && t.status !== "failed" && (t.fromRoom === e || t.toRoom === e)) return true;
+    }
+    return false;
+  },
+  autoBalanceTerminalEnergy: function() {
+    var e = Memory.terminalManager.settings.energyHighThreshold || 1e5;
+    var r = Memory.terminalManager.settings.energyTargetLevel || 2e4;
+    var a = Game.rooms;
+    for (var t in a) {
+      var o = a[t];
+      if (!o || !o.controller || !o.controller.my) continue;
+      if (roomSuspender.shouldAvoidRoomWork(t)) continue;
+      var i = o.terminal;
+      if (!i) continue;
+      var n = i.store && i.store[RESOURCE_ENERGY] ? i.store[RESOURCE_ENERGY] : 0;
+      if (n <= e) continue;
+      var s = Memory.terminalManager.operations;
+      var m = false;
+      for (var l = 0; l < s.length; l++) {
+        var u = s[l];
+        if (!u) continue;
+        if (u.type === "toStorage" && u.roomName === t && u.resourceType === RESOURCE_ENERGY && u.status !== "completed" && u.status !== "failed") {
+          m = true;
+          break;
+        }
+      }
+      if (m) continue;
+      var f = false;
+      for (var v = 0; v < s.length; v++) {
+        var R = s[v];
+        if (!R) continue;
+        if (R.type === "transfer" && R.fromRoom === t && R.resourceType === RESOURCE_ENERGY && R.status !== "completed" && R.status !== "failed") {
+          f = true;
+          break;
+        }
+      }
+      if (f) continue;
+      var g = n - r;
+      if (g <= 0) continue;
+      var c = {
+        id: "autobalance_" + Game.time + "_" + Math.random().toString(36).substr(2, 9),
+        type: "toStorage",
+        roomName: t,
+        resourceType: RESOURCE_ENERGY,
+        amount: g,
+        amountMoved: 0,
+        status: "pending",
+        created: Game.time,
+        autoBalance: true
+      };
+      if (this.v2Enabled(t)) {
+        var p = storageManager.storageFind(t, RESOURCE_ENERGY);
+        var M = p.terminal.total - p.terminal.reserved;
+        var y = Math.min(g, Math.max(0, M));
+        if (y > 0) {
+          var E = this.reserveOperationStock(c, t, RESOURCE_ENERGY, "terminal", y, "terminalManager_toStor_" + c.id);
+          if (E.ok) {
+            c.reservationProgram = "terminalManager_toStor_" + c.id;
+            c.reservationBuilding = "terminal";
+            c.reservationRoom = t;
+          }
+        }
+      }
+      Memory.terminalManager.operations.push(c);
+      this.assignTerminalBot(t, "drain", RESOURCE_ENERGY, c.id);
+      console.log("[Terminal] Auto-balance: draining " + g + " energy from terminal in " + t + " (have " + n + ", target " + r + ")");
+    }
+  },
+  checkAndCancelStuckWaits: function(e) {
+    if (typeof e !== "number" || e <= 0) e = 5e3;
+    var r = 1e3;
+    var a = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+    for (var t = a.length - 1; t >= 0; t--) {
+      var o = a[t];
+      if (!o) continue;
+      if (o.type === "toTerminal" && o.status !== "completed" && o.status !== "failed") {
+        this.observeOperationProgress(o);
+        if (this.isOperationStale(o, LOCAL_NO_PROGRESS_TIMEOUT)) {
+          var i = o.amountMoved || 0;
+          console.log("[Terminal] Auto-cancelling stale local toTerminal op (no progress for " + (Game.time - o._lastProgressTick) + " ticks): " + o.id + " (" + i + "/" + o.amount + " moved)");
+          this.cancelOperation(o.id);
+          continue;
+        }
+      }
+      if (o.status !== "waiting") {
+        if (o._waitingSince) delete o._waitingSince;
+        continue;
+      }
+      var n = typeof o._waitingSince === "number" ? o._waitingSince : typeof o.created === "number" ? o.created : Game.time;
+      o._waitingSince = n;
+      var s = Game.time - n;
+      if (o.type === "toTerminal" && o.roomName) {
+        var m = this.getRoomAvailableOutsideTerminal(o.roomName, o.resourceType);
+        if (m <= 0 && s >= r) {
+          console.log("[Terminal] Auto-cancelling local toTerminal op (no supply for " + s + " ticks): " + o.id);
+          this.cancelOperation(o.id);
+          continue;
+        }
+      } else if (o.type === "toStorage" && o.roomName) {
+        var l = Game.rooms[o.roomName];
+        var u = l && l.terminal ? l.terminal : null;
+        var f = u && u.store && u.store[o.resourceType] ? u.store[o.resourceType] : 0;
+        if (f <= 0 && s >= r) {
+          console.log("[Terminal] Auto-cancelling local toStorage op (no payload for " + s + " ticks): " + o.id);
+          this.cancelOperation(o.id);
+          continue;
+        }
+      }
+      if (s >= e) {
+        this.cancelOperation(o.id);
+      }
+    }
+  },
+  validateResource: function(e) {
+    var r = [ RESOURCE_ENERGY, RESOURCE_POWER, RESOURCE_HYDROGEN, RESOURCE_OXYGEN, RESOURCE_UTRIUM, RESOURCE_LEMERGIUM, RESOURCE_KEANIUM, RESOURCE_ZYNTHIUM, RESOURCE_CATALYST, RESOURCE_HYDROXIDE, RESOURCE_ZYNTHIUM_KEANITE, RESOURCE_UTRIUM_LEMERGITE, RESOURCE_UTRIUM_HYDRIDE, RESOURCE_UTRIUM_OXIDE, RESOURCE_KEANIUM_HYDRIDE, RESOURCE_KEANIUM_OXIDE, RESOURCE_LEMERGIUM_HYDRIDE, RESOURCE_LEMERGIUM_OXIDE, RESOURCE_ZYNTHIUM_HYDRIDE, RESOURCE_ZYNTHIUM_OXIDE, RESOURCE_GHODIUM_HYDRIDE, RESOURCE_GHODIUM_OXIDE, RESOURCE_CATALYZED_UTRIUM_ACID, RESOURCE_CATALYZED_UTRIUM_ALKALIDE, RESOURCE_CATALYZED_KEANIUM_ACID, RESOURCE_CATALYZED_KEANIUM_ALKALIDE, RESOURCE_CATALYZED_LEMERGIUM_ACID, RESOURCE_CATALYZED_LEMERGIUM_ALKALIDE, RESOURCE_CATALYZED_ZYNTHIUM_ACID, RESOURCE_CATALYZED_ZYNTHIUM_ALKALIDE, RESOURCE_CATALYZED_GHODIUM_ACID, RESOURCE_CATALYZED_GHODIUM_ALKALIDE, RESOURCE_UTRIUM_BAR, RESOURCE_LEMERGIUM_BAR, RESOURCE_ZYNTHIUM_BAR, RESOURCE_KEANIUM_BAR, RESOURCE_GHODIUM_MELT, RESOURCE_OXIDANT, RESOURCE_REDUCTANT, RESOURCE_PURIFIER, RESOURCE_BATTERY, RESOURCE_COMPOSITE, RESOURCE_CRYSTAL, RESOURCE_LIQUID, RESOURCE_WIRE, RESOURCE_SWITCH, RESOURCE_TRANSISTOR, RESOURCE_MICROCHIP, RESOURCE_CIRCUIT, RESOURCE_DEVICE, RESOURCE_CELL, RESOURCE_PHLEGM, RESOURCE_TISSUE, RESOURCE_MUSCLE, RESOURCE_ORGANOID, RESOURCE_ORGANISM, RESOURCE_ALLOY, RESOURCE_TUBE, RESOURCE_FIXTURES, RESOURCE_FRAME, RESOURCE_HYDRAULICS, RESOURCE_MACHINE, RESOURCE_CONDENSATE, RESOURCE_CONCENTRATE, RESOURCE_EXTRACT, RESOURCE_SPIRIT, RESOURCE_EMANATION, RESOURCE_ESSENCE, RESOURCE_UTRIUM_ACID, RESOURCE_UTRIUM_ALKALIDE, RESOURCE_KEANIUM_ACID, RESOURCE_KEANIUM_ALKALIDE, RESOURCE_LEMERGIUM_ACID, RESOURCE_LEMERGIUM_ALKALIDE, RESOURCE_ZYNTHIUM_ACID, RESOURCE_ZYNTHIUM_ALKALIDE, RESOURCE_GHODIUM_ACID, RESOURCE_GHODIUM_ALKALIDE, RESOURCE_GHODIUM, RESOURCE_BIOMASS, RESOURCE_METAL, RESOURCE_MIST, RESOURCE_SILICON, RESOURCE_OPS ];
+    for (var a = 0; a < r.length; a++) {
+      if (r[a] === e) return true;
+    }
+    return false;
+  },
+  getAllTerminalBots: function() {
+    var e = [];
+    var r = getRoomState.creepIndex();
+    var a = r && r.all ? r.all : [];
+    for (var t = 0; t < a.length; t++) {
+      var o = a[t];
+      if (!o || !o.memory) continue;
+      if (o.memory.role === "terminalBot" && typeof o.memory.terminalRoom === "string" && typeof o.memory.terminalTask === "string") {
+        e.push(o);
+      }
+    }
+    return e;
+  },
+  getResourceNeeded: function(e, r) {
+    var a = 0;
+    var t = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+    for (var o = 0; o < t.length; o++) {
+      var i = t[o];
+      if (!i) continue;
+      if (i.status === "completed" || i.status === "failed") continue;
+      if (i.type === "transfer" && i.fromRoom === e) {
+        var n = Math.max(0, i.amount - (i.amountTransferred || 0));
+        if (n <= 0) continue;
+        if (i.resourceType === r) {
+          a += n;
+        }
+        if (r === RESOURCE_ENERGY && n > 0) {
+          var s = util.calcTransactionCost(n, i.fromRoom, i.toRoom);
+          if (i.resourceType === RESOURCE_ENERGY) {
+            a += n + s;
+          } else {
+            a += s;
+          }
+        }
+      }
+      if (i.type === "toTerminal" && i.roomName === e && i.resourceType === r) {
+        var m = i.amountMoved || 0;
+        var l = Math.max(0, i.amount - m);
+        a += l;
+      }
+    }
+    return a;
+  },
+  sendNotification: function(e) {
+    if (Memory.terminalManager.settings.emailNotifications) {
+      Game.notify(e, 60);
+    }
+    console.log("[Terminal Notification] " + e);
+  },
+  bodyCost: function(e) {
+    return util.bodyCost(e);
+  },
+  getCreepBody: function(e, r) {
+    var a = {
+      supplier: {
+        200: [ CARRY, CARRY, MOVE, MOVE ],
+        300: [ CARRY, CARRY, CARRY, MOVE, MOVE, MOVE ],
+        400: [ CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE ],
+        600: [ CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE ],
+        800: [ CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE ],
+        1e3: [ CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE ],
+        1200: [ CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE ],
+        1500: [ CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE ],
+        1800: [ CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE ],
+        2e3: [ CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE ],
+        2400: [ CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, CARRY, MOVE, MOVE, CARRY, MOVE, CARRY, MOVE, MOVE, CARRY, MOVE, MOVE, MOVE, CARRY, MOVE, MOVE, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, CARRY, MOVE ]
+      }
+    };
+    var t = a[e] || a.supplier;
+    var o = [];
+    for (var i in t) o.push(Number(i));
+    o.sort(function(e, r) {
+      return e - r;
+    });
+    var n = o[0];
+    for (var s = 0; s < o.length; s++) {
+      var m = o[s];
+      if (r >= m) n = m; else break;
+    }
+    return t[n];
+  },
+  getTransferableStorageAvailable: function(e, r, oProgram) {
+    var room = Game.rooms[e];
+    if (!room || !room.storage || !room.storage.store) return 0;
+    var amount = room.storage.store[r] || 0;
+    var reserved = 0;
+    try {
+      var info = storageManager.storageFind(e, r);
+      var block = info && info.storage;
+      reserved = block ? block.reserved || 0 : 0;
+      if (oProgram && block && Array.isArray(block.reservations)) {
+        for (var index = 0; index < block.reservations.length; index++) {
+          var reservation = block.reservations[index];
+          if (reservation && reservation.program === oProgram) reserved -= reservation.amount || 0;
+        }
+      }
+    } catch (g) {}
+    return Math.max(0, amount - reserved);
+  },
+  getRoomAvailableOutsideTerminal: function(e, r, oProgram) {
+    var a = Game.rooms[e];
+    if (!a) return 0;
+    var t = 0;
+    var o = a.storage;
+    if (o && o.store && o.store[r]) {
+      var storageReserved = 0;
+      try {
+        var storageInfo = storageManager.storageFind(e, r);
+        storageReserved = storageInfo && storageInfo.storage ? storageInfo.storage.reserved || 0 : 0;
+        if (oProgram && storageInfo && storageInfo.storage && Array.isArray(storageInfo.storage.reservations)) {
+          for (var reservationIndex = 0; reservationIndex < storageInfo.storage.reservations.length; reservationIndex++) {
+            var reservation = storageInfo.storage.reservations[reservationIndex];
+            if (reservation && reservation.program === oProgram) storageReserved -= reservation.amount || 0;
+          }
+        }
+      } catch (g) {}
+      t += Math.max(0, (o.store[r] || 0) - storageReserved);
+    }
+    var i = getRoomState.get(e);
+    var n = i && i.structuresByType ? i.structuresByType : {};
+    var s = n[STRUCTURE_CONTAINER] || [];
+    for (var m = 0; m < s.length; m++) {
+      var l = s[m];
+      if (l.store && (l.store[r] || 0) > 0) {
+        t += l.store[r];
+      }
+    }
+    var u = n[STRUCTURE_LAB] || [];
+    for (var f = 0; f < u.length; f++) {
+      var v = u[f];
+      if (!v.my) continue;
+      if (v.store && (v.store[r] || 0) > 0) {
+        t += v.store[r];
+      }
+    }
+    var R = n[STRUCTURE_FACTORY] || [];
+    for (var g = 0; g < R.length; g++) {
+      var c = R[g];
+      if (!c.my) continue;
+      if (c.store && (c.store[r] || 0) > 0) {
+        t += c.store[r];
+        break;
+      }
+    }
+    return t;
+  },
+  findStorageTarget: function(e, r, a) {
+    if (!a) {
+      if (e.storage && e.storage.store) {
+        var t = true;
+        if (e.storage.store.getFreeCapacity && typeof e.storage.store.getFreeCapacity === "function") {
+          t = e.storage.store.getFreeCapacity(r) > 0;
+        }
+        if (t) return e.storage;
+      }
+    }
+    var o = getRoomState.get(e.name);
+    var i = o && o.structuresByType ? o.structuresByType : {};
+    var n = i[STRUCTURE_CONTAINER] || [];
+    var s = null;
+    for (var m = 0; m < n.length; m++) {
+      var l = n[m];
+      if (!l || !l.store) continue;
+      var u = true;
+      if (l.store.getFreeCapacity && typeof l.store.getFreeCapacity === "function") {
+        u = l.store.getFreeCapacity(r) > 0;
+      }
+      if (!u) continue;
+      s = l;
+      break;
+    }
+    if (s) return s;
+    if (e.storage && e.storage.store) return e.storage;
+    return null;
+  },
+  getRoomTotalAvailable: function(e, r) {
+    var a = 0;
+    var t = Game.rooms[e];
+    if (!t) return 0;
+    if (t.storage && t.storage.store && t.storage.store[r]) {
+      a += t.storage.store[r];
+    }
+    var o = getRoomState.get(e);
+    var i = o && o.structuresByType ? o.structuresByType : {};
+    var n = i[STRUCTURE_CONTAINER] || [];
+    for (var s = 0; s < n.length; s++) {
+      var m = n[s];
+      if (m.store && m.store[r]) a += m.store[r];
+    }
+    var l = i[STRUCTURE_LAB] || [];
+    for (var u = 0; u < l.length; u++) {
+      var f = l[u];
+      if (f.my && f.store && f.store[r]) a += f.store[r];
+    }
+    var v = i[STRUCTURE_FACTORY] || [];
+    for (var R = 0; R < v.length; R++) {
+      var g = v[R];
+      if (g.my && g.store && g.store[r]) {
+        a += g.store[r];
+        break;
+      }
+    }
+    return a;
+  }
 };
-
-// ===== GLOBAL CONSOLE COMMANDS =====
-
-global.transferStuff = function(fromRoom, toRoom, resourceType, amount) {
-    return terminalManager.transferStuff(fromRoom, toRoom, resourceType, amount);
+global.transferStuff = function(e, r, a, t) {
+  return terminalManager.transferStuff(e, r, a, t);
 };
-
 global.terminalStatus = function() {
-    return terminalManager.status();
+  return terminalManager.status();
 };
-
-global.whyTerminal = function(roomName) {
-    return terminalManager.whyTerminal(roomName);
+global.whyTerminal = function(e) {
+  return terminalManager.whyTerminal(e);
 };
-
-global.cancelTerminalOperation = function(operationId) {
-    return terminalManager.cancelOperation(operationId);
+global.cancelTerminalOperation = function(e) {
+  return terminalManager.cancelOperation(e);
 };
-
-global.isRoomBusy = function(roomName) {
-    return terminalManager.isRoomBusyWithTransfer(roomName);
+global.isRoomBusy = function(e) {
+  return terminalManager.isRoomBusyWithTransfer(e);
 };
-
-global.broadcastEnergy = function(toRoom, amount) {
-    return terminalManager.broadcastEnergy(toRoom, amount);
+global.broadcastEnergy = function(e, r) {
+  return terminalManager.broadcastEnergy(e, r);
 };
-
-// NEW globals
-global.storageToTerminal = function(roomName, resourceType, amount) {
-    return terminalManager.storageToTerminal(roomName, resourceType, amount);
+global.storageToTerminal = function(e, r, a) {
+  return terminalManager.storageToTerminal(e, r, a);
 };
-global.terminalToStorage = function(roomName, resourceType, amount) {
-    return terminalManager.terminalToStorage(roomName, resourceType, amount);
+global.terminalToStorage = function(e, r, a) {
+  return terminalManager.terminalToStorage(e, r, a);
 };
-
 module.exports = terminalManager;

@@ -1,1509 +1,1247 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// roomCPUProfiler.js
+// Console globals: profileRoom, cancelRoomProfile, roomProfileStatus, profileNeighbors
+// Example: profileRoom('W5N3') - Run detailed per-tick CPU profiling on room
+// Example: cancelRoomProfile() - Stop active room CPU profiling
+// Example: roomProfileStatus() - Display room CPU profiling status and collected samples
+// Example: profileNeighbors('W5N3') - Profile CPU for room and all neighboring rooms
 /**
- * roomCPUProfiler.js  (v10 — neighbor rankings)
+ * roomCPUProfiler.js  (v10 — room profiling with own-room fallback)
  * ==============================================
- * Profile a single room, a player, or ALL neighbors in observer range.
+ * Profile a single room, visible rooms owned by the current player, or the
+ * own-room fallback used when foreign-player scanning is unavailable.
  *
  *   profileRoom('W5N3')        — single room (own or foreign)
- *   profileRoom('PlayerName')  — all rooms owned by that player
- *                                 (uses wideScan to discover, then
- *                                  profiles each room for 100 ticks
- *                                  sequentially, then aggregates)
- *   profileNeighbors()         — discover ALL players in observer range
- *                                 via wideScanPlayers, then profile every
- *                                 room for each player (including yourself).
- *                                 Prints ranked CPU comparison + Game.notify.
+ *   profileRoom('PlayerName')  — own visible rooms when PlayerName is yours;
+ *                                 foreign-player discovery is unavailable here
+ *                                 because scanner wide scans are asynchronous.
+ *   profileNeighbors()         — profile own visible rooms; foreign neighbor
+ *                                 discovery is unavailable in this module.
+ *                                 Prints the ranked report + Game.notify.
  *   roomProfileStatus()        — check progress of an active profile
  *                                 single mode: ticks done, running avg,
  *                                   current CPU breakdown
- *                                 player mode: wideScan progress or
- *                                   rooms completed, current room ticks,
+ *                                 player mode: rooms completed, current room
+ *                                   ticks,
  *                                   per-room results so far
- *                                 neighbors mode: scan progress, rooms
- *                                   profiled per player, running averages
+ *                                 neighbors mode: own-room fallback progress,
+ *                                   profiled rooms, running averages
  *   cancelRoomProfile()        — abort at any point
+ *
+ * Usage: call the globals above from the Screeps console.
+ * Example: profileRoom('W5N3'); roomProfileStatus();
  */
-
-'use strict';
-
-// wideScan.js was merged into scanner.js. The new wideScan is async
-// (registry-backed sweep), which doesn't fit this file's synchronous
-// profile flow. Stub the old interface so this file can still load;
-// foreign player / neighbor modes will degrade to own-rooms-only
-// (or abort with a clear message). Use scanner's wideScan() global
-// directly when you need a full player report.
+"use strict";
+const scanner = require("scanner");
 const wideScan = {
-  start: function(target) {
-    console.log('[RoomCPUProfiler] Foreign player scan for "' + target +
-      '" is no longer supported in this file (wideScan was merged into scanner.js).');
+  start: function(e) {
+    console.log('[RoomCPUProfiler] Foreign player scan for "' + e + '" is no longer supported in this file (wideScan was merged into scanner.js).');
   },
   startPlayers: function() {
-    console.log('[RoomCPUProfiler] Neighbor scan is no longer supported in this file (wideScan was merged into scanner.js).');
+    console.log("[RoomCPUProfiler] Neighbor scan is no longer supported in this file (wideScan was merged into scanner.js).");
   },
-  cancel: function() {},
+  cancel: function() {}
 };
-
-const PROFILE_TICKS  = 100;
-const MAX_OBSERVERS  = 2;
-const LOG_INTERVAL   = 25;
-const MEM_KEY        = 'roomCPUProfile';
-const GLOBAL_PREV    = '__cpuProfilerPrev';  // heap-only, not serialized
-
-// Cost constants
-const CPU_SIMPLE     = 0.2;
-const CPU_TOWER      = 0.4;
-const CPU_LAB        = 0.4;
-const MOVE_CPU_OPT   = 0.2;
-const MOVE_CPU_TYP   = 0.5;
-const MOVE_CPU_NAIVE = 2.0;
-
-// Event constants
-const EV_ATTACK             = 1;
-const EV_OBJECT_DESTROYED   = 2;
-const EV_ATTACK_CONTROLLER  = 3;
-const EV_BUILD              = 4;
-const EV_HARVEST            = 5;
-const EV_HEAL               = 6;
-const EV_REPAIR             = 7;
+const PROFILE_TICKS = 100;
+const MAX_OBSERVERS = 2;
+const LOG_INTERVAL = 25;
+const MEM_KEY = "roomCPUProfile";
+const GLOBAL_PREV = "__cpuProfilerPrev";
+const OBSERVER_SOURCE = "roomCPUProfiler";
+const CPU_SIMPLE = .2;
+const CPU_TOWER = .4;
+const CPU_LAB = .4;
+const MOVE_CPU_OPT = .2;
+const MOVE_CPU_TYP = .5;
+const MOVE_CPU_NAIVE = 2;
+const EV_ATTACK = 1;
+const EV_OBJECT_DESTROYED = 2;
+const EV_ATTACK_CONTROLLER = 3;
+const EV_BUILD = 4;
+const EV_HARVEST = 5;
+const EV_HEAL = 6;
+const EV_REPAIR = 7;
 const EV_RESERVE_CONTROLLER = 8;
 const EV_UPGRADE_CONTROLLER = 9;
-const EV_EXIT               = 10;
-const EV_POWER              = 11;
-const EV_TRANSFER           = 12;
-const EV_ATTACK_NUKE        = 6;
-const EV_ATTACK_HIT_BACK    = 5;
-const EV_ATTACK_RANGED      = 2;
+const EV_EXIT = 10;
+const EV_POWER = 11;
+const EV_TRANSFER = 12;
+const EV_ATTACK_NUKE = 6;
+const EV_ATTACK_HIT_BACK = 5;
+const EV_ATTACK_RANGED = 2;
 const EV_ATTACK_RANGED_MASS = 3;
-const EV_ATTACK_DISMANTLE   = 4;
-
-// ═══════════════════════════════════════════════════════════════
-// HELPERS
-// ═══════════════════════════════════════════════════════════════
-
+const EV_ATTACK_DISMANTLE = 4;
 const ROOM_NAME_RE = /^[WE]\d+[NS]\d+$/;
-function isRoomName(s) { return ROOM_NAME_RE.test(s); }
-function isOwnRoom(roomName) {
-    const r = Game.rooms[roomName];
-    return !!(r && r.controller && r.controller.my);
+function isRoomName(e) {
+  return ROOM_NAME_RE.test(e);
 }
 
-function findObservers(targetRoom) {
-    const results = [];
-    for (const roomName in Game.rooms) {
-        const room = Game.rooms[roomName];
-        if (!room.controller || !room.controller.my) continue;
-        const obs = room.find(FIND_MY_STRUCTURES, {
-            filter: s => s.structureType === STRUCTURE_OBSERVER && s.isActive()
-        });
-        if (!obs.length) continue;
-        const dist = Game.map.getRoomLinearDistance(roomName, targetRoom);
-        if (dist <= 10) results.push({ observer: obs[0], dist, room: roomName });
-    }
-    results.sort((a, b) => a.dist - b.dist);
-    return results.slice(0, MAX_OBSERVERS);
+function isOwnRoom(e) {
+  const o = Game.rooms[e];
+  return !!(o && o.controller && o.controller.my);
 }
 
-function fireObservers(targetRoom) {
-    const observers = findObservers(targetRoom);
-    let fired = 0;
-    for (const { observer } of observers) {
-        if (observer.observeRoom(targetRoom) === OK) fired++;
-    }
-    return { count: observers.length, fired };
+function findObservers(e) {
+  return scanner.utils.findObserversInRange(e).slice(0, MAX_OBSERVERS).map(o => ({
+    observer: o,
+    dist: Game.map.getRoomLinearDistance(o.room.name, e),
+    room: o.room.name
+  }));
 }
 
-// ── Prev snapshot lives in global heap, not Memory ──────────────────────────
-// Key is `roomName` so single and player modes don't collide.
-
-function getPrev(roomName) {
-    return (global[GLOBAL_PREV] && global[GLOBAL_PREV][roomName]) || null;
+function fireObservers(e) {
+  const o = findObservers(e);
+  const t = scanner.observe.request(e, OBSERVER_SOURCE, scanner.observe.PRI.MONITOR, {
+    untilConsumed: true,
+    holdTicks: 5
+  }) ? 1 : 0;
+  return {
+    count: o.length,
+    fired: t
+  };
 }
 
-function setPrev(roomName, snap) {
-    if (!global[GLOBAL_PREV]) global[GLOBAL_PREV] = {};
-    global[GLOBAL_PREV][roomName] = snap;
+function getPrev(e) {
+  return global[GLOBAL_PREV] && global[GLOBAL_PREV][e] || null;
 }
 
-function clearPrev(roomName) {
-    if (global[GLOBAL_PREV]) delete global[GLOBAL_PREV][roomName];
+function setPrev(e, o) {
+  if (!global[GLOBAL_PREV]) global[GLOBAL_PREV] = {};
+  global[GLOBAL_PREV][e] = o;
+}
+
+function clearPrev(e) {
+  if (global[GLOBAL_PREV]) delete global[GLOBAL_PREV][e];
 }
 
 function clearAllPrev() {
-    delete global[GLOBAL_PREV];
+  delete global[GLOBAL_PREV];
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SNAPSHOT  (built fresh each tick, stored in global heap only)
-// ═══════════════════════════════════════════════════════════════
-
-function takeSnapshot(room) {
-    const snap = {
-        creepPos: {}, terminal: null, labs: {},
-        factory: null, spawns: {}, nuker: null,
-        powerSpawn: null, constructionSites: 0, controllerSafeMode: 0,
-    };
-    for (const c of room.find(FIND_CREEPS))
-        snap.creepPos[c.id] = { x: c.pos.x, y: c.pos.y };
-    for (const pc of room.find(FIND_POWER_CREEPS))
-        snap.creepPos['pc_' + pc.id] = { x: pc.pos.x, y: pc.pos.y };
-    for (const s of room.find(FIND_STRUCTURES)) {
-        switch (s.structureType) {
-            case STRUCTURE_TERMINAL:    snap.terminal   = { cooldown: s.cooldown || 0 };                           break;
-            case STRUCTURE_LAB:         snap.labs[s.id] = { cooldown: s.cooldown || 0 };                           break;
-            case STRUCTURE_FACTORY:     snap.factory    = { id: s.id, cooldown: s.cooldown || 0 };                 break;
-            case STRUCTURE_SPAWN:       snap.spawns[s.id] = { spawning: !!s.spawning };                            break;
-            case STRUCTURE_NUKER:       snap.nuker      = { id: s.id, cooldown: s.cooldown || 0 };                 break;
-            case STRUCTURE_POWER_SPAWN: snap.powerSpawn = { id: s.id, power: s.store[RESOURCE_POWER] || 0 };       break;
-            default: break;
-        }
+function takeSnapshot(e) {
+  const o = {
+    creepPos: {},
+    terminal: null,
+    labs: {},
+    factory: null,
+    spawns: {},
+    nuker: null,
+    powerSpawn: null,
+    constructionSites: 0,
+    controllerSafeMode: 0
+  };
+  for (const t of e.find(FIND_CREEPS)) o.creepPos[t.id] = {
+    x: t.pos.x,
+    y: t.pos.y
+  };
+  for (const t of e.find(FIND_POWER_CREEPS)) o.creepPos["pc_" + t.id] = {
+    x: t.pos.x,
+    y: t.pos.y
+  };
+  for (const t of e.find(FIND_STRUCTURES)) {
+    switch (t.structureType) {
+     case STRUCTURE_TERMINAL:
+      o.terminal = {
+        cooldown: t.cooldown || 0
+      };
+      break;
+     case STRUCTURE_LAB:
+      o.labs[t.id] = {
+        cooldown: t.cooldown || 0
+      };
+      break;
+     case STRUCTURE_FACTORY:
+      o.factory = {
+        id: t.id,
+        cooldown: t.cooldown || 0
+      };
+      break;
+     case STRUCTURE_SPAWN:
+      o.spawns[t.id] = {
+        spawning: !!t.spawning
+      };
+      break;
+     case STRUCTURE_NUKER:
+      o.nuker = {
+        id: t.id,
+        cooldown: t.cooldown || 0
+      };
+      break;
+     case STRUCTURE_POWER_SPAWN:
+      o.powerSpawn = {
+        id: t.id,
+        power: t.store[RESOURCE_POWER] || 0
+      };
+      break;
+     default:
+      break;
     }
-    if (room.controller) snap.controllerSafeMode = room.controller.safeMode || 0;
-    snap.constructionSites = room.find(FIND_CONSTRUCTION_SITES).length;
-    return snap;
+  }
+  if (e.controller) o.controllerSafeMode = e.controller.safeMode || 0;
+  o.constructionSites = e.find(FIND_CONSTRUCTION_SITES).length;
+  return o;
 }
-
-// ═══════════════════════════════════════════════════════════════
-// EVENT LOG
-// ═══════════════════════════════════════════════════════════════
 
 function emptyEvDetail() {
-    return {
-        intents: 0,
-        harvest: 0, build: 0, upgradeController: 0, reserveController: 0,
-        attackController: 0, transfer: 0, attackMelee: 0, attackRangedMass: 0,
-        dismantle: 0, healMelee: 0, powerAbility: 0,
-        repairAny: 0, attackRangedAny: 0, healRangedAny: 0,
-        objectsDestroyed: 0, nukeDetonations: 0, hitBacks: 0,
-    };
+  return {
+    intents: 0,
+    harvest: 0,
+    build: 0,
+    upgradeController: 0,
+    reserveController: 0,
+    attackController: 0,
+    transfer: 0,
+    attackMelee: 0,
+    attackRangedMass: 0,
+    dismantle: 0,
+    healMelee: 0,
+    powerAbility: 0,
+    repairAny: 0,
+    attackRangedAny: 0,
+    healRangedAny: 0,
+    objectsDestroyed: 0,
+    nukeDetonations: 0,
+    hitBacks: 0
+  };
 }
 
-function processEventLog(room) {
-    let events;
-    try { events = JSON.parse(room.getEventLog(true)); }
-    catch (e) { events = room.getEventLog(); }
-    if (!events || !events.length) return { intents: 0, detail: emptyEvDetail() };
-    const d = emptyEvDetail();
-    let intents = 0;
-    for (const ev of events) {
-        switch (ev.event) {
-            case EV_ATTACK: {
-                const at = ev.data && ev.data.attackType;
-                if      (at === EV_ATTACK_NUKE)     { d.nukeDetonations++; }
-                else if (at === EV_ATTACK_HIT_BACK)  { d.hitBacks++; }
-                else {
-                    intents++;
-                    if      (at === EV_ATTACK_RANGED)       d.attackRangedAny++;
-                    else if (at === EV_ATTACK_RANGED_MASS)  d.attackRangedMass++;
-                    else if (at === EV_ATTACK_DISMANTLE)    d.dismantle++;
-                    else                                    d.attackMelee++;
-                }
-                break;
-            }
-            case EV_OBJECT_DESTROYED:   d.objectsDestroyed++;                  break;
-            case EV_ATTACK_CONTROLLER:  intents++; d.attackController++;        break;
-            case EV_BUILD:              intents++; d.build++;                   break;
-            case EV_HARVEST:            intents++; d.harvest++;                 break;
-            case EV_HEAL: {
-                intents++;
-                if ((ev.data && ev.data.healType) === 2) d.healRangedAny++;
-                else                                     d.healMelee++;
-                break;
-            }
-            case EV_REPAIR:             intents++; d.repairAny++;               break;
-            case EV_RESERVE_CONTROLLER: intents++; d.reserveController++;       break;
-            case EV_UPGRADE_CONTROLLER: intents++; d.upgradeController++;       break;
-            case EV_EXIT:                                                        break;
-            case EV_POWER:              intents++; d.powerAbility++;            break;
-            case EV_TRANSFER:           intents++; d.transfer++;                break;
-            default: break;
+function processEventLog(e) {
+  let o;
+  try {
+    o = JSON.parse(e.getEventLog(true));
+  } catch (t) {
+    o = e.getEventLog();
+  }
+  if (!o || !o.length) return {
+    intents: 0,
+    detail: emptyEvDetail()
+  };
+  const t = emptyEvDetail();
+  let r = 0;
+  for (const e of o) {
+    switch (e.event) {
+     case EV_ATTACK:
+      {
+        const o = e.data && e.data.attackType;
+        if (o === EV_ATTACK_NUKE) {
+          t.nukeDetonations++;
+        } else if (o === EV_ATTACK_HIT_BACK) {
+          t.hitBacks++;
+        } else {
+          r++;
+          if (o === EV_ATTACK_RANGED) t.attackRangedAny++; else if (o === EV_ATTACK_RANGED_MASS) t.attackRangedMass++; else if (o === EV_ATTACK_DISMANTLE) t.dismantle++; else t.attackMelee++;
         }
+        break;
+      }
+     case EV_OBJECT_DESTROYED:
+      t.objectsDestroyed++;
+      break;
+     case EV_ATTACK_CONTROLLER:
+      r++;
+      t.attackController++;
+      break;
+     case EV_BUILD:
+      r++;
+      t.build++;
+      break;
+     case EV_HARVEST:
+      r++;
+      t.harvest++;
+      break;
+     case EV_HEAL:
+      {
+        r++;
+        if ((e.data && e.data.healType) === 2) t.healRangedAny++; else t.healMelee++;
+        break;
+      }
+     case EV_REPAIR:
+      r++;
+      t.repairAny++;
+      break;
+     case EV_RESERVE_CONTROLLER:
+      r++;
+      t.reserveController++;
+      break;
+     case EV_UPGRADE_CONTROLLER:
+      r++;
+      t.upgradeController++;
+      break;
+     case EV_EXIT:
+      break;
+     case EV_POWER:
+      r++;
+      t.powerAbility++;
+      break;
+     case EV_TRANSFER:
+      r++;
+      t.transfer++;
+      break;
+     default:
+      break;
     }
-    d.intents = intents;
-    return { intents, detail: d };
+  }
+  t.intents = r;
+  return {
+    intents: r,
+    detail: t
+  };
 }
-
-// ═══════════════════════════════════════════════════════════════
-// STATE DIFF
-// ═══════════════════════════════════════════════════════════════
 
 function emptyDiffDetail() {
-    return {
-        creepMoves: 0, powerCreepMoves: 0, terminalSends: 0, labReactions: 0,
-        factoryProduces: 0, spawnEvents: 0, nukerFired: 0, powerProcessed: 0,
-        constructionSites: 0, safeModeActivated: 0,
-    };
+  return {
+    creepMoves: 0,
+    powerCreepMoves: 0,
+    terminalSends: 0,
+    labReactions: 0,
+    factoryProduces: 0,
+    spawnEvents: 0,
+    nukerFired: 0,
+    powerProcessed: 0,
+    constructionSites: 0,
+    safeModeActivated: 0
+  };
 }
 
-function diffSnapshots(prev, curr) {
-    const d = emptyDiffDetail();
-    for (const id in curr.creepPos) {
-        const c = curr.creepPos[id]; const p = prev.creepPos[id];
-        if (!p) continue;
-        if (c.x !== p.x || c.y !== p.y) {
-            if (id.startsWith('pc_')) d.powerCreepMoves++;
-            else                      d.creepMoves++;
-        }
+function diffSnapshots(e, o) {
+  const t = emptyDiffDetail();
+  for (const r in o.creepPos) {
+    const n = o.creepPos[r];
+    const s = e.creepPos[r];
+    if (!s) continue;
+    if (n.x !== s.x || n.y !== s.y) {
+      if (r.startsWith("pc_")) t.powerCreepMoves++; else t.creepMoves++;
     }
-    if (curr.terminal && prev.terminal &&
-        prev.terminal.cooldown === 0 && curr.terminal.cooldown > 0) d.terminalSends++;
-    for (const id in curr.labs) {
-        const c = curr.labs[id]; const p = prev.labs[id];
-        if (p && p.cooldown === 0 && c.cooldown > 0) d.labReactions++;
-    }
-    if (curr.factory && prev.factory &&
-        prev.factory.cooldown === 0 && curr.factory.cooldown > 0) d.factoryProduces++;
-    for (const id in curr.spawns) {
-        const c = curr.spawns[id]; const p = prev.spawns[id];
-        if (p && !p.spawning && c.spawning) d.spawnEvents++;
-    }
-    if (curr.nuker && prev.nuker && prev.nuker.cooldown === 0 && curr.nuker.cooldown > 0) {
-        d.nukerFired++;
-        const n = Game.getObjectById(curr.nuker.id);
-        console.log('[RoomCPUProfiler] \u26A0 NUKE LAUNCHED from ' + (n ? n.room.name : '?') + ' tick ' + Game.time);
-    }
-    if (curr.powerSpawn && prev.powerSpawn) {
-        const drop = prev.powerSpawn.power - curr.powerSpawn.power;
-        if (drop > 0) d.powerProcessed += drop;
-    }
-    const newSites = curr.constructionSites - prev.constructionSites;
-    if (newSites > 0) d.constructionSites += newSites;
-    if (prev.controllerSafeMode === 0 && curr.controllerSafeMode > 0) {
-        d.safeModeActivated++;
-        console.log('[RoomCPUProfiler] \u26A0 SAFE MODE ACTIVATED tick ' + Game.time);
-    }
-    return { detail: d };
+  }
+  if (o.terminal && e.terminal && e.terminal.cooldown === 0 && o.terminal.cooldown > 0) t.terminalSends++;
+  for (const r in o.labs) {
+    const n = o.labs[r];
+    const s = e.labs[r];
+    if (s && s.cooldown === 0 && n.cooldown > 0) t.labReactions++;
+  }
+  if (o.factory && e.factory && e.factory.cooldown === 0 && o.factory.cooldown > 0) t.factoryProduces++;
+  for (const r in o.spawns) {
+    const n = o.spawns[r];
+    const s = e.spawns[r];
+    if (s && !s.spawning && n.spawning) t.spawnEvents++;
+  }
+  if (o.nuker && e.nuker && e.nuker.cooldown === 0 && o.nuker.cooldown > 0) {
+    t.nukerFired++;
+    const e = Game.getObjectById(o.nuker.id);
+    console.log("[RoomCPUProfiler] ⚠ NUKE LAUNCHED from " + (e ? e.room.name : "?") + " tick " + Game.time);
+  }
+  if (o.powerSpawn && e.powerSpawn) {
+    const r = e.powerSpawn.power - o.powerSpawn.power;
+    if (r > 0) t.powerProcessed += r;
+  }
+  const r = o.constructionSites - e.constructionSites;
+  if (r > 0) t.constructionSites += r;
+  if (e.controllerSafeMode === 0 && o.controllerSafeMode > 0) {
+    t.safeModeActivated++;
+    console.log("[RoomCPUProfiler] ⚠ SAFE MODE ACTIVATED tick " + Game.time);
+  }
+  return {
+    detail: t
+  };
 }
 
-// ═══════════════════════════════════════════════════════════════
-// CPU CALCULATION
-// ═══════════════════════════════════════════════════════════════
-
-function calcCPU(t) {
-    const simpleIntents =
-        t.ev_harvest + t.ev_build + t.ev_upgradeController + t.ev_reserveController +
-        t.ev_attackController + t.ev_transfer + t.ev_attackMelee + t.ev_attackRangedMass +
-        t.ev_dismantle + t.ev_healMelee + t.ev_powerAbility + t.diff_terminalSends +
-        t.diff_factoryProduces + t.diff_spawnEvents + t.diff_nukerFired +
-        t.diff_powerProcessed + t.diff_constructionSites + t.diff_safeModeActivated;
-    const simpleCPU  = simpleIntents * CPU_SIMPLE;
-    const labCPU     = t.diff_labReactions * CPU_LAB;
-    const ambig      = t.ev_repairAny + t.ev_attackRangedAny + t.ev_healRangedAny;
-    const moves      = t.diff_creepMoves + t.diff_powerCreepMoves;
-    return {
-        simpleIntents, simpleCPU, labCPU, ambig,
-        ambigLow: ambig * CPU_SIMPLE, ambigHigh: ambig * CPU_TOWER,
-        moves,
-        moveLow:   moves * MOVE_CPU_OPT,
-        moveMid:   moves * MOVE_CPU_TYP,
-        moveHigh:  moves * MOVE_CPU_NAIVE,
-        totalLow:  simpleCPU + labCPU + ambig * CPU_SIMPLE + moves * MOVE_CPU_OPT,
-        totalMid:  simpleCPU + labCPU + ambig * CPU_TOWER  + moves * MOVE_CPU_TYP,
-        totalHigh: simpleCPU + labCPU + ambig * CPU_TOWER  + moves * MOVE_CPU_NAIVE,
-    };
+function calcCPU(e) {
+  const o = e.ev_harvest + e.ev_build + e.ev_upgradeController + e.ev_reserveController + e.ev_attackController + e.ev_transfer + e.ev_attackMelee + e.ev_attackRangedMass + e.ev_dismantle + e.ev_healMelee + e.ev_powerAbility + e.diff_terminalSends + e.diff_factoryProduces + e.diff_spawnEvents + e.diff_nukerFired + e.diff_powerProcessed + e.diff_constructionSites + e.diff_safeModeActivated;
+  const t = o * CPU_SIMPLE;
+  const r = e.diff_labReactions * CPU_LAB;
+  const n = e.ev_repairAny + e.ev_attackRangedAny + e.ev_healRangedAny;
+  const s = e.diff_creepMoves + e.diff_powerCreepMoves;
+  return {
+    simpleIntents: o,
+    simpleCPU: t,
+    labCPU: r,
+    ambig: n,
+    ambigLow: n * CPU_SIMPLE,
+    ambigHigh: n * CPU_TOWER,
+    moves: s,
+    moveLow: s * MOVE_CPU_OPT,
+    moveMid: s * MOVE_CPU_TYP,
+    moveHigh: s * MOVE_CPU_NAIVE,
+    totalLow: t + r + n * CPU_SIMPLE + s * MOVE_CPU_OPT,
+    totalMid: t + r + n * CPU_TOWER + s * MOVE_CPU_TYP,
+    totalHigh: t + r + n * CPU_TOWER + s * MOVE_CPU_NAIVE
+  };
 }
-
-// ═══════════════════════════════════════════════════════════════
-// TOTALS
-// ═══════════════════════════════════════════════════════════════
 
 function initTotals() {
-    return {
-        ticksObserved: 0, creepCountSum: 0, invisibleTicks: 0,
-        ev_harvest: 0, ev_build: 0, ev_upgradeController: 0, ev_reserveController: 0,
-        ev_attackController: 0, ev_transfer: 0, ev_attackMelee: 0, ev_attackRangedMass: 0,
-        ev_dismantle: 0, ev_healMelee: 0, ev_powerAbility: 0,
-        ev_repairAny: 0, ev_attackRangedAny: 0, ev_healRangedAny: 0,
-        ev_objectsDestroyed: 0, ev_nukeDetonations: 0,
-        diff_creepMoves: 0, diff_powerCreepMoves: 0, diff_terminalSends: 0,
-        diff_labReactions: 0, diff_factoryProduces: 0, diff_spawnEvents: 0,
-        diff_nukerFired: 0, diff_powerProcessed: 0, diff_constructionSites: 0,
-        diff_safeModeActivated: 0,
-    };
+  return {
+    ticksObserved: 0,
+    creepCountSum: 0,
+    invisibleTicks: 0,
+    ev_harvest: 0,
+    ev_build: 0,
+    ev_upgradeController: 0,
+    ev_reserveController: 0,
+    ev_attackController: 0,
+    ev_transfer: 0,
+    ev_attackMelee: 0,
+    ev_attackRangedMass: 0,
+    ev_dismantle: 0,
+    ev_healMelee: 0,
+    ev_powerAbility: 0,
+    ev_repairAny: 0,
+    ev_attackRangedAny: 0,
+    ev_healRangedAny: 0,
+    ev_objectsDestroyed: 0,
+    ev_nukeDetonations: 0,
+    diff_creepMoves: 0,
+    diff_powerCreepMoves: 0,
+    diff_terminalSends: 0,
+    diff_labReactions: 0,
+    diff_factoryProduces: 0,
+    diff_spawnEvents: 0,
+    diff_nukerFired: 0,
+    diff_powerProcessed: 0,
+    diff_constructionSites: 0,
+    diff_safeModeActivated: 0
+  };
 }
 
-function accumulateTotals(dst, src) {
-    for (const k in src) {
-        if (typeof src[k] === 'number') dst[k] = (dst[k] || 0) + src[k];
-    }
+function accumulateTotals(e, o) {
+  for (const t in o) {
+    if (typeof o[t] === "number") e[t] = (e[t] || 0) + o[t];
+  }
 }
 
-function accumulateEventDetail(t, evD, dfD) {
-    t.ev_harvest             += evD.harvest;
-    t.ev_build               += evD.build;
-    t.ev_upgradeController   += evD.upgradeController;
-    t.ev_reserveController   += evD.reserveController;
-    t.ev_attackController    += evD.attackController;
-    t.ev_transfer            += evD.transfer;
-    t.ev_attackMelee         += evD.attackMelee;
-    t.ev_attackRangedMass    += evD.attackRangedMass;
-    t.ev_dismantle           += evD.dismantle;
-    t.ev_healMelee           += evD.healMelee;
-    t.ev_powerAbility        += evD.powerAbility;
-    t.ev_repairAny           += evD.repairAny;
-    t.ev_attackRangedAny     += evD.attackRangedAny;
-    t.ev_healRangedAny       += evD.healRangedAny;
-    t.ev_objectsDestroyed    += evD.objectsDestroyed;
-    t.ev_nukeDetonations     += evD.nukeDetonations;
-    t.diff_creepMoves        += dfD.creepMoves;
-    t.diff_powerCreepMoves   += dfD.powerCreepMoves;
-    t.diff_terminalSends     += dfD.terminalSends;
-    t.diff_labReactions      += dfD.labReactions;
-    t.diff_factoryProduces   += dfD.factoryProduces;
-    t.diff_spawnEvents       += dfD.spawnEvents;
-    t.diff_nukerFired        += dfD.nukerFired;
-    t.diff_powerProcessed    += dfD.powerProcessed;
-    t.diff_constructionSites += dfD.constructionSites;
-    t.diff_safeModeActivated += dfD.safeModeActivated;
+function accumulateEventDetail(e, o, t) {
+  e.ev_harvest += o.harvest;
+  e.ev_build += o.build;
+  e.ev_upgradeController += o.upgradeController;
+  e.ev_reserveController += o.reserveController;
+  e.ev_attackController += o.attackController;
+  e.ev_transfer += o.transfer;
+  e.ev_attackMelee += o.attackMelee;
+  e.ev_attackRangedMass += o.attackRangedMass;
+  e.ev_dismantle += o.dismantle;
+  e.ev_healMelee += o.healMelee;
+  e.ev_powerAbility += o.powerAbility;
+  e.ev_repairAny += o.repairAny;
+  e.ev_attackRangedAny += o.attackRangedAny;
+  e.ev_healRangedAny += o.healRangedAny;
+  e.ev_objectsDestroyed += o.objectsDestroyed;
+  e.ev_nukeDetonations += o.nukeDetonations;
+  e.diff_creepMoves += t.creepMoves;
+  e.diff_powerCreepMoves += t.powerCreepMoves;
+  e.diff_terminalSends += t.terminalSends;
+  e.diff_labReactions += t.labReactions;
+  e.diff_factoryProduces += t.factoryProduces;
+  e.diff_spawnEvents += t.spawnEvents;
+  e.diff_nukerFired += t.nukerFired;
+  e.diff_powerProcessed += t.powerProcessed;
+  e.diff_constructionSites += t.constructionSites;
+  e.diff_safeModeActivated += t.safeModeActivated;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// REPORT
-// ═══════════════════════════════════════════════════════════════
-
-function buildRoomReport(roomName, t, obsCount, ownRoom) {
-    const cpu       = calcCPU(t);
-    const obs       = t.ticksObserved;
-    const avgCreeps = obs > 0 ? (t.creepCountSum / obs).toFixed(1) : '0';
-    const obsLabel  = ownRoom ? 'own' : obsCount + ' obs';
-
-    function f(n)  { return n.toFixed(2); }
-    function fp(n) { return n.toFixed(3); }
-    function row(label, n, cpuPer) {
-        if (!n) return null;
-        return '  \u2502    ' + label.padEnd(30) + ': ' + String(n).padStart(5) +
-               '  (' + f(n * cpuPer) + ' CPU)';
-    }
-
-    const sep = '\u2500'.repeat(62);
-    const lines = [
-        '  \u250C' + sep + '\u2510',
-        '  \u2502  ' + roomName.padEnd(14) +
-            ' ticks=' + String(obs).padStart(3) +
-            '  creeps=' + avgCreeps +
-            '  invis=' + t.invisibleTicks +
-            '  [' + obsLabel + ']',
-        '  \u251C' + sep + '\u2524',
-    ];
-
-    // Simple rows — only non-zero
-    const simpleRows = [
-        row('harvest',             t.ev_harvest,             CPU_SIMPLE),
-        row('build',               t.ev_build,               CPU_SIMPLE),
-        row('upgradeController',   t.ev_upgradeController,   CPU_SIMPLE),
-        row('reserveController',   t.ev_reserveController,   CPU_SIMPLE),
-        row('attackController',    t.ev_attackController,    CPU_SIMPLE),
-        row('transfer/withdraw',   t.ev_transfer,            CPU_SIMPLE),
-        row('attackMelee',         t.ev_attackMelee,         CPU_SIMPLE),
-        row('rangedMassAttack',    t.ev_attackRangedMass,    CPU_SIMPLE),
-        row('dismantle',           t.ev_dismantle,           CPU_SIMPLE),
-        row('healMelee',           t.ev_healMelee,           CPU_SIMPLE),
-        row('powerAbility',        t.ev_powerAbility,        CPU_SIMPLE),
-        row('terminal sends',      t.diff_terminalSends,     CPU_SIMPLE),
-        row('factory produce',     t.diff_factoryProduces,   CPU_SIMPLE),
-        row('spawn events',        t.diff_spawnEvents,       CPU_SIMPLE),
-        row('nuker launches',      t.diff_nukerFired,        CPU_SIMPLE),
-        row('power processed',     t.diff_powerProcessed,    CPU_SIMPLE),
-        row('new construct sites', t.diff_constructionSites, CPU_SIMPLE),
-        row('safe mode',           t.diff_safeModeActivated, CPU_SIMPLE),
-    ].filter(Boolean);
-
-    if (simpleRows.length) {
-        lines.push('  \u2502  simple intents (~0.2 each):');
-        for (const r of simpleRows) lines.push(r);
-    }
-
-    // Elevated
-    const elevatedRows = [
-        t.diff_labReactions > 0
-            ? '  \u2502    ' + 'lab reactions/boosts'.padEnd(30) + ': ' +
-              String(t.diff_labReactions).padStart(5) + '  (' + f(t.diff_labReactions * CPU_LAB) + ' CPU)'
-            : null,
-        (t.ev_repairAny + t.ev_attackRangedAny + t.ev_healRangedAny) > 0
-            ? '  \u2502    ' + 'repair+rngdAtk+rngdHeal'.padEnd(30) + ': ' +
-              String(t.ev_repairAny + t.ev_attackRangedAny + t.ev_healRangedAny).padStart(5) +
-              '  (' + f(cpu.ambigLow) + '\u2013' + f(cpu.ambigHigh) + ' CPU, ambiguous)'
-            : null,
-    ].filter(Boolean);
-
-    if (elevatedRows.length) {
-        lines.push('  \u2502  elevated cost (~0.4+ each):');
-        for (const r of elevatedRows) lines.push(r);
-    }
-
-    // Movement
-    if (cpu.moves > 0) {
-        lines.push('  \u2502  movement (' + cpu.moves + ' moves):  ' +
-            'opt=' + f(cpu.moveLow) + '  typical=' + f(cpu.moveMid) + '  naive=' + f(cpu.moveHigh) + ' CPU');
-    }
-
-    lines.push('  \u251C' + sep + '\u2524');
-    lines.push('  \u2502  TOTAL  opt=' + f(cpu.totalLow) +
-        '  typical=' + f(cpu.totalMid) +
-        '  naive=' + f(cpu.totalHigh) +
-        ' CPU    (' + fp(cpu.totalMid / Math.max(1, obs)) + '/tick typical)');
-    lines.push('  \u2514' + sep + '\u2518');
-
-    return lines;
+function buildRoomReport(e, o, t, r) {
+  const n = calcCPU(o);
+  const s = o.ticksObserved;
+  const i = s > 0 ? (o.creepCountSum / s).toFixed(1) : "0";
+  const a = r ? "own" : t + " obs";
+  function f(e) {
+    return e.toFixed(2);
+  }
+  function fp(e) {
+    return e.toFixed(3);
+  }
+  function row(e, o, t) {
+    if (!o) return null;
+    return "  │    " + e.padEnd(30) + ": " + String(o).padStart(5) + "  (" + f(o * t) + " CPU)";
+  }
+  const l = "─".repeat(62);
+  const c = [ "  ┌" + l + "┐", "  │  " + e.padEnd(14) + " ticks=" + String(s).padStart(3) + "  creeps=" + i + "  invis=" + o.invisibleTicks + "  [" + a + "]", "  ├" + l + "┤" ];
+  const m = [ row("harvest", o.ev_harvest, CPU_SIMPLE), row("build", o.ev_build, CPU_SIMPLE), row("upgradeController", o.ev_upgradeController, CPU_SIMPLE), row("reserveController", o.ev_reserveController, CPU_SIMPLE), row("attackController", o.ev_attackController, CPU_SIMPLE), row("transfer/withdraw", o.ev_transfer, CPU_SIMPLE), row("attackMelee", o.ev_attackMelee, CPU_SIMPLE), row("rangedMassAttack", o.ev_attackRangedMass, CPU_SIMPLE), row("dismantle", o.ev_dismantle, CPU_SIMPLE), row("healMelee", o.ev_healMelee, CPU_SIMPLE), row("powerAbility", o.ev_powerAbility, CPU_SIMPLE), row("terminal sends", o.diff_terminalSends, CPU_SIMPLE), row("factory produce", o.diff_factoryProduces, CPU_SIMPLE), row("spawn events", o.diff_spawnEvents, CPU_SIMPLE), row("nuker launches", o.diff_nukerFired, CPU_SIMPLE), row("power processed", o.diff_powerProcessed, CPU_SIMPLE), row("new construct sites", o.diff_constructionSites, CPU_SIMPLE), row("safe mode", o.diff_safeModeActivated, CPU_SIMPLE) ].filter(Boolean);
+  if (m.length) {
+    c.push("  │  simple intents (~0.2 each):");
+    for (const e of m) c.push(e);
+  }
+  const d = [ o.diff_labReactions > 0 ? "  │    " + "lab reactions/boosts".padEnd(30) + ": " + String(o.diff_labReactions).padStart(5) + "  (" + f(o.diff_labReactions * CPU_LAB) + " CPU)" : null, o.ev_repairAny + o.ev_attackRangedAny + o.ev_healRangedAny > 0 ? "  │    " + "repair+rngdAtk+rngdHeal".padEnd(30) + ": " + String(o.ev_repairAny + o.ev_attackRangedAny + o.ev_healRangedAny).padStart(5) + "  (" + f(n.ambigLow) + "–" + f(n.ambigHigh) + " CPU, ambiguous)" : null ].filter(Boolean);
+  if (d.length) {
+    c.push("  │  elevated cost (~0.4+ each):");
+    for (const e of d) c.push(e);
+  }
+  if (n.moves > 0) {
+    c.push("  │  movement (" + n.moves + " moves):  " + "opt=" + f(n.moveLow) + "  typical=" + f(n.moveMid) + "  naive=" + f(n.moveHigh) + " CPU");
+  }
+  c.push("  ├" + l + "┤");
+  c.push("  │  TOTAL  opt=" + f(n.totalLow) + "  typical=" + f(n.totalMid) + "  naive=" + f(n.totalHigh) + " CPU    (" + fp(n.totalMid / Math.max(1, s)) + "/tick typical)");
+  c.push("  └" + l + "┘");
+  return c;
 }
 
-function printSingleReport(roomName, t, startTick, obsCount, ownRoom) {
-    const obs = t.ticksObserved;
-    if (!obs) { console.log('[RoomCPUProfiler] No data collected.'); return; }
-
-    const cpu       = calcCPU(t);
-    const modeLabel = ownRoom ? 'OWN ROOM' : 'FOREIGN ROOM';
-
-    function f(n)  { return n.toFixed(2); }
-    function fp(n) { return n.toFixed(3); }
-    function row(label, n, cpuPer) {
-        return '  ' + label.padEnd(32) + ': ' + String(n).padStart(5) +
-               '  (' + f(n * cpuPer) + ' CPU @ ' + cpuPer + '/ea)';
-    }
-
-    const W   = 64;
-    const sep = '\u2500'.repeat(W);
-    const lines = [
-        '\u256C' + '\u2550'.repeat(W) + '\u256C',
-        '  ROOM CPU PROFILE \u2014 ' + roomName + '  [' + modeLabel + ']',
-        '  Ticks: ' + obs + ' / ' + PROFILE_TICKS +
-            '   (game ' + startTick + ' \u2013 ' + (startTick + obs + 1) + ')',
-        sep,
-        '  \u2500\u2500 SIMPLE INTENTS ~0.2 each \u2500\u2500',
-        row('  Harvest',              t.ev_harvest,             CPU_SIMPLE),
-        row('  Build',                t.ev_build,               CPU_SIMPLE),
-        row('  Upgrade controller',   t.ev_upgradeController,   CPU_SIMPLE),
-        row('  Reserve controller',   t.ev_reserveController,   CPU_SIMPLE),
-        row('  Attack controller',    t.ev_attackController,    CPU_SIMPLE),
-        row('  Transfer/Withdraw',    t.ev_transfer,            CPU_SIMPLE),
-        row('  Attack melee',         t.ev_attackMelee,         CPU_SIMPLE),
-        row('  Attack ranged mass',   t.ev_attackRangedMass,    CPU_SIMPLE),
-        row('  Dismantle',            t.ev_dismantle,           CPU_SIMPLE),
-        row('  Heal melee',           t.ev_healMelee,           CPU_SIMPLE),
-        row('  Power creep ability',  t.ev_powerAbility,        CPU_SIMPLE),
-        row('  Terminal sends/deals', t.diff_terminalSends,     CPU_SIMPLE),
-        row('  Factory productions',  t.diff_factoryProduces,   CPU_SIMPLE),
-        row('  Spawn events',         t.diff_spawnEvents,       CPU_SIMPLE),
-        row('  Nuker launches',       t.diff_nukerFired,        CPU_SIMPLE),
-        row('  Power processed',      t.diff_powerProcessed,    CPU_SIMPLE),
-        row('  New construct sites',  t.diff_constructionSites, CPU_SIMPLE),
-        row('  Safe mode activated',  t.diff_safeModeActivated, CPU_SIMPLE),
-        '  ' + '\u2508'.repeat(W - 2),
-        '  Simple CPU: ' + f(cpu.simpleCPU),
-        sep,
-        '  \u2500\u2500 ELEVATED COST ~0.4+ each \u2500\u2500',
-        '  Lab reactions/boosts     : ' + t.diff_labReactions +
-            '  (' + f(cpu.labCPU) + ' CPU)',
-        '  Repair+RngdAtk+RngdHeal  : ' + t.ev_repairAny + '/' +
-            t.ev_attackRangedAny + '/' + t.ev_healRangedAny +
-            '  [' + f(cpu.ambigLow) + '\u2013' + f(cpu.ambigHigh) + ' CPU, ambiguous]',
-        sep,
-        '  \u2500\u2500 MOVEMENT \u2500\u2500',
-        '  Moves: ' + cpu.moves + '  opt=' + f(cpu.moveLow) +
-            '  typical=' + f(cpu.moveMid) + '  naive=' + f(cpu.moveHigh) + ' CPU',
-        sep,
-        '  TOTALS',
-        '  Optimized        | ' + f(cpu.totalLow)  + '  | ' + fp(cpu.totalLow  / obs) + '/tick',
-        '  Typical (moveTo) | ' + f(cpu.totalMid)  + '  | ' + fp(cpu.totalMid  / obs) + '/tick  \u2190',
-        '  Naive (recalc)   | ' + f(cpu.totalHigh) + '  | ' + fp(cpu.totalHigh / obs) + '/tick',
-        sep,
-        '  avg creeps=' + (t.creepCountSum / obs).toFixed(1) +
-            '   invisible=' + t.invisibleTicks +
-            '   ' + (ownRoom ? 'own room' : obsCount + ' observer(s)'),
-        '\u2569' + '\u2550'.repeat(W) + '\u2569',
-    ];
-
-    console.log(lines.join('\n'));
-
-    Game.notify((
-        '[RoomCPUProfiler] ' + roomName + ' | ' + obs + ' ticks' +
-        ' | typical=' + fp(cpu.totalMid / obs) + '/tick' +
-        ' | total=' + f(cpu.totalLow) + '-' + f(cpu.totalHigh) + ' CPU' +
-        ' | moves=' + cpu.moves + ' creeps=' + (t.creepCountSum / obs).toFixed(1)
-    ).slice(0, 398), 0);
+function printSingleReport(e, o, t, r, n) {
+  const s = o.ticksObserved;
+  if (!s) {
+    console.log("[RoomCPUProfiler] No data collected.");
+    return;
+  }
+  const i = calcCPU(o);
+  const a = n ? "OWN ROOM" : "FOREIGN ROOM";
+  function f(e) {
+    return e.toFixed(2);
+  }
+  function fp(e) {
+    return e.toFixed(3);
+  }
+  function row(e, o, t) {
+    return "  " + e.padEnd(32) + ": " + String(o).padStart(5) + "  (" + f(o * t) + " CPU @ " + t + "/ea)";
+  }
+  const l = 64;
+  const c = "─".repeat(l);
+  const m = [ "╬" + "═".repeat(l) + "╬", "  ROOM CPU PROFILE — " + e + "  [" + a + "]", "  Ticks: " + s + " / " + PROFILE_TICKS + "   (game " + t + " – " + (t + s + 1) + ")", c, "  ── SIMPLE INTENTS ~0.2 each ──", row("  Harvest", o.ev_harvest, CPU_SIMPLE), row("  Build", o.ev_build, CPU_SIMPLE), row("  Upgrade controller", o.ev_upgradeController, CPU_SIMPLE), row("  Reserve controller", o.ev_reserveController, CPU_SIMPLE), row("  Attack controller", o.ev_attackController, CPU_SIMPLE), row("  Transfer/Withdraw", o.ev_transfer, CPU_SIMPLE), row("  Attack melee", o.ev_attackMelee, CPU_SIMPLE), row("  Attack ranged mass", o.ev_attackRangedMass, CPU_SIMPLE), row("  Dismantle", o.ev_dismantle, CPU_SIMPLE), row("  Heal melee", o.ev_healMelee, CPU_SIMPLE), row("  Power creep ability", o.ev_powerAbility, CPU_SIMPLE), row("  Terminal sends/deals", o.diff_terminalSends, CPU_SIMPLE), row("  Factory productions", o.diff_factoryProduces, CPU_SIMPLE), row("  Spawn events", o.diff_spawnEvents, CPU_SIMPLE), row("  Nuker launches", o.diff_nukerFired, CPU_SIMPLE), row("  Power processed", o.diff_powerProcessed, CPU_SIMPLE), row("  New construct sites", o.diff_constructionSites, CPU_SIMPLE), row("  Safe mode activated", o.diff_safeModeActivated, CPU_SIMPLE), "  " + "┈".repeat(l - 2), "  Simple CPU: " + f(i.simpleCPU), c, "  ── ELEVATED COST ~0.4+ each ──", "  Lab reactions/boosts     : " + o.diff_labReactions + "  (" + f(i.labCPU) + " CPU)", "  Repair+RngdAtk+RngdHeal  : " + o.ev_repairAny + "/" + o.ev_attackRangedAny + "/" + o.ev_healRangedAny + "  [" + f(i.ambigLow) + "–" + f(i.ambigHigh) + " CPU, ambiguous]", c, "  ── MOVEMENT ──", "  Moves: " + i.moves + "  opt=" + f(i.moveLow) + "  typical=" + f(i.moveMid) + "  naive=" + f(i.moveHigh) + " CPU", c, "  TOTALS", "  Optimized        | " + f(i.totalLow) + "  | " + fp(i.totalLow / s) + "/tick", "  Typical (moveTo) | " + f(i.totalMid) + "  | " + fp(i.totalMid / s) + "/tick  ←", "  Naive (recalc)   | " + f(i.totalHigh) + "  | " + fp(i.totalHigh / s) + "/tick", c, "  avg creeps=" + (o.creepCountSum / s).toFixed(1) + "   invisible=" + o.invisibleTicks + "   " + (n ? "own room" : r + " observer(s)"), "╩" + "═".repeat(l) + "╩" ];
+  console.log(m.join("\n"));
+  Game.notify(("[RoomCPUProfiler] " + e + " | " + s + " ticks" + " | typical=" + fp(i.totalMid / s) + "/tick" + " | total=" + f(i.totalLow) + "-" + f(i.totalHigh) + " CPU" + " | moves=" + i.moves + " creeps=" + (o.creepCountSum / s).toFixed(1)).slice(0, 398), 0);
 }
 
-function printPlayerReport(playerName, completedRooms) {
-    if (!completedRooms.length) {
-        console.log('[RoomCPUProfiler] No rooms profiled for ' + playerName + '.');
-        return;
-    }
-
-    const agg      = initTotals();
-    for (const r of completedRooms) accumulateTotals(agg, r.totals);
-    const aggCPU   = calcCPU(agg);
-    const totalObs = completedRooms.reduce((s, r) => s + r.totals.ticksObserved, 0);
-    const avgCreeps = totalObs > 0 ? (agg.creepCountSum / totalObs).toFixed(1) : '0';
-
-    function f(n)  { return n.toFixed(2); }
-    function fp(n) { return n.toFixed(3); }
-
-    const W   = 66;
-    const sep = '\u2500'.repeat(W);
-
-    // ── Concurrent intent load: sum per-room per-tick rates ──────────────────
-    // totalObs is sequential (5 rooms × 100 ticks = 500). That gives the
-    // average across rooms, NOT what happens in a live tick where all rooms
-    // run simultaneously. Sum each room's per-tick rate instead.
-    let concLow = 0, concMid = 0, concHigh = 0, concCreeps = 0;
-    for (const r of completedRooms) {
-        const rc  = calcCPU(r.totals);
-        const obs = Math.max(1, r.totals.ticksObserved);
-        concLow    += rc.totalLow  / obs;
-        concMid    += rc.totalMid  / obs;
-        concHigh   += rc.totalHigh / obs;
-        concCreeps += r.totals.creepCountSum / obs;
-    }
-    concCreeps = Math.round(concCreeps);
-
-    // ── Overhead estimates (script logic + Memory — not captured by intent scan) ──
-    // Script logic per creep: player code running conditionals, Memory reads,
-    // find() calls, pathfinding computation (on top of moveTo intent cost).
-    // Conservative: ~0.3 CPU/creep  Moderate: ~0.6  Heavy: ~1.0
-    const overheadLow  = concCreeps * 0.20 + 0.5;  // throttled/cached scripts like yours
-    const overheadMid  = concCreeps * 0.35 + 1.0;  // typical non-throttled optimized
-    const overheadHigh = concCreeps * 0.65 + 1.5;  // unoptimized, naive, per-tick recalc
-    const totalEstLow  = concLow  + overheadLow;
-    const totalEstMid  = concMid  + overheadMid;
-    const totalEstHigh = concHigh + overheadHigh;
-
-    function scaleBar(val, maxVal) {
-        const BAR    = 24;
-        const filled = Math.min(BAR, Math.round((val / maxVal) * BAR));
-        const pct    = Math.round((val / maxVal) * 100);
-        const over   = val > maxVal;
-        return '[' + '\u2588'.repeat(filled) +
-               '\u2591'.repeat(Math.max(0, BAR - filled)) +
-               '] ' + f(val) + ' CPU/tick' +
-               (over ? ' \u26A0 OVER ' + maxVal : ' (' + pct + '% of ' + maxVal + ')');
-    }
-
-    const lines = [
-        '\u256C' + '\u2550'.repeat(W) + '\u256C',
-        '  PLAYER CPU PROFILE \u2014 ' + playerName,
-        '  Rooms profiled: ' + completedRooms.length +
-            '   Concurrent creeps: ~' + concCreeps +
-            '   Avg creeps/room: ' + avgCreeps,
-        sep,
-        '  \u2500\u2500 CONCURRENT INTENT CPU (all rooms running simultaneously) \u2500\u2500',
-        '  These are the per-tick intent costs when all rooms run in the same tick.',
-        '  (Aggregate ÷ total ticks would undercount by ' + completedRooms.length + 'x for concurrent use.)',
-        '',
-        '  Optimized  (move cached)  : ' + scaleBar(concLow,  20),
-        '  Typical    (moveTo ~0.5)  : ' + scaleBar(concMid,  20) + '  \u2190',
-        '  Naive      (recalc/tick)  : ' + scaleBar(concHigh, 20),
-        '',
-        '  Breakdown: simple=' + f(aggCPU.simpleCPU / completedRooms.length) +
-            '/room  labs=' + f(aggCPU.labCPU / completedRooms.length) +
-            '/room  moves=' + f(concLow) + '-' + f(concHigh) + ' total',
-        sep,
-        '  \u2500\u2500 ESTIMATED TOTAL CPU (intents + script overhead) \u2500\u2500',
-        '  Overhead = script logic per creep + Memory parse + game loop base.',
-        '  ~' + concCreeps + ' concurrent creeps  ×  0.3-1.0 CPU/creep  +  0.5-1.5 base',
-        '',
-        '  Low    (opt intents + lean script)   : ' + scaleBar(totalEstLow,  40),
-        '  Mid    (typical intents + avg script): ' + scaleBar(totalEstMid,  40) + '  \u2190',
-        '  Heavy  (naive intents + heavy script): ' + scaleBar(totalEstHigh, 40),
-        '',
-        '  Intent share of estimated total (mid): ' +
-            Math.round((concMid / totalEstMid) * 100) + '% from intents, ' +
-            Math.round((overheadMid / totalEstMid) * 100) + '% from script overhead',
-        sep,
-        '  \u2500\u2500 PER-ROOM BREAKDOWN (sorted by typical CPU, highest first) \u2500\u2500',
-        '',
-    ];
-
-    const sorted = completedRooms.slice().sort((a, b) =>
-        calcCPU(b.totals).totalMid - calcCPU(a.totals).totalMid
-    );
-
-    for (const r of sorted) {
-        const roomLines = buildRoomReport(r.roomName, r.totals, r.observerCount, r.ownRoom);
-        for (const l of roomLines) lines.push(l);
-        lines.push('');
-    }
-
-    lines.push('\u2569' + '\u2550'.repeat(W) + '\u2569');
-    console.log(lines.join('\n'));
-
-    const roomSummaries = sorted.map(r => {
-        const c = calcCPU(r.totals);
-        return r.roomName + '=' + fp(c.totalMid / Math.max(1, r.totals.ticksObserved)) + '/t';
-    }).join(' ');
-
-    Game.notify((
-        '[RoomCPUProfiler] ' + playerName + ' | ' + completedRooms.length + ' rooms | ' +
-        'intents=' + f(concMid) + 'CPU/tick | est.total=' + f(totalEstMid) + 'CPU/tick | ' +
-        roomSummaries
-    ).slice(0, 398), 0);
+function printPlayerReport(e, o) {
+  if (!o.length) {
+    console.log("[RoomCPUProfiler] No rooms profiled for " + e + ".");
+    return;
+  }
+  const t = initTotals();
+  for (const e of o) accumulateTotals(t, e.totals);
+  const r = calcCPU(t);
+  const n = o.reduce((e, o) => e + o.totals.ticksObserved, 0);
+  const s = n > 0 ? (t.creepCountSum / n).toFixed(1) : "0";
+  function f(e) {
+    return e.toFixed(2);
+  }
+  function fp(e) {
+    return e.toFixed(3);
+  }
+  const i = 66;
+  const a = "─".repeat(i);
+  let l = 0, c = 0, m = 0, d = 0;
+  for (const e of o) {
+    const o = calcCPU(e.totals);
+    const t = Math.max(1, e.totals.ticksObserved);
+    l += o.totalLow / t;
+    c += o.totalMid / t;
+    m += o.totalHigh / t;
+    d += e.totals.creepCountSum / t;
+  }
+  d = Math.round(d);
+  const u = d * .2 + .5;
+  const p = d * .35 + 1;
+  const P = d * .65 + 1.5;
+  const g = l + u;
+  const _ = c + p;
+  const v = m + P;
+  function scaleBar(e, o) {
+    const t = 24;
+    const r = Math.min(t, Math.round(e / o * t));
+    const n = Math.round(e / o * 100);
+    const s = e > o;
+    return "[" + "█".repeat(r) + "░".repeat(Math.max(0, t - r)) + "] " + f(e) + " CPU/tick" + (s ? " ⚠ OVER " + o : " (" + n + "% of " + o + ")");
+  }
+  const R = [ "╬" + "═".repeat(i) + "╬", "  PLAYER CPU PROFILE — " + e, "  Rooms profiled: " + o.length + "   Concurrent creeps: ~" + d + "   Avg creeps/room: " + s, a, "  ── CONCURRENT INTENT CPU (all rooms running simultaneously) ──", "  These are the per-tick intent costs when all rooms run in the same tick.", "  (Aggregate ÷ total ticks would undercount by " + o.length + "x for concurrent use.)", "", "  Optimized  (move cached)  : " + scaleBar(l, 20), "  Typical    (moveTo ~0.5)  : " + scaleBar(c, 20) + "  ←", "  Naive      (recalc/tick)  : " + scaleBar(m, 20), "", "  Breakdown: simple=" + f(r.simpleCPU / o.length) + "/room  labs=" + f(r.labCPU / o.length) + "/room  moves=" + f(l) + "-" + f(m) + " total", a, "  ── ESTIMATED TOTAL CPU (intents + script overhead) ──", "  Overhead = script logic per creep + Memory parse + game loop base.", "  ~" + d + " concurrent creeps  ×  0.3-1.0 CPU/creep  +  0.5-1.5 base", "", "  Low    (opt intents + lean script)   : " + scaleBar(g, 40), "  Mid    (typical intents + avg script): " + scaleBar(_, 40) + "  ←", "  Heavy  (naive intents + heavy script): " + scaleBar(v, 40), "", "  Intent share of estimated total (mid): " + Math.round(c / _ * 100) + "% from intents, " + Math.round(p / _ * 100) + "% from script overhead", a, "  ── PER-ROOM BREAKDOWN (sorted by typical CPU, highest first) ──", "" ];
+  const E = o.slice().sort((e, o) => calcCPU(o.totals).totalMid - calcCPU(e.totals).totalMid);
+  for (const e of E) {
+    const o = buildRoomReport(e.roomName, e.totals, e.observerCount, e.ownRoom);
+    for (const e of o) R.push(e);
+    R.push("");
+  }
+  R.push("╩" + "═".repeat(i) + "╩");
+  console.log(R.join("\n"));
+  const C = E.map(e => {
+    const o = calcCPU(e.totals);
+    return e.roomName + "=" + fp(o.totalMid / Math.max(1, e.totals.ticksObserved)) + "/t";
+  }).join(" ");
+  Game.notify(("[RoomCPUProfiler] " + e + " | " + o.length + " rooms | " + "intents=" + f(c) + "CPU/tick | est.total=" + f(_) + "CPU/tick | " + C).slice(0, 398), 0);
 }
 
-// ═══════════════════════════════════════════════════════════════
-// CORE ROOM TICK  (shared by single and player modes)
-// Returns true when 100 diff ticks have been collected.
-// roomState = { roomName, ownRoom, observerCount, totals }
 //   prev is in global[GLOBAL_PREV][roomName] — not in Memory
-// ═══════════════════════════════════════════════════════════════
-
-function tickRoom(roomState) {
-    const name = roomState.roomName;
-    const own  = roomState.ownRoom;
-
-    if (!own) {
-        const { count, fired } = fireObservers(name);
-        roomState.observerCount = count;
-        if (count > 0 && fired === 0 && Game.time % 10 === 0) {
-            console.log('[RoomCPUProfiler] WARNING: all observers busy for ' + name);
-        }
+function tickRoom(e) {
+  const o = e.roomName;
+  const t = e.ownRoom;
+  if (!t) {
+    const {count: t, fired: r} = fireObservers(o);
+    e.observerCount = t;
+    if (t > 0 && r === 0 && Game.time % 10 === 0) {
+      console.log("[RoomCPUProfiler] WARNING: all observers busy for " + o);
     }
-
-    const room = Game.rooms[name];
-    if (!room) {
-        roomState.totals.invisibleTicks++;
-        return false;
-    }
-
-    const snap = takeSnapshot(room);
-    const prev = getPrev(name);
-
-    if (!prev) {
-        // First visible tick — store baseline in global heap, nothing in Memory
-        setPrev(name, snap);
-        console.log('[RoomCPUProfiler] Baseline \u2014 ' + name + ' @ tick ' + Game.time);
-        return false;
-    }
-
-    const { intents: evI, detail: evD } = processEventLog(room);
-    const { detail: dfD }               = diffSnapshots(prev, snap);
-
-    accumulateEventDetail(roomState.totals, evD, dfD);
-    roomState.totals.ticksObserved++;
-    roomState.totals.creepCountSum += room.find(FIND_CREEPS).length;
-
-    // Update prev in global heap — zero Memory cost
-    setPrev(name, snap);
-
-    const t = roomState.totals.ticksObserved;
-    if (t % LOG_INTERVAL === 0 && t < PROFILE_TICKS) {
-        const cpu = calcCPU(roomState.totals);
-        console.log('[RoomCPUProfiler] ' + name + ' \u2014 ' + t + '/' + PROFILE_TICKS +
-            ' | typical: ~' + (cpu.totalMid / t).toFixed(3) + ' CPU/tick');
-    }
-
-    return t >= PROFILE_TICKS;
+  }
+  const r = Game.rooms[o];
+  if (!r) {
+    e.totals.invisibleTicks++;
+    clearPrev(o);
+    return false;
+  }
+  const n = takeSnapshot(r);
+  const s = getPrev(o);
+  if (!s) {
+    setPrev(o, n);
+    console.log("[RoomCPUProfiler] Baseline — " + o + " @ tick " + Game.time);
+    return false;
+  }
+  const {intents: i, detail: a} = processEventLog(r);
+  const {detail: l} = diffSnapshots(s, n);
+  accumulateEventDetail(e.totals, a, l);
+  e.totals.ticksObserved++;
+  e.totals.creepCountSum += r.find(FIND_CREEPS).length;
+  setPrev(o, n);
+  const c = e.totals.ticksObserved;
+  if (c % LOG_INTERVAL === 0 && c < PROFILE_TICKS) {
+    const t = calcCPU(e.totals);
+    console.log("[RoomCPUProfiler] " + o + " — " + c + "/" + PROFILE_TICKS + " | typical: ~" + (t.totalMid / c).toFixed(3) + " CPU/tick");
+  }
+  const m = c >= PROFILE_TICKS;
+  if (m && !t) scanner.observe.consume(o, OBSERVER_SOURCE);
+  return m;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// PUBLIC API
-// ═══════════════════════════════════════════════════════════════
-
-function start(target) {
-    if (!target || typeof target !== 'string') {
-        console.log('[RoomCPUProfiler] Usage: profileRoom("W5N3") or profileRoom("PlayerName")');
-        return;
-    }
-    if (Memory[MEM_KEY] && Memory[MEM_KEY].active) {
-        console.log('[RoomCPUProfiler] Already active. Call cancelRoomProfile() first.');
-        return;
-    }
-    clearAllPrev();
-
-    if (isRoomName(target)) {
-        // ── Single room mode ──────────────────────────────────────────────────
-        const own = isOwnRoom(target);
-        let obsCount = 0;
-        if (own) {
-            console.log('[RoomCPUProfiler] ' + target + ' is your room \u2014 no observer needed.');
-        } else {
-            const obs = findObservers(target);
-            obsCount = obs.length;
-            if (!obs.length) {
-                console.log('[RoomCPUProfiler] WARNING: no observer within 10 rooms of ' + target);
-            } else {
-                console.log('[RoomCPUProfiler] ' + obs.length + ' observer(s): ' +
-                    obs.map(o => o.room + '(d' + o.dist + ')').join(', '));
-                // Fire immediately — eliminates the guaranteed 1-tick visibility delay
-                for (const { observer } of obs) observer.observeRoom(target);
-            }
-        }
-
-        Memory[MEM_KEY] = {
-            mode: 'single', active: true,
-            roomName: target, startTick: Game.time,
-            ownRoom: own, observerCount: obsCount,
-            totals: initTotals(),
-            // NOTE: no 'prev' here — it lives in global[GLOBAL_PREV][target]
-        };
-        console.log('[RoomCPUProfiler] Started \u2014 ' + target + ' for ' + PROFILE_TICKS + ' ticks.');
-
+function start(e) {
+  if (!e || typeof e !== "string") {
+    console.log('[RoomCPUProfiler] Usage: profileRoom("W5N3") or profileRoom("PlayerName")');
+    return;
+  }
+  if (Memory[MEM_KEY] && Memory[MEM_KEY].active) {
+    console.log("[RoomCPUProfiler] Already active. Call cancelRoomProfile() first.");
+    return;
+  }
+  clearAllPrev();
+  if (isRoomName(e)) {
+    const o = isOwnRoom(e);
+    let t = 0;
+    if (o) {
+      console.log("[RoomCPUProfiler] " + e + " is your room — no observer needed.");
     } else {
-        // ── Player mode ───────────────────────────────────────────────────────
-
-        // Detect if the target is ourselves — if so, all owned rooms are already
-        // visible in Game.rooms. No wideScan needed, and wideScan would miss rooms
-        // outside observer range anyway.
-        let myName = null;
-        for (const rn in Game.rooms) {
-            const r = Game.rooms[rn];
-            if (r.controller && r.controller.my && r.controller.owner) {
-                myName = r.controller.owner.username;
-                break;
-            }
-        }
-        const isSelf = myName && myName.toLowerCase() === target.toLowerCase();
-
-        if (isSelf) {
-            // Own rooms — collect directly from Game.rooms, no scanning required
-            const ownRooms = [];
-            for (const rn in Game.rooms) {
-                const r = Game.rooms[rn];
-                if (r.controller && r.controller.my) ownRooms.push(rn);
-            }
-            if (!ownRooms.length) {
-                console.log('[RoomCPUProfiler] No owned rooms found in Game.rooms.');
-                return;
-            }
-            console.log('[RoomCPUProfiler] Self-profile \u2014 found ' + ownRooms.length +
-                ' owned room(s): ' + ownRooms.join(', '));
-            console.log('[RoomCPUProfiler] Profiling each room for ' + PROFILE_TICKS +
-                ' ticks. Est. ' + (ownRooms.length * (PROFILE_TICKS + 3)) + ' ticks total.');
-            Memory[MEM_KEY] = {
-                mode: 'player', active: true,
-                playerName: target, startTick: Game.time,
-                phase: 'profiling',   // skip scanning entirely
-                roomQueue: ownRooms.slice(),
-                completedRooms: [],
-                current: null,
-            };
-            // Advance to first room immediately
-            advanceToNextRoom(Memory[MEM_KEY]);
-
-        } else {
-            // Foreign player — use wideScan to discover rooms
-            console.log('[RoomCPUProfiler] Player mode \u2014 scanning for ' + target + '\'s rooms via wideScan...');
-            wideScan.start(target);
-            Memory[MEM_KEY] = {
-                mode: 'player', active: true,
-                playerName: target, startTick: Game.time,
-                phase: 'scanning',
-                roomQueue: [], completedRooms: [],
-                current: null,
-            };
-        }
+      const o = findObservers(e);
+      t = o.length;
+      if (!o.length) {
+        console.log("[RoomCPUProfiler] No observer within 10 rooms of " + e + ".");
+        return;
+      } else {
+        console.log("[RoomCPUProfiler] " + o.length + " observer(s): " + o.map(e => e.room + "(d" + e.dist + ")").join(", "));
+        scanner.observe.request(e, OBSERVER_SOURCE, scanner.observe.PRI.MONITOR, {
+          untilConsumed: true,
+          holdTicks: 5
+        });
+      }
     }
+    Memory[MEM_KEY] = {
+      mode: "single",
+      active: true,
+      roomName: e,
+      startTick: Game.time,
+      ownRoom: o,
+      observerCount: t,
+      totals: initTotals()
+    };
+    console.log("[RoomCPUProfiler] Started — " + e + " for " + PROFILE_TICKS + " ticks.");
+  } else {
+    let o = null;
+    for (const e in Game.rooms) {
+      const t = Game.rooms[e];
+      if (t.controller && t.controller.my && t.controller.owner) {
+        o = t.controller.owner.username;
+        break;
+      }
+    }
+    const t = o && o.toLowerCase() === e.toLowerCase();
+    if (t) {
+      const o = [];
+      for (const e in Game.rooms) {
+        const t = Game.rooms[e];
+        if (t.controller && t.controller.my) o.push(e);
+      }
+      if (!o.length) {
+        console.log("[RoomCPUProfiler] No owned rooms found in Game.rooms.");
+        return;
+      }
+      console.log("[RoomCPUProfiler] Self-profile — found " + o.length + " owned room(s): " + o.join(", "));
+      console.log("[RoomCPUProfiler] Profiling each room for " + PROFILE_TICKS + " ticks. Est. " + o.length * (PROFILE_TICKS + 3) + " ticks total.");
+      Memory[MEM_KEY] = {
+        mode: "player",
+        active: true,
+        playerName: e,
+        startTick: Game.time,
+        phase: "profiling",
+        roomQueue: o.slice(),
+        completedRooms: [],
+        current: null
+      };
+      advanceToNextRoom(Memory[MEM_KEY]);
+    } else {
+      console.log("[RoomCPUProfiler] Player mode — scanning for " + e + "'s rooms via wideScan...");
+      wideScan.start(e);
+      Memory[MEM_KEY] = {
+        mode: "player",
+        active: true,
+        playerName: e,
+        startTick: Game.time,
+        phase: "scanning",
+        roomQueue: [],
+        completedRooms: [],
+        current: null
+      };
+    }
+  }
 }
 
 function cancel() {
-    if (!Memory[MEM_KEY]) { console.log('[RoomCPUProfiler] Nothing active.'); return; }
-    const state = Memory[MEM_KEY];
-    if ((state.mode === 'player' || state.mode === 'neighbors') &&
-        state.phase === 'scanning' && Memory.wideScan && Memory.wideScan.active) {
-        wideScan.cancel();
-    }
-    const label = state.mode === 'player' ? state.playerName :
-                  state.mode === 'neighbors' ? 'neighbor scan' : state.roomName;
-    clearAllPrev();
-    delete Memory[MEM_KEY];
-    console.log('[RoomCPUProfiler] Cancelled. Memory wiped.');
-    _ = label; // suppress lint
-    console.log('[RoomCPUProfiler] Profile for ' + label + ' cancelled.');
+  if (!Memory[MEM_KEY]) {
+    console.log("[RoomCPUProfiler] Nothing active.");
+    return;
+  }
+  const e = Memory[MEM_KEY];
+  if ((e.mode === "player" || e.mode === "neighbors") && e.phase === "scanning" && Memory.wideScan && Memory.wideScan.active) {
+    wideScan.cancel();
+  }
+  const o = e.mode === "player" ? e.playerName : e.mode === "neighbors" ? "neighbor scan" : e.roomName;
+  const t = e.mode === "single" ? e.roomName : e.current && e.current.roomName;
+  if (t) scanner.observe.cancel(t, OBSERVER_SOURCE);
+  clearAllPrev();
+  delete Memory[MEM_KEY];
+  console.log("[RoomCPUProfiler] Cancelled. Memory wiped.");
+  _ = o;
+  console.log("[RoomCPUProfiler] Profile for " + o + " cancelled.");
 }
 
 function run() {
-    const state = Memory[MEM_KEY];
-    if (!state || !state.active) return;
-    if (state.mode === 'single')         runSingle(state);
-    else if (state.mode === 'player')    runPlayer(state);
-    else if (state.mode === 'neighbors') runNeighbors(state);
+  const e = Memory[MEM_KEY];
+  if (!e || !e.active) return;
+  if (e.mode === "single") runSingle(e); else if (e.mode === "player") runPlayer(e); else if (e.mode === "neighbors") runNeighbors(e);
 }
 
-// ── Single mode ──────────────────────────────────────────────────────────────
-
-function runSingle(state) {
-    // Reconstruct transient roomState from Memory fields + global prev
-    const roomState = {
-        roomName:      state.roomName,
-        ownRoom:       state.ownRoom,
-        observerCount: state.observerCount,
-        totals:        state.totals,
-    };
-
-    const done = tickRoom(roomState);
-
-    // Sync observerCount back (tickRoom may update it)
-    state.observerCount = roomState.observerCount;
-
-    if (done) {
-        printSingleReport(state.roomName, state.totals, state.startTick,
-                          state.observerCount, state.ownRoom);
-        clearPrev(state.roomName);
-        delete Memory[MEM_KEY];
-        console.log('[RoomCPUProfiler] Complete. Memory wiped.');
-    }
+function runSingle(e) {
+  const o = {
+    roomName: e.roomName,
+    ownRoom: e.ownRoom,
+    observerCount: e.observerCount,
+    totals: e.totals
+  };
+  const t = tickRoom(o);
+  e.observerCount = o.observerCount;
+  if (t) {
+    printSingleReport(e.roomName, e.totals, e.startTick, e.observerCount, e.ownRoom);
+    clearPrev(e.roomName);
+    delete Memory[MEM_KEY];
+    console.log("[RoomCPUProfiler] Complete. Memory wiped.");
+  }
 }
 
-// ── Player mode ──────────────────────────────────────────────────────────────
-
-function runPlayer(state) {
-    if (state.phase === 'scanning') {
-        const ws = Memory.wideScan;
-
-        // Mirror foundRooms into our own state every tick while wideScan is active.
-        // wideScan.completeScan() calls delete Memory.wideScan before returning,
-        // so by the time we run on the following tick ws is already undefined.
-        // Caching progressively ensures we never lose the list.
-        if (ws && ws.foundRooms && ws.foundRooms.length) {
-            state._foundRooms = ws.foundRooms.slice();
-        }
-
-        // Still scanning — wait
-        if (ws && ws.active) return;
-
-        // wideScan has finished (Memory.wideScan is gone — use our cached copy)
-        const found = (state._foundRooms && state._foundRooms.length)
-            ? state._foundRooms
-            : [];
-        delete state._foundRooms;
-
-        if (!found.length) {
-            console.log('[RoomCPUProfiler] wideScan found no rooms for ' + state.playerName + '. Aborting.');
-            clearAllPrev();
-            delete Memory[MEM_KEY];
-            return;
-        }
-
-        state.roomQueue = found.slice();
-        state.phase     = 'profiling';
-        console.log('[RoomCPUProfiler] Found ' + found.length + ' room(s) for ' +
-            state.playerName + ': ' + found.join(', '));
-        console.log('[RoomCPUProfiler] Profiling each room for ' + PROFILE_TICKS +
-            ' ticks. Est. ' + (found.length * (PROFILE_TICKS + 3)) + ' ticks total.');
-        advanceToNextRoom(state);
-        return;
+function runPlayer(e) {
+  if (e.phase === "scanning") {
+    const o = Memory.wideScan;
+    if (o && o.foundRooms && o.foundRooms.length) {
+      e._foundRooms = o.foundRooms.slice();
     }
-
-    if (state.phase === 'profiling') {
-        if (!state.current) {
-            state.phase = 'done';
-        } else {
-            const roomState = state.current; // already the right shape
-            const done = tickRoom(roomState);
-            state.current = roomState;       // sync back (observerCount may have changed)
-
-            if (done) {
-                // Save completed — only totals, no prev (that's in global heap and gets cleared)
-                state.completedRooms.push({
-                    roomName:      roomState.roomName,
-                    totals:        roomState.totals,
-                    observerCount: roomState.observerCount,
-                    ownRoom:       roomState.ownRoom,
-                });
-                clearPrev(roomState.roomName);
-                console.log('[RoomCPUProfiler] ' + roomState.roomName + ' complete. ' +
-                    state.roomQueue.length + ' room(s) remaining.');
-                advanceToNextRoom(state);
-            }
-        }
+    if (o && o.active) return;
+    const t = e._foundRooms && e._foundRooms.length ? e._foundRooms : [];
+    delete e._foundRooms;
+    if (!t.length) {
+      console.log("[RoomCPUProfiler] wideScan found no rooms for " + e.playerName + ". Aborting.");
+      clearAllPrev();
+      delete Memory[MEM_KEY];
+      return;
     }
-
-    if (state.phase === 'done') {
-        printPlayerReport(state.playerName, state.completedRooms);
-        clearAllPrev();
-        delete Memory[MEM_KEY];
-        console.log('[RoomCPUProfiler] Player profile complete. Memory wiped.');
-    }
-}
-
-function advanceToNextRoom(state) {
-    if (!state.roomQueue.length) {
-        state.current = null;
-        state.phase   = 'done';
-        return;
-    }
-    const next   = state.roomQueue.shift();
-    const own    = isOwnRoom(next);
-    let obsCount = 0;
-
-    if (!own) {
-        const obs = findObservers(next);
-        obsCount = obs.length;
-        if (!obs.length) {
-            console.log('[RoomCPUProfiler] No observer for ' + next + ' \u2014 skipping.');
-            advanceToNextRoom(state);
-            return;
-        }
-        // Fire immediately to avoid first-tick visibility gap
-        for (const { observer } of obs) observer.observeRoom(next);
-        console.log('[RoomCPUProfiler] Now profiling ' + next +
-            ' (' + obs.length + ' observer(s))');
+    e.roomQueue = t.slice();
+    e.phase = "profiling";
+    console.log("[RoomCPUProfiler] Found " + t.length + " room(s) for " + e.playerName + ": " + t.join(", "));
+    console.log("[RoomCPUProfiler] Profiling each room for " + PROFILE_TICKS + " ticks. Est. " + t.length * (PROFILE_TICKS + 3) + " ticks total.");
+    advanceToNextRoom(e);
+    return;
+  }
+  if (e.phase === "profiling") {
+    if (!e.current) {
+      e.phase = "done";
     } else {
-        console.log('[RoomCPUProfiler] Now profiling ' + next + ' (own room)');
+      const o = e.current;
+      const t = tickRoom(o);
+      e.current = o;
+      if (t) {
+        e.completedRooms.push({
+          roomName: o.roomName,
+          totals: o.totals,
+          observerCount: o.observerCount,
+          ownRoom: o.ownRoom
+        });
+        clearPrev(o.roomName);
+        console.log("[RoomCPUProfiler] " + o.roomName + " complete. " + e.roomQueue.length + " room(s) remaining.");
+        advanceToNextRoom(e);
+      }
     }
-
-    state.current = {
-        roomName: next, ownRoom: own, observerCount: obsCount,
-        totals: initTotals(),
-        // prev lives in global[GLOBAL_PREV][next] — not here
-    };
+  }
+  if (e.phase === "done") {
+    printPlayerReport(e.playerName, e.completedRooms);
+    clearAllPrev();
+    delete Memory[MEM_KEY];
+    console.log("[RoomCPUProfiler] Player profile complete. Memory wiped.");
+  }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// NEIGHBORS MODE
-// ═══════════════════════════════════════════════════════════════
-//
-// Phase 1 (scanning):  wideScanPlayers() discovers all foreign
-//     players + rooms.  Own rooms are added when scanning ends.
-//
-// Phase 2 (profiling): Each room profiled for PROFILE_TICKS via
+function advanceToNextRoom(e) {
+  if (!e.roomQueue.length) {
+    e.current = null;
+    e.phase = "done";
+    return;
+  }
+  const o = e.roomQueue.shift();
+  const t = isOwnRoom(o);
+  let r = 0;
+  if (!t) {
+    const t = findObservers(o);
+    r = t.length;
+    if (!t.length) {
+      console.log("[RoomCPUProfiler] No observer for " + o + " — skipping.");
+      advanceToNextRoom(e);
+      return;
+    }
+    scanner.observe.request(o, OBSERVER_SOURCE, scanner.observe.PRI.MONITOR, {
+      untilConsumed: true,
+      holdTicks: 5
+    });
+    console.log("[RoomCPUProfiler] Now profiling " + o + " (" + t.length + " observer(s))");
+  } else {
+    console.log("[RoomCPUProfiler] Now profiling " + o + " (own room)");
+  }
+  e.current = {
+    roomName: o,
+    ownRoom: t,
+    observerCount: r,
+    totals: initTotals()
+  };
+}
+
+//     supplied scan data, the mode falls back to the visible own rooms.
 //     the shared tickRoom(). On completion, only 5 compact
 //     numbers are kept per room (low/mid/high per-tick + creeps
 //     + rcl). The full totals object is discarded immediately.
-//
-// Phase 3 (done):      Ranked report printed + Game.notify.
-//
-// Memory footprint during profiling:
 //   - current.totals  (~30 numbers, one room at a time)
 //   - completed{}     (~5 numbers per finished room)
 //   - playerRoomMap   (room names + rcl per player, read-only after scan)
 //   - profileQueue    (shrinks as rooms are consumed)
-//
-// ═══════════════════════════════════════════════════════════════
-
 function getMyUsername() {
-    for (const rn in Game.rooms) {
-        const r = Game.rooms[rn];
-        if (r.controller && r.controller.my && r.controller.owner) {
-            return r.controller.owner.username;
-        }
+  for (const e in Game.rooms) {
+    const o = Game.rooms[e];
+    if (o.controller && o.controller.my && o.controller.owner) {
+      return o.controller.owner.username;
     }
-    return null;
+  }
+  return null;
 }
 
 function startNeighbors() {
-    if (Memory[MEM_KEY] && Memory[MEM_KEY].active) {
-        console.log('[NeighborProfile] Already active. Call cancelRoomProfile() first.');
-        return;
+  if (Memory[MEM_KEY] && Memory[MEM_KEY].active) {
+    console.log("[NeighborProfile] Already active. Call cancelRoomProfile() first.");
+    return;
+  }
+  clearAllPrev();
+  const e = getMyUsername();
+  wideScan.startPlayers();
+  Memory[MEM_KEY] = {
+    mode: "neighbors",
+    active: true,
+    phase: "scanning",
+    startTick: Game.time,
+    myName: e,
+    playerRoomMap: {},
+    profileQueue: [],
+    currentPlayer: null,
+    current: null,
+    completed: {}
+  };
+  console.log("[NeighborProfile] Started. Scanning for all players in observer range...");
+}
+
+function runNeighbors(e) {
+  if (e.phase === "scanning") runNeighborScanning(e); else if (e.phase === "profiling") runNeighborProfiling(e);
+}
+
+function runNeighborScanning(e) {
+  const o = Memory.wideScan;
+  if (!o && !e._cachedFound) {
+    console.log("[NeighborProfile] No observers — profiling own rooms only.");
+    buildNeighborQueue(e, {});
+    return;
+  }
+  if (o && o.foundRooms && typeof o.foundRooms === "object" && !Array.isArray(o.foundRooms)) {
+    const t = Object.keys(o.foundRooms).length;
+    const r = e._cachedPlayerCount || 0;
+    if (t !== r) {
+      e._cachedFound = JSON.parse(JSON.stringify(o.foundRooms));
+      e._cachedPlayerCount = t;
     }
-    clearAllPrev();
+  }
+  if (o && o.active) return;
+  const t = e._cachedFound || {};
+  delete e._cachedFound;
+  delete e._cachedPlayerCount;
+  buildNeighborQueue(e, t);
+}
 
-    const myName = getMyUsername();
-
-    wideScan.startPlayers();
-    // wideScan.startPlayers → initScan(null). If no observers exist,
-    // Memory.wideScan will NOT be created (initScan returns false).
-    // We handle that gracefully in runNeighborScanning.
-
-    Memory[MEM_KEY] = {
-        mode: 'neighbors', active: true,
-        phase: 'scanning',
-        startTick: Game.time,
-        myName: myName,
-        // Populated after scan completes:
-        playerRoomMap: {},  // player -> { rooms:[], rcls:{room:level} }
-        profileQueue:  [],  // [{ player, room }]
-        currentPlayer: null,
-        current:       null, // { roomName, ownRoom, observerCount, totals }
-        completed:     {},   // player -> [{ room, low, mid, high, creeps }]
+function buildNeighborQueue(e, o) {
+  const t = {};
+  for (const e in o) {
+    const r = o[e];
+    if (!r || !r.length) continue;
+    t[e] = {
+      rooms: [],
+      rcls: {}
     };
-
-    console.log('[NeighborProfile] Started. Scanning for all players in observer range...');
-}
-
-function runNeighbors(state) {
-    if (state.phase === 'scanning')       runNeighborScanning(state);
-    else if (state.phase === 'profiling') runNeighborProfiling(state);
-    // phase 'done' is handled at the end of runNeighborProfiling
-}
-
-// ── Phase 1: scanning ─────────────────────────────────────────
-
-function runNeighborScanning(state) {
-    const ws = Memory.wideScan;
-
-    // If wideScan never started (no observers), go straight to own rooms
-    if (!ws && !state._cachedFound) {
-        console.log('[NeighborProfile] No observers — profiling own rooms only.');
-        buildNeighborQueue(state, {});
-        return;
+    for (const o of r) {
+      t[e].rooms.push(o.room);
+      t[e].rcls[o.room] = o.rcl;
     }
-
-    // Cache wideScan results progressively.
-    // wideScanPlayers stores foundRooms as { player: [{ room, rcl }] }
-    // We must cache because wideScan deletes Memory.wideScan on completion.
-    if (ws && ws.foundRooms && typeof ws.foundRooms === 'object' &&
-        !Array.isArray(ws.foundRooms)) {
-        // Only re-cache when the number of players has changed (cheap check)
-        const newCount = Object.keys(ws.foundRooms).length;
-        const oldCount = state._cachedPlayerCount || 0;
-        if (newCount !== oldCount) {
-            state._cachedFound = JSON.parse(JSON.stringify(ws.foundRooms));
-            state._cachedPlayerCount = newCount;
+  }
+  if (e.myName) {
+    if (!t[e.myName]) {
+      t[e.myName] = {
+        rooms: [],
+        rcls: {}
+      };
+    }
+    const o = t[e.myName];
+    for (const e in Game.rooms) {
+      const t = Game.rooms[e];
+      if (t.controller && t.controller.my) {
+        if (o.rooms.indexOf(e) === -1) {
+          o.rooms.push(e);
+          o.rcls[e] = t.controller.level;
         }
+      }
     }
-
-    // Still scanning — wait
-    if (ws && ws.active) return;
-
-    // wideScan has finished
-    const found = state._cachedFound || {};
-    delete state._cachedFound;
-    delete state._cachedPlayerCount;
-
-    buildNeighborQueue(state, found);
-}
-
-function buildNeighborQueue(state, wideScanFound) {
-    const playerRoomMap = {};
-
-    // Add foreign players from wideScan
-    for (const player in wideScanFound) {
-        const entries = wideScanFound[player];
-        if (!entries || !entries.length) continue;
-        playerRoomMap[player] = { rooms: [], rcls: {} };
-        for (const e of entries) {
-            playerRoomMap[player].rooms.push(e.room);
-            playerRoomMap[player].rcls[e.room] = e.rcl;
-        }
-    }
-
-    // Add own rooms (wideScan excludes rooms we own)
-    if (state.myName) {
-        if (!playerRoomMap[state.myName]) {
-            playerRoomMap[state.myName] = { rooms: [], rcls: {} };
-        }
-        const me = playerRoomMap[state.myName];
-        for (const rn in Game.rooms) {
-            const r = Game.rooms[rn];
-            if (r.controller && r.controller.my) {
-                if (me.rooms.indexOf(rn) === -1) {
-                    me.rooms.push(rn);
-                    me.rcls[rn] = r.controller.level;
-                }
-            }
-        }
-    }
-
-    state.playerRoomMap = playerRoomMap;
-
-    // Build flat profiling queue sorted alphabetically
-    const queue   = [];
-    const players = Object.keys(playerRoomMap).sort();
-    for (const player of players) {
-        const rooms = playerRoomMap[player].rooms.slice().sort();
-        for (const room of rooms) queue.push({ player: player, room: room });
-    }
-
-    if (!queue.length) {
-        console.log('[NeighborProfile] No rooms found. Aborting.');
-        clearAllPrev();
-        delete Memory[MEM_KEY];
-        return;
-    }
-
-    state.profileQueue = queue;
-    state.completed    = {};
-    state.phase        = 'profiling';
-
-    const totalRooms = queue.length;
-    console.log('[NeighborProfile] Found ' + players.length + ' player(s), ' +
-        totalRooms + ' room(s): ' + players.join(', '));
-    console.log('[NeighborProfile] Est. ' + (totalRooms * (PROFILE_TICKS + 3)) + ' ticks.');
-
-    advanceNeighborRoom(state);
-}
-
-// ── Phase 2: profiling ────────────────────────────────────────
-
-function runNeighborProfiling(state) {
-    if (!state.current) {
-        finishNeighborProfile(state);
-        return;
-    }
-
-    const roomState = state.current;
-    const done = tickRoom(roomState);
-    state.current = roomState; // sync back
-
-    if (done) {
-        // Extract only the compact stats we need, discard bulky totals
-        const t   = roomState.totals;
-        const obs = Math.max(1, t.ticksObserved);
-        const cpu = calcCPU(t);
-
-        const player = state.currentPlayer;
-        if (!state.completed[player]) state.completed[player] = [];
-        state.completed[player].push({
-            room:   roomState.roomName,
-            low:    cpu.totalLow  / obs,
-            mid:    cpu.totalMid  / obs,
-            high:   cpu.totalHigh / obs,
-            creeps: t.creepCountSum / obs,
-        });
-
-        clearPrev(roomState.roomName);
-
-        const remaining = state.profileQueue.length;
-        const doneCount = Object.values(state.completed)
-            .reduce(function (s, arr) { return s + arr.length; }, 0);
-        console.log('[NeighborProfile] ' + roomState.roomName + ' (' + player +
-            ') done — ' + doneCount + ' profiled, ' + remaining + ' queued.');
-
-        advanceNeighborRoom(state);
-
-        // If queue is exhausted, finish immediately this tick
-        if (!state.current) {
-            finishNeighborProfile(state);
-        }
-    }
-}
-
-function advanceNeighborRoom(state) {
-    while (state.profileQueue.length) {
-        const next = state.profileQueue.shift();
-        state.currentPlayer = next.player;
-
-        const own = isOwnRoom(next.room);
-        let obsCount = 0;
-
-        if (!own) {
-            const obs = findObservers(next.room);
-            obsCount = obs.length;
-            if (!obs.length) {
-                console.log('[NeighborProfile] No observer for ' + next.room + ' — skipping.');
-                continue; // try next in queue
-            }
-            for (const { observer } of obs) observer.observeRoom(next.room);
-            console.log('[NeighborProfile] Profiling ' + next.room +
-                ' (' + next.player + ', ' + obs.length + ' obs)');
-        } else {
-            console.log('[NeighborProfile] Profiling ' + next.room +
-                ' (' + next.player + ', own)');
-        }
-
-        state.current = {
-            roomName: next.room, ownRoom: own, observerCount: obsCount,
-            totals: initTotals(),
-        };
-        return;
-    }
-
-    // Queue exhausted
-    state.current       = null;
-    state.currentPlayer = null;
-}
-
-// ── Phase 3: report ───────────────────────────────────────────
-
-function finishNeighborProfile(state) {
-    printNeighborReport(state);
+  }
+  e.playerRoomMap = t;
+  const r = [];
+  const n = Object.keys(t).sort();
+  for (const e of n) {
+    const o = t[e].rooms.slice().sort();
+    for (const t of o) r.push({
+      player: e,
+      room: t
+    });
+  }
+  if (!r.length) {
+    console.log("[NeighborProfile] No rooms found. Aborting.");
     clearAllPrev();
     delete Memory[MEM_KEY];
-    console.log('[NeighborProfile] Complete. Memory wiped.');
+    return;
+  }
+  e.profileQueue = r;
+  e.completed = {};
+  e.phase = "profiling";
+  const s = r.length;
+  console.log("[NeighborProfile] Found " + n.length + " player(s), " + s + " room(s): " + n.join(", "));
+  console.log("[NeighborProfile] Est. " + s * (PROFILE_TICKS + 3) + " ticks.");
+  advanceNeighborRoom(e);
 }
 
-function printNeighborReport(state) {
-    const elapsed  = Game.time - state.startTick;
-    const myName   = state.myName;
-
-    function f2(n) { return n.toFixed(2); }
-    function f3(n) { return n.toFixed(3); }
-
-    // ── Build per-player summaries ──────────────────────────────────────
-    const summaries = [];
-    for (const player in state.completed) {
-        const rooms = state.completed[player];
-        if (!rooms.length) continue;
-
-        let concLow = 0, concMid = 0, concHigh = 0, concCreeps = 0;
-        for (const r of rooms) {
-            concLow    += r.low;
-            concMid    += r.mid;
-            concHigh   += r.high;
-            concCreeps += r.creeps;
-        }
-        concCreeps = Math.round(concCreeps);
-
-        const overheadMid = concCreeps * 0.35 + 1.0;
-
-        // RCLs from playerRoomMap
-        const rcls = [];
-        const pMap = state.playerRoomMap[player];
-        if (pMap) {
-            for (const r of rooms) rcls.push(pMap.rcls[r.room] || '?');
-        }
-        rcls.sort(function (a, b) { return b - a; });
-
-        summaries.push({
-            player:        player,
-            roomCount:     rooms.length,
-            creeps:        concCreeps,
-            intentPerTick: concMid,
-            cpuPerRoom:    concMid / rooms.length,
-            cpuPerCreep:   concCreeps > 0 ? concMid / concCreeps : 0,
-            estTotal:      concMid + overheadMid,
-            rcls:          rcls,
-            roomDetails:   rooms.slice().sort(function (a, b) { return b.mid - a.mid; }),
-            isSelf:        player === myName,
-        });
+function runNeighborProfiling(e) {
+  if (!e.current) {
+    finishNeighborProfile(e);
+    return;
+  }
+  const o = e.current;
+  const t = tickRoom(o);
+  e.current = o;
+  if (t) {
+    const t = o.totals;
+    const r = Math.max(1, t.ticksObserved);
+    const n = calcCPU(t);
+    const s = e.currentPlayer;
+    if (!e.completed[s]) e.completed[s] = [];
+    e.completed[s].push({
+      room: o.roomName,
+      low: n.totalLow / r,
+      mid: n.totalMid / r,
+      high: n.totalHigh / r,
+      creeps: t.creepCountSum / r
+    });
+    clearPrev(o.roomName);
+    const i = e.profileQueue.length;
+    const a = Object.values(e.completed).reduce(function(e, o) {
+      return e + o.length;
+    }, 0);
+    console.log("[NeighborProfile] " + o.roomName + " (" + s + ") done — " + a + " profiled, " + i + " queued.");
+    advanceNeighborRoom(e);
+    if (!e.current) {
+      finishNeighborProfile(e);
     }
-
-    // Sort by intent/tick descending (highest load first)
-    summaries.sort(function (a, b) { return b.intentPerTick - a.intentPerTick; });
-
-    const totalPlayers = summaries.length;
-    const totalRooms   = summaries.reduce(function (s, p) { return s + p.roomCount; }, 0);
-
-    // ── Console output ──────────────────────────────────────────────────
-    const W   = 82;
-    const sep = '\u2500'.repeat(W);
-
-    const lines = [
-        '\u256C' + '\u2550'.repeat(W) + '\u256C',
-        '  NEIGHBOR CPU RANKINGS \u2014 ' + totalPlayers + ' players, ' +
-            totalRooms + ' rooms, ' + elapsed + ' ticks elapsed',
-        sep,
-        '  #  Player            Rooms  Creeps  Intent/tick  CPU/room  CPU/creep  Est.Total',
-    ];
-
-    for (var i = 0; i < summaries.length; i++) {
-        var p    = summaries[i];
-        var star = p.isSelf ? ' \u2605' : '  ';
-        var rank = String(i + 1).padStart(2);
-        lines.push(
-            '  ' + rank + ' ' + (p.player + star).padEnd(18) +
-            String(p.roomCount).padStart(4) +
-            String(p.creeps).padStart(8) +
-            f3(p.intentPerTick).padStart(12) +
-            f3(p.cpuPerRoom).padStart(10) +
-            f3(p.cpuPerCreep).padStart(10) +
-            f2(p.estTotal).padStart(10)
-        );
-    }
-
-    lines.push(sep);
-    lines.push('  \u2605 = you    Intent = observer-measured    Est.Total = intents + overhead');
-    lines.push('  CPU/room = intent CPU per room    CPU/creep = intent CPU per concurrent creep');
-    lines.push('');
-
-    // Per-player room detail
-    for (i = 0; i < summaries.length; i++) {
-        p    = summaries[i];
-        star = p.isSelf ? ' \u2605' : '';
-        var rclStr = p.rcls.join('/');
-        lines.push('  ' + p.player + star + ' (' + p.roomCount + ' rooms, ~' +
-            p.creeps + ' creeps, RCL ' + rclStr + '):');
-        var roomStrs = p.roomDetails.map(function (r) {
-            return r.room + '  ' + f3(r.mid) + '/t';
-        });
-        lines.push('    ' + roomStrs.join('  '));
-        lines.push('');
-    }
-
-    lines.push('\u2569' + '\u2550'.repeat(W) + '\u2569');
-    console.log(lines.join('\n'));
-
-    // ── Game.notify — compact format, batched under 1000 chars ─────────
-    //
-    // Compression vs old format:
-    //   - RCLs grouped: "8×12,7×2,6×2" instead of "8/8/8/8/8/8/8/8/8/8/8/8/7/7/6/6"
-    //   - Room values 2 decimals, no "/t" suffix
-    //   - Room details capped at 6, remainder shown as "(+N)"
-    //   - Summary + rooms on ONE line per player (no separate indented line)
-
-    function compactRcls(rcls) {
-        if (!rcls.length) return '?';
-        var counts = {}, order = [];
-        for (var r = 0; r < rcls.length; r++) {
-            var v = rcls[r];
-            if (!counts[v]) { counts[v] = 0; order.push(v); }
-            counts[v]++;
-        }
-        return order.map(function (v) {
-            return counts[v] > 1 ? v + '\u00D7' + counts[v] : String(v);
-        }).join(',');
-    }
-
-    var MAX_NOTIFY_ROOMS = 6;
-
-    var notifyLines = [
-        '[NeighborProfile] ' + totalPlayers + ' players, ' +
-            totalRooms + ' rooms, ' + elapsed + ' ticks'
-    ];
-
-    for (i = 0; i < summaries.length; i++) {
-        p    = summaries[i];
-        star = p.isSelf ? ' \u2605' : '';
-
-        // Room details: top N rooms, compressed
-        var topRooms = p.roomDetails.slice(0, MAX_NOTIFY_ROOMS);
-        var roomStr = topRooms.map(function (r) {
-            return r.room + '=' + f2(r.mid);
-        }).join(' ');
-        var extra = p.roomDetails.length - MAX_NOTIFY_ROOMS;
-        if (extra > 0) roomStr += ' (+' + extra + ')';
-
-        notifyLines.push(
-            '#' + (i + 1) + ' ' + p.player + star + ': ' +
-            p.roomCount + 'rm(RCL' + compactRcls(p.rcls) + ') ~' + p.creeps + 'cr ' +
-            f3(p.intentPerTick) + 'int/t ' +
-            f3(p.cpuPerRoom) + '/rm ' +
-            f3(p.cpuPerCreep) + '/cr ~' + f2(p.estTotal) + 'est/t | ' +
-            roomStr
-        );
-    }
-
-    // Batch into ≤998-char notifications.
-    // If a single line exceeds 998 it is sent alone (truncated by the server,
-    // but this should no longer happen with the compression above).
-    var batch = '';
-    for (var j = 0; j < notifyLines.length; j++) {
-        var line = notifyLines[j];
-        if (batch && batch.length + line.length + 1 > 998) {
-            Game.notify(batch, 0);
-            batch = line;
-        } else {
-            batch += (batch ? '\n' : '') + line;
-        }
-    }
-    if (batch) Game.notify(batch, 0);
+  }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// STATUS  (handles single, player, AND neighbors modes)
-// ═══════════════════════════════════════════════════════════════
+function advanceNeighborRoom(e) {
+  while (e.profileQueue.length) {
+    const o = e.profileQueue.shift();
+    e.currentPlayer = o.player;
+    const t = isOwnRoom(o.room);
+    let r = 0;
+    if (!t) {
+      const e = findObservers(o.room);
+      r = e.length;
+      if (!e.length) {
+        console.log("[NeighborProfile] No observer for " + o.room + " — skipping.");
+        continue;
+      }
+      scanner.observe.request(o.room, OBSERVER_SOURCE, scanner.observe.PRI.MONITOR, {
+        untilConsumed: true,
+        holdTicks: 5
+      });
+      console.log("[NeighborProfile] Profiling " + o.room + " (" + o.player + ", " + e.length + " obs)");
+    } else {
+      console.log("[NeighborProfile] Profiling " + o.room + " (" + o.player + ", own)");
+    }
+    e.current = {
+      roomName: o.room,
+      ownRoom: t,
+      observerCount: r,
+      totals: initTotals()
+    };
+    return;
+  }
+  e.current = null;
+  e.currentPlayer = null;
+}
+
+function finishNeighborProfile(e) {
+  printNeighborReport(e);
+  clearAllPrev();
+  delete Memory[MEM_KEY];
+  console.log("[NeighborProfile] Complete. Memory wiped.");
+}
+
+function printNeighborReport(e) {
+  const o = Game.time - e.startTick;
+  const t = e.myName;
+  function f2(e) {
+    return e.toFixed(2);
+  }
+  function f3(e) {
+    return e.toFixed(3);
+  }
+  const r = [];
+  for (const o in e.completed) {
+    const n = e.completed[o];
+    if (!n.length) continue;
+    let s = 0, i = 0, a = 0, l = 0;
+    for (const e of n) {
+      s += e.low;
+      i += e.mid;
+      a += e.high;
+      l += e.creeps;
+    }
+    l = Math.round(l);
+    const c = l * .35 + 1;
+    const m = [];
+    const d = e.playerRoomMap[o];
+    if (d) {
+      for (const e of n) m.push(d.rcls[e.room] || "?");
+    }
+    m.sort(function(e, o) {
+      return o - e;
+    });
+    r.push({
+      player: o,
+      roomCount: n.length,
+      creeps: l,
+      intentPerTick: i,
+      cpuPerRoom: i / n.length,
+      cpuPerCreep: l > 0 ? i / l : 0,
+      estTotal: i + c,
+      rcls: m,
+      roomDetails: n.slice().sort(function(e, o) {
+        return o.mid - e.mid;
+      }),
+      isSelf: o === t
+    });
+  }
+  r.sort(function(e, o) {
+    return o.intentPerTick - e.intentPerTick;
+  });
+  const n = r.length;
+  const s = r.reduce(function(e, o) {
+    return e + o.roomCount;
+  }, 0);
+  const i = 82;
+  const a = "─".repeat(i);
+  const l = [ "╬" + "═".repeat(i) + "╬", "  NEIGHBOR CPU RANKINGS — " + n + " players, " + s + " rooms, " + o + " ticks elapsed", a, "  #  Player            Rooms  Creeps  Intent/tick  CPU/room  CPU/creep  Est.Total" ];
+  for (var c = 0; c < r.length; c++) {
+    var m = r[c];
+    var d = m.isSelf ? " ★" : "  ";
+    var u = String(c + 1).padStart(2);
+    l.push("  " + u + " " + (m.player + d).padEnd(18) + String(m.roomCount).padStart(4) + String(m.creeps).padStart(8) + f3(m.intentPerTick).padStart(12) + f3(m.cpuPerRoom).padStart(10) + f3(m.cpuPerCreep).padStart(10) + f2(m.estTotal).padStart(10));
+  }
+  l.push(a);
+  l.push("  ★ = you    Intent = observer-measured    Est.Total = intents + overhead");
+  l.push("  CPU/room = intent CPU per room    CPU/creep = intent CPU per concurrent creep");
+  l.push("");
+  for (c = 0; c < r.length; c++) {
+    m = r[c];
+    d = m.isSelf ? " ★" : "";
+    var p = m.rcls.join("/");
+    l.push("  " + m.player + d + " (" + m.roomCount + " rooms, ~" + m.creeps + " creeps, RCL " + p + "):");
+    var P = m.roomDetails.map(function(e) {
+      return e.room + "  " + f3(e.mid) + "/t";
+    });
+    l.push("    " + P.join("  "));
+    l.push("");
+  }
+  l.push("╩" + "═".repeat(i) + "╩");
+  console.log(l.join("\n"));
+  //   - RCLs grouped: "8×12,7×2,6×2" instead of "8/8/8/8/8/8/8/8/8/8/8/8/7/7/6/6"
+  //   - Room values 2 decimals, no "/t" suffix
+  //   - Room details capped at 6, remainder shown as "(+N)"
+  //   - Summary + rooms on ONE line per player (no separate indented line)
+    function compactRcls(e) {
+    if (!e.length) return "?";
+    var o = {}, t = [];
+    for (var r = 0; r < e.length; r++) {
+      var n = e[r];
+      if (!o[n]) {
+        o[n] = 0;
+        t.push(n);
+      }
+      o[n]++;
+    }
+    return t.map(function(e) {
+      return o[e] > 1 ? e + "×" + o[e] : String(e);
+    }).join(",");
+  }
+  var g = 6;
+  var _ = [ "[NeighborProfile] " + n + " players, " + s + " rooms, " + o + " ticks" ];
+  for (c = 0; c < r.length; c++) {
+    m = r[c];
+    d = m.isSelf ? " ★" : "";
+    var v = m.roomDetails.slice(0, g);
+    var R = v.map(function(e) {
+      return e.room + "=" + f2(e.mid);
+    }).join(" ");
+    var E = m.roomDetails.length - g;
+    if (E > 0) R += " (+" + E + ")";
+    _.push("#" + (c + 1) + " " + m.player + d + ": " + m.roomCount + "rm(RCL" + compactRcls(m.rcls) + ") ~" + m.creeps + "cr " + f3(m.intentPerTick) + "int/t " + f3(m.cpuPerRoom) + "/rm " + f3(m.cpuPerCreep) + "/cr ~" + f2(m.estTotal) + "est/t | " + R);
+  }
+  var C = "";
+  for (var h = 0; h < _.length; h++) {
+    var M = _[h];
+    if (C && C.length + M.length + 1 > 998) {
+      Game.notify(C, 0);
+      C = M;
+    } else {
+      C += (C ? "\n" : "") + M;
+    }
+  }
+  if (C) Game.notify(C, 0);
+}
 
 function status() {
-    const state = Memory[MEM_KEY];
-    if (!state || !state.active) {
-        console.log('[RoomCPUProfiler] No active profile.');
-        return null;
+  const e = Memory[MEM_KEY];
+  if (!e || !e.active) {
+    console.log("[RoomCPUProfiler] No active profile.");
+    return null;
+  }
+  const o = Game.time - e.startTick;
+  if (e.mode === "single") {
+    const t = e.totals;
+    const r = t.ticksObserved;
+    const n = (r / PROFILE_TICKS * 100).toFixed(1);
+    const s = calcCPU(t);
+    console.log("[RoomCPUProfiler] SINGLE — " + e.roomName);
+    console.log("  Progress  : " + r + " / " + PROFILE_TICKS + " ticks (" + n + "%)");
+    console.log("  Elapsed   : " + o + " ticks");
+    console.log("  Invisible : " + t.invisibleTicks);
+    console.log("  Observers : " + (e.ownRoom ? "own room" : e.observerCount));
+    if (r > 0) {
+      console.log("  Running avg (typical): ~" + (s.totalMid / r).toFixed(3) + " CPU/tick");
+      console.log("  Simple CPU so far    : " + s.simpleCPU.toFixed(2));
+      console.log("  Move range so far    : " + s.moveLow.toFixed(2) + "–" + s.moveHigh.toFixed(2) + " CPU");
     }
-
-    const elapsed = Game.time - state.startTick;
-
-    if (state.mode === 'single') {
-        const t   = state.totals;
-        const obs = t.ticksObserved;
-        const pct = ((obs / PROFILE_TICKS) * 100).toFixed(1);
-        const cpu = calcCPU(t);
-        console.log('[RoomCPUProfiler] SINGLE \u2014 ' + state.roomName);
-        console.log('  Progress  : ' + obs + ' / ' + PROFILE_TICKS + ' ticks (' + pct + '%)');
-        console.log('  Elapsed   : ' + elapsed + ' ticks');
-        console.log('  Invisible : ' + t.invisibleTicks);
-        console.log('  Observers : ' + (state.ownRoom ? 'own room' : state.observerCount));
-        if (obs > 0) {
-            console.log('  Running avg (typical): ~' +
-                (cpu.totalMid / obs).toFixed(3) + ' CPU/tick');
-            console.log('  Simple CPU so far    : ' + cpu.simpleCPU.toFixed(2));
-            console.log('  Move range so far    : ' +
-                cpu.moveLow.toFixed(2) + '\u2013' + cpu.moveHigh.toFixed(2) + ' CPU');
+  } else if (e.mode === "player") {
+    const t = e.phase;
+    console.log("[RoomCPUProfiler] PLAYER — " + e.playerName + "  [phase: " + t + "]");
+    console.log("  Elapsed     : " + o + " ticks");
+    if (t === "scanning") {
+      const e = Memory.wideScan;
+      if (e && e.active) {
+        const o = (e.scannedCount / Math.max(1, e.totalRooms) * 100).toFixed(1);
+        console.log("  wideScan    : " + e.scannedCount + "/" + e.totalRooms + " (" + o + "%)  found " + e.foundRooms.length + " room(s) so far");
+      } else {
+        console.log("  wideScan    : finishing up...");
+      }
+    } else if (t === "profiling") {
+      const o = e.completedRooms.length;
+      const t = o + e.roomQueue.length + (e.current ? 1 : 0);
+      console.log("  Rooms done  : " + o + " / " + t);
+      if (e.roomQueue.length) {
+        console.log("  Queue       : " + e.roomQueue.join(", "));
+      }
+      if (e.current) {
+        const o = e.current;
+        const t = o.totals;
+        const r = (t.ticksObserved / PROFILE_TICKS * 100).toFixed(1);
+        const n = calcCPU(t);
+        console.log("  Current     : " + o.roomName + "  " + t.ticksObserved + "/" + PROFILE_TICKS + " ticks (" + r + "%)" + "  invis=" + t.invisibleTicks);
+        if (t.ticksObserved > 0) {
+          console.log("  Running avg : ~" + (n.totalMid / t.ticksObserved).toFixed(3) + " CPU/tick");
         }
-
-    } else if (state.mode === 'player') {
-        // Player mode
-        const phase = state.phase;
-        console.log('[RoomCPUProfiler] PLAYER \u2014 ' + state.playerName +
-            '  [phase: ' + phase + ']');
-        console.log('  Elapsed     : ' + elapsed + ' ticks');
-
-        if (phase === 'scanning') {
-            const ws = Memory.wideScan;
-            if (ws && ws.active) {
-                const pct = ((ws.scannedCount / Math.max(1, ws.totalRooms)) * 100).toFixed(1);
-                console.log('  wideScan    : ' + ws.scannedCount + '/' + ws.totalRooms +
-                    ' (' + pct + '%)  found ' + ws.foundRooms.length + ' room(s) so far');
-            } else {
-                console.log('  wideScan    : finishing up...');
-            }
-
-        } else if (phase === 'profiling') {
-            const done  = state.completedRooms.length;
-            const total = done + state.roomQueue.length + (state.current ? 1 : 0);
-            console.log('  Rooms done  : ' + done + ' / ' + total);
-            if (state.roomQueue.length) {
-                console.log('  Queue       : ' + state.roomQueue.join(', '));
-            }
-            if (state.current) {
-                const cur = state.current;
-                const t   = cur.totals;
-                const pct = ((t.ticksObserved / PROFILE_TICKS) * 100).toFixed(1);
-                const cpu = calcCPU(t);
-                console.log('  Current     : ' + cur.roomName +
-                    '  ' + t.ticksObserved + '/' + PROFILE_TICKS + ' ticks (' + pct + '%)' +
-                    '  invis=' + t.invisibleTicks);
-                if (t.ticksObserved > 0) {
-                    console.log('  Running avg : ~' + (cpu.totalMid / t.ticksObserved).toFixed(3) + ' CPU/tick');
-                }
-            }
-            if (done > 0) {
-                console.log('  Completed rooms:');
-                for (const r of state.completedRooms) {
-                    const c = calcCPU(r.totals);
-                    const obs = r.totals.ticksObserved;
-                    console.log('    ' + r.roomName.padEnd(10) +
-                        ' typical=' + (c.totalMid / Math.max(1, obs)).toFixed(3) + '/tick' +
-                        '  total=' + c.totalLow.toFixed(2) + '-' + c.totalHigh.toFixed(2) + ' CPU');
-                }
-            }
+      }
+      if (o > 0) {
+        console.log("  Completed rooms:");
+        for (const o of e.completedRooms) {
+          const e = calcCPU(o.totals);
+          const t = o.totals.ticksObserved;
+          console.log("    " + o.roomName.padEnd(10) + " typical=" + (e.totalMid / Math.max(1, t)).toFixed(3) + "/tick" + "  total=" + e.totalLow.toFixed(2) + "-" + e.totalHigh.toFixed(2) + " CPU");
         }
-
-    } else if (state.mode === 'neighbors') {
-        console.log('[NeighborProfile] NEIGHBORS  [phase: ' + state.phase + ']');
-        console.log('  Elapsed     : ' + elapsed + ' ticks');
-
-        if (state.phase === 'scanning') {
-            const ws = Memory.wideScan;
-            if (ws && ws.active) {
-                const pct = ((ws.scannedCount / Math.max(1, ws.totalRooms)) * 100).toFixed(1);
-                const playerCount = typeof ws.foundRooms === 'object' && !Array.isArray(ws.foundRooms)
-                    ? Object.keys(ws.foundRooms).length : 0;
-                console.log('  wideScan    : ' + ws.scannedCount + '/' + ws.totalRooms +
-                    ' (' + pct + '%)  ' + playerCount + ' player(s) found');
-            } else {
-                console.log('  wideScan    : finishing...');
-            }
-
-        } else if (state.phase === 'profiling') {
-            const doneCount = Object.values(state.completed)
-                .reduce(function (s, arr) { return s + arr.length; }, 0);
-            const totalRooms = doneCount + state.profileQueue.length +
-                (state.current ? 1 : 0);
-            const players = Object.keys(state.playerRoomMap).length;
-
-            console.log('  Players     : ' + players);
-            console.log('  Rooms       : ' + doneCount + '/' + totalRooms + ' profiled');
-
-            if (state.current) {
-                const cur = state.current;
-                const t   = cur.totals;
-                const pct = ((t.ticksObserved / PROFILE_TICKS) * 100).toFixed(1);
-                console.log('  Current     : ' + cur.roomName + ' (' + state.currentPlayer +
-                    ')  ' + t.ticksObserved + '/' + PROFILE_TICKS + ' (' + pct + '%)' +
-                    '  invis=' + t.invisibleTicks);
-                if (t.ticksObserved > 0) {
-                    const cpu = calcCPU(t);
-                    console.log('  Running avg : ~' + (cpu.totalMid / t.ticksObserved).toFixed(3) + ' CPU/tick');
-                }
-            }
-
-            // Show completed players with compact stats
-            for (const player in state.completed) {
-                const rooms = state.completed[player];
-                if (!rooms.length) continue;
-                const mid = rooms.reduce(function (s, r) { return s + r.mid; }, 0);
-                const roomStr = rooms.map(function (r) {
-                    return r.room + '=' + r.mid.toFixed(3) + '/t';
-                }).join(' ');
-                console.log('  ' + player.padEnd(16) + ' ' + mid.toFixed(3) +
-                    ' intent/t  [' + roomStr + ']');
-            }
-        }
+      }
     }
-
-    return state;
+  } else if (e.mode === "neighbors") {
+    console.log("[NeighborProfile] NEIGHBORS  [phase: " + e.phase + "]");
+    console.log("  Elapsed     : " + o + " ticks");
+    if (e.phase === "scanning") {
+      const e = Memory.wideScan;
+      if (e && e.active) {
+        const o = (e.scannedCount / Math.max(1, e.totalRooms) * 100).toFixed(1);
+        const t = typeof e.foundRooms === "object" && !Array.isArray(e.foundRooms) ? Object.keys(e.foundRooms).length : 0;
+        console.log("  wideScan    : " + e.scannedCount + "/" + e.totalRooms + " (" + o + "%)  " + t + " player(s) found");
+      } else {
+        console.log("  wideScan    : finishing...");
+      }
+    } else if (e.phase === "profiling") {
+      const o = Object.values(e.completed).reduce(function(e, o) {
+        return e + o.length;
+      }, 0);
+      const t = o + e.profileQueue.length + (e.current ? 1 : 0);
+      const r = Object.keys(e.playerRoomMap).length;
+      console.log("  Players     : " + r);
+      console.log("  Rooms       : " + o + "/" + t + " profiled");
+      if (e.current) {
+        const o = e.current;
+        const t = o.totals;
+        const r = (t.ticksObserved / PROFILE_TICKS * 100).toFixed(1);
+        console.log("  Current     : " + o.roomName + " (" + e.currentPlayer + ")  " + t.ticksObserved + "/" + PROFILE_TICKS + " (" + r + "%)" + "  invis=" + t.invisibleTicks);
+        if (t.ticksObserved > 0) {
+          const e = calcCPU(t);
+          console.log("  Running avg : ~" + (e.totalMid / t.ticksObserved).toFixed(3) + " CPU/tick");
+        }
+      }
+      for (const o in e.completed) {
+        const t = e.completed[o];
+        if (!t.length) continue;
+        const r = t.reduce(function(e, o) {
+          return e + o.mid;
+        }, 0);
+        const n = t.map(function(e) {
+          return e.room + "=" + e.mid.toFixed(3) + "/t";
+        }).join(" ");
+        console.log("  " + o.padEnd(16) + " " + r.toFixed(3) + " intent/t  [" + n + "]");
+      }
+    }
+  }
+  return e;
 }
 
-module.exports = { start, cancel, run, status, startNeighbors: startNeighbors };
-
-global.profileRoom          = start;
-global.cancelRoomProfile    = cancel;
-global.roomProfileStatus    = status;
-global.profileNeighbors     = startNeighbors;
+module.exports = {
+  start: start,
+  cancel: cancel,
+  run: run,
+  status: status,
+  startNeighbors: startNeighbors
+};
+global.profileRoom = start;
+global.cancelRoomProfile = cancel;
+global.roomProfileStatus = status;
+global.profileNeighbors = startNeighbors;

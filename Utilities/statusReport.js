@@ -1,695 +1,555 @@
-// === statusReport.js ===
-// Handles the 100-tick colony status console output.
-// Emits a single console.log() call so the entire report appears under
-// one timestamp in the Screeps console.
-
-const getRoomState     = require('getRoomState');
-const singleSourceRoom = require('singleSourceRoom');
-const marketPricing    = require('marketPricing');
-
-let ENABLE_CPU_LOGGING  = false;
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// statusReport.js
+// Console globals: status
+// Example: status('playerName') - Show high-level empire & defense status overview
+//   status()
+//     Print the colony status board: CPU/bucket/GCL header, one row per
+//     owned room (RCL, energy, storage, creep role emoji, RCL ETA),
+//     total creep counts, energy summary, daily income, trade summary.
+//   status('PlayerName')
+const getRoomState = require("getRoomState");
+const singleSourceRoom = require("singleSourceRoom");
+const marketPricing = require("marketPricing");
+const memoryManager = require("memoryManager");
+const autoTrader = require("autoTrader");
+const util = require("util");
+let ENABLE_CPU_LOGGING = false;
 let DISABLE_CPU_CONSOLE = true;
-
-// ===== TRADE DATA HELPERS =====
-
-const DECOMPRESSION_PRODUCTS = [
-    RESOURCE_UTRIUM, RESOURCE_LEMERGIUM, RESOURCE_ZYNTHIUM, RESOURCE_KEANIUM,
-    RESOURCE_GHODIUM, RESOURCE_OXYGEN, RESOURCE_HYDROGEN, RESOURCE_CATALYST,
-    RESOURCE_ENERGY
-];
-
-function getActiveReverseCount() {
-    let count = 0;
-    if (Memory.marketLabReverse && Memory.marketLabReverse.rooms) {
-        for (const roomName in Memory.marketLabReverse.rooms) {
-            const queue = Memory.marketLabReverse.rooms[roomName];
-            if (!queue) continue;
-            for (let i = 0; i < queue.length; i++) {
-                if (queue[i] && queue[i].state !== 'SELLING') count++;
-            }
-        }
-    }
-    return count;
-}
-
-function getActiveForwardCount() {
-    let count = 0;
-    if (Memory.marketLabForward && Memory.marketLabForward.rooms) {
-        for (const roomName in Memory.marketLabForward.rooms) {
-            const queue = Memory.marketLabForward.rooms[roomName];
-            if (!queue) continue;
-            for (let i = 0; i < queue.length; i++) {
-                if (queue[i] && queue[i].state !== 'SELLING') count++;
-            }
-        }
-    }
-    return count;
-}
-
-function getFactoryJobCounts() {
-    let compression = 0;
-    let decompression = 0;
-
-    if (Memory.marketRefine && Memory.marketRefine.ops) {
-        for (let i = 0; i < Memory.marketRefine.ops.length; i++) {
-            const op = Memory.marketRefine.ops[i];
-            if (op && op.output) {
-                if (DECOMPRESSION_PRODUCTS.indexOf(op.output) >= 0) {
-                    decompression++;
-                } else {
-                    compression++;
-                }
-            }
-        }
-    }
-
-    if (Memory.localRefine && Array.isArray(Memory.localRefine.ops)) {
-        for (let i = 0; i < Memory.localRefine.ops.length; i++) {
-            const op = Memory.localRefine.ops[i];
-            if (op && op.output) compression++;
-        }
-    }
-
-    if (Memory.factoryOrders && Array.isArray(Memory.factoryOrders)) {
-        for (let i = 0; i < Memory.factoryOrders.length; i++) {
-            const order = Memory.factoryOrders[i];
-            if (order && order.product) {
-                if (DECOMPRESSION_PRODUCTS.indexOf(order.product) >= 0) {
-                    decompression++;
-                } else {
-                    compression++;
-                }
-            }
-        }
-    }
-
-    return { compression, decompression };
-}
-
 function getMarketOrderCounts() {
-    let buys = 0;
-    let sells = 0;
-
-    if (Game.market && Game.market.orders) {
-        for (const id in Game.market.orders) {
-            const order = Game.market.orders[id];
-            if (order && order.remainingAmount > 0) {
-                if (order.type === ORDER_BUY) buys++;
-                else if (order.type === ORDER_SELL) sells++;
-            }
-        }
+  let e = 0;
+  let t = 0;
+  if (Game.market && Game.market.orders) {
+    for (const o in Game.market.orders) {
+      const r = Game.market.orders[o];
+      if (r && util.getOrderRemaining(r) > 0) {
+        if (r.type === ORDER_BUY) e++; else if (r.type === ORDER_SELL) t++;
+      }
     }
-
-    return { buys, sells };
-}
-
-function getOpportunisticBuyCount() {
-    let count = 0;
-    if (Memory.opportunisticBuy && Memory.opportunisticBuy.requests) {
-        for (const key in Memory.opportunisticBuy.requests) {
-            const req = Memory.opportunisticBuy.requests[key];
-            if (req && req.remaining > 0) count++;
-        }
-    }
-    return count;
-}
-
-// Count labs currently in the active PROCESSING phase
-function getActiveLabReactingCount() {
-    let count = 0;
-    // Reverse reactions
-    if (Memory.marketLabReverse && Memory.marketLabReverse.rooms) {
-        for (const roomName in Memory.marketLabReverse.rooms) {
-            const queue = Memory.marketLabReverse.rooms[roomName];
-            if (!queue) continue;
-            for (let i = 0; i < queue.length; i++) {
-                if (queue[i] && queue[i].state === 'PROCESSING') count++;
-            }
-        }
-    }
-    // Forward reactions
-    if (Memory.marketLabForward && Memory.marketLabForward.rooms) {
-        for (const roomName in Memory.marketLabForward.rooms) {
-            const queue = Memory.marketLabForward.rooms[roomName];
-            if (!queue) continue;
-            for (let i = 0; i < queue.length; i++) {
-                if (queue[i] && queue[i].state === 'PROCESSING') count++;
-            }
-        }
-    }
-    return count;
-}
-
-// Count active factory orders (rough analogue to lab PROCESSING state)
-function getActiveFactoryProducingCount() {
-    let count = 0;
-    if (Memory.factoryOrders && Array.isArray(Memory.factoryOrders)) {
-        for (let i = 0; i < Memory.factoryOrders.length; i++) {
-            const order = Memory.factoryOrders[i];
-            if (order && order.status === 'active') count++;
-        }
-    }
-    return count;
+  }
+  return {
+    buys: e,
+    sells: t
+  };
 }
 
 function getSellOrderInventoryValue() {
-    let totalValue = 0;
-    if (Game.market && Game.market.orders) {
-        for (const id in Game.market.orders) {
-            const order = Game.market.orders[id];
-            if (order && order.remainingAmount > 0 && order.type === ORDER_SELL) {
-                totalValue += order.remainingAmount * order.price;
-            }
-        }
+  let e = 0;
+  if (Game.market && Game.market.orders) {
+    for (const t in Game.market.orders) {
+      const o = Game.market.orders[t];
+      if (o && util.getOrderRemaining(o) > 0 && o.type === ORDER_SELL) {
+        e += util.getOrderRemaining(o) * o.price;
+      }
     }
-    return totalValue;
+  }
+  return e;
 }
 
 function getArbitrageBufferValue() {
-    let totalValue = 0;
-    const buffered = Memory.marketArbitrage && Memory.marketArbitrage.buffered;
-    if (buffered && Array.isArray(buffered)) {
-        for (let i = 0; i < buffered.length; i++) {
-            const buf = buffered[i];
-            if (buf && buf.amount > 0 && buf.sellPrice > 0) {
-                totalValue += buf.amount * buf.sellPrice;
-            }
-        }
+  let e = 0;
+  const t = Memory.marketArbitrage && Memory.marketArbitrage.buffered;
+  if (t && Array.isArray(t)) {
+    for (let o = 0; o < t.length; o++) {
+      const r = t[o];
+      if (r && r.amount > 0 && r.sellPrice > 0) {
+        e += r.amount * r.sellPrice;
+      }
     }
-    return totalValue;
+  }
+  return e;
 }
 
-// ===== END TRADE DATA HELPERS =====
-
-function init(cpuLogging, disableCpuConsole) {
-  ENABLE_CPU_LOGGING  = cpuLogging;
-  DISABLE_CPU_CONSOLE = disableCpuConsole;
+function init(e, t) {
+  ENABLE_CPU_LOGGING = e;
+  DISABLE_CPU_CONSOLE = t;
 }
 
-// ---------------------------------------------------------------
-
-function formatTime(totalMinutes) {
-  const days    = Math.floor(totalMinutes / (24 * 60));
-  const hours   = Math.floor((totalMinutes % (24 * 60)) / 60);
-  const minutes = Math.floor(totalMinutes % 60);
-  if (days > 0) {
-    return hours > 0
-      ? (days + "d " + hours + "h " + minutes + "m")
-      : (days + "d " + minutes + "m");
-  } else if (hours > 0) {
-    return hours + "h " + minutes + "m";
+function formatTime(e) {
+  const t = Math.floor(e / (24 * 60));
+  const o = Math.floor(e % (24 * 60) / 60);
+  const r = Math.floor(e % 60);
+  if (t > 0) {
+    return o > 0 ? t + "d " + o + "h " + r + "m" : t + "d " + r + "m";
+  } else if (o > 0) {
+    return o + "h " + r + "m";
   } else {
-    return minutes + "m";
+    return r + "m";
   }
 }
 
 function getPerformanceData() {
-  let cpuMin     = 0;
-  let cpuMax     = 0;
-  let cpuAverage = 0;
-
-  if (Memory.cpuStats && Memory.cpuStats.history && Memory.cpuStats.history.length > 0) {
-    const history = Memory.cpuStats.history;
-    cpuMin     = Math.min.apply(null, history);
-    cpuMax     = Math.max.apply(null, history);
-    cpuAverage = history.reduce(function(sum, val) { return sum + val; }, 0) / history.length;
+  let e = 0;
+  let t = 0;
+  let o = 0;
+  const r = require("memoryManager").heap.cpuStats;
+  if (r && r.history && r.history.length > 0) {
+    const n = r.history;
+    e = Math.min.apply(null, n);
+    t = Math.max.apply(null, n);
+    o = n.reduce(function(e, t) {
+      return e + t;
+    }, 0) / n.length;
   }
-
-  return { cpuAverage, cpuMin, cpuMax };
+  return {
+    cpuAverage: o,
+    cpuMin: e,
+    cpuMax: t
+  };
 }
 
 function calculateTotalEnergy() {
-  let totalEnergy = 0;
-  for (const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
-    if (room.storage && room.storage.store) {
-      totalEnergy += room.storage.store.getUsedCapacity(RESOURCE_ENERGY);
+  let e = 0;
+  for (const t in Game.rooms) {
+    const o = Game.rooms[t];
+    if (!o.controller || !o.controller.my) continue;
+    if (o.storage && o.storage.store) {
+      e += o.storage.store.getUsedCapacity(RESOURCE_ENERGY);
     }
   }
-  return totalEnergy;
+  return e;
 }
 
-// Emoji-aware padEnd: emoji render 2 columns wide in the Screeps console
-// but JS counts them as 1-2 code units, so plain padEnd undershoots.
-function emojiPadEnd(str, targetLen) {
-  let extraWidth = 0;
-  for (let i = 0; i < str.length; i++) {
-    const cp = str.codePointAt(i);
-    if (cp > 0xFFFF) { extraWidth++; i++; }
+function emojiPadEnd(e, t) {
+  let o = 0;
+  for (let t = 0; t < e.length; t++) {
+    const r = e.codePointAt(t);
+    if (r > 65535) {
+      o++;
+      t++;
+    }
   }
-  const bmpWide = /[\u26CF\u26A1\u2692\u2694\u2699]/g;
-  const bmpMatches = str.match(bmpWide);
-  if (bmpMatches) extraWidth += bmpMatches.length;
-  return str.padEnd(Math.max(0, targetLen - extraWidth));
+  const r = /[\u26CF\u26A1\u2692\u2694\u2699]/g;
+  const n = e.match(r);
+  if (n) o += n.length;
+  return e.padEnd(Math.max(0, t - o));
 }
 
-// Show a role icon only when count > 0 (or always, if alwaysShow is true)
-function icon(emoji, count, alwaysShow) {
-  if (!alwaysShow && (count || 0) === 0) return '';
-  return ' ' + emoji + (count || 0);
+function icon(e, t, o) {
+  if (!o && (t || 0) === 0) return "";
+  return " " + e + (t || 0);
 }
 
-/**
- * Display-only energy price: raw bestBid + 0.1 (what a posted BUY order would
- * cost to lead the book right now). Bypasses marketPricing.actualBuyPrice's
- * avg*1.5 cap because the cap is buyer-math defense, not a true market signal —
- * showing it in status would mislead the operator about actual acquisition cost.
- *
- * Falls back to the volume-weighted ask when no bid exists, else 0.
- */
 function getStatusEnergyPrice() {
-  const book = marketPricing.getBook(RESOURCE_ENERGY);
-  if (book && book.bestBid !== null) return book.bestBid + 0.1;
-  if (book && book.vwAsk !== null)   return book.vwAsk;
-  return 0;
+  return marketPricing.getStatusEnergyPrice();
 }
 
-function run(perRoomRoleCounts) {
-  const lines = [];
-
-  // ---------------------------------------------------------------
-  // ENERGY MARKET PRICE
-  // ---------------------------------------------------------------
-  const energyMktPrice = getStatusEnergyPrice();
-
-  // ---------------------------------------------------------------
-  // GCL TRACKING — cache ETA in Memory so status() always shows it
-  // ---------------------------------------------------------------
-  const GCL_WINDOW   = 5000;
-  const GCL_INTERVAL = 100;
-
-  if (!Memory.gclTracker) Memory.gclTracker = { anchor: null, lastLevel: Game.gcl.level, etaString: '' };
-
-  if (Game.time % GCL_INTERVAL === 0) {
-    const currentPercent = Game.gcl.progress / Game.gcl.progressTotal * 100;
-    const tracker        = Memory.gclTracker;
-
-    // Reset anchor on level-up or if window has expired
-    if (!tracker.anchor ||
-        tracker.lastLevel !== Game.gcl.level ||
-        Game.time - tracker.anchor.tick >= GCL_WINDOW) {
-      tracker.anchor    = { tick: Game.time, percent: currentPercent };
-      tracker.lastLevel = Game.gcl.level;
+function run(e) {
+  const t = [];
+  const o = getStatusEnergyPrice();
+  const r = 5e3;
+  const n = 100;
+  if (!Memory.gclTracker) {
+    Memory.gclTracker = {
+      anchor: null,
+      lastLevel: Game.gcl.level,
+      etaString: "",
+      lastSampleTick: null
+    };
+    memoryManager.requestSave();
+  } else if (typeof Memory.gclTracker.lastSampleTick !== "number") {
+    Memory.gclTracker.lastSampleTick = null;
+    memoryManager.requestSave();
+  }
+  const a = Memory.gclTracker;
+  const s = a.lastSampleTick === null || a.lastSampleTick > Game.time || Game.time - a.lastSampleTick >= n;
+  if (s) {
+    const e = Game.gcl.progress / Game.gcl.progressTotal * 100;
+    const t = a;
+    if (!t.anchor || t.lastLevel !== Game.gcl.level || Game.time - t.anchor.tick >= r) {
+      t.anchor = {
+        tick: Game.time,
+        percent: e
+      };
+      t.lastLevel = Game.gcl.level;
+      t.etaString = "";
     } else {
-      const dt    = Game.time - tracker.anchor.tick;
-      const dPerc = currentPercent - tracker.anchor.percent;
-
-      if (dt >= GCL_INTERVAL && dPerc > 0) {
-        const rate      = dPerc / dt;
-        const remaining = 100 - currentPercent;
-        const etaTicks  = Math.ceil(remaining / rate);
-        const totalSec  = etaTicks * 4;
-        const days    = Math.floor(totalSec / 86400);
-        const hours   = Math.floor((totalSec % 86400) / 3600);
-        const minutes = Math.floor((totalSec % 3600) / 60);
-        tracker.etaString = days + "d " + hours + "h " + minutes + "m";
+      const o = Game.time - t.anchor.tick;
+      const r = e - t.anchor.percent;
+      if (o >= n && r > 0) {
+        const n = r / o;
+        const a = 100 - e;
+        const s = Math.ceil(a / n);
+        const i = s * 4;
+        const l = Math.floor(i / 86400);
+        const c = Math.floor(i % 86400 / 3600);
+        const m = Math.floor(i % 3600 / 60);
+        t.etaString = l + "d " + c + "h " + m + "m";
       } else {
-        tracker.etaString = '∞';
+        t.etaString = "∞";
       }
     }
+    a.lastSampleTick = Game.time;
+    memoryManager.requestSave();
   }
-
-  const gclPercent = (Game.gcl.progress / Game.gcl.progressTotal * 100).toFixed(1);
-  const gclEtaPart = Memory.gclTracker.etaString
-    ? " ETA: " + Memory.gclTracker.etaString
-    : '';
-  const gclString = "GCL " + Game.gcl.level + " " + gclPercent + "%" + gclEtaPart;
-
-  // ---------------------------------------------------------------
-  // CREEP COUNTS PER ROOM
-  // ---------------------------------------------------------------
-  const perRoomStats = {};
-  for (const name in Game.creeps) {
-    const creep        = Game.creeps[name];
-    const assignedRoom = creep.memory.homeRoom || creep.memory.assignedRoom || creep.room.name;
-    if (!perRoomStats[assignedRoom]) perRoomStats[assignedRoom] = { totalCreeps: 0, powerCreeps: 0 };
-    perRoomStats[assignedRoom].totalCreeps++;
+  const i = (Game.gcl.progress / Game.gcl.progressTotal * 100).toFixed(1);
+  const l = Memory.gclTracker.etaString ? " ETA: " + Memory.gclTracker.etaString : "";
+  const c = "GCL " + Game.gcl.level + " " + i + "%" + l;
+  const m = {};
+  const f = getRoomState.creepIndex();
+  const u = f && f.all ? f.all : [];
+  for (let e = 0; e < u.length; e++) {
+    const t = u[e];
+    const o = t.memory.homeRoom || t.memory.assignedRoom || t.room.name;
+    if (!m[o]) m[o] = {
+      totalCreeps: 0,
+      powerCreeps: 0
+    };
+    m[o].totalCreeps++;
   }
-  for (const name in Game.powerCreeps) {
-    const pc = Game.powerCreeps[name];
-    if (!pc.room) continue;
-    const roomName = pc.room.name;
-    if (!perRoomStats[roomName]) perRoomStats[roomName] = { totalCreeps: 0, powerCreeps: 0 };
-    perRoomStats[roomName].powerCreeps++;
-    perRoomStats[roomName].totalCreeps++;
+  for (const e in Game.powerCreeps) {
+    const t = Game.powerCreeps[e];
+    if (!t.room) continue;
+    const o = t.room.name;
+    if (!m[o]) m[o] = {
+      totalCreeps: 0,
+      powerCreeps: 0
+    };
+    m[o].powerCreeps++;
+    m[o].totalCreeps++;
   }
-
-  // ---------------------------------------------------------------
-  // HEADER
-  // ---------------------------------------------------------------
-  lines.push("======================== COLONY STATUS =========================");
-
-  // ---------------------------------------------------------------
-  // CPU + GCL LINE
-  // ---------------------------------------------------------------
-  const perfData = getPerformanceData();
+  t.push("======================== COLONY STATUS =========================");
+  const p = getPerformanceData();
   if (!ENABLE_CPU_LOGGING || !DISABLE_CPU_CONSOLE) {
-    const bucketPercent = Math.round((Game.cpu.bucket / 10000) * 100);
-    const bucketStatus  = Game.cpu.bucket >= 10000 ? 'FULL' : bucketPercent + '%';
-    lines.push(
-      "CPU Min: "    + Math.round(perfData.cpuMin) +
-      " Avg: "       + Math.round(perfData.cpuAverage) +
-      " Max: "       + Math.round(perfData.cpuMax) +
-      " | Bucket: "  + Game.cpu.bucket + " (" + bucketStatus + ")" +
-      " | "          + gclString
-    );
+    const e = Math.round(Game.cpu.bucket / 1e4 * 100);
+    const o = Game.cpu.bucket >= 1e4 ? "FULL" : e + "%";
+    const r = memoryManager.getSerializationReserveStats();
+    const n = r.hitRate * 100;
+    t.push("CPU Min: " + Math.round(p.cpuMin) + " Avg: " + Math.round(p.cpuAverage) + " Max: " + Math.round(p.cpuMax) + " Mem: " + r.amortizedCpu.toFixed(3) + " (" + (r.hitRate * 100).toFixed(1) + "% hit)" + " Save" + (r.recentTicks || 0) + ": " + n.toFixed(1) + "%" + " | Bucket: " + Game.cpu.bucket + " (" + o + ")" + " | " + c);
   } else {
-    lines.push(gclString);
+    t.push(c);
   }
-
-  lines.push("----------------------------------------------------------------");
-
-  // ---------------------------------------------------------------
-  // ROOM ROWS
-  // ---------------------------------------------------------------
+  t.push("----------------------------------------------------------------");
   if (!Memory.progressTracker) Memory.progressTracker = {};
-
-  const myRooms = Object.keys(Game.rooms).sort();
-
-  for (const roomName of myRooms) {
-    const room = Game.rooms[roomName];
-    if (!room.controller || !room.controller.my) continue;
-
-    // RCL progress & ETA
-    const percent = room.controller.progress / room.controller.progressTotal * 100;
-
-    if (!Memory.progressTracker[roomName]) {
-      Memory.progressTracker[roomName] = { level: room.controller.level, anchor: { tick: Game.time, percent } };
+  const g = Object.keys(Game.rooms).sort();
+  for (const o of g) {
+    const r = Game.rooms[o];
+    if (!r.controller || !r.controller.my) continue;
+    const n = r.controller.progress / r.controller.progressTotal * 100;
+    if (!Memory.progressTracker[o]) {
+      Memory.progressTracker[o] = {
+        level: r.controller.level,
+        anchor: {
+          tick: Game.time,
+          percent: n
+        }
+      };
     }
-
-    const tracker = Memory.progressTracker[roomName];
-
-    // Reset anchor on level-up or if window has expired
-    if (tracker.level !== room.controller.level ||
-        Game.time - tracker.anchor.tick >= 500) {
-      tracker.level  = room.controller.level;
-      tracker.anchor = { tick: Game.time, percent };
+    const a = Memory.progressTracker[o];
+    if (a.level !== r.controller.level || Game.time - a.anchor.tick >= 500) {
+      a.level = r.controller.level;
+      a.anchor = {
+        tick: Game.time,
+        percent: n
+      };
     }
-
-    let etaText = '';
-    if (room.controller.level < 8) {
-      const tickDelta    = Game.time - tracker.anchor.tick;
-      const percentDelta = percent - tracker.anchor.percent;
-
-      if (tickDelta >= 100 && percentDelta > 0) {
-        const remaining  = 100 - percent;
-        const rate       = percentDelta / tickDelta;
-        const etaTicks   = Math.ceil(remaining / rate);
-        const etaMinutes = etaTicks * 4 / 60;
-        etaText = "ETA: ~" + formatTime(etaMinutes) + " (" + percent.toFixed(1) + "%)";
+    let s = "";
+    if (r.controller.level < 8) {
+      const e = Game.time - a.anchor.tick;
+      const t = n - a.anchor.percent;
+      if (e >= 100 && t > 0) {
+        const o = 100 - n;
+        const r = t / e;
+        const a = Math.ceil(o / r);
+        const i = a * 4 / 60;
+        s = "ETA: ~" + formatTime(i) + " (" + n.toFixed(1) + "%)";
       }
     }
-
-    const counts = perRoomRoleCounts[roomName] || {};
-    const stats  = perRoomStats[roomName]      || { totalCreeps: 0 };
-
-    // Energy
-    const enAvail = room.energyAvailable >= 1000
-      ? (room.energyAvailable / 1000).toFixed(1) + 'k' : room.energyAvailable;
-    const enCap = room.energyCapacityAvailable >= 1000
-      ? (room.energyCapacityAvailable / 1000).toFixed(1) + 'k' : room.energyCapacityAvailable;
-
-    // Storage
-    let stoDisplay = "NoSto";
-    if (room.storage && room.storage.store) {
-      const sVal = room.storage.store[RESOURCE_ENERGY];
-      stoDisplay = "Sto:" + (sVal >= 1000 ? (sVal / 1000).toFixed(0) + 'k' : sVal);
+    const i = e[o] || {};
+    const l = m[o] || {
+      totalCreeps: 0
+    };
+    const c = r.energyAvailable >= 1e3 ? (r.energyAvailable / 1e3).toFixed(1) + "k" : r.energyAvailable;
+    const f = r.energyCapacityAvailable >= 1e3 ? (r.energyCapacityAvailable / 1e3).toFixed(1) + "k" : r.energyCapacityAvailable;
+    let u = "NoSto";
+    if (r.storage && r.storage.store) {
+      const e = r.storage.store[RESOURCE_ENERGY];
+      u = "Sto:" + (e >= 1e3 ? (e / 1e3).toFixed(0) + "k" : e);
     }
-
-    // Creep icons — only show non-zero counts, except core roles always shown
-    let creepDisplay = "";
-    if (stats.totalCreeps === 0) {
-      creepDisplay = "Idle";
-    } else if (singleSourceRoom.isSingleSourceActive(roomName)) {
-      creepDisplay =
-        icon('⛏',  counts.hd,                    true)  +
-        icon('🛠',  counts.maintainer,             false) +
-        icon('🔨',  counts.builder,               false) +
-        icon('🔧',  counts.comboBot,              false) +
-        icon('🔋',  counts.staticDistributor,     true)  +
-        icon('🧪',  counts.labBot,                false) +
-        icon('📡',  counts.terminalBot,           false) +
-        icon('💎',  counts.extractor,             false) +
-        icon('🗼',  counts.towerFiller,           false) +
-        icon('💠',  counts.mineralCollector,      false) +
-        icon('🪣',  counts.extractorAssistant,    false) +
-        icon('🔩',  counts.defenseRepair,         false) +
-        icon('🌾',  counts.depositHarvester,      false) +
-        icon('☢️',  counts.nukeFill,              false) +
-        icon('🌀',  counts.towerDrain,            false) +
-        icon('🔭',  counts.scout,                 false) +
-        icon('🚚',  counts.remoteSupplier,        false) +
-        icon('🪧',  counts.signbot,               false) +
-        icon('🗡️', counts.defender,               false) +
-        icon('⚔️',  counts.attacker,              false) +
-        icon('💨',  counts.fastAttacker,          false) +
-        icon('🥷',  counts.skAttacker,            false) +
-        icon('🤖',  counts.quad,                  false) +
-        icon('🔓',  counts.controllerAttacker,    false) +
-        icon('🦹',  counts.thief,                 false) +
-        icon('🚩',  counts.claimbot,              false) +
-        icon('💥',  counts.demolition,            false) +
-        icon('💣',  counts.contestedDemolisher,   false) +
-        icon('💢',  stats.powerCreeps,            false);
+    let p = "";
+    if (l.totalCreeps === 0) {
+      p = "Idle";
+    } else if (singleSourceRoom.isSingleSourceActive(o)) {
+      p = icon("⛏", i.hd, true) + icon("🛠", i.maintainer, false) + icon("🔨", i.builder, false) + icon("🔧", i.comboBot, false) + icon("🔋", i.staticDistributor, true) + icon("🧪", i.labBot, false) + icon("📡", i.terminalBot, false) + icon("💎", i.extractor, false) + icon("🗼", i.towerFiller, false) + icon("💠", i.mineralCollector, false) + icon("🪣", i.extractorAssistant, false) + icon("🔩", i.defenseRepair, false) + icon("🌾", i.depositHarvester, false) + icon("☢️", i.nukeFill, false) + icon("🌀", i.towerDrain, false) + icon("🧨", i.drainDemolisher, false) + icon("🔭", i.scout, false) + icon("🚚", i.remoteSupplier, false) + icon("🪧", i.signbot, false) + icon("🗡️", i.defender, false) + icon("⚔️", i.attacker, false) + icon("🏹", i.harasser, false) + icon("💚", i.healer, false) + icon("💨", i.fastAttacker, false) + icon("🥷", i.skAttacker, false) + icon("🤖", i.quad, false) + icon("🔓", i.controllerAttacker, false) + icon("🦹", i.thief, false) + icon("🧹", i.scavenger, false) + icon("🚩", i.claimbot, false) + icon("💥", i.demolition, false) + icon("💣", i.contestedDemolisher, false) + icon("🪖", i.squad, false) + icon("🧠", i.operator, false) + icon("💢", l.powerCreeps, false);
     } else {
-      creepDisplay =
-        icon('⛏',  counts.harvester,             true)  +
-        icon('🛠',  counts.maintainer,            false) +
-        icon('🔨',  counts.builder,               false) +
-        icon('🏗️', counts.remoteBuilder,          false) +
-        icon('⚡',  counts.upgrader,              false) +
-        icon('🔋',  counts.supplier,              true)  +
-        icon('🔧',  counts.comboBot,              false) +
-        icon('🧪',  counts.labBot,                false) +
-        icon('🚧',  counts.repairer,              false) +
-        icon('🔩',  counts.defenseRepair,         false) +
-        icon('📡',  counts.terminalBot,           false) +
-        icon('💎',  counts.extractor,             false) +
-        icon('💠',  counts.mineralCollector,      false) +
-        icon('🪣',  counts.extractorAssistant,    false) +
-        icon('🌾',  counts.depositHarvester,      false) +
-        icon('🔌',  counts.powerBot,              false) +
-        icon('☢️',  counts.nukeFill,              false) +
-        icon('🌀',  counts.towerDrain,            false) +
-        icon('🔭',  counts.scout,                 false) +
-        icon('🚚',  counts.remoteSupplier,        false) +
-        icon('🪧',  counts.signbot,               false) +
-        icon('🗡️', counts.defender,               false) +
-        icon('⚔️',  counts.attacker,              false) +
-        icon('💨',  counts.fastAttacker,          false) +
-        icon('🥷',  counts.skAttacker,            false) +
-        icon('🤖',  counts.quad,                  false) +
-        icon('🔓',  counts.controllerAttacker,    false) +
-        icon('🦹',  counts.thief,                 false) +
-        icon('🚩',  counts.claimbot,              false) +
-        icon('🗼',  counts.towerFiller,           false) +
-        icon('💥',  counts.demolition,            false) +
-        icon('💣',  counts.contestedDemolisher,   false) +
-        icon('💢',  stats.powerCreeps,            false);
+      p = icon("⛏", i.harvester, true) + icon("🛠", i.maintainer, false) + icon("🔨", i.builder, false) + icon("🏗️", i.remoteBuilder, false) + icon("⚡", i.upgrader, false) + icon("🔋", i.supplier, true) + icon("🔧", i.comboBot, false) + icon("🧪", i.labBot, false) + icon("🚧", i.repairer, false) + icon("🔩", i.defenseRepair, false) + icon("📡", i.terminalBot, false) + icon("💎", i.extractor, false) + icon("💠", i.mineralCollector, false) + icon("🪣", i.extractorAssistant, false) + icon("🌾", i.depositHarvester, false) + icon("🔌", i.powerBot, false) + icon("☢️", i.nukeFill, false) + icon("🌀", i.towerDrain, false) + icon("🧨", i.drainDemolisher, false) + icon("🔭", i.scout, false) + icon("🚚", i.remoteSupplier, false) + icon("🪧", i.signbot, false) + icon("🗡️", i.defender, false) + icon("⚔️", i.attacker, false) + icon("🏹", i.harasser, false) + icon("💚", i.healer, false) + icon("💨", i.fastAttacker, false) + icon("🥷", i.skAttacker, false) + icon("🤖", i.quad, false) + icon("🔓", i.controllerAttacker, false) + icon("🦹", i.thief, false) + icon("🧹", i.scavenger, false) + icon("🚩", i.claimbot, false) + icon("🗼", i.towerFiller, false) + icon("💥", i.demolition, false) + icon("💣", i.contestedDemolisher, false) + icon("🪖", i.squad, false) + icon("🧠", i.operator, false) + icon("💢", l.powerCreeps, false);
     }
-
-    const col1 = (roomName + " RCL" + room.controller.level).padEnd(12);
-    const col2 = ("En:" + enAvail + "/" + enCap).padEnd(16);
-    const col3 = stoDisplay.padEnd(9);
-    const col4 = emojiPadEnd(creepDisplay, 20);
-
-    const endOfLine = etaText ? " | " + etaText : "";
-
-    lines.push(col1 + " | " + col2 + " | " + col3 + " | " + col4 + endOfLine);
+    const g = (o + " RCL" + r.controller.level).padEnd(12);
+    const d = ("En:" + c + "/" + f).padEnd(16);
+    const h = u.padEnd(9);
+    const y = emojiPadEnd(p, 20);
+    const k = s ? " | " + s : "";
+    t.push(g + " | " + d + " | " + h + " | " + y + k);
   }
-
-  // ---------------------------------------------------------------
-  // TOTAL CREEP COUNTS
-  // ---------------------------------------------------------------
-  let totalAll = 0;
-  const totalCounts = {};
-  for (const name in Game.creeps) {
-    const creep = Game.creeps[name];
-    const role  = creep.memory.role;
-    if (role) totalCounts[role] = (totalCounts[role] || 0) + 1;
-    totalAll++;
+  let d = 0;
+  const h = {};
+  for (let e = 0; e < u.length; e++) {
+    const t = u[e];
+    const o = t.memory.role;
+    if (o) h[o] = (h[o] || 0) + 1;
+    d++;
   }
-  let totalPowerCreeps = 0;
-  for (const name in Game.powerCreeps) {
-    if (Game.powerCreeps[name].room) totalPowerCreeps++;
+  let y = 0;
+  for (const e in Game.powerCreeps) {
+    if (Game.powerCreeps[e].room) y++;
   }
-  if (totalPowerCreeps > 0) totalAll += totalPowerCreeps;
-
-  const ROLE_ICONS = {
-    harvester:           '⛏',
-    hd:                  '⛏',
-    maintainer:          '🛠',
-    builder:             '🔨',
-    remoteBuilder:       '🏗️',
-    upgrader:            '⚡',
-    supplier:            '🔋',
-    staticDistributor:   '🔋',
-    comboBot:            '🔧',
-    repairer:            '🚧',
-    defenseRepair:       '🔩',
-    labBot:              '🧪',
-    terminalBot:         '📡',
-    extractor:           '💎',
-    mineralCollector:    '💠',
-    extractorAssistant:  '🪣',
-    depositHarvester:    '🌾',
-    powerBot:            '🔌',
-    towerFiller:         '🗼',
-    nukeFill:            '☢️',
-    towerDrain:          '🌀',
-    scout:               '🔭',
-    remoteSupplier:      '🚚',
-    signbot:             '🪧',
-    defender:            '🗡️',
-    attacker:            '⚔️',
-    fastAttacker:        '💨',
-    skAttacker:          '🥷',
-    quad:                '🤖',
-    controllerAttacker:  '🔓',
-    thief:               '🦹',
-    claimbot:            '🚩',
-    demolition:          '💥',
-    contestedDemolisher: '💣',
+  if (y > 0) d += y;
+  const k = {
+    harvester: "⛏",
+    hd: "⛏",
+    maintainer: "🛠",
+    builder: "🔨",
+    remoteBuilder: "🏗️",
+    upgrader: "⚡",
+    supplier: "🔋",
+    staticDistributor: "🔋",
+    comboBot: "🔧",
+    repairer: "🚧",
+    defenseRepair: "🔩",
+    labBot: "🧪",
+    terminalBot: "📡",
+    extractor: "💎",
+    mineralCollector: "💠",
+    extractorAssistant: "🪣",
+    depositHarvester: "🌾",
+    powerBot: "🔌",
+    towerFiller: "🗼",
+    nukeFill: "☢️",
+    towerDrain: "🌀",
+    drainDemolisher: "🧨",
+    scout: "🔭",
+    remoteSupplier: "🚚",
+    signbot: "🪧",
+    defender: "🗡️",
+    attacker: "⚔️",
+    harasser: "🏹",
+    healer: "💚",
+    fastAttacker: "💨",
+    skAttacker: "🥷",
+    quad: "🤖",
+    controllerAttacker: "🔓",
+    thief: "🦹",
+    scavenger: "🧹",
+    claimbot: "🚩",
+    demolition: "💥",
+    contestedDemolisher: "💣",
+    operator: "🧠",
+    squad: "🪖"
   };
-
-  // Merge hd into harvester so both mining roles share one ⛏ icon
-  if (totalCounts.hd) {
-    totalCounts.harvester = (totalCounts.harvester || 0) + totalCounts.hd;
-    delete totalCounts.hd;
+  if (h.hd) {
+    h.harvester = (h.harvester || 0) + h.hd;
+    delete h.hd;
   }
-  // Merge staticDistributor into supplier so both share one 🔋 icon
-  if (totalCounts.staticDistributor) {
-    totalCounts.supplier = (totalCounts.supplier || 0) + totalCounts.staticDistributor;
-    delete totalCounts.staticDistributor;
+  if (h.staticDistributor) {
+    h.supplier = (h.supplier || 0) + h.staticDistributor;
+    delete h.staticDistributor;
   }
-  if (totalPowerCreeps > 0) totalCounts['💢_powerCreep'] = totalPowerCreeps;
-
-  const roleParts = Object.entries(totalCounts)
-    .sort((a, b) => b[1] - a[1])
-    .map(([role, count]) => {
-      if (role === '💢_powerCreep') return '💢' + count;
-      return (ROLE_ICONS[role] || role) + count;
-    });
-
-  lines.push("Total creeps: " + totalAll + "  (" + roleParts.join(' ') + ")");
-
-  // ---------------------------------------------------------------
-  // ENERGY SUMMARY + MARKET PRICE (plain text)
-  // ---------------------------------------------------------------
-  const totalEnergy = calculateTotalEnergy();
-  const ownedRoomNames = Object.keys(Game.rooms).filter(rn => {
-    const r = Game.rooms[rn];
-    return r.controller && r.controller.my;
+  if (y > 0) h["💢_powerCreep"] = y;
+  const E = Object.entries(h).sort((e, t) => t[1] - e[1]).map(([e, t]) => {
+    if (e === "💢_powerCreep") return "💢" + t;
+    return (k[e] || e) + t;
   });
-  const avgEnergy = ownedRoomNames.length > 0 ? Math.round(totalEnergy / ownedRoomNames.length) : 0;
-
-  const totalEnergyStr = totalEnergy >= 1000000 ? (totalEnergy / 1000000).toFixed(2) + 'M' :
-                         totalEnergy >= 1000    ? (totalEnergy / 1000).toFixed(1) + 'k' :
-                         totalEnergy;
-  const avgEnergyStr   = avgEnergy >= 1000    ? (avgEnergy / 1000).toFixed(1) + 'k' :
-                         avgEnergy;
-
-  const priceStr = energyMktPrice.toFixed(3);
-  lines.push("Total energy: " + totalEnergyStr + " | Avg/room: " + avgEnergyStr + " | ⚡ Mkt: " + priceStr + "/u");
-
-  // ---------------------------------------------------------------
-  // DAILY INCOME (from dailyFinance) + INVENTORY VALUE
-  // ---------------------------------------------------------------
-  const df = Memory.dailyFinance;
-  let dailyIncomeStr = '';
-  if (df && df.totalIncome > 0) {
-    const income = df.totalIncome >= 1000000 ? (df.totalIncome / 1000000).toFixed(2) + 'M' :
-                   df.totalIncome >= 1000    ? (df.totalIncome / 1000).toFixed(1) + 'k' :
-                   df.totalIncome;
-    const bought = (df.totalExpenses || 0) >= 1000000 ? ((df.totalExpenses || 0) / 1000000).toFixed(2) + 'M' :
-                   (df.totalExpenses || 0) >= 1000    ? ((df.totalExpenses || 0) / 1000).toFixed(1) + 'k' :
-                   (df.totalExpenses || 0);
-    const profit = df.totalIncome - (df.totalExpenses || 0);
-    const profitStr = profit >= 1000000 ? (profit / 1000000).toFixed(2) + 'M' :
-                      profit >= 1000    ? (profit / 1000).toFixed(1) + 'k' :
-                      profit;
-    const profitSign = profit >= 0 ? '+' : '';
-    const tx = (df.totalSalesTx || 0) + (df.totalPurchasesTx || 0);
-
-    // Inventory value: sell orders + arbitrage buffer
-    const invSellOrders = getSellOrderInventoryValue();
-    const invArbitrage  = getArbitrageBufferValue();
-    const invTotal      = invSellOrders + invArbitrage;
-    const invStr = invTotal >= 1000000 ? (invTotal / 1000000).toFixed(2) + 'M' :
-                   invTotal >= 1000    ? (invTotal / 1000).toFixed(1) + 'k' :
-                   invTotal;
-
-    dailyIncomeStr = 'Daily income: ' + income + ' | Expenses: ' + bought +
-      ' | Net: ' + profitSign + profitStr + ' | Inv: ' + invStr + ' | Tx: ' + tx +
-      ' (' + (df.totalSalesTx || 0) + 's/' + (df.totalPurchasesTx || 0) + 'b)';
-  } else if (df) {
-    dailyIncomeStr = 'Daily income: 0 | Inv: 0 | Tx: 0 (no transactions yet today)';
+  const S = Memory.stats && typeof Memory.stats.kills === "number" ? Memory.stats.kills : 0;
+  t.push("Total creeps: " + d + "  (" + E.join(" ") + ")" + " | Kills: " + S);
+  const b = calculateTotalEnergy();
+  const M = Object.keys(Game.rooms).filter(e => {
+    const t = Game.rooms[e];
+    return t.controller && t.controller.my;
+  });
+  const C = M.length > 0 ? Math.round(b / M.length) : 0;
+  const v = b >= 1e6 ? (b / 1e6).toFixed(2) + "M" : b >= 1e3 ? (b / 1e3).toFixed(1) + "k" : b;
+  const R = C >= 1e3 ? (C / 1e3).toFixed(1) + "k" : C;
+  // ⚡ Mkt is replacement cost: the cheaper of resting the most competitive bid
+  // (freight-free) or taking a live ask (we deal, so we pay the transfer). The
+  // suffix names which route is winning and, for a direct take, where from.
+  const A = o.toFixed(3);
+  const q = marketPricing.energyAcquisitionQuote();
+  let Q = "";
+  if (q.route === "DIRECT" && q.direct) {
+    Q = " (buy " + q.direct.sellerRoom + "→" + q.direct.destinationRoom + " @" + q.direct.price.toFixed(2) + " +" + Math.round((1 - q.direct.yield) * 100) + "% freight" + (q.bid ? ", bid " + q.bid.toFixed(2) : "") + ")";
+  } else if (q.route === "BID") {
+    Q = " (bid" + (q.direct ? ", direct " + q.direct.delivered.toFixed(2) : "") + ")";
   }
-  if (dailyIncomeStr) {
-    lines.push(dailyIncomeStr);
+  t.push("Total energy: " + v + " | Avg/room: " + R + " | ⚡ Mkt: " + A + "/u" + Q);
+  const G = Memory.dailyFinance;
+  let x = "";
+  if (G && G.totalIncome > 0) {
+    const e = G.totalIncome >= 1e6 ? (G.totalIncome / 1e6).toFixed(2) + "M" : G.totalIncome >= 1e3 ? (G.totalIncome / 1e3).toFixed(1) + "k" : G.totalIncome;
+    const t = (G.totalExpenses || 0) >= 1e6 ? ((G.totalExpenses || 0) / 1e6).toFixed(2) + "M" : (G.totalExpenses || 0) >= 1e3 ? ((G.totalExpenses || 0) / 1e3).toFixed(1) + "k" : G.totalExpenses || 0;
+    const o = G.totalIncome - (G.totalExpenses || 0);
+    const r = Math.abs(o);
+    const n = r >= 1e6 ? (r / 1e6).toFixed(2) + "M" : r >= 1e3 ? (r / 1e3).toFixed(1) + "k" : r;
+    const a = o >= 0 ? "+" : "-";
+    const s = (G.totalSalesTx || 0) + (G.totalPurchasesTx || 0);
+    const i = getSellOrderInventoryValue();
+    const l = getArbitrageBufferValue();
+    const c = i + l;
+    const m = c >= 1e6 ? (c / 1e6).toFixed(2) + "M" : c >= 1e3 ? (c / 1e3).toFixed(1) + "k" : c;
+    x = "Daily income: " + e + " | Expenses: " + t + " | Net: " + a + n + " | Inv: " + m + " | Tx: " + s + " (" + (G.totalSalesTx || 0) + "s/" + (G.totalPurchasesTx || 0) + "b)";
+  } else if (G) {
+    x = "Daily income: 0 | Inv: 0 | Tx: 0 (no transactions yet today)";
   }
-
-  // ---------------------------------------------------------------
-  // TRADE SUMMARY LINE
-  // ---------------------------------------------------------------
-  const revCount   = getActiveReverseCount();
-  const fwdCount   = getActiveForwardCount();
-  const facCounts  = getFactoryJobCounts();
-  const orderCount = getMarketOrderCounts();
-  const oppCount   = getOpportunisticBuyCount();
-  const labActive  = getActiveLabReactingCount();
-  const facActive  = getActiveFactoryProducingCount();
-
-  const tradeLine =
-    '[Trade] ' +
-    '🔬◀' + revCount + ' ▶' + fwdCount + ' (' + labActive + ') | ' +
-    '🏭▼' + facCounts.compression + ' ▲' + facCounts.decompression + ' (' + facActive + ') | ' +
-    '📦⬇' + orderCount.buys + ' ⬆' + orderCount.sells + ' | ' +
-    '⌛ ' + oppCount;
-
-  lines.push(tradeLine);
-
-  lines.push("================================================================");
-
-  // Single console.log — one timestamp for the whole block
-  console.log(lines.join('\n'));
-
-  // Background: track total energy
-  if (!Memory.stats) Memory.stats = {};
-  Memory.stats.lastTotalEnergy = totalEnergy;
+  if (x) {
+    t.push(x);
+  }
+  const T = autoTrader.getStatusSnapshot();
+  const P = getMarketOrderCounts();
+  const w = "[Trade] " + "🔬◀" + T.lab.reverse + " ▶" + T.lab.forward + " (B" + T.lab.buying + " W" + T.lab.waiting + " P" + T.lab.processing + ") | " + "🏭▼" + T.factory.compression + " ▲" + T.factory.decompression + " (B" + T.factory.buying + " Q" + T.factory.queued + " P" + T.factory.processing + ") | " + "📦⬇" + P.buys + " ⬆" + P.sells + " | " + "⌛ " + T.opportunistic;
+  t.push(w);
+  t.push("================================================================");
+  console.log(t.join("\n"));
 }
 
 function getPerRoomRoleCounts() {
-  const perRoomCounts = {};
-  for (const roomName in Game.rooms) {
-    const room = Game.rooms[roomName];
-    if (room.controller && room.controller.my) {
-      perRoomCounts[roomName] = {
-        harvester: 0, upgrader: 0, builder: 0, remoteBuilder: 0,
-        scout: 0, defender: 0, supplier: 0,
-        claimbot: 0, attacker: 0, fastAttacker: 0,
-        thief: 0, towerDrain: 0, demolition: 0, contestedDemolisher: 0,
-        defenseRepair: 0, depositHarvester: 0,
-        powerBot: 0, quad: 0, maintainer: 0, skAttacker: 0,
+  const e = {};
+  for (const t in Game.rooms) {
+    const o = Game.rooms[t];
+    if (o.controller && o.controller.my) {
+      e[t] = {
+        harvester: 0,
+        upgrader: 0,
+        builder: 0,
+        remoteBuilder: 0,
+        scout: 0,
+        defender: 0,
+        supplier: 0,
+        claimbot: 0,
+        attacker: 0,
+        harasser: 0,
+        healer: 0,
+        fastAttacker: 0,
+        thief: 0,
+        scavenger: 0,
+        towerDrain: 0,
+        drainDemolisher: 0,
+        demolition: 0,
+        contestedDemolisher: 0,
+        defenseRepair: 0,
+        depositHarvester: 0,
+        powerBot: 0,
+        quad: 0,
+        maintainer: 0,
+        skAttacker: 0,
         labBot: 0,
-        hd: 0, staticDistributor: 0, comboBot: 0,
+        hd: 0,
+        staticDistributor: 0,
+        comboBot: 0,
         repairer: 0,
-        terminalBot: 0, extractor: 0, nukeFill: 0,
-        mineralCollector: 0, signbot: 0, remoteSupplier: 0,
-        controllerAttacker: 0, extractorAssistant: 0, towerFiller: 0,
+        terminalBot: 0,
+        extractor: 0,
+        nukeFill: 0,
+        mineralCollector: 0,
+        signbot: 0,
+        remoteSupplier: 0,
+        controllerAttacker: 0,
+        extractorAssistant: 0,
+        towerFiller: 0,
+        operator: 0,
+        squad: 0
       };
     }
   }
-  for (const name in Game.creeps) {
-    const creep = Game.creeps[name];
-    const role = creep.memory.role;
-    const assignedRoom = creep.memory.homeRoom || creep.memory.assignedRoom || creep.room.name;
-    if (perRoomCounts[assignedRoom] && perRoomCounts[assignedRoom][role] !== undefined) {
-      perRoomCounts[assignedRoom][role]++;
+  const t = getRoomState.creepIndex();
+  const o = t && t.all ? t.all : [];
+  for (let t = 0; t < o.length; t++) {
+    const r = o[t];
+    const n = r.memory.role === "wallRepair" || r.memory.role === "rampartBot" ? "repairer" : r.memory.role;
+    const a = r.memory.homeRoom || r.memory.assignedRoom || r.room.name;
+    if (e[a] && e[a][n] !== undefined) {
+      e[a][n]++;
     }
   }
-  return perRoomCounts;
+  return e;
 }
 
-module.exports = { init, run, getPerRoomRoleCounts };
+const PLAYER_CREEP_ICONS = [ [ "worker", "⛏" ], [ "upgrader", "⚡" ], [ "builder", "🔨" ], [ "repairer", "🚧" ], [ "maintainer", "🛠" ], [ "hauler", "🚚" ], [ "extractor", "💎" ], [ "claimer", "🚩" ], [ "scout", "🔭" ], [ "demolisher", "💥" ], [ "melee", "⚔️" ], [ "ranged", "🏹" ], [ "healer", "🩹" ], [ "other", "🔧" ] ];
+function fmtK(e) {
+  if (e >= 1e6) return (e / 1e6).toFixed(2) + "M";
+  if (e >= 1e3) return (e / 1e3).toFixed(1) + "k";
+  return String(e);
+}
+
+function printPlayerStatus(e) {
+  const t = [];
+  const o = " PLAYER STATUS: " + e.player + (e.status ? " [" + e.status + "]" : "") + " ";
+  const r = Math.max(0, 64 - o.length);
+  t.push("=".repeat(Math.ceil(r / 2)) + o + "=".repeat(Math.floor(r / 2)));
+  t.push("Rooms: " + e.rooms.length + " | Scan: " + e.elapsed + "t" + (e.registryAge !== null ? " | Registry age: " + e.registryAge + "t" : ""));
+  t.push("----------------------------------------------------------------");
+  const n = {};
+  for (const [e] of PLAYER_CREEP_ICONS) n[e] = 0;
+  let a = 0, s = 0, i = 0, l = 0, c = 0;
+  const m = {};
+  const f = [], u = [], p = [], g = [], d = [];
+  for (const o of e.rooms) {
+    if (!o.ok) {
+      d.push(o.name + (o.reason === "range" ? " (out of observer range)" : " (never became visible)"));
+      continue;
+    }
+    if (o.lost) {
+      g.push(o.name + " → " + (o.owner || "unowned"));
+      continue;
+    }
+    c++;
+    a += o.totalCreeps;
+    s += o.boosted;
+    i += o.power;
+    l += (o.storageE || 0) + (o.terminalE || 0);
+    for (const e in o.inventory || {}) {
+      m[e] = (m[e] || 0) + o.inventory[e];
+    }
+    for (const [e] of PLAYER_CREEP_ICONS) n[e] += o.creeps[e] || 0;
+    if (o.nuker) f.push(o.name + "(G:" + fmtK(o.nukerG) + " E:" + fmtK(o.nukerE) + ")");
+    if (o.safeMode) u.push(o.name + "(" + o.safeMode + "t)");
+    if (o.towersLow) p.push(o.name);
+    let e = "";
+    for (const [t, r] of PLAYER_CREEP_ICONS) e += icon(r, o.creeps[t], false);
+    e += icon("💢", o.power, false);
+    e += icon("💉", o.boosted, false);
+    if (!e) e = "Idle";
+    let r = "";
+    if (o.pct !== null) {
+      r = " | " + o.pct.toFixed(1) + "%";
+      if (o.etaTicks) r += " ETA: ~" + formatTime(o.etaTicks * 4 / 60);
+    }
+    const h = (o.safeMode ? " 🛡️" : "") + (o.nuker ? " ☢️" : "") + (o.towersLow ? " 🗼!" : "");
+    const y = (o.name + " RCL" + o.rcl).padEnd(12);
+    const k = ("En:" + fmtK(o.enAvail) + "/" + fmtK(o.enCap)).padEnd(16);
+    const E = (o.storageE === null ? "NoSto" : "Sto:" + fmtK(o.storageE)).padEnd(9);
+    const S = emojiPadEnd(e, 20);
+    t.push(y + " | " + k + " | " + E + " | " + S + r + h);
+  }
+  const h = {};
+  for (const [e, t] of PLAYER_CREEP_ICONS) h[e] = t;
+  const y = Object.entries(n).filter(([, e]) => e > 0).sort((e, t) => t[1] - e[1]).map(([e, t]) => h[e] + t);
+  if (i > 0) y.push("💢" + i);
+  t.push("Total creeps: " + a + (y.length ? "  (" + y.join(" ") + ")" : "") + (s ? " | 💉 " + s + " boosted" : ""));
+  t.push("Total energy: " + fmtK(l) + " | Avg/room: " + fmtK(c > 0 ? Math.round(l / c) : 0) + " (storage + terminal)");
+  let k = 0;
+  for (const e in m) {
+    k += m[e] * (marketPricing.liquidationPrice(e) || 0);
+  }
+  t.push("Est. inventory: ~" + fmtK(k) + " liq. | storage + terminal | " + c + "/" + e.rooms.length + " rooms visible");
+  const E = [];
+  if (f.length) E.push("☢️ " + f.join(", "));
+  if (u.length) E.push("🛡️ " + u.join(", "));
+  if (p.length) E.push("🗼 empty: " + p.join(", "));
+  if (E.length) t.push("Threats: " + E.join(" | "));
+  if (g.length) t.push("Lost rooms: " + g.join(", "));
+  if (d.length) t.push("Not seen: " + d.join(", "));
+  t.push("================================================================");
+  console.log(t.join("\n"));
+}
+
+global.status = function(e) {
+  if (typeof e === "string" && e.length > 0) {
+    require("scanner").player.statusScan(e);
+    return;
+  }
+  run(getPerRoomRoleCounts());
+};
+module.exports = {
+  init: init,
+  run: run,
+  getPerRoomRoleCounts: getPerRoomRoleCounts,
+  printPlayerStatus: printPlayerStatus
+};

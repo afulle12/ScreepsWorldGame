@@ -1,9 +1,18 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// taskScheduler.js
+// Console globals: schedule, unschedule, listScheduled, runScheduled, updateScheduled
+// Example: schedule('cmd', 100, 5) - Schedule recurring command with interval and offset
+// Example: unschedule('cmd') - Remove a scheduled command
+// Example: listScheduled() - List all registered periodic tasks and intervals
+// Example: runScheduled('cmd') - Immediately execute a scheduled task
+// Example: updateScheduled('cmd', 50) - Update interval of existing scheduled task
+
 /**
  * taskScheduler.js
  * ================
  * Persist console commands to Memory and re-execute them every N ticks.
  *
- * GLOBAL COMMANDS (exposed in main.js):
+ * GLOBAL COMMANDS (registered here by taskScheduler.js):
  *
  *   schedule("cmd", interval, [offset])
  *     Register a command string to run every <interval> ticks.
@@ -26,32 +35,36 @@
 'use strict';
 
 const taskScheduler = {
-
   // ----------------------------------------------------------------
   // Internal helpers
   // ----------------------------------------------------------------
 
-  _init: function() {
+  _init: function () {
     if (!Memory.taskScheduler) {
       Memory.taskScheduler = { nextId: 1, tasks: {} };
     }
-    if (!Memory.taskScheduler.tasks)  Memory.taskScheduler.tasks  = {};
+    if (!Memory.taskScheduler.tasks) Memory.taskScheduler.tasks = {};
     if (!Memory.taskScheduler.nextId) Memory.taskScheduler.nextId = 1;
   },
 
-  _exec: function(task) {
+  _exec: function (task) {
     try {
       // eslint-disable-next-line no-eval
       const result = eval(task.command);
-      task.lastRan    = Game.time;
-      task.runCount   = (task.runCount || 0) + 1;
-      task.lastResult = (result !== undefined) ? String(result).slice(0, 120) : 'ok';
-      console.log('[Scheduler] Task #' + task.id + ' ran: ' + task.command
-        + (task.lastResult !== 'ok' ? ' → ' + task.lastResult : ''));
+      task.lastRan = Game.time;
+      task.runCount = (task.runCount || 0) + 1;
+      task.lastResult = result !== undefined ? String(result).slice(0, 120) : 'ok';
+      console.log(
+        '[Scheduler] Task #' +
+          task.id +
+          ' ran: ' +
+          task.command +
+          (task.lastResult !== 'ok' ? ' → ' + task.lastResult : '')
+      );
     } catch (e) {
-      task.lastError  = e.toString();
-      task.lastRan    = Game.time;
-      task.runCount   = (task.runCount || 0) + 1;
+      task.lastError = e.toString();
+      task.lastRan = Game.time;
+      task.runCount = (task.runCount || 0) + 1;
       console.log('[Scheduler] ERROR in task #' + task.id + ' (' + task.command + '): ' + e);
     }
   },
@@ -68,7 +81,7 @@ const taskScheduler = {
    *                             so the first run is on the NEXT due tick.
    * @returns {number} task id
    */
-  schedule: function(command, interval, offset) {
+  schedule: function (command, interval, offset) {
     this._init();
 
     if (typeof command !== 'string' || !command.trim()) {
@@ -84,22 +97,31 @@ const taskScheduler = {
 
     const id = Memory.taskScheduler.nextId++;
     Memory.taskScheduler.tasks[id] = {
-      id:        id,
-      command:   command,
-      interval:  interval,
-      offset:    offset % interval,
+      id: id,
+      command: command,
+      interval: interval,
+      offset: offset % interval,
       createdAt: Game.time,
-      runCount:  0,
-      lastRan:   null,
+      runCount: 0,
+      lastRan: null,
       lastResult: null,
-      lastError:  null,
+      lastError: null,
     };
 
     const nextDue = interval - ((Game.time - offset) % interval);
-    console.log('[Scheduler] Task #' + id + ' registered.'
-      + ' Runs every ' + interval + ' ticks.'
-      + ' Next execution in ~' + nextDue + ' ticks.'
-      + ' Command: ' + command);
+    console.log(
+      '[Scheduler] Task #' +
+        id +
+        ' registered.' +
+        ' Runs every ' +
+        interval +
+        ' ticks.' +
+        ' Next execution in ~' +
+        nextDue +
+        ' ticks.' +
+        ' Command: ' +
+        command
+    );
 
     return id;
   },
@@ -107,7 +129,7 @@ const taskScheduler = {
   /**
    * Remove a task by ID.
    */
-  unschedule: function(id) {
+  unschedule: function (id) {
     this._init();
 
     id = Number(id);
@@ -127,7 +149,7 @@ const taskScheduler = {
    * @param {number} id
    * @param {{command?: string, interval?: number, offset?: number}} updates
    */
-  update: function(id, updates) {
+  update: function (id, updates) {
     this._init();
 
     id = Number(id);
@@ -164,7 +186,8 @@ const taskScheduler = {
     }
 
     if (updates.offset !== undefined) {
-      const newOffset = ((Math.floor(updates.offset) % task.interval) + task.interval) % task.interval;
+      const newOffset =
+        ((Math.floor(updates.offset) % task.interval) + task.interval) % task.interval;
       if (newOffset !== task.offset) {
         changes.push('offset: ' + task.offset + ' → ' + newOffset);
         task.offset = newOffset;
@@ -172,7 +195,11 @@ const taskScheduler = {
     }
 
     if (changes.length === 0) {
-      console.log('[Scheduler] Task #' + id + ' update: nothing changed. Recognized fields: command, interval, offset.');
+      console.log(
+        '[Scheduler] Task #' +
+          id +
+          ' update: nothing changed. Recognized fields: command, interval, offset.'
+      );
       return false;
     }
 
@@ -180,8 +207,15 @@ const taskScheduler = {
     task.lastError = null;
 
     const nextDue = task.interval - ((Game.time - task.offset) % task.interval);
-    console.log('[Scheduler] Task #' + id + ' updated — ' + changes.join('; ')
-      + '. Next execution in ~' + nextDue + ' ticks.');
+    console.log(
+      '[Scheduler] Task #' +
+        id +
+        ' updated — ' +
+        changes.join('; ') +
+        '. Next execution in ~' +
+        nextDue +
+        ' ticks.'
+    );
 
     return true;
   },
@@ -189,11 +223,11 @@ const taskScheduler = {
   /**
    * Print all registered tasks.
    */
-  list: function() {
+  list: function () {
     this._init();
 
     const tasks = Memory.taskScheduler.tasks;
-    const ids   = Object.keys(tasks);
+    const ids = Object.keys(tasks);
 
     if (ids.length === 0) {
       console.log('[Scheduler] No scheduled tasks.');
@@ -202,17 +236,25 @@ const taskScheduler = {
 
     console.log('=== SCHEDULED TASKS (' + ids.length + ') ===');
     for (const id of ids) {
-      const t       = tasks[id];
-      const due     = t.interval - ((Game.time - t.offset) % t.interval);
-      const lastRan = t.lastRan !== null ? ('tick ' + t.lastRan) : 'never';
+      const t = tasks[id];
+      const due = t.interval - ((Game.time - t.offset) % t.interval);
+      const lastRan = t.lastRan !== null ? 'tick ' + t.lastRan : 'never';
       console.log(
-        '  #' + t.id
-        + ' | every ' + t.interval + ' ticks'
-        + ' | next in ' + due
-        + ' | ran ' + t.runCount + 'x'
-        + ' | last: ' + lastRan
-        + (t.lastError ? ' | ERR: ' + t.lastError : '')
-        + '\n      CMD: ' + t.command
+        '  #' +
+          t.id +
+          ' | every ' +
+          t.interval +
+          ' ticks' +
+          ' | next in ' +
+          due +
+          ' | ran ' +
+          t.runCount +
+          'x' +
+          ' | last: ' +
+          lastRan +
+          (t.lastError ? ' | ERR: ' + t.lastError : '') +
+          '\n      CMD: ' +
+          t.command
       );
     }
     console.log('=== END ===');
@@ -221,7 +263,7 @@ const taskScheduler = {
   /**
    * Force-execute a task right now regardless of tick gate.
    */
-  forceRun: function(id) {
+  forceRun: function (id) {
     this._init();
 
     id = Number(id);
@@ -239,7 +281,7 @@ const taskScheduler = {
   // ----------------------------------------------------------------
   // Called once per tick from main loop
   // ----------------------------------------------------------------
-  run: function() {
+  run: function () {
     this._init();
 
     const tasks = Memory.taskScheduler.tasks;
@@ -252,6 +294,13 @@ const taskScheduler = {
       }
     }
   },
+};
+global.schedule = taskScheduler.schedule.bind(taskScheduler);
+global.unschedule = taskScheduler.unschedule.bind(taskScheduler);
+global.listScheduled = taskScheduler.list.bind(taskScheduler);
+global.runScheduled = taskScheduler.forceRun.bind(taskScheduler);
+global.updateScheduled = function (id, updates) {
+  return taskScheduler.update(id, updates);
 };
 
 module.exports = taskScheduler;

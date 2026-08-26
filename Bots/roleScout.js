@@ -1,854 +1,791 @@
-// =================================================================================================
-// |                                                                                               |
-// |                                     HOW TO USE THIS SCOUT                                     |
-// |                                                                                               |
-// | 1. To spawn a scout and send it to a specific room to start exploring:                        |
-// |    require('roleScout').orderExplore('W1N8'); // (Target Room Name)                           |
-// |                                                                                               |
-// | 2. To order a scout for a specific mission (e.g., check if a path is clear):                  |
-// |    require('roleScout').orderCheckRoom('E2N47', 'E9N44'); // (From, To)                        |
-// |                                                                                               |
-// | 3. To spawn a "fire-and-forget" autonomous scout that explores on its own:                    |
-// |    require('roleScout').orderAutonomousScout();                                               |
-// |                                                                                               |
-// | 4. To find a safe path from one room to another, retrying until a path is found:              |
-// |    require('roleScout').orderPathfinder('W1N8', 'E5N8'); // (From, To)                         |
-// |                                                                                               |
-// | 5. To spawn a scout that autonomously finds inter-shard portals and traverses them:           |
-// |    require('roleScout').orderAutonomousInterShardScout();                                     |
-// |    require('roleScout').orderAutonomousInterShardScout('shard2'); // prefer specific shard    |
-// |                                                                                               |
-// | 6. To list all discovered inter-shard portals:                                               |
-// |    require('roleScout').listInterShardPortals();                                              |
-// |                                                                                               |
-// =================================================================================================
-
-// =================================================================
-// CONFIGURATION
-// =================================================================
-const DETAILED_LOGGING = true; // Set to false to disable verbose scout console logs.
-const FRIENDLY_PLAYERS = ['tarenty', 'AlFe', 'AnotherFriend']; // Add friendly usernames here
-// =================================================================
-
-const log = (message) => {
-    if (DETAILED_LOGGING) {
-        console.log(message);
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// roleScout.js
+// Role dispatch: memory.role === 'scout' -> roleScout.run(creep).
+// Example: require('roleScout').run(creep);
+// Example: require('roleScout').run(creep);
+//   orderExplore('W1N8')                     Spawn a scout, explore that room.
+//   orderCheckRoom('E2N47', 'E9N44')         Mission: check if a path is clear (from, to).
+//   orderAutonomousScout()                   Fire-and-forget autonomous explorer.
+//   orderPathfinder('W1N8', 'E5N8')          Find a safe path (from, to), retrying until found.
+//   orderAutonomousInterShardScout()         Autonomously find + traverse inter-shard portals.
+//   orderAutonomousInterShardScout('shard2') Same, preferring a specific shard.
+//   listInterShardPortals()                  List all discovered inter-shard portals.
+//   All are require('roleScout').<fn>(...).
+const DETAILED_LOGGING = true;
+const spawnManager = require("spawnManager");
+const iff = require("iff");
+const getRoomState = require("getRoomState");
+const log = o => {
+  if (DETAILED_LOGGING) {
+    console.log(o);
+  }
+};
+function getScoutState(o) {
+  if (!Memory.scoutState) Memory.scoutState = {};
+  const e = Memory.scoutState[o.name] || (Memory.scoutState[o.name] = {});
+  const t = [ "route", "routeTarget", "localBlacklist", "pathTaken", "visitedRooms" ];
+  for (let n = 0; n < t.length; n++) {
+    const r = t[n];
+    if (o.memory[r] !== undefined && e[r] === undefined) {
+      e[r] = o.memory[r];
     }
+    if (o.memory[r] !== undefined) delete o.memory[r];
+  }
+  return e;
+}
+
+function rememberPathRoom(o, e, t) {
+  if (!e.pathTaken) e.pathTaken = [ t || o.room.name ];
+  if (e.pathTaken[e.pathTaken.length - 1] !== o.room.name) {
+    e.pathTaken.push(o.room.name);
+  }
+  return e.pathTaken;
+}
+
+const parseRoomName = function(o) {
+  const e = o.match(/^([WE])(\d+)([NS])(\d+)$/);
+  if (!e) return null;
+  return {
+    xDir: e[1],
+    x: parseInt(e[2], 10),
+    yDir: e[3],
+    y: parseInt(e[4], 10)
+  };
 };
-
-const parseRoomName = function(roomName) {
-    const match = roomName.match(/^([WE])(\d+)([NS])(\d+)$/);
-    if (!match) return null;
-    return {
-        xDir: match[1],
-        x:    parseInt(match[2], 10),
-        yDir: match[3],
-        y:    parseInt(match[4], 10)
-    };
-};
-
-const getNearbyHighwayRooms = function(fromRoomName, searchRadius) {
-    searchRadius = searchRadius || 3; // how many highway steps out to look
-    const parsed = parseRoomName(fromRoomName);
-    if (!parsed) return [];
-
-    // Convert to signed integers for easy maths
-    const signedX = parsed.xDir === 'W' ? -parsed.x : parsed.x;
-    const signedY = parsed.yDir === 'N' ? -parsed.y : parsed.y;
-
-    // Nearest highway intersection (round to nearest multiple of 10)
-    const baseHX = Math.round(signedX / 10) * 10;
-    const baseHY = Math.round(signedY / 10) * 10;
-
-    const candidates = [];
-    for (let dx = -searchRadius; dx <= searchRadius; dx++) {
-        for (let dy = -searchRadius; dy <= searchRadius; dy++) {
-            const hx = baseHX + dx * 10;
-            const hy = baseHY + dy * 10;
-            const xDir = hx < 0 ? 'W' : 'E';
-            const yDir = hy < 0 ? 'N' : 'S';
-            const name = `${xDir}${Math.abs(hx)}${yDir}${Math.abs(hy)}`;
-            const dist = Game.map.getRoomLinearDistance(fromRoomName, name);
-            candidates.push({ name, dist });
-        }
+const getNearbyHighwayRooms = function(o, e) {
+  e = e || 3;
+  const t = parseRoomName(o);
+  if (!t) return [];
+  const n = t.xDir === "W" ? -t.x : t.x;
+  const r = t.yDir === "N" ? -t.y : t.y;
+  const s = Math.round(n / 10) * 10;
+  const a = Math.round(r / 10) * 10;
+  const i = [];
+  for (let t = -e; t <= e; t++) {
+    for (let n = -e; n <= e; n++) {
+      const e = s + t * 10;
+      const r = a + n * 10;
+      const m = e < 0 ? "W" : "E";
+      const l = r < 0 ? "N" : "S";
+      const c = `${m}${Math.abs(e)}${l}${Math.abs(r)}`;
+      const u = Game.map.getRoomLinearDistance(o, c);
+      i.push({
+        name: c,
+        dist: u
+      });
     }
-
-    // Sort nearest first, dedupe
-    candidates.sort((a, b) => a.dist - b.dist);
-    return [...new Map(candidates.map(c => [c.name, c])).values()].map(c => c.name);
+  }
+  i.sort((o, e) => o.dist - e.dist);
+  return [ ...new Map(i.map(o => [ o.name, o ])).values() ].map(o => o.name);
 };
-
 const roleScout = {
-    // =============================================================
-    // NEW: orderAutonomousInterShardScout
-    // Spawns a scout that independently hunts highway intersection
-    // rooms for inter-shard portals and, once found, jumps through
-    // them to continue autonomous exploration on the target shard.
-    //
-    // Usage:
-    //   require('roleScout').orderAutonomousInterShardScout();
-    //   require('roleScout').orderAutonomousInterShardScout('shard2');
-    // =============================================================
-    orderAutonomousInterShardScout: function(preferredShard) {
-        let spawn = null;
-        for (const roomName in Game.rooms) {
-            const room = Game.rooms[roomName];
-            if (room.controller && room.controller.my) {
-                const available = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
-                if (available.length > 0) {
-                    spawn = available[0];
-                    break;
-                }
-            }
-        }
-        if (!spawn) {
-            const msg = `❌ Error: No available spawn found to launch an inter-shard scout.`;
-            console.log(msg);
-            return msg;
-        }
-
-        // Build the initial queue of highway rooms to visit, nearest first
-        const highwayQueue = getNearbyHighwayRooms(spawn.room.name, 3);
-
-        const newName   = `ISScout_${Game.time % 1000}`;
-        const body      = [MOVE];
-        const memory    = {
-            role:           'scout',
-            task:           'interShardAutonomous',
-            phase:          'findingPortals',      // findingPortals → traversing
-            homeRoom:       spawn.room.name,
-            homeShard:      Game.shard ? Game.shard.name : 'shard0',
-            preferredShard: preferredShard || null, // null = take any inter-shard portal
-            highwayQueue:   highwayQueue,            // rooms still to check
-            checkedRooms:   [],                      // highway rooms already visited
-            portalId:       null,
-            portalRoom:     null,
-        };
-
-        const result = spawn.spawnCreep(body, newName, { memory });
-        if (result === OK) {
-            const shardNote = preferredShard ? ` (targeting ${preferredShard})` : ' (any shard)';
-            const msg = `✅ Spawning inter-shard scout '${newName}' from ${spawn.room.name}${shardNote}.`;
-            console.log(msg);
-            return msg;
-        } else {
-            const msg = `❌ Failed to spawn inter-shard scout. Error code: ${result}`;
-            console.log(msg);
-            return msg;
-        }
-    },
-
-    // =============================================================
-    // NEW: listInterShardPortals
-    // Prints all inter-shard portal data gathered by scouts so far.
-    // =============================================================
-    listInterShardPortals: function() {
-        if (!Memory.interShardPortals || Object.keys(Memory.interShardPortals).length === 0) {
-            console.log('No inter-shard portals discovered yet.');
-            return;
-        }
-        console.log('=== INTER-SHARD PORTALS ===');
-        for (const key in Memory.interShardPortals) {
-            const p = Memory.interShardPortals[key];
-            console.log(`  ${p.fromRoom} (${p.fromShard}) → ${p.toRoom} on ${p.toShard}  [found tick ${p.foundAt}]`);
-        }
-    },
-
-    // =============================================================
-    // NEW: runInterShardAutonomousTask
-    // Called each tick for creeps with task === 'interShardAutonomous'.
-    //
-    // Phase flow:
-    //   findingPortals  — travel through highway queue, scan each room
-    //   traversing      — move onto the discovered portal tile
-    //
-    // After the shard jump the creep's memory transitions to the
-    // standard 'autonomous' task so the existing runAutonomousTask
-    // handler takes over on the new shard automatically.
-    // =============================================================
-    runInterShardAutonomousTask: function(creep) {
-        const mem = creep.memory;
-
-        // ── Phase: traversing ────────────────────────────────────
-        if (mem.phase === 'traversing') {
-            // PRIMARY check: have we already jumped? If so, transition to autonomous.
-            // We do this BEFORE touching the portal so the task is only rewritten
-            // after a confirmed shard change, not speculatively.
-            const currentShard = Game.shard ? Game.shard.name : 'shard0';
-            if (currentShard !== mem.homeShard) {
-                log(`✅ Inter-shard scout [${creep.name}] confirmed jump to ${currentShard}! Switching to autonomous.`);
-                mem.task  = 'autonomous';
-                mem.phase = null;
-                return;
-            }
-
-            // Try ID lookup first; if it fails and we're in the portal room,
-            // re-scan by structure type so a stale ID doesn't stall us forever.
-            let portal = Game.getObjectById(mem.portalId);
-
-            if (!portal && creep.room.name === mem.portalRoom) {
-                const found = creep.room.find(FIND_STRUCTURES, {
-                    filter: s =>
-                        s.structureType === STRUCTURE_PORTAL &&
-                        s.destination && typeof s.destination === 'object' &&
-                        s.destination.shard === mem.targetShard
-                });
-                if (found.length > 0) {
-                    portal = found[0];
-                    mem.portalId = portal.id; // refresh stale ID
-                    log(`🌀 Inter-shard scout [${creep.name}] re-acquired portal reference in ${creep.room.name}.`);
-                }
-            }
-
-            if (!portal) {
-                if (creep.room.name !== mem.portalRoom) {
-                    // Drifted away — travel back to the portal room
-                    log(`🌀 Inter-shard scout [${creep.name}] lost portal, heading back to ${mem.portalRoom}.`);
-                    this.travelToRoom(creep, mem.portalRoom);
-                } else {
-                    // In the right room, still nothing — portal may have expired; re-hunt
-                    log(`⚠️ Inter-shard scout [${creep.name}] portal gone from ${mem.portalRoom}. Re-scanning highway rooms.`);
-                    mem.phase      = 'findingPortals';
-                    mem.portalId   = null;
-                    mem.portalRoom = null;
-                    mem.targetShard = null;
-                    // Remove this room from checkedRooms so we re-visit it next pass
-                    mem.checkedRooms = (mem.checkedRooms || []).filter(r => r !== creep.room.name);
-                }
-                return;
-            }
-
-            // Step onto the portal. Do NOT rewrite mem.task here —
-            // the shard-name check at the top of the next tick will do that
-            // only after the jump is confirmed.
-            creep.say('🌀 Jump!');
-            log(`🌀 Inter-shard scout [${creep.name}] stepping onto portal in ${creep.room.name} → ${mem.targetShard}.`);
-            creep.moveTo(portal, { reusePath: 3, visualizePathStyle: false });
-            return;
-        }
-
-        // ── Phase: findingPortals ─────────────────────────────────
-        if (!mem.highwayQueue) mem.highwayQueue = [];
-        if (!mem.checkedRooms) mem.checkedRooms = [];
-
-        // If we're already in a highway room, scan it first
-        if (creep.room.name !== mem.currentHighwayTarget || !mem.currentHighwayTarget) {
-            // Pick next unchecked room from the queue
-            while (mem.highwayQueue.length > 0 && mem.checkedRooms.includes(mem.highwayQueue[0])) {
-                mem.highwayQueue.shift();
-            }
-
-            if (mem.highwayQueue.length === 0) {
-                // Exhausted initial queue — expand the search radius
-                log(`🔭 Inter-shard scout [${creep.name}] exhausted initial highway queue. Expanding search.`);
-                const expanded = getNearbyHighwayRooms(creep.room.name, 6);
-                mem.highwayQueue = expanded.filter(r => !mem.checkedRooms.includes(r));
-                if (mem.highwayQueue.length === 0) {
-                    console.log(`❌ Inter-shard scout [${creep.name}] could not find any new highway rooms to check. Suiciding.`);
-                    creep.suicide();
-                    return;
-                }
-            }
-
-            mem.currentHighwayTarget = mem.highwayQueue[0];
-            log(`🗺️ Inter-shard scout [${creep.name}] heading to highway room ${mem.currentHighwayTarget}.`);
-        }
-
-        // Travel to the current target highway room
-        if (creep.room.name !== mem.currentHighwayTarget) {
-            const result = this.travelToRoom(creep, mem.currentHighwayTarget);
-            if (result === ERR_NO_PATH) {
-                log(`⚠️ Inter-shard scout [${creep.name}] can't reach ${mem.currentHighwayTarget}. Skipping.`);
-                mem.checkedRooms.push(mem.currentHighwayTarget);
-                mem.highwayQueue.shift();
-                mem.currentHighwayTarget = null;
-            }
-            return;
-        }
-
-        // ── We are in the highway room — scan for inter-shard portals ──
-        if (!mem.checkedRooms.includes(creep.room.name)) {
-            mem.checkedRooms.push(creep.room.name);
-        }
-        mem.highwayQueue = mem.highwayQueue.filter(r => r !== creep.room.name);
-
-        const allPortals = creep.room.find(FIND_STRUCTURES, {
-            filter: s => s.structureType === STRUCTURE_PORTAL
+  //   require('roleScout').orderAutonomousInterShardScout();
+  //   require('roleScout').orderAutonomousInterShardScout('shard2');
+  orderAutonomousInterShardScout: function(o) {
+    let e = null;
+    for (const o in Game.rooms) {
+      const t = Game.rooms[o];
+      if (t.controller && t.controller.my) {
+        const o = t.find(FIND_MY_SPAWNS, {
+          filter: o => !o.spawning
         });
-
-        // Filter to inter-shard portals only (destination has a .shard property)
-        const interShardPortals = allPortals.filter(p =>
-            p.destination && typeof p.destination === 'object' && p.destination.shard
-        );
-
-        if (interShardPortals.length === 0) {
-            log(`🔭 Inter-shard scout [${creep.name}] found no inter-shard portals in ${creep.room.name}.`);
-            mem.currentHighwayTarget = null;
-            return;
+        if (o.length > 0) {
+          e = o[0];
+          break;
         }
-
-        // Pick the portal matching preferredShard, or just take the first one
-        let chosenPortal = null;
-        if (mem.preferredShard) {
-            chosenPortal = interShardPortals.find(p => p.destination.shard === mem.preferredShard);
-            if (!chosenPortal) {
-                log(`ℹ️ Inter-shard scout [${creep.name}] found portals in ${creep.room.name} but none go to ${mem.preferredShard}. Continuing search.`);
-                mem.currentHighwayTarget = null;
-                return;
-            }
-        } else {
-            chosenPortal = interShardPortals[0];
-        }
-
-        // Record the discovery in global Memory so it persists after the scout is gone
-        if (!Memory.interShardPortals) Memory.interShardPortals = {};
-        const portalKey = `${creep.room.name}_${chosenPortal.destination.shard}`;
-        Memory.interShardPortals[portalKey] = {
-            fromShard: mem.homeShard,
-            fromRoom:  creep.room.name,
-            toShard:   chosenPortal.destination.shard,
-            toRoom:    chosenPortal.destination.room || '?',
-            portalPos: chosenPortal.pos,
-            foundAt:   Game.time
-        };
-
-        console.log(`🌀 Inter-shard scout [${creep.name}] found portal in ${creep.room.name} → ${chosenPortal.destination.shard} (${chosenPortal.destination.room || 'unknown room'}). Preparing to jump!`);
-        Game.notify(`🌀 Inter-shard portal discovered in ${creep.room.name} → ${chosenPortal.destination.shard}`, 60);
-
-        mem.portalId    = chosenPortal.id;
-        mem.portalRoom  = creep.room.name;
-        mem.targetShard = chosenPortal.destination.shard;
-        mem.phase       = 'traversing';
-    },
-
-    // ─────────────────────────────────────────────────────────────
-    // Everything below is unchanged from the original file
-    // ─────────────────────────────────────────────────────────────
-
-    orderExplore: function(destinationRoomName) {
-        if (!destinationRoomName) return 'Error: destinationRoomName is required.';
-        let bestSpawnRoom = null;
-        let minDistance = Infinity;
-        for (const roomName in Game.rooms) {
-            const room = Game.rooms[roomName];
-            if (room.controller && room.controller.my) {
-                const spawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
-                if (spawns.length > 0) {
-                    const distance = Game.map.getRoomLinearDistance(roomName, destinationRoomName);
-                    if (distance < minDistance) {
-                        minDistance = distance;
-                        bestSpawnRoom = room;
-                    }
-                }
-            }
-        }
-        if (!bestSpawnRoom) {
-            const message = `❌ Error: No available spawn found to start exploration mission to ${destinationRoomName}.`;
-            console.log(message);
-            return message;
-        }
-        const spawn = bestSpawnRoom.find(FIND_MY_SPAWNS, { filter: s => !s.spawning })[0];
-        const newName = `Scout_${destinationRoomName}_${Game.time % 1000}`;
-        const body = [MOVE];
-        const memory = { role: 'scout', targetRoom: destinationRoomName };
-        const result = spawn.spawnCreep(body, newName, { memory: memory });
-        if (result === OK) {
-            const message = `✅ Spawning scout '${newName}' from ${bestSpawnRoom.name} to explore ${destinationRoomName}.`;
-            console.log(message);
-            return message;
-        } else {
-            const errorMessage = `❌ Failed to spawn scout from ${bestSpawnRoom.name}. Error code: ${result}`;
-            console.log(errorMessage);
-            return errorMessage;
-        }
-    },
-
-    orderCheckRoom: function(spawnRoomName, destinationRoomName) {
-        if (!spawnRoomName || !destinationRoomName) return 'Error: Both spawnRoomName and destinationRoomName are required.';
-        const spawnRoom = Game.rooms[spawnRoomName];
-        if (!spawnRoom) return `Error: No vision in spawn room ${spawnRoomName}.`;
-        const spawns = spawnRoom.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
-        if (!spawns.length) return `Error: No available spawn in room ${spawnRoomName}.`;
-        const spawn = spawns[0];
-        const newName = `VisCheck_${destinationRoomName}_${Game.time % 1000}`;
-        const body = [MOVE];
-        const memory = { role: 'scout', task: 'checkRoom', destinationRoom: destinationRoomName, spawnRoom: spawnRoomName, pathTaken: [spawnRoomName] };
-        const result = spawn.spawnCreep(body, newName, { memory: memory });
-        if (result === OK) {
-            const message = `✅ Spawning scout '${newName}' from ${spawnRoomName} to check room ${destinationRoomName}.`;
-            console.log(message);
-            return message;
-        } else {
-            const errorMessage = `❌ Failed to spawn scout. Error code: ${result}`;
-            console.log(errorMessage);
-            return errorMessage;
-        }
-    },
-
-    orderAutonomousScout: function() {
-        let spawn = null;
-        for (const roomName in Game.rooms) {
-            const room = Game.rooms[roomName];
-            if (room.controller && room.controller.my) {
-                const availableSpawns = room.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
-                if (availableSpawns.length > 0) {
-                    spawn = availableSpawns[0];
-                    break;
-                }
-            }
-        }
-        if (!spawn) {
-            const message = `❌ Error: No available spawn found to launch an autonomous scout.`;
-            console.log(message);
-            return message;
-        }
-        const newName = `AutoScout_${Game.time % 1000}`;
-        const body = [MOVE];
-        const memory = { role: 'scout', task: 'autonomous', homeRoom: spawn.room.name };
-        const result = spawn.spawnCreep(body, newName, { memory: memory });
-        if (result === OK) {
-            const message = `✅ Spawning autonomous scout '${newName}' from ${spawn.room.name}.`;
-            console.log(message);
-            return message;
-        } else {
-            const errorMessage = `❌ Failed to spawn autonomous scout from ${spawn.room.name}. Error code: ${result}`;
-            console.log(errorMessage);
-            return errorMessage;
-        }
-    },
-
-    orderPathfinder: function(originRoomName, destinationRoomName) {
-        if (!originRoomName || !destinationRoomName) return 'Error: Both originRoomName and destinationRoomName are required.';
-        const missionId = `path_${originRoomName}_${destinationRoomName}`;
-        if (!Memory.pathfindingMissions) Memory.pathfindingMissions = {};
-        const existingMission = Memory.pathfindingMissions[missionId];
-        if (existingMission && existingMission.status === 'active') return `ℹ️ Mission [${missionId}] is already active.`;
-        if (existingMission && existingMission.status === 'success') return `✅ Mission [${missionId}] has already succeeded. Path: ${existingMission.foundPath.join(' → ')}`;
-        Memory.pathfindingMissions[missionId] = { origin: originRoomName, destination: destinationRoomName, status: 'initializing', attempts: 0, blacklistedRooms: {}, activeScout: null, foundPath: null, startTime: Game.time };
-        console.log(`🚀 Initializing new pathfinding mission [${missionId}] from ${originRoomName} to ${destinationRoomName}.`);
-        return this.spawnPathfinderScout(missionId);
-    },
-
-    spawnPathfinderScout: function(missionId) {
-        if (!Memory.pathfindingMissions || !Memory.pathfindingMissions[missionId]) {
-            return `Error: Cannot find mission data for ${missionId}.`;
-        }
-        const mission = Memory.pathfindingMissions[missionId];
-        if (mission.blacklistedRooms[mission.origin]) {
-            mission.status = 'failed';
-            mission.failureReason = `Origin room ${mission.origin} is impassable or dangerous.`;
-            const message = `❌ Pathfinding Mission [${missionId}] Failed: ${mission.failureReason}`;
-            console.log(message);
-            Game.notify(message, 60);
-            return message;
-        }
-        const preflightRoute = Game.map.findRoute(mission.origin, mission.destination, {
-            routeCallback: (roomName) => {
-                if (mission.blacklistedRooms[roomName]) return Infinity;
-                return 1;
-            }
-        });
-        if (preflightRoute === ERR_NO_PATH || preflightRoute.length === 0) {
-            mission.status = 'failed';
-            mission.failureReason = `No possible global path exists from ${mission.origin} to ${mission.destination} with the current blacklist.`;
-            const message = `❌ Pathfinding Mission [${missionId}] Failed: ${mission.failureReason}`;
-            console.log(message);
-            Game.notify(message, 60);
-            return message;
-        }
-        const spawnRoom = Game.rooms[mission.origin];
-        if (!spawnRoom || !spawnRoom.controller || !spawnRoom.controller.my) {
-            mission.status = 'failed';
-            mission.failureReason = `No vision or control in origin room ${mission.origin}.`;
-            console.log(`❌ Mission [${missionId}] Failed: ${mission.failureReason}`);
-            Game.notify(`❌ Mission [${missionId}] Failed: ${mission.failureReason}`);
-            return mission.failureReason;
-        }
-        const spawns = spawnRoom.find(FIND_MY_SPAWNS, { filter: s => !s.spawning });
-        if (!spawns.length) {
-            return `Warning: No available spawn in room ${mission.origin} to continue mission [${missionId}].`;
-        }
-        const spawn = spawns[0];
-        mission.attempts += 1;
-        const newName = `Pathfinder_${missionId.replace(/_/g, '')}_${Game.time % 1000}`;
-        const body = [MOVE];
-        const memory = { role: 'scout', task: 'pathfinder', missionId: missionId, originRoom: mission.origin, destinationRoom: mission.destination, pathTaken: [mission.origin] };
-        const result = spawn.spawnCreep(body, newName, { memory: memory });
-        if (result === OK) {
-            mission.status = 'active';
-            mission.activeScout = newName;
-            const message = `✅ Spawning pathfinder scout '${newName}' (Attempt #${mission.attempts}) for mission [${missionId}].`;
-            console.log(message);
-            return message;
-        } else {
-            mission.attempts -= 1;
-            return `❌ Failed to spawn pathfinder scout for mission [${missionId}]. Error code: ${result}`;
-        }
-    },
-
-    handleDeadCreeps: function() {
-        if (!Memory.creeps) return;
-        for (const name in Memory.creeps) {
-            if (Game.creeps[name]) continue;
-            const memory = Memory.creeps[name];
-            if (memory.role !== 'scout') {
-                delete Memory.creeps[name];
-                continue;
-            }
-
-            if (memory.task === 'pathfinder') {
-                const missionId = memory.missionId;
-                const mission = Memory.pathfindingMissions ? Memory.pathfindingMissions[missionId] : undefined;
-                if (mission && mission.status === 'active' && mission.activeScout === name) {
-                    const deathRoom = memory.lastAttackedIn || memory.lastRoom;
-
-                    if (deathRoom) {
-                        this.markRoomAsDangerous(deathRoom, 'pathfinder_death', true);
-                        mission.blacklistedRooms[deathRoom] = true;
-                        console.log(`💀 Pathfinder [${name}] died in ${deathRoom}. Room blacklisted globally and for mission [${missionId}].`);
-                        this.spawnPathfinderScout(missionId);
-                    } else {
-                        mission.status = 'failed';
-                        mission.failureReason = `Scout [${name}] died in an unknown location.`;
-                        const message = `❌ Pathfinding Mission [${missionId}] Failed: ${mission.failureReason}`;
-                        console.log(message);
-                        Game.notify(message, 60);
-                    }
-                }
-            } else if (memory.task === 'checkRoom' && !memory.notificationSent) {
-                const deathRoom = memory.lastAttackedIn || memory.lastRoom;
-                if (deathRoom) {
-                    this.markRoomAsDangerous(deathRoom, 'scout_death', true);
-                    console.log(`💀 Scout [${name}] died in ${deathRoom}. Room marked as dangerous.`);
-                }
-
-                const message = `❌ Mission Failed: Scout [${name}] died before reaching ${memory.destinationRoom}.`;
-                Game.notify(message, 0);
-                console.log(message);
-            }
-
-            delete Memory.creeps[name];
-        }
-    },
-
-    run: function(creep) {
-        if (creep.spawning) return;
-
-        if (creep.memory.lastRoom !== creep.room.name) {
-            creep.memory.previousRoom = creep.memory.lastRoom;
-            creep.memory.lastRoom = creep.room.name;
-
-            if (!creep.memory.backtracking) {
-                delete creep.memory.localBlacklist;
-            }
-
-            if (creep.memory.task === 'pathfinder') {
-                log(`Pathfinder [${creep.name}] mission [${creep.memory.missionId}] entered new room: ${creep.room.name}`);
-            }
-        }
-
-        if (this.checkForDanger(creep)) {
-            return;
-        }
-
-        if (creep.memory.task === 'interShardAutonomous') {
-            this.runInterShardAutonomousTask(creep);
-        } else if (creep.memory.task === 'pathfinder') {
-            this.runPathfinderTask(creep);
-        } else if (creep.memory.task === 'checkRoom') {
-            this.runCheckRoomTask(creep);
-        } else {
-            this.runAutonomousTask(creep);
-        }
-    },
-
-    travelToRoom: function(creep, targetRoomName) {
-        if (!creep.memory.route || creep.memory.routeTarget !== targetRoomName) {
-            delete creep.memory.route;
-            creep.memory.backtracking = false;
-
-            log(`🗺️ Scout [${creep.name}] calculating new route from ${creep.room.name} to ${targetRoomName}.`);
-            const missionBlacklist = (creep.memory.task === 'pathfinder' && Memory.pathfindingMissions && Memory.pathfindingMissions[creep.memory.missionId])
-                ? Memory.pathfindingMissions[creep.memory.missionId].blacklistedRooms
-                : {};
-            if (Object.keys(missionBlacklist).length > 0) log(`   - Mission blacklist: [${Object.keys(missionBlacklist).join(', ')}]`);
-            if (creep.memory.localBlacklist && Object.keys(creep.memory.localBlacklist).length > 0) log(`   - Temp local blacklist: [${Object.keys(creep.memory.localBlacklist).join(', ')}]`);
-
-            const route = Game.map.findRoute(creep.room.name, targetRoomName, {
-                routeCallback: (roomName) => {
-                    if (creep.memory.task === 'pathfinder') {
-                        if (missionBlacklist[roomName]) return Infinity;
-                        if (creep.memory.localBlacklist && creep.memory.localBlacklist[roomName]) return Infinity;
-                    } else {
-                        if (this.isRoomDangerous(roomName)) return Infinity;
-                    }
-                    return 1;
-                }
-            });
-
-            if (route === ERR_NO_PATH || route.length === 0) {
-                log(`❌ Scout [${creep.name}] found NO GLOBAL PATH to ${targetRoomName}. All exits may be blocked or blacklisted.`);
-                return ERR_NO_PATH;
-            }
-            log(`   ✔️ Path found for [${creep.name}]: ${JSON.stringify(route.map(r => r.room))}`);
-            creep.memory.route = route;
-            creep.memory.routeTarget = targetRoomName;
-        }
-
-        const route = creep.memory.route;
-        if (route && route.length > 0) {
-            if (route[0].room === creep.room.name) {
-                route.shift();
-            }
-            if (route.length > 0) {
-                const exit = creep.pos.findClosestByPath(route[0].exit);
-                if (exit) {
-                    log(`   🏃 [${creep.name}] moving towards exit to ${route[0].room}.`);
-                    creep.moveTo(exit, { reusePath: 5, ignoreCreeps: true, visualizePathStyle: false });
-                    return OK;
-                } else {
-                    const failedExitRoom = route[0].room;
-                    log(`   ⚠️ [${creep.name}] could not find a LOCAL path to the exit for room ${failedExitRoom}. Adding to temporary blacklist and will recalculate route.`);
-
-                    if (!creep.memory.localBlacklist) {
-                        creep.memory.localBlacklist = {};
-                    }
-                    creep.memory.localBlacklist[failedExitRoom] = true;
-                    creep.memory.backtracking = true;
-                    delete creep.memory.route;
-                    return OK;
-                }
-            }
-        }
-        delete creep.memory.route;
-        return OK;
-    },
-
-    runPathfinderTask: function(creep) {
-        const missionId = creep.memory.missionId;
-        const mission = Memory.pathfindingMissions ? Memory.pathfindingMissions[missionId] : undefined;
-        if (!mission || mission.status !== 'active') {
-            creep.say('✅ Over');
-            creep.suicide();
-            return;
-        }
-        const destination = creep.memory.destinationRoom;
-        if (creep.room.name === destination) {
-            if (creep.memory.pathTaken[creep.memory.pathTaken.length - 1] !== creep.room.name) creep.memory.pathTaken.push(creep.room.name);
-            const pathString = creep.memory.pathTaken.join(' → ');
-            mission.status = 'success';
-            mission.foundPath = creep.memory.pathTaken;
-            mission.finishTime = Game.time;
-            const message = `✅ Path Found! Mission [${missionId}] succeeded.\nRoute: ${pathString}`;
-            console.log(message);
-            Game.notify(message, 60);
-            creep.say('✅ Path!');
-            creep.suicide();
-            return;
-        }
-        if (creep.memory.pathTaken[creep.memory.pathTaken.length - 1] !== creep.room.name) creep.memory.pathTaken.push(creep.room.name);
-        const travelResult = this.travelToRoom(creep, destination);
-        if (travelResult === ERR_NO_PATH) {
-            log(`Pathfinder [${creep.name}] is stuck in ${creep.room.name}. Terminating scout to trigger retry.`);
-            creep.say('🚫 Stuck');
-            creep.suicide();
-        }
-    },
-
-    runCheckRoomTask: function(creep) {
-        const destination = creep.memory.destinationRoom;
-        if (creep.room.name === destination) {
-            if (!creep.memory.notificationSent) {
-                if (creep.memory.pathTaken[creep.memory.pathTaken.length - 1] !== creep.room.name) creep.memory.pathTaken.push(creep.room.name);
-                const pathString = creep.memory.pathTaken.join(' → ');
-                const message = `✅ Mission Complete: Scout [${creep.name}] reached ${destination}.\nPath: ${pathString}`;
-                Game.notify(message, 0);
-                console.log(message);
-                creep.memory.notificationSent = true;
-                creep.say('✅ Done!');
-            }
-            this.idle(creep);
-        } else {
-            if (creep.memory.pathTaken[creep.memory.pathTaken.length - 1] !== creep.room.name) creep.memory.pathTaken.push(creep.room.name);
-            const travelResult = this.travelToRoom(creep, destination);
-            if (travelResult === ERR_NO_PATH) {
-                if (!creep.memory.notificationSent) {
-                    const message = `❌ Mission Failed: Scout [${creep.name}] could not find a safe path to ${destination}.`;
-                    Game.notify(message, 0);
-                    console.log(message);
-                    creep.memory.notificationSent = true;
-                }
-                creep.say('🚫 Path');
-                creep.suicide();
-            }
-        }
-    },
-
-    runAutonomousTask: function(creep) {
-        if (creep.memory.fleeing) {
-            if (creep.room.name === creep.memory.previousRoom || !creep.memory.previousRoom) {
-                log(`✅ Scout ${creep.name} successfully fled. Looking for new target.`);
-                delete creep.memory.fleeing;
-                this.assignTargetRoom(creep);
-            } else {
-                creep.say('😱 RUN!');
-                creep.moveTo(new RoomPosition(25, 25, creep.memory.previousRoom));
-                return;
-            }
-        }
-        if (!Memory.dangerousRooms) Memory.dangerousRooms = {};
-        if (!creep.memory.targetRoom) this.assignTargetRoom(creep);
-        if (creep.memory.lastRoom !== creep.room.name) {
-            creep.memory.roomScanned = false;
-            delete creep.memory.route;
-            if (!creep.memory.visitedRooms) creep.memory.visitedRooms = {};
-            creep.memory.visitedRooms[creep.room.name] = Game.time;
-            log(`🔍 Scout ${creep.name} entered room ${creep.room.name} (target: ${creep.memory.targetRoom})`);
-        }
-        if (creep.room.name !== creep.memory.targetRoom) {
-            this.travelToRoom(creep, creep.memory.targetRoom);
-        } else {
-            log(`🎯 Scout ${creep.name} arrived at target room ${creep.room.name}`);
-            this.gatherIntelligence(creep);
-            log(`⏱️ Scout ${creep.name} finished scanning ${creep.room.name}, looking for new target`);
-            this.assignTargetRoom(creep);
-        }
-    },
-
-    idle: function(creep) {
-        const idlePosition = new RoomPosition(48, 48, creep.room.name);
-        if (!creep.pos.isEqualTo(idlePosition)) creep.moveTo(idlePosition);
-    },
-
-    checkForDanger: function(creep) {
-        const room = creep.room;
-        if (room.controller && room.controller.owner && FRIENDLY_PLAYERS.includes(room.controller.owner.username)) return false;
-
-        if (creep.hits < creep.hitsMax && (!creep.memory.lastHits || creep.memory.lastHits > creep.hits)) {
-            creep.memory.lastAttackedIn = creep.room.name;
-
-            if (creep.memory.task !== 'pathfinder' && creep.memory.task !== 'interShardAutonomous') {
-                this.markRoomAsDangerous(creep.room.name, 'hostile_creeps', false);
-                log(`⚔️ DANGER! Scout ${creep.name} under attack in ${creep.room.name}!`);
-                creep.memory.fleeing = true;
-                return true;
-            } else {
-                log(`⚔️ Scout ${creep.name} taking damage in ${creep.room.name} but continuing mission`);
-            }
-        }
-        creep.memory.lastHits = creep.hits;
-
-        const towers = room.find(FIND_HOSTILE_STRUCTURES, { filter: (s) => s.structureType === STRUCTURE_TOWER });
-        if (towers.length > 0) {
-            if (creep.memory.task !== 'pathfinder' && creep.memory.task !== 'interShardAutonomous') {
-                this.markRoomAsDangerous(creep.room.name, 'hostile_towers', true);
-                creep.memory.lastAttackedIn = creep.room.name;
-                log(`🏰 DANGER! Scout ${creep.name} detected hostile towers in ${creep.room.name}!`);
-                creep.memory.fleeing = true;
-                return true;
-            } else {
-                log(`🏰 Scout ${creep.name} detected hostile towers in ${creep.room.name} but continuing mission`);
-            }
-        }
-
-        return false;
-    },
-
-    markRoomAsDangerous: function(roomName, reason, permanent) {
-        if (!Memory.dangerousRooms) Memory.dangerousRooms = {};
-        const cooldownTime = permanent ? 999999999 : 50000;
-        Memory.dangerousRooms[roomName] = {
-            markedAt: Game.time,
-            reason: reason,
-            cooldownUntil: Game.time + cooldownTime,
-            permanent: permanent
-        };
-
-        const reasonText = {
-            'hostile_creeps': 'hostile creeps',
-            'hostile_towers': 'hostile towers',
-            'pathfinder_death': 'pathfinder scout death',
-            'scout_death': 'scout death'
-        }[reason] || reason;
-
-        if (Memory.pathfindingMissions) {
-            for (const missionId in Memory.pathfindingMissions) {
-                const mission = Memory.pathfindingMissions[missionId];
-                if (mission.status === 'active') {
-                    mission.blacklistedRooms[roomName] = true;
-                    console.log(`Added dangerous room ${roomName} to mission ${missionId} blacklist`);
-                }
-            }
-        }
-
-        if (permanent) console.log(`🚫 PERMANENTLY AVOIDING room ${roomName} due to ${reasonText}`);
-        else console.log(`⏰ Avoiding room ${roomName} for ${cooldownTime} ticks due to ${reasonText}`);
-    },
-
-    isRoomDangerous: function(roomName) {
-        if (!Memory.dangerousRooms || !Memory.dangerousRooms[roomName]) return false;
-        const dangerData = Memory.dangerousRooms[roomName];
-        if (dangerData.permanent) return true;
-        if (Game.time > dangerData.cooldownUntil) {
-            delete Memory.dangerousRooms[roomName];
-            console.log(`✅ Room ${roomName} is no longer marked as dangerous.`);
-            return false;
-        }
-        return true;
-    },
-
-    assignTargetRoom: function(creep) {
-        delete creep.memory.route;
-        const exits = Game.map.describeExits(creep.room.name);
-        if (!exits) return;
-        if (!creep.memory.visitedRooms) creep.memory.visitedRooms = {};
-        const candidateRooms = [];
-        for (const dir in exits) {
-            const roomName = exits[dir];
-            if (Game.rooms[roomName] && Game.rooms[roomName].controller && Game.rooms[roomName].controller.my) continue;
-            const recentlyVisited = creep.memory.visitedRooms[roomName] && (Game.time - creep.memory.visitedRooms[roomName] < 500);
-            const isDangerous = this.isRoomDangerous(roomName);
-            if (!recentlyVisited && !isDangerous) candidateRooms.push(roomName);
-        }
-        if (candidateRooms.length > 0) {
-            const targetRoom = candidateRooms[Math.floor(Math.random() * candidateRooms.length)];
-            creep.memory.targetRoom = targetRoom;
-            creep.say('🚪' + targetRoom);
-            log(`🆕 Scout ${creep.name} assigned NEW target: ${targetRoom}`);
-            return;
-        }
-        let oldestVisit = Game.time;
-        let oldestRoom = null;
-        for (const dir in exits) {
-            const roomName = exits[dir];
-            if (!this.isRoomDangerous(roomName)) {
-                const lastVisit = creep.memory.visitedRooms[roomName] || 0;
-                if (lastVisit < oldestVisit) {
-                    oldestVisit = lastVisit;
-                    oldestRoom = roomName;
-                }
-            }
-        }
-        if (oldestRoom) {
-            creep.memory.targetRoom = oldestRoom;
-            creep.say('🔄' + oldestRoom);
-            log(`🔄 Scout ${creep.name} assigned OLD target: ${oldestRoom}`);
-        } else {
-            creep.memory.targetRoom = creep.room.name;
-            creep.say('🏠 SAFE');
-            console.log(`⚠️ Scout ${creep.name} has no safe rooms to explore, staying put.`);
-        }
-    },
-
-    gatherIntelligence: function(creep) {
-        if (creep.memory.roomScanned) return;
-        const room = creep.room;
-        const roomName = room.name;
-        const hostiles = room.find(FIND_HOSTILE_CREEPS);
-        let ownerInfo = (room.controller && room.controller.owner) ? ` (owned by ${room.controller.owner.username})` : '';
-        log(`📊 Scout ${creep.name} scanned ${roomName}: ${room.find(FIND_SOURCES).length} sources, ${room.find(FIND_MINERALS).length} minerals, ${hostiles.length} hostiles${ownerInfo}`);
-        creep.memory.roomScanned = true;
+      }
     }
+    if (!e) {
+      const o = `❌ Error: No available spawn found to launch an inter-shard scout.`;
+      console.log(o);
+      return o;
+    }
+    const t = getNearbyHighwayRooms(e.room.name, 3);
+    const n = `ISScout_${Game.time % 1e3}`;
+    const r = [ MOVE ];
+    const s = {
+      role: "scout",
+      task: "interShardAutonomous",
+      phase: "findingPortals",
+      homeRoom: e.room.name,
+      homeShard: Game.shard ? Game.shard.name : "shard0",
+      preferredShard: o || null,
+      highwayQueue: t,
+      checkedRooms: [],
+      portalId: null,
+      portalRoom: null
+    };
+    const a = spawnManager.spawnCustomCreep(e, r, n, s);
+    if (a === OK) {
+      const t = o ? ` (targeting ${o})` : " (any shard)";
+      const r = `✅ Spawning inter-shard scout '${n}' from ${e.room.name}${t}.`;
+      console.log(r);
+      return r;
+    } else {
+      const o = `❌ Failed to spawn inter-shard scout. Error code: ${a}`;
+      console.log(o);
+      return o;
+    }
+  },
+  listInterShardPortals: function() {
+    if (!Memory.interShardPortals || Object.keys(Memory.interShardPortals).length === 0) {
+      console.log("No inter-shard portals discovered yet.");
+      return;
+    }
+    console.log("=== INTER-SHARD PORTALS ===");
+    for (const o in Memory.interShardPortals) {
+      const e = Memory.interShardPortals[o];
+      console.log(`  ${e.fromRoom} (${e.fromShard}) → ${e.toRoom} on ${e.toShard}  [found tick ${e.foundAt}]`);
+    }
+  },
+  //   findingPortals  — travel through highway queue, scan each room
+  //   traversing      — move onto the discovered portal tile
+  runInterShardAutonomousTask: function(o) {
+    const e = o.memory;
+    if (e.phase === "traversing") {
+      const t = Game.shard ? Game.shard.name : "shard0";
+      if (t !== e.homeShard) {
+        log(`✅ Inter-shard scout [${o.name}] confirmed jump to ${t}! Switching to autonomous.`);
+        e.task = "autonomous";
+        e.phase = null;
+        return;
+      }
+      let n = Game.getObjectById(e.portalId);
+      if (!n && o.room.name === e.portalRoom) {
+        const t = o.room.find(FIND_STRUCTURES, {
+          filter: o => o.structureType === STRUCTURE_PORTAL && o.destination && typeof o.destination === "object" && o.destination.shard === e.targetShard
+        });
+        if (t.length > 0) {
+          n = t[0];
+          e.portalId = n.id;
+          log(`🌀 Inter-shard scout [${o.name}] re-acquired portal reference in ${o.room.name}.`);
+        }
+      }
+      if (!n) {
+        if (o.room.name !== e.portalRoom) {
+          log(`🌀 Inter-shard scout [${o.name}] lost portal, heading back to ${e.portalRoom}.`);
+          this.travelToRoom(o, e.portalRoom);
+        } else {
+          log(`⚠️ Inter-shard scout [${o.name}] portal gone from ${e.portalRoom}. Re-scanning highway rooms.`);
+          e.phase = "findingPortals";
+          e.portalId = null;
+          e.portalRoom = null;
+          e.targetShard = null;
+          e.checkedRooms = (e.checkedRooms || []).filter(e => e !== o.room.name);
+        }
+        return;
+      }
+      o.say("🌀 Jump!");
+      log(`🌀 Inter-shard scout [${o.name}] stepping onto portal in ${o.room.name} → ${e.targetShard}.`);
+      o.moveTo(n, {
+        reusePath: 3,
+        visualizePathStyle: false
+      });
+      return;
+    }
+    if (!e.highwayQueue) e.highwayQueue = [];
+    if (!e.checkedRooms) e.checkedRooms = [];
+    if (o.room.name !== e.currentHighwayTarget || !e.currentHighwayTarget) {
+      while (e.highwayQueue.length > 0 && e.checkedRooms.includes(e.highwayQueue[0])) {
+        e.highwayQueue.shift();
+      }
+      if (e.highwayQueue.length === 0) {
+        log(`🔭 Inter-shard scout [${o.name}] exhausted initial highway queue. Expanding search.`);
+        const t = getNearbyHighwayRooms(o.room.name, 6);
+        e.highwayQueue = t.filter(o => !e.checkedRooms.includes(o));
+        if (e.highwayQueue.length === 0) {
+          console.log(`❌ Inter-shard scout [${o.name}] could not find any new highway rooms to check. Suiciding.`);
+          o.suicide();
+          return;
+        }
+      }
+      e.currentHighwayTarget = e.highwayQueue[0];
+      log(`🗺️ Inter-shard scout [${o.name}] heading to highway room ${e.currentHighwayTarget}.`);
+    }
+    if (o.room.name !== e.currentHighwayTarget) {
+      const t = this.travelToRoom(o, e.currentHighwayTarget);
+      if (t === ERR_NO_PATH) {
+        log(`⚠️ Inter-shard scout [${o.name}] can't reach ${e.currentHighwayTarget}. Skipping.`);
+        e.checkedRooms.push(e.currentHighwayTarget);
+        e.highwayQueue.shift();
+        e.currentHighwayTarget = null;
+      }
+      return;
+    }
+    if (!e.checkedRooms.includes(o.room.name)) {
+      e.checkedRooms.push(o.room.name);
+    }
+    e.highwayQueue = e.highwayQueue.filter(e => e !== o.room.name);
+    const t = o.room.find(FIND_STRUCTURES, {
+      filter: o => o.structureType === STRUCTURE_PORTAL
+    });
+    const n = t.filter(o => o.destination && typeof o.destination === "object" && o.destination.shard);
+    if (n.length === 0) {
+      log(`🔭 Inter-shard scout [${o.name}] found no inter-shard portals in ${o.room.name}.`);
+      e.currentHighwayTarget = null;
+      return;
+    }
+    let r = null;
+    if (e.preferredShard) {
+      r = n.find(o => o.destination.shard === e.preferredShard);
+      if (!r) {
+        log(`ℹ️ Inter-shard scout [${o.name}] found portals in ${o.room.name} but none go to ${e.preferredShard}. Continuing search.`);
+        e.currentHighwayTarget = null;
+        return;
+      }
+    } else {
+      r = n[0];
+    }
+    if (!Memory.interShardPortals) Memory.interShardPortals = {};
+    const s = `${o.room.name}_${r.destination.shard}`;
+    Memory.interShardPortals[s] = {
+      fromShard: e.homeShard,
+      fromRoom: o.room.name,
+      toShard: r.destination.shard,
+      toRoom: r.destination.room || "?",
+      portalPos: r.pos,
+      foundAt: Game.time
+    };
+    console.log(`🌀 Inter-shard scout [${o.name}] found portal in ${o.room.name} → ${r.destination.shard} (${r.destination.room || "unknown room"}). Preparing to jump!`);
+    Game.notify(`🌀 Inter-shard portal discovered in ${o.room.name} → ${r.destination.shard}`, 60);
+    e.portalId = r.id;
+    e.portalRoom = o.room.name;
+    e.targetShard = r.destination.shard;
+    e.phase = "traversing";
+  },
+  orderExplore: function(o) {
+    if (!o) return "Error: destinationRoomName is required.";
+    let e = null;
+    let t = Infinity;
+    for (const n in Game.rooms) {
+      const r = Game.rooms[n];
+      if (r.controller && r.controller.my) {
+        const s = r.find(FIND_MY_SPAWNS, {
+          filter: o => !o.spawning
+        });
+        if (s.length > 0) {
+          const s = Game.map.getRoomLinearDistance(n, o);
+          if (s < t) {
+            t = s;
+            e = r;
+          }
+        }
+      }
+    }
+    if (!e) {
+      const e = `❌ Error: No available spawn found to start exploration mission to ${o}.`;
+      console.log(e);
+      return e;
+    }
+    const n = e.find(FIND_MY_SPAWNS, {
+      filter: o => !o.spawning
+    })[0];
+    const r = `Scout_${o}_${Game.time % 1e3}`;
+    const s = [ MOVE ];
+    const a = {
+      role: "scout",
+      targetRoom: o
+    };
+    const i = spawnManager.spawnCustomCreep(n, s, r, a);
+    if (i === OK) {
+      const t = `✅ Spawning scout '${r}' from ${e.name} to explore ${o}.`;
+      console.log(t);
+      return t;
+    } else {
+      const o = `❌ Failed to spawn scout from ${e.name}. Error code: ${i}`;
+      console.log(o);
+      return o;
+    }
+  },
+  orderCheckRoom: function(o, e) {
+    if (!o || !e) return "Error: Both spawnRoomName and destinationRoomName are required.";
+    const t = Game.rooms[o];
+    if (!t) return `Error: No vision in spawn room ${o}.`;
+    const n = t.find(FIND_MY_SPAWNS, {
+      filter: o => !o.spawning
+    });
+    if (!n.length) return `Error: No available spawn in room ${o}.`;
+    const r = n[0];
+    const s = `VisCheck_${e}_${Game.time % 1e3}`;
+    const a = [ MOVE ];
+    const i = {
+      role: "scout",
+      task: "checkRoom",
+      destinationRoom: e,
+      spawnRoom: o
+    };
+    const m = spawnManager.spawnCustomCreep(r, a, s, i);
+    if (m === OK) {
+      const t = `✅ Spawning scout '${s}' from ${o} to check room ${e}.`;
+      console.log(t);
+      return t;
+    } else {
+      const o = `❌ Failed to spawn scout. Error code: ${m}`;
+      console.log(o);
+      return o;
+    }
+  },
+  orderAutonomousScout: function() {
+    let o = null;
+    for (const e in Game.rooms) {
+      const t = Game.rooms[e];
+      if (t.controller && t.controller.my) {
+        const e = t.find(FIND_MY_SPAWNS, {
+          filter: o => !o.spawning
+        });
+        if (e.length > 0) {
+          o = e[0];
+          break;
+        }
+      }
+    }
+    if (!o) {
+      const o = `❌ Error: No available spawn found to launch an autonomous scout.`;
+      console.log(o);
+      return o;
+    }
+    const e = `AutoScout_${Game.time % 1e3}`;
+    const t = [ MOVE ];
+    const n = {
+      role: "scout",
+      task: "autonomous",
+      homeRoom: o.room.name
+    };
+    const r = spawnManager.spawnCustomCreep(o, t, e, n);
+    if (r === OK) {
+      const t = `✅ Spawning autonomous scout '${e}' from ${o.room.name}.`;
+      console.log(t);
+      return t;
+    } else {
+      const e = `❌ Failed to spawn autonomous scout from ${o.room.name}. Error code: ${r}`;
+      console.log(e);
+      return e;
+    }
+  },
+  orderPathfinder: function(o, e) {
+    if (!o || !e) return "Error: Both originRoomName and destinationRoomName are required.";
+    const t = `path_${o}_${e}`;
+    if (!Memory.pathfindingMissions) Memory.pathfindingMissions = {};
+    const n = Memory.pathfindingMissions[t];
+    if (n && n.status === "active") return `ℹ️ Mission [${t}] is already active.`;
+    if (n && n.status === "success") return `✅ Mission [${t}] has already succeeded. Path: ${n.foundPath.join(" → ")}`;
+    Memory.pathfindingMissions[t] = {
+      origin: o,
+      destination: e,
+      status: "initializing",
+      attempts: 0,
+      blacklistedRooms: {},
+      activeScout: null,
+      foundPath: null,
+      startTime: Game.time
+    };
+    console.log(`🚀 Initializing new pathfinding mission [${t}] from ${o} to ${e}.`);
+    return this.spawnPathfinderScout(t);
+  },
+  spawnPathfinderScout: function(o) {
+    if (!Memory.pathfindingMissions || !Memory.pathfindingMissions[o]) {
+      return `Error: Cannot find mission data for ${o}.`;
+    }
+    const e = Memory.pathfindingMissions[o];
+    if (e.blacklistedRooms[e.origin]) {
+      e.status = "failed";
+      e.failureReason = `Origin room ${e.origin} is impassable or dangerous.`;
+      const t = `❌ Pathfinding Mission [${o}] Failed: ${e.failureReason}`;
+      console.log(t);
+      Game.notify(t, 60);
+      return t;
+    }
+    const t = Game.map.findRoute(e.origin, e.destination, {
+      routeCallback: o => {
+        if (e.blacklistedRooms[o]) return Infinity;
+        return 1;
+      }
+    });
+    if (t === ERR_NO_PATH || t.length === 0) {
+      e.status = "failed";
+      e.failureReason = `No possible global path exists from ${e.origin} to ${e.destination} with the current blacklist.`;
+      const t = `❌ Pathfinding Mission [${o}] Failed: ${e.failureReason}`;
+      console.log(t);
+      Game.notify(t, 60);
+      return t;
+    }
+    const n = Game.rooms[e.origin];
+    if (!n || !n.controller || !n.controller.my) {
+      e.status = "failed";
+      e.failureReason = `No vision or control in origin room ${e.origin}.`;
+      console.log(`❌ Mission [${o}] Failed: ${e.failureReason}`);
+      Game.notify(`❌ Mission [${o}] Failed: ${e.failureReason}`);
+      return e.failureReason;
+    }
+    const r = n.find(FIND_MY_SPAWNS, {
+      filter: o => !o.spawning
+    });
+    if (!r.length) {
+      return `Warning: No available spawn in room ${e.origin} to continue mission [${o}].`;
+    }
+    const s = r[0];
+    e.attempts += 1;
+    const a = `Pathfinder_${o.replace(/_/g, "")}_${Game.time % 1e3}`;
+    const i = [ MOVE ];
+    const m = {
+      role: "scout",
+      task: "pathfinder",
+      missionId: o,
+      originRoom: e.origin,
+      destinationRoom: e.destination
+    };
+    const l = spawnManager.spawnCustomCreep(s, i, a, m);
+    if (l === OK) {
+      e.status = "active";
+      e.activeScout = a;
+      const t = `✅ Spawning pathfinder scout '${a}' (Attempt #${e.attempts}) for mission [${o}].`;
+      console.log(t);
+      return t;
+    } else {
+      e.attempts -= 1;
+      return `❌ Failed to spawn pathfinder scout for mission [${o}]. Error code: ${l}`;
+    }
+  },
+  handleCreepDeath: function(o, e) {
+    if (!e || e.role !== "scout") return;
+    if (e.task === "pathfinder") {
+      const t = e.missionId;
+      const n = Memory.pathfindingMissions ? Memory.pathfindingMissions[t] : undefined;
+      if (n && n.status === "active" && n.activeScout === o) {
+        const r = e.lastAttackedIn || e.lastRoom;
+        if (r) {
+          this.markRoomAsDangerous(r, "pathfinder_death", true);
+          n.blacklistedRooms[r] = true;
+          console.log(`💀 Pathfinder [${o}] died in ${r}. Room blacklisted globally and for mission [${t}].`);
+          this.spawnPathfinderScout(t);
+        } else {
+          n.status = "failed";
+          n.failureReason = `Scout [${o}] died in an unknown location.`;
+          const e = `❌ Pathfinding Mission [${t}] Failed: ${n.failureReason}`;
+          console.log(e);
+          Game.notify(e, 60);
+        }
+      }
+    } else if (e.task === "checkRoom" && !e.notificationSent) {
+      const t = e.lastAttackedIn || e.lastRoom;
+      if (t) {
+        this.markRoomAsDangerous(t, "scout_death", true);
+        console.log(`💀 Scout [${o}] died in ${t}. Room marked as dangerous.`);
+      }
+      const n = `❌ Mission Failed: Scout [${o}] died before reaching ${e.destinationRoom}.`;
+      Game.notify(n, 0);
+      console.log(n);
+    }
+    if (Memory.scoutState) delete Memory.scoutState[o];
+  },
+  handleDeadCreeps: function() {
+    if (!Memory.scoutState) return;
+    for (const o in Memory.scoutState) {
+      if (!Game.creeps[o]) delete Memory.scoutState[o];
+    }
+  },
+  run: function(o) {
+    if (o.spawning) return;
+    const e = getScoutState(o);
+    if (o.memory.lastRoom !== o.room.name) {
+      o.memory.previousRoom = o.memory.lastRoom;
+      o.memory.lastRoom = o.room.name;
+      if (!o.memory.backtracking) {
+        delete e.localBlacklist;
+      }
+      if (o.memory.task === "pathfinder") {
+        log(`Pathfinder [${o.name}] mission [${o.memory.missionId}] entered new room: ${o.room.name}`);
+      }
+    }
+    if (this.checkForDanger(o)) {
+      return;
+    }
+    if (o.memory.task === "interShardAutonomous") {
+      this.runInterShardAutonomousTask(o);
+    } else if (o.memory.task === "pathfinder") {
+      this.runPathfinderTask(o);
+    } else if (o.memory.task === "checkRoom") {
+      this.runCheckRoomTask(o);
+    } else {
+      this.runAutonomousTask(o);
+    }
+  },
+  travelToRoom: function(o, e) {
+    const t = getScoutState(o);
+    if (!t.route || t.routeTarget !== e) {
+      delete t.route;
+      o.memory.backtracking = false;
+      log(`🗺️ Scout [${o.name}] calculating new route from ${o.room.name} to ${e}.`);
+      const n = o.memory.task === "pathfinder" && Memory.pathfindingMissions && Memory.pathfindingMissions[o.memory.missionId] ? Memory.pathfindingMissions[o.memory.missionId].blacklistedRooms : {};
+      if (Object.keys(n).length > 0) log(`   - Mission blacklist: [${Object.keys(n).join(", ")}]`);
+      if (t.localBlacklist && Object.keys(t.localBlacklist).length > 0) log(`   - Temp local blacklist: [${Object.keys(t.localBlacklist).join(", ")}]`);
+      const r = Game.map.findRoute(o.room.name, e, {
+        routeCallback: e => {
+          if (o.memory.task === "pathfinder") {
+            if (n[e]) return Infinity;
+            if (t.localBlacklist && t.localBlacklist[e]) return Infinity;
+          } else {
+            if (this.isRoomDangerous(e)) return Infinity;
+          }
+          return 1;
+        }
+      });
+      if (r === ERR_NO_PATH || r.length === 0) {
+        log(`❌ Scout [${o.name}] found NO GLOBAL PATH to ${e}. All exits may be blocked or blacklisted.`);
+        return ERR_NO_PATH;
+      }
+      log(`   ✔️ Path found for [${o.name}]: ${JSON.stringify(r.map(o => o.room))}`);
+      t.route = r;
+      t.routeTarget = e;
+    }
+    const n = t.route;
+    if (n && n.length > 0) {
+      if (n[0].room === o.room.name) {
+        n.shift();
+      }
+      if (n.length > 0) {
+        const e = o.pos.findClosestByPath(n[0].exit);
+        if (e) {
+          log(`   🏃 [${o.name}] moving towards exit to ${n[0].room}.`);
+          o.moveTo(e, {
+            reusePath: 5,
+            ignoreCreeps: true,
+            visualizePathStyle: false
+          });
+          return OK;
+        } else {
+          const e = n[0].room;
+          log(`   ⚠️ [${o.name}] could not find a LOCAL path to the exit for room ${e}. Adding to temporary blacklist and will recalculate route.`);
+          if (!t.localBlacklist) {
+            t.localBlacklist = {};
+          }
+          t.localBlacklist[e] = true;
+          o.memory.backtracking = true;
+          delete t.route;
+          return OK;
+        }
+      }
+    }
+    delete t.route;
+    return OK;
+  },
+  runPathfinderTask: function(o) {
+    const e = o.memory.missionId;
+    const t = Memory.pathfindingMissions ? Memory.pathfindingMissions[e] : undefined;
+    if (!t || t.status !== "active") {
+      o.say("✅ Over");
+      o.suicide();
+      return;
+    }
+    const n = getScoutState(o);
+    const r = o.memory.destinationRoom;
+    if (o.room.name === r) {
+      const r = rememberPathRoom(o, n, o.memory.originRoom);
+      const s = r.join(" → ");
+      t.status = "success";
+      t.foundPath = r;
+      t.finishTime = Game.time;
+      const a = `✅ Path Found! Mission [${e}] succeeded.\nRoute: ${s}`;
+      console.log(a);
+      Game.notify(a, 60);
+      o.say("✅ Path!");
+      o.suicide();
+      return;
+    }
+    rememberPathRoom(o, n, o.memory.originRoom);
+    const s = this.travelToRoom(o, r);
+    if (s === ERR_NO_PATH) {
+      log(`Pathfinder [${o.name}] is stuck in ${o.room.name}. Terminating scout to trigger retry.`);
+      o.say("🚫 Stuck");
+      o.suicide();
+    }
+  },
+  runCheckRoomTask: function(o) {
+    const e = getScoutState(o);
+    const t = o.memory.destinationRoom;
+    if (o.room.name === t) {
+      if (!o.memory.notificationSent) {
+        const n = rememberPathRoom(o, e, o.memory.spawnRoom);
+        const r = n.join(" → ");
+        const s = `✅ Mission Complete: Scout [${o.name}] reached ${t}.\nPath: ${r}`;
+        Game.notify(s, 0);
+        console.log(s);
+        o.memory.notificationSent = true;
+        o.say("✅ Done!");
+      }
+      this.idle(o);
+    } else {
+      rememberPathRoom(o, e, o.memory.spawnRoom);
+      const n = this.travelToRoom(o, t);
+      if (n === ERR_NO_PATH) {
+        if (!o.memory.notificationSent) {
+          const e = `❌ Mission Failed: Scout [${o.name}] could not find a safe path to ${t}.`;
+          Game.notify(e, 0);
+          console.log(e);
+          o.memory.notificationSent = true;
+        }
+        o.say("🚫 Path");
+        o.suicide();
+      }
+    }
+  },
+  runAutonomousTask: function(o) {
+    const e = getScoutState(o);
+    if (o.memory.fleeing) {
+      if (o.room.name === o.memory.previousRoom || !o.memory.previousRoom) {
+        log(`✅ Scout ${o.name} successfully fled. Looking for new target.`);
+        delete o.memory.fleeing;
+        this.assignTargetRoom(o);
+      } else {
+        o.say("😱 RUN!");
+        o.moveTo(new RoomPosition(25, 25, o.memory.previousRoom));
+        return;
+      }
+    }
+    if (!Memory.dangerousRooms) Memory.dangerousRooms = {};
+    if (!o.memory.targetRoom) this.assignTargetRoom(o);
+    if (o.memory.lastRoom !== o.room.name) {
+      o.memory.roomScanned = false;
+      delete e.route;
+      if (!e.visitedRooms) e.visitedRooms = {};
+      e.visitedRooms[o.room.name] = Game.time;
+      log(`🔍 Scout ${o.name} entered room ${o.room.name} (target: ${o.memory.targetRoom})`);
+    }
+    if (o.room.name !== o.memory.targetRoom) {
+      this.travelToRoom(o, o.memory.targetRoom);
+    } else {
+      log(`🎯 Scout ${o.name} arrived at target room ${o.room.name}`);
+      this.gatherIntelligence(o);
+      log(`⏱️ Scout ${o.name} finished scanning ${o.room.name}, looking for new target`);
+      this.assignTargetRoom(o);
+    }
+  },
+  idle: function(o) {
+    const e = new RoomPosition(48, 48, o.room.name);
+    if (!o.pos.isEqualTo(e)) o.moveTo(e);
+  },
+  checkForDanger: function(o) {
+    const e = o.room;
+    if (e.controller && e.controller.owner && iff.isFriendlyUsername(e.controller.owner.username)) return false;
+    if (o.hits < o.hitsMax && (!o.memory.lastHits || o.memory.lastHits > o.hits)) {
+      o.memory.lastAttackedIn = o.room.name;
+      if (o.memory.task !== "pathfinder" && o.memory.task !== "interShardAutonomous") {
+        this.markRoomAsDangerous(o.room.name, "hostile_creeps", false);
+        log(`⚔️ DANGER! Scout ${o.name} under attack in ${o.room.name}!`);
+        o.memory.fleeing = true;
+        return true;
+      } else {
+        log(`⚔️ Scout ${o.name} taking damage in ${o.room.name} but continuing mission`);
+      }
+    }
+    o.memory.lastHits = o.hits;
+    const t = e.find(FIND_HOSTILE_STRUCTURES, {
+      filter: o => o.structureType === STRUCTURE_TOWER
+    });
+    if (t.length > 0) {
+      if (o.memory.task !== "pathfinder" && o.memory.task !== "interShardAutonomous") {
+        this.markRoomAsDangerous(o.room.name, "hostile_towers", true);
+        o.memory.lastAttackedIn = o.room.name;
+        log(`🏰 DANGER! Scout ${o.name} detected hostile towers in ${o.room.name}!`);
+        o.memory.fleeing = true;
+        return true;
+      } else {
+        log(`🏰 Scout ${o.name} detected hostile towers in ${o.room.name} but continuing mission`);
+      }
+    }
+    return false;
+  },
+  markRoomAsDangerous: function(o, e, t) {
+    if (!Memory.dangerousRooms) Memory.dangerousRooms = {};
+    const n = t ? 999999999 : 5e4;
+    Memory.dangerousRooms[o] = {
+      markedAt: Game.time,
+      reason: e,
+      cooldownUntil: Game.time + n,
+      permanent: t
+    };
+    const r = {
+      hostile_creeps: "hostile creeps",
+      hostile_towers: "hostile towers",
+      pathfinder_death: "pathfinder scout death",
+      scout_death: "scout death"
+    }[e] || e;
+    if (Memory.pathfindingMissions) {
+      for (const e in Memory.pathfindingMissions) {
+        const t = Memory.pathfindingMissions[e];
+        if (t.status === "active") {
+          t.blacklistedRooms[o] = true;
+          console.log(`Added dangerous room ${o} to mission ${e} blacklist`);
+        }
+      }
+    }
+    if (t) console.log(`🚫 PERMANENTLY AVOIDING room ${o} due to ${r}`); else console.log(`⏰ Avoiding room ${o} for ${n} ticks due to ${r}`);
+  },
+  isRoomDangerous: function(o) {
+    if (!Memory.dangerousRooms || !Memory.dangerousRooms[o]) return false;
+    const e = Memory.dangerousRooms[o];
+    if (e.permanent) return true;
+    if (Game.time > e.cooldownUntil) {
+      delete Memory.dangerousRooms[o];
+      console.log(`✅ Room ${o} is no longer marked as dangerous.`);
+      return false;
+    }
+    return true;
+  },
+  assignTargetRoom: function(o) {
+    const e = getScoutState(o);
+    delete e.route;
+    const t = Game.map.describeExits(o.room.name);
+    if (!t) return;
+    if (!e.visitedRooms) e.visitedRooms = {};
+    const n = [];
+    for (const o in t) {
+      const r = t[o];
+      if (Game.rooms[r] && Game.rooms[r].controller && Game.rooms[r].controller.my) continue;
+      const s = e.visitedRooms[r] && Game.time - e.visitedRooms[r] < 500;
+      const a = this.isRoomDangerous(r);
+      if (!s && !a) n.push(r);
+    }
+    if (n.length > 0) {
+      const e = n[Math.floor(Math.random() * n.length)];
+      o.memory.targetRoom = e;
+      o.say("🚪" + e);
+      log(`🆕 Scout ${o.name} assigned NEW target: ${e}`);
+      return;
+    }
+    let r = Game.time;
+    let s = null;
+    for (const o in t) {
+      const n = t[o];
+      if (!this.isRoomDangerous(n)) {
+        const o = e.visitedRooms[n] || 0;
+        if (o < r) {
+          r = o;
+          s = n;
+        }
+      }
+    }
+    if (s) {
+      o.memory.targetRoom = s;
+      o.say("🔄" + s);
+      log(`🔄 Scout ${o.name} assigned OLD target: ${s}`);
+    } else {
+      o.memory.targetRoom = o.room.name;
+      o.say("🏠 SAFE");
+      console.log(`⚠️ Scout ${o.name} has no safe rooms to explore, staying put.`);
+    }
+  },
+  gatherIntelligence: function(o) {
+    if (o.memory.roomScanned) return;
+    const e = o.room;
+    const t = e.name;
+    const n = getRoomState.get(t);
+    const r = n && n.hostiles || e.find(FIND_HOSTILE_CREEPS);
+    const s = n && n.sources || e.find(FIND_SOURCES);
+    const a = n && n.minerals || e.find(FIND_MINERALS);
+    let i = e.controller && e.controller.owner ? ` (owned by ${e.controller.owner.username})` : "";
+    log(`📊 Scout ${o.name} scanned ${t}: ${s.length} sources, ${a.length} minerals, ${r.length} hostiles${i}`);
+    o.memory.roomScanned = true;
+  }
 };
-
 module.exports = roleScout;

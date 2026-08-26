@@ -1,7 +1,15 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// screeps-profiler.js
+// Console globals: profileFor, InterShardMemory
+// Example: profileFor(100, 'runCreeps') - Profile CPU usage of functions over given ticks
+// Example: InterShardMemory - Global reference to Screeps InterShardMemory object
+
 'use strict';
 
-// Start profiling for 100 ticks
-//Game.profiler.profile(100);
+// Start a full-tick profile for 100 ticks. profileFor() validates its input,
+// prints the report automatically when the capture completes, and then stops
+// recording.
+//profileFor(100);
 
 // View results (tree view, default)
 //Game.profiler.output();
@@ -9,21 +17,20 @@
 // View flat results (old style)
 //Game.profiler.flat();
 
-// Profile specific functions only
-//Game.profiler.profile(100, ['runCreeps', 'runTowers']);
+// Profile calls beneath a specific function only
+//profileFor(100, 'runCreeps');
 
-// Reset data
+// Reset the most recent profile data manually
 //Game.profiler.reset();
 
+// Usage: start a bounded capture, then inspect the generated report.
+// Example: profileFor(100, 'runCreeps');
 
 let usedOnStart = 0;
 let enabled = false;
 let depth = 0;
-
 const parentStack = ['(tick)'];
-
 class ProfilerError extends Error {}
-
 // Hack to ensure the InterShardMemory constant exists in sim
 try {
   // eslint-disable-next-line no-unused-expressions
@@ -31,7 +38,6 @@ try {
 } catch (e) {
   global.InterShardMemory = undefined;
 }
-
 function setupProfiler() {
   depth = 0; // reset depth, this needs to be done each tick.
   parentStack.length = 0;
@@ -70,7 +76,6 @@ function setupProfiler() {
     flat: Profiler.flat,
     downloadCallgrind: Profiler.downloadCallgrind,
   };
-
   overloadCPUCalc();
 }
 
@@ -91,7 +96,7 @@ function setupMemory(profileType, duration, filter) {
 }
 
 function resetMemory() {
-  Memory.profiler = null;
+  delete Memory.profiler;
 }
 
 function overloadCPUCalc() {
@@ -111,16 +116,13 @@ const functionBlackList = [
   'getUsed', // Let's avoid wrapping this... may lead to recursion issues and should be inexpensive.
   'constructor', // es6 class constructors need to be called with `new`
 ];
-
 const commonProperties = ['length', 'name', 'arguments', 'caller', 'prototype'];
-
 function wrapFunction(name, originalFunction) {
   if (originalFunction.__profiler) {
     // eslint-disable-next-line no-param-reassign
     originalFunction.__profiler = Profiler;
     return originalFunction;
   }
-
   function wrappedFunction() {
     const profiler = wrappedFunction.__profiler;
     if (profiler.isProfiling()) {
@@ -129,13 +131,11 @@ function wrapFunction(name, originalFunction) {
       if (nameMatchesFilter) {
         depth++;
       }
-
       // FIX: Push onto the stack so any profiled function called from within
       // an un-profiled intermediary still sees the correct nearest profiled
       // ancestor as its parent, rather than a stale ancestor left over from
       // a previous call frame.
       parentStack.push(name);
-
       let result;
       if (this && this.constructor === wrappedFunction) {
         // eslint-disable-next-line new-cap
@@ -143,13 +143,12 @@ function wrapFunction(name, originalFunction) {
       } else {
         result = originalFunction.apply(this, arguments);
       }
-
       // Pop before recording — the parent is now the item below us on the stack,
       // and the grandparent is one further down.
       parentStack.pop();
       const currentParent = parentStack[parentStack.length - 1];
-      const currentGrandparent = parentStack.length >= 2 ? parentStack[parentStack.length - 2] : null;
-
+      const currentGrandparent =
+        parentStack.length >= 2 ? parentStack[parentStack.length - 2] : null;
       if (depth > 0 || !getFilter()) {
         const end = Game.cpu.getUsed();
         profiler.record(name, end - start, currentParent, currentGrandparent);
@@ -159,24 +158,20 @@ function wrapFunction(name, originalFunction) {
       }
       return result;
     }
-
     if (this && this.constructor === wrappedFunction) {
       // eslint-disable-next-line new-cap
       return new originalFunction(...arguments);
     }
     return originalFunction.apply(this, arguments);
   }
-
   wrappedFunction.__profiler = Profiler;
   wrappedFunction.toString = () =>
     `// screeps-profiler wrapped function:\n${originalFunction.toString()}`;
-
-  Object.getOwnPropertyNames(originalFunction).forEach(property => {
+  Object.getOwnPropertyNames(originalFunction).forEach((property) => {
     if (!commonProperties.includes(property)) {
       wrappedFunction[property] = originalFunction[property];
     }
   });
-
   return wrappedFunction;
 }
 
@@ -195,48 +190,38 @@ function profileObjectFunctions(object, label) {
     throw new ProfilerError(`Asked to profile non-object ${object} for ${label}
       (${typeof object})`);
   }
-
   if (object.prototype) {
     profileObjectFunctions(object.prototype, label);
   }
   const objectToWrap = object;
-
-  Object.getOwnPropertyNames(objectToWrap).forEach(functionName => {
+  Object.getOwnPropertyNames(objectToWrap).forEach((functionName) => {
     const extendedLabel = `${label}.${functionName}`;
-
     const isBlackListed = functionBlackList.indexOf(functionName) !== -1;
     if (isBlackListed) {
       return;
     }
-
     const descriptor = Object.getOwnPropertyDescriptor(objectToWrap, functionName);
     if (!descriptor) {
       return;
     }
-
     const hasAccessor = descriptor.get || descriptor.set;
     if (hasAccessor) {
       const configurable = descriptor.configurable;
       if (!configurable) {
         return;
       }
-
       const profileDescriptor = {};
-
       if (descriptor.get) {
         const extendedLabelGet = `${extendedLabel}:get`;
         profileDescriptor.get = profileFunction(descriptor.get, extendedLabelGet);
       }
-
       if (descriptor.set) {
         const extendedLabelSet = `${extendedLabel}:set`;
         profileDescriptor.set = profileFunction(descriptor.set, extendedLabelSet);
       }
-
       Object.defineProperty(objectToWrap, functionName, profileDescriptor);
       return;
     }
-
     const isFunction = typeof descriptor.value === 'function';
     if (!isFunction || !descriptor.writable) {
       return;
@@ -244,18 +229,16 @@ function profileObjectFunctions(object, label) {
     const originalFunction = objectToWrap[functionName];
     objectToWrap[functionName] = profileFunction(originalFunction, extendedLabel);
   });
-
   return objectToWrap;
 }
 
 function profileFunction(fn, functionName) {
   const fnName = functionName || fn.name;
   if (!fnName) {
-    console.log('Couldn\'t find a function name for - ', fn);
+    console.log("Couldn't find a function name for - ", fn);
     console.log('Will not profile this function.');
     return fn;
   }
-
   return wrapFunction(fnName, fn);
 }
 
@@ -323,9 +306,9 @@ const Profiler = {
     /* eslint-enable */
     console.log(
       download
-      .split('\n')
-      .map((s) => s.trim())
-      .join('')
+        .split('\n')
+        .map((s) => s.trim())
+        .join('')
     );
   },
 
@@ -341,9 +324,7 @@ const Profiler = {
     Profiler.checkMapItem('(tick)', Memory.profiler.map['(root)'].subs);
     Memory.profiler.map['(root)'].subs['(tick)'].calls = elapsedTicks;
     Memory.profiler.map['(root)'].subs['(tick)'].time = Memory.profiler.totalTime;
-    let body = `events: ns\nsummary: ${Math.round(
-      Memory.profiler.totalTime * 1000000
-      )}\n`;
+    let body = `events: ns\nsummary: ${Math.round(Memory.profiler.totalTime * 1000000)}\n`;
     for (const fnName of Object.keys(Memory.profiler.map)) {
       const fn = Memory.profiler.map[fnName];
       let callsBody = '';
@@ -354,9 +335,7 @@ const Profiler = {
         callsBody += `cfn=${callName}\ncalls=${call.calls} 1\n1 ${ns}\n`;
         callsTime += call.time;
       }
-      body += `\nfn=${fnName}\n1 ${Math.round(
-        (fn.time - callsTime) * 1000000
-        )}\n${callsBody}`;
+      body += `\nfn=${fnName}\n1 ${Math.round((fn.time - callsTime) * 1000000)}\n${callsBody}`;
     }
     return body;
   },
@@ -396,28 +375,30 @@ const Profiler = {
   },
 
   lines() {
-    const stats = Object.keys(Memory.profiler.map).map(functionName => {
-      const functionCalls = Memory.profiler.map[functionName];
-      // Calculate time spent in child/sub calls
-      let childTime = 0;
-      if (functionCalls.subs) {
-        for (const subName of Object.keys(functionCalls.subs)) {
-          childTime += functionCalls.subs[subName].time;
+    const stats = Object.keys(Memory.profiler.map)
+      .map((functionName) => {
+        const functionCalls = Memory.profiler.map[functionName];
+        // Calculate time spent in child/sub calls
+        let childTime = 0;
+        if (functionCalls.subs) {
+          for (const subName of Object.keys(functionCalls.subs)) {
+            childTime += functionCalls.subs[subName].time;
+          }
         }
-      }
-      const selfTime = functionCalls.time - childTime;
-      return {
-        name: functionName,
-        calls: functionCalls.calls,
-        totalTime: functionCalls.time,
-        selfTime: selfTime,
-        averageTime: functionCalls.time / functionCalls.calls,
-      };
-    }).sort((val1, val2) => {
-      return val2.selfTime - val1.selfTime;
-    });
+        const selfTime = functionCalls.time - childTime;
+        return {
+          name: functionName,
+          calls: functionCalls.calls,
+          totalTime: functionCalls.time,
+          selfTime: selfTime,
+          averageTime: functionCalls.time / functionCalls.calls,
+        };
+      })
+      .sort((val1, val2) => {
+        return val2.selfTime - val1.selfTime;
+      });
 
-    const lines = stats.map(data => {
+    const lines = stats.map((data) => {
       return [
         data.calls,
         data.selfTime.toFixed(1),
@@ -485,8 +466,8 @@ const Profiler = {
       const fnData = map[fnName];
       if (!fnData) return;
 
-      const displayCalls = (scopedCalls != null) ? scopedCalls : fnData.calls;
-      const displayTime = (scopedTime != null) ? scopedTime : fnData.time;
+      const displayCalls = scopedCalls != null ? scopedCalls : fnData.calls;
+      const displayTime = scopedTime != null ? scopedTime : fnData.time;
 
       // Self time only shown for root-level rows (depth 0).
       let selfStr = '';
@@ -504,37 +485,40 @@ const Profiler = {
       const prefix = depth === 0 ? '' : '  '.repeat(depth - 1) + '└ ';
 
       // For top-level rows, append cpu/tick and cpu/tick/call columns.
-      const cpuPerTick = (depth === 0 && elapsedTicks)
-        ? (displayTime / elapsedTicks).toFixed(2)
-        : '';
-      const cpuPerTickPerCall = (depth === 0 && elapsedTicks && displayCalls)
-        ? (displayTime / elapsedTicks / displayCalls).toFixed(4)
-        : '';
+      const cpuPerTick = depth === 0 && elapsedTicks ? (displayTime / elapsedTicks).toFixed(2) : '';
+      const cpuPerTickPerCall =
+        depth === 0 && elapsedTicks && displayCalls
+          ? (displayTime / elapsedTicks / displayCalls).toFixed(4)
+          : '';
 
-      lines.push([
-        displayCalls,
-        selfStr,
-        displayTime.toFixed(1),
-        cpuPerTick,
-        cpuPerTickPerCall,
-        prefix + fnName,
-      ].join('\t\t'));
+      lines.push(
+        [
+          displayCalls,
+          selfStr,
+          displayTime.toFixed(1),
+          cpuPerTick,
+          cpuPerTickPerCall,
+          prefix + fnName,
+        ].join('\t\t')
+      );
 
       if (depth < maxDepth) {
         // At depth 0→1: use the node's own global subs (already scoped to this
         // parent because record() writes parent.subs[child]).
         // At depth 1→2: use the 2-level scoped subs passed in from the parent,
         // i.e. map[grandparent].subs[parent].subs — fully path-scoped.
-        const subsToUse = (scopedSubs != null) ? scopedSubs : fnData.subs;
+        const subsToUse = scopedSubs != null ? scopedSubs : fnData.subs;
         if (!subsToUse) return;
 
-        const children = Object.keys(subsToUse).map(subName => ({
-          name: subName,
-          calls: subsToUse[subName].calls,
-          time: Math.min(subsToUse[subName].time, displayTime),
-          // Pass the 2-level subs down so depth-2 children are path-scoped.
-          subs: subsToUse[subName].subs || null,
-        })).sort((a, b) => b.time - a.time);
+        const children = Object.keys(subsToUse)
+          .map((subName) => ({
+            name: subName,
+            calls: subsToUse[subName].calls,
+            time: Math.min(subsToUse[subName].time, displayTime),
+            // Pass the 2-level subs down so depth-2 children are path-scoped.
+            subs: subsToUse[subName].subs || null,
+          }))
+          .sort((a, b) => b.time - a.time);
 
         for (const child of children) {
           if (child.time < Math.min(displayTime * 0.05, 0.5)) continue;
@@ -543,10 +527,12 @@ const Profiler = {
       }
     };
 
-    const topLevel = Object.keys(tickSubs).map(fnName => ({
-      name: fnName,
-      time: tickSubs[fnName].time,
-    })).sort((a, b) => b.time - a.time);
+    const topLevel = Object.keys(tickSubs)
+      .map((fnName) => ({
+        name: fnName,
+        time: tickSubs[fnName].time,
+      }))
+      .sort((a, b) => b.time - a.time);
 
     for (const entry of topLevel) {
       if (entry.time < threshold) continue;
@@ -675,13 +661,9 @@ const Profiler = {
   },
 
   shouldCallgrind() {
-    return (
-      Profiler.type() === 'callgrind' &&
-      Memory.profiler.disableTick === Game.time
-    );
+    return Profiler.type() === 'callgrind' && Memory.profiler.disableTick === Game.time;
   },
 };
-
 module.exports = {
   wrap(callback) {
     if (enabled) {
@@ -726,3 +708,24 @@ module.exports = {
 
   Error: ProfilerError,
 };
+
+(function registerProfileForGlobal() {
+  global.profileFor = function (ticks, filter) {
+    const duration = ticks === undefined ? 100 : ticks;
+    if (!Number.isInteger(duration) || duration < 1) {
+      return 'Usage: profileFor(ticks?, filter?) - ticks must be a positive integer.';
+    }
+    if (filter !== undefined && typeof filter !== 'string') {
+      return 'Usage: profileFor(ticks?, filter?) - filter must be a function name string.';
+    }
+
+    Game.profiler.profile(duration, filter);
+    return (
+      'Profiling started for ' +
+      duration +
+      ' ticks' +
+      (filter ? ' (filter: ' + filter + ')' : '') +
+      '.'
+    );
+  };
+})();

@@ -1,571 +1,436 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // roleClaimbot.js
-// Bot that travels to a target room, avoids edges, then attacks or claims the controller.
-// To launch: launchClaimbot('SpawnRoomName', 'TargetRoomName')
-// With hardcoded route: launchClaimbot('SpawnRoomName', 'TargetRoomName', ['Room1', 'Room2', 'Room3'])
-
-const enableLogging = true;  // Set false to silence logs
-
-// == BANNED ROOMS (keep in sync with demolition) ==
-const BANNED_ROOMS = [
-  'E8N49', 'W8N49'
-];
-
-// == Helper: is a room banned? ==
-function isRoomBanned(roomName) {
-  for (let i = 0; i < BANNED_ROOMS.length; i++) {
-    if (BANNED_ROOMS[i] === roomName) return true;
+// Role dispatch: memory.role === 'claimbot' -> roleClaimbot.run(creep).
+// Console globals: launchClaimbot
+// Example: launchClaimbot('W1N1', 'W2N2', 'claim') - Spawn claimbot to claim or reserve room
+const enableLogging = false;
+const spawnManager = require("spawnManager");
+const util = require("util");
+const memoryManager = require("memoryManager");
+const heap = memoryManager.heap;
+var roleClaimbot;
+const BANNED_ROOMS = [ "E8N49", "W8N49" ];
+function isRoomBanned(e) {
+  for (let o = 0; o < BANNED_ROOMS.length; o++) {
+    if (BANNED_ROOMS[o] === e) return true;
   }
   return false;
 }
 
-// == Edge helpers ==
-function isOnRoomEdge(pos) {
-  return pos.x === 0 || pos.x === 49 || pos.y === 0 || pos.y === 49;
-}
-
-function nudgeOffRoomEdge(creep) {
-  if (creep.pos.y === 0) {
-    var mv = creep.move(BOTTOM);
-    if (mv === OK) return true;
-    if (creep.pos.x > 0 && creep.move(BOTTOM_LEFT) === OK) return true;
-    if (creep.pos.x < 49 && creep.move(BOTTOM_RIGHT) === OK) return true;
-  } else if (creep.pos.y === 49) {
-    var mv2 = creep.move(TOP);
-    if (mv2 === OK) return true;
-    if (creep.pos.x > 0 && creep.move(TOP_LEFT) === OK) return true;
-    if (creep.pos.x < 49 && creep.move(TOP_RIGHT) === OK) return true;
-  } else if (creep.pos.x === 0) {
-    var mv3 = creep.move(RIGHT);
-    if (mv3 === OK) return true;
-    if (creep.pos.y > 0 && creep.move(BOTTOM_RIGHT) === OK) return true;
-    if (creep.pos.y < 49 && creep.move(TOP_RIGHT) === OK) return true;
-  } else if (creep.pos.x === 49) {
-    var mv4 = creep.move(LEFT);
-    if (mv4 === OK) return true;
-    if (creep.pos.y > 0 && creep.move(BOTTOM_LEFT) === OK) return true;
-    if (creep.pos.y < 49 && creep.move(TOP_LEFT) === OK) return true;
-  }
-  return false;
-}
-
-module.exports = {
-  // == SPAWN COMMAND LOGIC ==
-  // Call this via console: launchClaimbot('SpawnRoom', 'TargetRoom')
-  // With hardcoded route: launchClaimbot('SpawnRoom', 'TargetRoom', ['Room1', 'Room2', ...])
+const isOnRoomEdge = util.isOnRoomEdge;
+const nudgeOffRoomEdge = util.nudgeOffRoomEdge;
+roleClaimbot = {
   //   The route should be the sequence of rooms to travel through (excluding spawn room, including target)
-  spawn: function(spawnRoomName, targetRoomName, route) {
-    if (!spawnRoomName || !targetRoomName) {
+  spawn: function(e, o, r) {
+    if (!e || !o) {
       return '❌ Usage: launchClaimbot("SpawnRoomName", "TargetRoomName", [optional route array])';
     }
-
-    var room = Game.rooms[spawnRoomName];
-    if (!room) {
-      return '❌ Room ' + spawnRoomName + ' is not visible or has no spawns.';
+    var n = Game.rooms[e];
+    if (!n) {
+      return "❌ Room " + e + " is not visible or has no spawns.";
     }
-
-    var spawns = room.find(FIND_MY_SPAWNS);
-    if (spawns.length === 0) {
-      return '❌ No available spawns in ' + spawnRoomName;
+    var a = n.find(FIND_MY_SPAWNS);
+    if (a.length === 0) {
+      return "❌ No available spawns in " + e;
     }
-
-    var spawn = spawns[0]; // Uses the first found spawn
-
-    // Validate route if provided
-    if (route) {
-      if (!Array.isArray(route)) {
+    var t = a[0];
+    if (r) {
+      if (!Array.isArray(r)) {
         return '❌ Route must be an array of room names, e.g. ["E1N1", "E2N1", "E3N1"]';
       }
-      if (route.length === 0) {
-        return '❌ Route array cannot be empty';
+      if (r.length === 0) {
+        return "❌ Route array cannot be empty";
       }
-      // Ensure the route ends at the target room
-      if (route[route.length - 1] !== targetRoomName) {
-        return '❌ Route must end with target room ' + targetRoomName + ' (last room in route: ' + route[route.length - 1] + ')';
+      if (r[r.length - 1] !== o) {
+        return "❌ Route must end with target room " + o + " (last room in route: " + r[r.length - 1] + ")";
       }
-      // Warn about banned rooms in the route
-      for (var r = 0; r < route.length; r++) {
-        if (isRoomBanned(route[r])) {
-          return '⚠️ Warning: Route includes banned room ' + route[r] + '. Spawn aborted.';
+      for (var i = 0; i < r.length; i++) {
+        if (isRoomBanned(r[i])) {
+          return "⚠️ Warning: Route includes banned room " + r[i] + ". Spawn aborted.";
         }
       }
     }
-
-    // BODY DEFINITION
-    // Your script attempts to attack creeps/structures AND claim.
-    // Therefore, it needs ATTACK, CLAIM, and MOVE parts.
-    // Adjust this array based on your room's capacity.
-    var body = [MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, ATTACK, CLAIM];
-
-    // Check energy cost
-    var cost = 0;
-    for(var i=0; i<body.length; i++) {
-        cost += BODYPART_COST[body[i]];
+    var l = [ MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, MOVE, ATTACK, CLAIM ];
+    var m = util.bodyCost(l);
+    if (n.energyAvailable < m) {
+      return "❌ Not enough energy in " + e + " (Need " + m + ")";
     }
-    if (room.energyAvailable < cost) {
-        return '❌ Not enough energy in ' + spawnRoomName + ' (Need ' + cost + ')';
-    }
-
-    var creepName = 'Claimbot_' + targetRoomName + '_' + Game.time;
-    
-    var memory = {
-      role: 'claimbot',
-      targetRoom: targetRoomName
+    var s = "Claimbot_" + o + "_" + Game.time;
+    var g = {
+      role: "claimbot",
+      targetRoom: o
     };
-    
-    // Add hardcoded route to memory if provided
-    if (route) {
-      memory.hardcodedRoute = route;
-      memory.routeIndex = 0;  // Track progress through the route
+    if (r) {
+      g.hardcodedRoute = r;
+      g.routeIndex = 0;
     }
-    
-    var result = spawn.spawnCreep(body, creepName, { memory: memory });
-
-    if (result === OK) {
-      var msg = '✅ Spawning ' + creepName + ' in ' + spawnRoomName + ' targeting ' + targetRoomName;
-      if (route) {
-        msg += ' via hardcoded route: ' + route.join(' → ');
+    var u = spawnManager.spawnCustomCreep(t, l, s, g);
+    if (u === OK) {
+      var f = "✅ Spawning " + s + " in " + e + " targeting " + o;
+      if (r) {
+        f += " via hardcoded route: " + r.join(" → ");
       }
-      return msg;
+      return f;
     } else {
-      return '❌ Spawn error: ' + result;
+      return "❌ Spawn error: " + u;
     }
   },
-
-  run: function(creep) {
-    // --- INIT & LOGGING ---
+  run: function(e) {
+    if (e.memory && (e.memory.autoBuilderCancelled || Memory.autoBuilder && Memory.autoBuilder.cancelled && Memory.autoBuilder.cancelled[e.memory.targetRoom])) {
+      return e.suicide();
+    }
     if (enableLogging) {
-      var routeInfo = creep.memory.hardcodedRoute 
-        ? ' route=[' + creep.memory.hardcodedRoute.join('→') + '] idx=' + creep.memory.routeIndex
-        : ' (dynamic route)';
-      console.log(
-        '[' + creep.name + '] start; room=' + creep.room.name + ' target=' + creep.memory.targetRoom + routeInfo
-      );
+      var o = e.memory.hardcodedRoute ? " route=[" + e.memory.hardcodedRoute.join("→") + "] idx=" + e.memory.routeIndex : " (dynamic route)";
+      console.log("[" + e.name + "] start; room=" + e.room.name + " target=" + e.memory.targetRoom + o);
     }
-    var targetRoom = creep.memory.targetRoom;
-    if (!targetRoom) {
-      if (enableLogging) console.log('[' + creep.name + '] no target → suiciding');
-      return creep.suicide();
+    var r = e.memory.targetRoom;
+    if (!r) {
+      if (enableLogging) console.log("[" + e.name + "] no target → suiciding");
+      return e.suicide();
     }
-
-    // Clear old controller path if we've left the target room
-    if (creep.room.name !== targetRoom && creep.memory.controllerPath) {
+    if (e.room.name !== r && (e.memory.controllerPath || heap.claimbotControllerPaths && heap.claimbotControllerPaths[e.name])) {
       if (enableLogging) {
-        console.log('[' + creep.name + '] left ' + targetRoom + ' → clearing controllerPath');
+        console.log("[" + e.name + "] left " + r + " → clearing controllerPath");
       }
-      delete creep.memory.controllerPath;
+      delete e.memory.controllerPath;
+      if (heap.claimbotControllerPaths) delete heap.claimbotControllerPaths[e.name];
     }
-
-    // --- moveAvoidEdges(dest, style) ---
     //  • Inter‐room: defer to banned-room aware router
     //  • In‐room: PathFinder with outer 2‐tile border blocked
-    function moveAvoidEdges(dest, style) {
-      var pos = dest.pos ? dest.pos : dest;
-
-      // If target is in another room, use cross-room router (not in-room PF)
-      if (pos.roomName && pos.roomName !== creep.room.name) {
-        moveToRoomAvoidingBanned(pos.roomName, style);
+        function moveAvoidEdges(o, r) {
+      var n = o.pos ? o.pos : o;
+      if (n.roomName && n.roomName !== e.room.name) {
+        moveToRoomAvoidingBanned(n.roomName, r);
         return;
       }
-
-      // Build CostMatrix blocking walls & outer border
-      // Priority changed to ensure Roads overwrite Walls for the road-through-wall logic
-      var terrain = Game.map.getRoomTerrain(creep.room.name);
-      var costs = new PathFinder.CostMatrix();
-      for (var y = 0; y < 50; y++) {
-        for (var x = 0; x < 50; x++) {
-          var t = terrain.get(x, y);
-          var c = t === 0 ? 2 : t === 2 ? 10 : 255;
-          if (x <= 1 || x >= 48 || y <= 1 || y >= 48) c = 255;
-          costs.set(x, y, c);
+      var a = Game.map.getRoomTerrain(e.room.name);
+      var t = new PathFinder.CostMatrix;
+      for (var i = 0; i < 50; i++) {
+        for (var l = 0; l < 50; l++) {
+          var m = a.get(l, i);
+          var s = m === 0 ? 2 : m === 2 ? 10 : 255;
+          if (l <= 1 || l >= 48 || i <= 1 || i >= 48) s = 255;
+          t.set(l, i, s);
         }
       }
-      
-      var structures = creep.room.find(FIND_STRUCTURES);
-      
-      // PASS 1: Set obstacles (Walls, Hostile Ramparts)
-      structures.forEach(function(s) {
-        if (s.structureType === STRUCTURE_CONTAINER) {
-            costs.set(s.pos.x, s.pos.y, 5);
-        } else if (s.structureType === STRUCTURE_RAMPART && s.my) {
-            costs.set(s.pos.x, s.pos.y, 1);
-        } else if (s.structureType === STRUCTURE_ROAD) {
-            // Skip roads in pass 1
-            return;
-        } else if (s.structureType !== STRUCTURE_CONTROLLER) {
-            // Walls, Hostile Ramparts, Extensions, etc.
-            // We set this to 50. This allows pathing if no other option exists.
-            costs.set(s.pos.x, s.pos.y, 50);
+      var g = e.room.find(FIND_STRUCTURES);
+      g.forEach(function(e) {
+        if (e.structureType === STRUCTURE_CONTAINER) {
+          t.set(e.pos.x, e.pos.y, 5);
+        } else if (e.structureType === STRUCTURE_RAMPART && e.my) {
+          t.set(e.pos.x, e.pos.y, 1);
+        } else if (e.structureType === STRUCTURE_ROAD) {
+          return;
+        } else if (e.structureType !== STRUCTURE_CONTROLLER) {
+          t.set(e.pos.x, e.pos.y, 50);
         } else {
-            // Controller is impassable
-            costs.set(s.pos.x, s.pos.y, 255);
+          t.set(e.pos.x, e.pos.y, 255);
         }
       });
-
-      // PASS 2: Set ROADS (Overwrites walls/obstacles on the same tile)
-      // This forces the bot to prefer the road even if it goes through a wall.
-      structures.forEach(function(s) {
-        if (s.structureType === STRUCTURE_ROAD) {
-            costs.set(s.pos.x, s.pos.y, 1);
+      g.forEach(function(e) {
+        if (e.structureType === STRUCTURE_ROAD) {
+          t.set(e.pos.x, e.pos.y, 1);
         }
       });
-
-      var res = PathFinder.search(
-        creep.pos,
-        { pos: pos, range: 1 }, 
-        {
-          maxOps: 2000,
-          roomCallback: function(rn) { return rn === creep.room.name ? costs : new PathFinder.CostMatrix(); }
+      var u = PathFinder.search(e.pos, {
+        pos: n,
+        range: 1
+      }, {
+        maxOps: 2e3,
+        roomCallback: function(o) {
+          return o === e.room.name ? t : new PathFinder.CostMatrix;
         }
-      );
-
-      if (res.path.length) {
+      });
+      if (u.path.length) {
         if (enableLogging) {
-          console.log(
-            '[' + creep.name + '] PF→ next (' + res.path[0].x + ',' + res.path[0].y + ')'
-          );
+          console.log("[" + e.name + "] PF→ next (" + u.path[0].x + "," + u.path[0].y + ")");
         }
-        
-        // --- AUTO-ATTACK BLOCKERS ---
-        // Attacks walls/ramparts only if they are directly in the path
-        var nextPos = new RoomPosition(res.path[0].x, res.path[0].y, creep.room.name);
-        var structuresAtNext = nextPos.lookFor(LOOK_STRUCTURES);
-        for (var i = 0; i < structuresAtNext.length; i++) {
-            var s = structuresAtNext[i];
-            if (s.structureType === STRUCTURE_WALL || 
-                (s.structureType === STRUCTURE_RAMPART && !s.my) || 
-                (s.structureType !== STRUCTURE_ROAD && s.structureType !== STRUCTURE_CONTAINER && s.structureType !== STRUCTURE_CONTROLLER)) {
-                creep.attack(s);
-                creep.say('⚔️Clear');
-                break; 
-            }
+        var f = new RoomPosition(u.path[0].x, u.path[0].y, e.room.name);
+        var c = f.lookFor(LOOK_STRUCTURES);
+        for (var R = 0; R < c.length; R++) {
+          var p = c[R];
+          if (p.structureType === STRUCTURE_WALL || p.structureType === STRUCTURE_RAMPART && !p.my || p.structureType !== STRUCTURE_ROAD && p.structureType !== STRUCTURE_CONTAINER && p.structureType !== STRUCTURE_CONTROLLER) {
+            e.attack(p);
+            e.say("⚔️Clear");
+            break;
+          }
         }
-        
-        return creep.moveByPath(res.path, { visualizePathStyle: style, maxRooms: 1 });
+        return e.moveByPath(u.path, {
+          visualizePathStyle: r,
+          maxRooms: 1
+        });
       }
-
       if (enableLogging) {
-        console.log(
-          '[' + creep.name + '] PF failed → fallback moveTo (' + pos.x + ',' + pos.y + ')'
-        );
+        console.log("[" + e.name + "] PF failed → fallback moveTo (" + n.x + "," + n.y + ")");
       }
-      return creep.moveTo(pos, { visualizePathStyle: style, maxRooms: 1 });
+      return e.moveTo(n, {
+        visualizePathStyle: r,
+        maxRooms: 1
+      });
     }
-
-    // --- Cross-room travel avoiding banned rooms; safe edge behavior ---
-    // Now supports hardcoded routes
-    function moveToRoomAvoidingBanned(targetRoomName, style) {
-      if (creep.room.name === targetRoomName) return;
-
-      // Abort if target is banned
-      if (isRoomBanned(targetRoomName)) {
-        creep.say('BAN');
+    function moveToRoomAvoidingBanned(o, r) {
+      if (e.room.name === o) return;
+      if (isRoomBanned(o)) {
+        e.say("BAN");
         if (enableLogging) {
-          console.log('[' + creep.name + '] Target room ' + targetRoomName + ' is banned, aborting travel');
+          console.log("[" + e.name + "] Target room " + o + " is banned, aborting travel");
         }
-        if (isOnRoomEdge(creep.pos)) nudgeOffRoomEdge(creep);
+        if (isOnRoomEdge(e.pos)) nudgeOffRoomEdge(e);
         return;
       }
-
-      var route;
-      var nextHop;
-
-      // Check if we have a hardcoded route
-      if (creep.memory.hardcodedRoute && creep.memory.hardcodedRoute.length > 0) {
-        // Update route index based on current room position
-        var hardRoute = creep.memory.hardcodedRoute;
-        var currentIdx = creep.memory.routeIndex || 0;
-        
-        // Advance index if we've reached the current waypoint
-        while (currentIdx < hardRoute.length && creep.room.name === hardRoute[currentIdx]) {
-          currentIdx++;
-          creep.memory.routeIndex = currentIdx;
+      var n;
+      var a;
+      if (e.memory.hardcodedRoute && e.memory.hardcodedRoute.length > 0) {
+        var t = e.memory.hardcodedRoute;
+        var i = e.memory.routeIndex || 0;
+        while (i < t.length && e.room.name === t[i]) {
+          i++;
+          e.memory.routeIndex = i;
         }
-        
-        // If we've completed the hardcoded route, we're done traveling
-        if (currentIdx >= hardRoute.length) {
+        if (i >= t.length) {
           if (enableLogging) {
-            console.log('[' + creep.name + '] Hardcoded route complete');
+            console.log("[" + e.name + "] Hardcoded route complete");
           }
           return;
         }
-        
-        // Get the next room in the hardcoded route
-        var nextRoom = hardRoute[currentIdx];
-        
+        var l = t[i];
         if (enableLogging) {
-          console.log('[' + creep.name + '] Following hardcoded route: step ' + currentIdx + ' → ' + nextRoom);
+          console.log("[" + e.name + "] Following hardcoded route: step " + i + " → " + l);
         }
-        
-        // Find exit to next hardcoded room
-        var exitDir = Game.map.findExit(creep.room.name, nextRoom);
-        if (exitDir === ERR_NO_PATH || exitDir < 0) {
+        var m = Game.map.findExit(e.room.name, l);
+        if (m === ERR_NO_PATH || m < 0) {
           if (enableLogging) {
-            console.log('[' + creep.name + '] No direct exit from ' + creep.room.name + ' to hardcoded next room ' + nextRoom);
+            console.log("[" + e.name + "] No direct exit from " + e.room.name + " to hardcoded next room " + l);
           }
-          // Fallback: use dynamic routing for just this hop
-          route = Game.map.findRoute(creep.room.name, nextRoom, {
-            routeCallback: function(roomName) {
-              if (isRoomBanned(roomName)) return Infinity;
+          n = Game.map.findRoute(e.room.name, l, {
+            routeCallback: function(e) {
+              if (isRoomBanned(e)) return Infinity;
               return 1;
             }
           });
-          if (route === ERR_NO_PATH || !route || !route.length) {
-            if (isOnRoomEdge(creep.pos)) nudgeOffRoomEdge(creep);
+          if (n === ERR_NO_PATH || !n || !n.length) {
+            if (isOnRoomEdge(e.pos)) nudgeOffRoomEdge(e);
             return;
           }
-          nextHop = route[0];
+          a = n[0];
         } else {
-          // Direct exit exists
-          nextHop = { room: nextRoom, exit: exitDir };
+          a = {
+            room: l,
+            exit: m
+          };
         }
       } else {
-        // No hardcoded route - compute safe route that avoids banned rooms
-        route = Game.map.findRoute(creep.room.name, targetRoomName, {
-          routeCallback: function(roomName) {
-            if (isRoomBanned(roomName)) return Infinity;
+        n = Game.map.findRoute(e.room.name, o, {
+          routeCallback: function(e) {
+            if (isRoomBanned(e)) return Infinity;
             return 1;
           }
         });
-
-        // If no route, back away from any edge to stop oscillation
-        if (route === ERR_NO_PATH || !route || !route.length) {
+        if (n === ERR_NO_PATH || !n || !n.length) {
           if (enableLogging) {
-            console.log('[' + creep.name + '] No safe route to ' + targetRoomName);
+            console.log("[" + e.name + "] No safe route to " + o);
           }
-          if (isOnRoomEdge(creep.pos)) nudgeOffRoomEdge(creep);
+          if (isOnRoomEdge(e.pos)) nudgeOffRoomEdge(e);
           return;
         }
-
-        nextHop = route[0];
+        a = n[0];
       }
-
-      var exitDir = Game.map.findExit(creep.room, nextHop.room);
-      if (exitDir === ERR_NO_PATH) {
+      var m = Game.map.findExit(e.room, a.room);
+      if (m === ERR_NO_PATH) {
         if (enableLogging) {
-          console.log('[' + creep.name + '] No exit toward ' + nextHop.room);
+          console.log("[" + e.name + "] No exit toward " + a.room);
         }
-        if (isOnRoomEdge(creep.pos)) nudgeOffRoomEdge(creep);
+        if (isOnRoomEdge(e.pos)) nudgeOffRoomEdge(e);
         return;
       }
-
-      // If we are on an edge that is NOT the chosen exit side, step inward first
-      var onWrongEdge =
-        (creep.pos.y === 0 && exitDir !== FIND_EXIT_TOP) ||
-        (creep.pos.y === 49 && exitDir !== FIND_EXIT_BOTTOM) ||
-        (creep.pos.x === 0 && exitDir !== FIND_EXIT_LEFT) ||
-        (creep.pos.x === 49 && exitDir !== FIND_EXIT_RIGHT);
-
-      if (onWrongEdge) {
-        if (nudgeOffRoomEdge(creep)) return;
+      var s = e.pos.y === 0 && m !== FIND_EXIT_TOP || e.pos.y === 49 && m !== FIND_EXIT_BOTTOM || e.pos.x === 0 && m !== FIND_EXIT_LEFT || e.pos.x === 49 && m !== FIND_EXIT_RIGHT;
+      if (s) {
+        if (nudgeOffRoomEdge(e)) return;
       }
-
-      // Choose a concrete exit tile; prefer pathable choice to avoid oscillation
-      var exitPos = creep.pos.findClosestByPath(exitDir);
-      if (!exitPos) exitPos = creep.pos.findClosestByRange(exitDir);
-
-      if (exitPos) {
-        // Direct move to exit; do not use edge-blocking matrix here
-        creep.moveTo(exitPos, {
-          visualizePathStyle: style,
+      var g = e.pos.findClosestByPath(m);
+      if (!g) g = e.pos.findClosestByRange(m);
+      if (g) {
+        e.moveTo(g, {
+          visualizePathStyle: r,
           reusePath: 5
         });
       }
     }
-
-    // --- moveToController(style) ---
-    function moveToController(style) {
-      var ctrl = creep.room.controller;
-      if (!ctrl) {
-        if (enableLogging) console.log('[' + creep.name + '] no controller here');
+    function moveToController(o) {
+      var r = e.room.controller;
+      if (!r) {
+        if (enableLogging) console.log("[" + e.name + "] no controller here");
         return;
       }
-
-      // If adjacent, clear stored path
-      if (creep.pos.inRangeTo(ctrl, 1)) {
-        if (creep.memory.controllerPath) {
+      if (!heap.claimbotControllerPaths) heap.claimbotControllerPaths = {};
+      var n = heap.claimbotControllerPaths;
+      if (e.memory.controllerPath) delete e.memory.controllerPath;
+      function clearControllerPath() {
+        delete n[e.name];
+      }
+      if (e.pos.inRangeTo(r, 1)) {
+        if (n[e.name]) {
           if (enableLogging) {
-            console.log('[' + creep.name + '] at controller → clearing path');
+            console.log("[" + e.name + "] at controller → clearing path");
           }
-          delete creep.memory.controllerPath;
+          clearControllerPath();
         }
         return;
       }
-
-      // 1) Compute path once on entry
-      if (!creep.memory.controllerPath) {
+      if (!n[e.name]) {
         if (enableLogging) {
-          console.log(
-            '[' + creep.name + '] computing path from (' + creep.pos.x + ',' + creep.pos.y + ') to controller'
-          );
+          console.log("[" + e.name + "] computing path from (" + e.pos.x + "," + e.pos.y + ") to controller");
         }
-        var terrain = Game.map.getRoomTerrain(creep.room.name);
-        var costs = new PathFinder.CostMatrix();
-        for (var y2 = 0; y2 < 50; y2++) {
-          for (var x2 = 0; x2 < 50; x2++) {
-            var t = terrain.get(x2, y2);
-            var c = t === 0 ? 2 : t === 2 ? 10 : 255;
-            if (x2 <= 1 || x2 >= 48 || y2 <= 1 || y2 >= 48) c = 255;
-            costs.set(x2, y2, c);
+        var a = Game.map.getRoomTerrain(e.room.name);
+        var t = new PathFinder.CostMatrix;
+        for (var i = 0; i < 50; i++) {
+          for (var l = 0; l < 50; l++) {
+            var m = a.get(l, i);
+            var s = m === 0 ? 2 : m === 2 ? 10 : 255;
+            if (l <= 1 || l >= 48 || i <= 1 || i >= 48) s = 255;
+            t.set(l, i, s);
           }
         }
-        
-        var structures = creep.room.find(FIND_STRUCTURES);
-        
-        // PASS 1: Obstacles
-        structures.forEach(function(s) {
-           if (s.structureType === STRUCTURE_ROAD) {
-              return; // Skip
-           } else if (s.structureType === STRUCTURE_RAMPART && !s.my) {
-              costs.set(s.pos.x, s.pos.y, 50); 
-           } else if (s.structureType === STRUCTURE_WALL) {
-              costs.set(s.pos.x, s.pos.y, 50);
-           } else if (s.structureType !== STRUCTURE_CONTAINER && s.structureType !== STRUCTURE_CONTROLLER) {
-              costs.set(s.pos.x, s.pos.y, 50);
-           }
+        var g = e.room.find(FIND_STRUCTURES);
+        g.forEach(function(e) {
+          if (e.structureType === STRUCTURE_ROAD) {
+            return;
+          } else if (e.structureType === STRUCTURE_RAMPART && !e.my) {
+            t.set(e.pos.x, e.pos.y, 50);
+          } else if (e.structureType === STRUCTURE_WALL) {
+            t.set(e.pos.x, e.pos.y, 50);
+          } else if (e.structureType !== STRUCTURE_CONTAINER && e.structureType !== STRUCTURE_CONTROLLER) {
+            t.set(e.pos.x, e.pos.y, 50);
+          }
         });
-        
-        // PASS 2: Roads (Overwrite obstacles)
-        structures.forEach(function(s) {
-           if (s.structureType === STRUCTURE_ROAD) {
-              costs.set(s.pos.x, s.pos.y, 1);
-           }
+        g.forEach(function(e) {
+          if (e.structureType === STRUCTURE_ROAD) {
+            t.set(e.pos.x, e.pos.y, 1);
+          }
         });
-
-        var res = PathFinder.search(creep.pos, { pos: ctrl.pos, range: 1 }, {
-          maxOps: 2000,
-          roomCallback: function(rn) { return rn === creep.room.name ? costs : new PathFinder.CostMatrix(); }
+        var u = PathFinder.search(e.pos, {
+          pos: r.pos,
+          range: 1
+        }, {
+          maxOps: 2e3,
+          roomCallback: function(o) {
+            return o === e.room.name ? t : new PathFinder.CostMatrix;
+          }
         });
-        creep.memory.controllerPath = res.path;
+        n[e.name] = u.path;
         if (enableLogging) {
-          console.log(
-            '[' + creep.name + '] stored controllerPath, length=' + res.path.length
-          );
+          console.log("[" + e.name + "] stored controllerPath, length=" + u.path.length);
         }
       }
-
-      // 2) Step one tile
-      var path = creep.memory.controllerPath;
-      if (Array.isArray(path) && path.length > 0) {
-        if (path[0].x === creep.pos.x && path[0].y === creep.pos.y) {
-          path.shift();
+      var f = n[e.name];
+      if (Array.isArray(f) && f.length > 0) {
+        if (f[0].x === e.pos.x && f[0].y === e.pos.y) {
+          f.shift();
         }
-        if (path.length > 0) {
-          var nxt = path[0];
-          
-          // --- AUTO-ATTACK BLOCKERS FOR CONTROLLER PATH ---
-          var nextPos = new RoomPosition(nxt.x, nxt.y, creep.room.name);
-          var structuresAtNext = nextPos.lookFor(LOOK_STRUCTURES);
-          for (var i = 0; i < structuresAtNext.length; i++) {
-            var s = structuresAtNext[i];
-            if (s.structureType === STRUCTURE_WALL || 
-                (s.structureType === STRUCTURE_RAMPART && !s.my) || 
-                (s.structureType !== STRUCTURE_ROAD && s.structureType !== STRUCTURE_CONTAINER && s.structureType !== STRUCTURE_CONTROLLER)) {
-                creep.attack(s);
-                creep.say('⚔️Open');
-                break; 
+        if (f.length > 0) {
+          var c = f[0];
+          var R = new RoomPosition(c.x, c.y, e.room.name);
+          var p = R.lookFor(LOOK_STRUCTURES);
+          for (var d = 0; d < p.length; d++) {
+            var T = p[d];
+            if (T.structureType === STRUCTURE_WALL || T.structureType === STRUCTURE_RAMPART && !T.my || T.structureType !== STRUCTURE_ROAD && T.structureType !== STRUCTURE_CONTAINER && T.structureType !== STRUCTURE_CONTROLLER) {
+              e.attack(T);
+              e.say("⚔️Open");
+              break;
             }
           }
-          
-          var res2 = creep.moveTo(
-            new RoomPosition(nxt.x, nxt.y, creep.room.name),
-            { visualizePathStyle: style, reusePath: 0, maxRooms: 1 }
-          );
+          var h = e.moveTo(new RoomPosition(c.x, c.y, e.room.name), {
+            visualizePathStyle: o,
+            reusePath: 0,
+            maxRooms: 1
+          });
           if (enableLogging) {
-            console.log(
-              '[' + creep.name + '] step→ (' + nxt.x + ',' + nxt.y + ') result=' + res2
-            );
+            console.log("[" + e.name + "] step→ (" + c.x + "," + c.y + ") result=" + h);
           }
-          if (res2 === OK) {
-            path.shift();
+          if (h === OK) {
+            f.shift();
             return;
           }
-          if (res2 !== ERR_TIRED) {
+          if (h !== ERR_TIRED) {
             if (enableLogging) {
-              console.log(
-                '[' + creep.name + '] step error (' + res2 + ') → clearing path'
-              );
+              console.log("[" + e.name + "] step error (" + h + ") → clearing path");
             }
-            delete creep.memory.controllerPath;
+            clearControllerPath();
           }
         }
       }
-
-      // 3) Fallback: direct moveTo(controller) constrained to this room
       if (enableLogging) {
-        console.log('[' + creep.name + '] fallback direct moveTo controller');
+        console.log("[" + e.name + "] fallback direct moveTo controller");
       }
-      creep.moveTo(ctrl, { visualizePathStyle: style, reusePath: 0, maxRooms: 1 });
+      e.moveTo(r, {
+        visualizePathStyle: o,
+        reusePath: 0,
+        maxRooms: 1
+      });
     }
-
-    // --- MAIN BEHAVIOR ---
-
-    // In target room: if on edge, only step inward this tick (prevents accidental exits)
-    if (creep.room.name === targetRoom && isOnRoomEdge(creep.pos)) {
-      if (nudgeOffRoomEdge(creep)) return;
+    if (e.room.name === r && isOnRoomEdge(e.pos)) {
+      if (nudgeOffRoomEdge(e)) return;
     }
-
-    // 1) Travel to target room center
-    if (creep.room.name !== targetRoom) {
+    if (e.room.name !== r) {
       if (enableLogging) {
-        console.log('[' + creep.name + '] traveling to ' + targetRoom);
+        console.log("[" + e.name + "] traveling to " + r);
       }
-      // Route around banned rooms; leave only via chosen exit
-      moveToRoomAvoidingBanned(targetRoom, { stroke: '#ffaa00' });
+      moveToRoomAvoidingBanned(r, {
+        stroke: "#ffaa00"
+      });
       return;
     }
-
-    // 2) Controller logic
-    var controller = creep.room.controller;
-    if (!controller) {
-      if (enableLogging) console.log('[' + creep.name + '] no controller here');
-      creep.say('No ctrl');
+    var n = e.room.controller;
+    if (!n) {
+      if (enableLogging) console.log("[" + e.name + "] no controller here");
+      e.say("No ctrl");
       return;
     }
-
-    // 2a) Enemy-owned → attack
-    if (!controller.my && controller.owner) {
-      if (creep.pos.inRangeTo(controller, 1)) {
+    if (!n.my && n.owner) {
+      if (e.pos.inRangeTo(n, 1)) {
         if (enableLogging) {
-          console.log(
-            '[' + creep.name + '] attacking enemy controller at ' + controller.pos
-          );
+          console.log("[" + e.name + "] attacking enemy controller at " + n.pos);
         }
-        creep.attackController(controller);
-        creep.say('AtkCtrl');
+        e.attackController(n);
+        e.say("AtkCtrl");
       } else {
-        moveToController({ stroke: '#ff00ff' });
+        moveToController({
+          stroke: "#ff00ff"
+        });
       }
       return;
     }
-
-    // 2b) Unowned → claim
-    if (!controller.my && !controller.owner) {
-      if (creep.pos.inRangeTo(controller, 1)) {
+    if (!n.my && !n.owner) {
+      if (e.pos.inRangeTo(n, 1)) {
         if (enableLogging) {
-          console.log(
-            '[' + creep.name + '] claiming controller at ' + controller.pos
-          );
+          console.log("[" + e.name + "] claiming controller at " + n.pos);
         }
-        var resClaim = creep.claimController(controller);
-        if (resClaim === OK) {
-          creep.say('Claimed');
+        var a = e.claimController(n);
+        if (a === OK) {
+          e.say("Claimed");
         } else {
-          creep.say('Err ' + resClaim);
+          e.say("Err " + a);
           if (enableLogging) {
-            console.log('[' + creep.name + '] claim result=' + resClaim);
+            console.log("[" + e.name + "] claim result=" + a);
           }
         }
       } else {
-        moveToController({ stroke: '#00ff00' });
+        moveToController({
+          stroke: "#00ff00"
+        });
       }
       return;
     }
-
-    // 2c) Already ours → done
-    if (controller.my) {
-      if (enableLogging) console.log('[' + creep.name + '] controller mine → suiciding');
-      creep.say('Done');
-      creep.suicide();
+    if (n.my) {
+      if (heap.claimbotControllerPaths) delete heap.claimbotControllerPaths[e.name];
+      if (enableLogging) console.log("[" + e.name + "] controller mine → suiciding");
+      e.say("Done");
+      e.suicide();
     }
   }
 };
+roleClaimbot.clearCreepCache = function(e) {
+  if (heap.claimbotControllerPaths) delete heap.claimbotControllerPaths[e];
+};
+global.launchClaimbot = roleClaimbot.spawn;
+module.exports = roleClaimbot;

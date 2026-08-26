@@ -1,217 +1,170 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // linkManager.js
-/**
- * Link manager:
- * - Donor links feed storage links only (keep donors near 0).
- * - Storage links feed recipient (controller) links only (keep recipients full).
- * - Minimum transfer is 5.
- * - At most one successful send per room per tick.
- *
- * Uses getRoomState for cached structure lookups.
- */
-
-var getRoomState = require('getRoomState');
-var singleSourceRoom = require('singleSourceRoom');
-
-// Heap cache: survives between ticks, never serialized to Memory.
-// Structure: { [roomName]: { donors: [], storage: [], recipients: [], lastUpdated: tick } }
+var getRoomState = require("getRoomState");
+var singleSourceRoom = require("singleSourceRoom");
+var roomSuspender = require("roomSuspender");
 var _linkCache = {};
-
 function runLinks() {
-  const MIN_TRANSFER = 200;
-  const CACHE_DURATION = 50; // Refresh link classifications every 50 ticks
-
-  function energyOf(link) {
-    if (link && link.store && typeof link.store.getUsedCapacity === 'function') {
-      var used = link.store.getUsedCapacity(RESOURCE_ENERGY);
-      return typeof used === 'number' ? used : 0;
+  const e = 200;
+  const r = 50;
+  function energyOf(e) {
+    if (e && e.store && typeof e.store.getUsedCapacity === "function") {
+      var r = e.store.getUsedCapacity(RESOURCE_ENERGY);
+      return typeof r === "number" ? r : 0;
     }
-    if (link && typeof link.energy === 'number') return link.energy;
+    if (e && typeof e.energy === "number") return e.energy;
     return 0;
   }
-
-  function freeOf(link) {
-    if (link && link.store && typeof link.store.getFreeCapacity === 'function') {
-      var free = link.store.getFreeCapacity(RESOURCE_ENERGY);
-      return typeof free === 'number' ? free : 0;
+  function freeOf(e) {
+    if (e && e.store && typeof e.store.getFreeCapacity === "function") {
+      var r = e.store.getFreeCapacity(RESOURCE_ENERGY);
+      return typeof r === "number" ? r : 0;
     }
-    if (link && typeof link.energyCapacity === 'number' && typeof link.energy === 'number') {
-      return link.energyCapacity - link.energy;
+    if (e && typeof e.energyCapacity === "number" && typeof e.energy === "number") {
+      return e.energyCapacity - e.energy;
     }
     return 0;
   }
-
-  function canSend(sender) {
-    if (!sender) return false;
-    if (sender.cooldown && sender.cooldown > 0) return false;
-    return energyOf(sender) >= MIN_TRANSFER;
+  function canSend(r) {
+    if (!r) return false;
+    if (r.cooldown && r.cooldown > 0) return false;
+    return energyOf(r) >= e;
   }
-
-  function canReceive(target) {
-    if (!target) return false;
-    return freeOf(target) >= MIN_TRANSFER;
+  function canReceive(r) {
+    if (!r) return false;
+    return freeOf(r) >= e;
   }
-
-  // Ensure getRoomState is initialized
   getRoomState.init();
-  var allRoomStates = getRoomState.all();
-
-  for (var roomName in allRoomStates) {
-    var roomState = allRoomStates[roomName];
-    if (!roomState) continue;
-
-    var controller = roomState.controller;
-    var storage = roomState.storage;
-    var sources = roomState.sources || [];
-
-    // Get links from cached structures
-    var structuresByType = roomState.structuresByType || {};
-    var allLinks = structuresByType[STRUCTURE_LINK] || [];
-
-    // Skip if no links
-    if (allLinks.length === 0) continue;
-
-    // === CHAIN MODE for single-source rooms ===
-    if (singleSourceRoom.isSingleSourceActive(roomName)) {
-        var chain = singleSourceRoom.getLinkChain(roomName);
-        if (chain && chain.length >= 2) {
-            for (var ci = 0; ci < chain.length - 1; ci++) {
-                var sender = Game.getObjectById(chain[ci]);
-                var receiver = Game.getObjectById(chain[ci + 1]);
-                if (!sender || !receiver) continue;
-                if (sender.cooldown && sender.cooldown > 0) continue;
-                if (energyOf(sender) < MIN_TRANSFER) continue;
-                if (freeOf(receiver) < MIN_TRANSFER) continue;
-                var chainRes = sender.transferEnergy(receiver);
-                if (chainRes === OK) break; // one transfer per room per tick
-            }
-            continue;
+  var n = getRoomState.ownedNames();
+  for (var o = 0; o < n.length; o++) {
+    var t = n[o];
+    var a = getRoomState.get(t);
+    if (!a) continue;
+    if (roomSuspender.shouldAvoidRoomWork(t)) continue;
+    var i = a.controller;
+    var f = a.storage;
+    var u = a.sources || [];
+    var v = a.structuresByType || {};
+    var c = v[STRUCTURE_LINK] || [];
+    if (c.length === 0) continue;
+    if (singleSourceRoom.isSingleSourceActive(t)) {
+      var s = singleSourceRoom.getLinkChain(t);
+      if (s && s.length >= 2) {
+        for (var g = 0; g < s.length - 1; g++) {
+          var l = Game.getObjectById(s[g]);
+          var d = Game.getObjectById(s[g + 1]);
+          if (!l || !d) continue;
+          if (l.cooldown && l.cooldown > 0) continue;
+          if (energyOf(l) < e) continue;
+          if (freeOf(d) < e) continue;
+          var m = l.transferEnergy(d);
+          if (m === OK) break;
         }
+        continue;
+      }
     }
-
-    var room = Game.rooms[roomName];
-    if (!room) continue;
-
-    // Rebuild heap cache if missing or stale
-    var cached = _linkCache[roomName];
-    if (!cached || (Game.time - cached.lastUpdated) >= CACHE_DURATION) {
-      cached = { donors: [], storage: [], recipients: [], lastUpdated: Game.time };
-
-      for (var i = 0; i < allLinks.length; i++) {
-        var link = allLinks[i];
-
-        // Classify as recipient (near controller)
-        if (controller && link.pos.inRangeTo(controller, 2)) {
-          cached.recipients.push(link.id);
-        }
-        // Classify as storage link
-        else if (storage && link.pos.inRangeTo(storage, 2)) {
-          cached.storage.push(link.id);
-        }
-        // Classify as donor (near source)
-        else {
-          for (var s = 0; s < sources.length; s++) {
-            if (link.pos.inRangeTo(sources[s], 3)) {
-              cached.donors.push(link.id);
+    var y = Game.rooms[t];
+    if (!y) continue;
+    var p = _linkCache[t];
+    if (!p || Game.time - p.lastUpdated >= r) {
+      p = {
+        donors: [],
+        storage: [],
+        recipients: [],
+        lastUpdated: Game.time
+      };
+      for (var R = 0; R < c.length; R++) {
+        var h = c[R];
+        if (i && h.pos.inRangeTo(i, 2)) {
+          p.recipients.push(h.id);
+        } else if (f && h.pos.inRangeTo(f, 2)) {
+          p.storage.push(h.id);
+        } else {
+          for (var S = 0; S < u.length; S++) {
+            if (h.pos.inRangeTo(u[S], 3)) {
+              p.donors.push(h.id);
               break;
             }
           }
         }
       }
-
-      _linkCache[roomName] = cached;
+      _linkCache[t] = p;
     }
-
-    // Resolve IDs to live objects each tick (getObjectById is cheap)
-    var donors = [];
-    var storageLinks = [];
-    var recipients = [];
-
-    for (var d = 0; d < cached.donors.length; d++) {
-      var donorLink = Game.getObjectById(cached.donors[d]);
-      if (donorLink) donors.push(donorLink);
+    var O = [];
+    var C = [];
+    var b = [];
+    for (var E = 0; E < p.donors.length; E++) {
+      var k = Game.getObjectById(p.donors[E]);
+      if (k) O.push(k);
     }
-
-    for (var st = 0; st < cached.storage.length; st++) {
-      var storageLink = Game.getObjectById(cached.storage[st]);
-      if (storageLink) storageLinks.push(storageLink);
+    for (var G = 0; G < p.storage.length; G++) {
+      var U = Game.getObjectById(p.storage[G]);
+      if (U) C.push(U);
     }
-
-    for (var r = 0; r < cached.recipients.length; r++) {
-      var recipientLink = Game.getObjectById(cached.recipients[r]);
-      if (recipientLink) recipients.push(recipientLink);
+    for (var _ = 0; _ < p.recipients.length; _++) {
+      var B = Game.getObjectById(p.recipients[_]);
+      if (B) b.push(B);
     }
-
-    // Find best donor (highest energy that can send)
-    var bestDonor = null;
-    var bestDonorEnergy = 0;
-    for (var dIdx = 0; dIdx < donors.length; dIdx++) {
-      var donor = donors[dIdx];
-      if (canSend(donor)) {
-        var donorEnergy = energyOf(donor);
-        if (donorEnergy > bestDonorEnergy) {
-          bestDonor = donor;
-          bestDonorEnergy = donorEnergy;
+    var I = null;
+    var T = 0;
+    for (var j = 0; j < O.length; j++) {
+      var w = O[j];
+      if (canSend(w)) {
+        var L = energyOf(w);
+        if (L > T) {
+          I = w;
+          T = L;
         }
       }
     }
-
-    // Find best storage target (most free space that can receive)
-    var bestStorage = null;
-    var bestStorageFree = 0;
-    for (var sIdx = 0; sIdx < storageLinks.length; sIdx++) {
-      var storageTarget = storageLinks[sIdx];
-      if (canReceive(storageTarget)) {
-        var storageFree = freeOf(storageTarget);
-        if (storageFree > bestStorageFree) {
-          bestStorage = storageTarget;
-          bestStorageFree = storageFree;
+    var N = null;
+    var q = 0;
+    for (var K = 0; K < C.length; K++) {
+      var A = C[K];
+      if (canReceive(A)) {
+        var F = freeOf(A);
+        if (F > q) {
+          N = A;
+          q = F;
         }
       }
     }
-
-    // Try donor → storage (1 intent max)
-    if (bestDonor && bestStorage) {
-      var res = bestDonor.transferEnergy(bestStorage);
-      if (res === OK) continue; // One intent per room, move to next room
+    if (I && N) {
+      var Y = I.transferEnergy(N);
+      if (Y === OK) continue;
     }
-
-    // Try storage → recipient (only if no donor sent)
-    var bestStorageSender = null;
-    var bestStorageSenderEnergy = 0;
-    for (var seIdx = 0; seIdx < storageLinks.length; seIdx++) {
-      var storageSender = storageLinks[seIdx];
-      if (canSend(storageSender)) {
-        var senderEnergy = energyOf(storageSender);
-        if (senderEnergy > bestStorageSenderEnergy) {
-          bestStorageSender = storageSender;
-          bestStorageSenderEnergy = senderEnergy;
+    var x = null;
+    var W = 0;
+    for (var z = 0; z < C.length; z++) {
+      var D = C[z];
+      if (canSend(D)) {
+        var H = energyOf(D);
+        if (H > W) {
+          x = D;
+          W = H;
         }
       }
     }
-
-    var bestRecipient = null;
-    var bestRecipientFree = 0;
-    for (var rIdx = 0; rIdx < recipients.length; rIdx++) {
-      var recipient = recipients[rIdx];
-      if (canReceive(recipient)) {
-        var recipientFree = freeOf(recipient);
-        if (recipientFree > bestRecipientFree) {
-          bestRecipient = recipient;
-          bestRecipientFree = recipientFree;
+    var J = null;
+    var M = 0;
+    for (var P = 0; P < b.length; P++) {
+      var Q = b[P];
+      if (canReceive(Q)) {
+        var V = freeOf(Q);
+        if (V > M) {
+          J = Q;
+          M = V;
         }
       }
     }
-
-    if (bestStorageSender && bestRecipient) {
-      bestStorageSender.transferEnergy(bestRecipient);
-      // One intent per room (implicit continue at end of loop)
+    if (x && J) {
+      x.transferEnergy(J);
     }
   }
 }
 
-// Expose cache invalidation for when structures change (e.g. new link placed)
-function invalidateRoom(roomName) {
-  delete _linkCache[roomName];
+function invalidateRoom(e) {
+  delete _linkCache[e];
 }
 
 module.exports = {

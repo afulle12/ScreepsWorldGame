@@ -1,694 +1,642 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // roleComboBot.js
-// ============================================================================
-// ComboBot — Stationary multi-role for 1-source RCL 8 rooms.
-var getRoomState = require('getRoomState');
-
+// Role dispatch: memory.role === 'comboBot' -> roleComboBot.run(creep).
+// Example: require('roleComboBot').run(creep);
+// Example: require('roleComboBot').run(creep);
+var getRoomState = require("getRoomState");
+var util = require("util");
+var factoryManager = require("factoryManager");
 var LINK_FEED_THRESHOLD = 600;
-var TERMINAL_LOW = 19000;
-var TERMINAL_HIGH = 21000;
-
+var TERMINAL_LOW = 19e3;
+var TERMINAL_HIGH = 21e3;
 var neighborCache = {};
 var neighborCacheLastPrune = 0;
-
-// Per-tick caches (reset automatically when Game.time changes)
 var _recipeCache = {};
-var _factoryOrderCache = { tick: -1 };
-var _termNeedCache = { tick: -1 };
-var _toStorageCache = { tick: -1 };
-
-function getRecipe(product) {
-    if (!product) return null;
-    if (_recipeCache[product] !== undefined) return _recipeCache[product];
-
-    var result = null;
-    if (typeof COMMODITIES !== 'undefined' && COMMODITIES[product]) {
-        var c = COMMODITIES[product];
-        var inputs = {};
-        var components = c.components || {};
-        for (var res in components) {
-            if (components.hasOwnProperty(res)) inputs[res] = components[res];
-        }
-        result = { inputs: inputs, out: c.amount || 1 };
+var _factoryOrderCache = {
+  tick: -1
+};
+var _termNeedCache = {
+  tick: -1
+};
+var _toStorageCache = {
+  tick: -1
+};
+function getRecipe(e) {
+  if (!e) return null;
+  if (_recipeCache[e] !== undefined) return _recipeCache[e];
+  var r = null;
+  if (typeof COMMODITIES !== "undefined" && COMMODITIES[e]) {
+    var t = COMMODITIES[e];
+    var a = {};
+    var i = t.components || {};
+    for (var o in i) {
+      if (i.hasOwnProperty(o)) a[o] = i[o];
     }
-    _recipeCache[product] = result;
-    return result;
+    r = {
+      inputs: a,
+      out: t.amount || 1
+    };
+  }
+  _recipeCache[e] = r;
+  return r;
 }
 
-// Fallback lookups when getRoomState is missing structures
-function findAdjacentSpawn(creep) {
-    var nearSpawns = creep.pos.findInRange(FIND_MY_SPAWNS, 1);
-    return nearSpawns.length > 0 ? nearSpawns[0] : null;
+function findAdjacentSpawn(e) {
+  var r = e.pos.findInRange(FIND_MY_SPAWNS, 1);
+  return r.length > 0 ? r[0] : null;
 }
 
-function findAdjacentMineral(creep) {
-    var nearMinerals = creep.pos.findInRange(FIND_MINERALS, 1);
-    return nearMinerals.length > 0 ? nearMinerals[0] : null;
+function findAdjacentMineral(e) {
+  var r = e.pos.findInRange(FIND_MINERALS, 1);
+  return r.length > 0 ? r[0] : null;
 }
 
 module.exports = {
-    run: function(creep) {
-        if (creep.spawning) return;
-
-        // Prune dead entries
-        if (Game.time - neighborCacheLastPrune > 200) {
-            neighborCacheLastPrune = Game.time;
-            for (var name in neighborCache) {
-                if (!Game.creeps[name]) delete neighborCache[name];
-            }
-        }
-
-        var state = getRoomState.get(creep.room.name);
-        if (!state) return;
-
-        var hood = this.getNeighbors(creep, state);
-
-        // === BODY TYPE (cached once) ===
-        if (creep.memory._hasWork === undefined) {
-            var hw = false;
-            for (var bp = 0; bp < creep.body.length; bp++) {
-                if (creep.body[bp].type === WORK) { hw = true; break; }
-            }
-            creep.memory._hasWork = hw;
-        }
-        var hasWorkParts = creep.memory._hasWork;
-
-        // === MINERAL STATUS (with fallback lookup) ===
-        var mineral = hood.mineral || findAdjacentMineral(creep);
-        var mineralExhausted = false;
-        var mineralCooldownHigh = false;
-        if (mineral) {
-            if (mineral.mineralAmount === 0) {
-                mineralExhausted = true;
-                if (mineral.ticksToRegeneration === undefined || mineral.ticksToRegeneration >= 300) {
-                    mineralCooldownHigh = true;
-                }
-            }
-        }
-
-        // === LIFECYCLE: Mining body suicide when mineral exhausted ===
-        if (hasWorkParts && mineralExhausted && mineralCooldownHigh) {
-            // Deposit any non-energy resources first
-            for (var res in creep.store) {
-                if (res === RESOURCE_ENERGY) continue;
-                if ((creep.store[res] || 0) <= 0) continue;
-                if (hood.factory && hood.factory.store && hood.factory.store.getFreeCapacity() > 0) {
-                    creep.transfer(hood.factory, res); return;
-                }
-                if (hood.terminal && hood.terminal.store && hood.terminal.store.getFreeCapacity() > 0) {
-                    creep.transfer(hood.terminal, res); return;
-                }
-                if (hood.storage && hood.storage.store && hood.storage.store.getFreeCapacity() > 0) {
-                    creep.transfer(hood.storage, res); return;
-                }
-            }
-            // Dump energy
-            if ((creep.store[RESOURCE_ENERGY] || 0) > 0) {
-                if (hood.storage && hood.storage.store && hood.storage.store.getFreeCapacity() > 0) {
-                    creep.transfer(hood.storage, RESOURCE_ENERGY); return;
-                }
-                if (hood.link && hood.link.store && hood.link.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                    creep.transfer(hood.link, RESOURCE_ENERGY); return;
-                }
-            }
-            console.log('[ComboBot] ' + creep.name + ' minerals exhausted, suiciding for carry-only respawn');
-            creep.suicide();
-            return;
-        }
-
-        // === LIFECYCLE: Renewal (mining body only, with fallback spawn lookup) ===
-        if (hasWorkParts && creep.ticksToLive < 1400) {
-            // Skip renewal if mineral will be exhausted within ~200 ticks
-            var skipRenew = false;
-            if (mineral && mineral.mineralAmount > 0) {
-                var workCount = 0;
-                for (var wp = 0; wp < creep.body.length; wp++) {
-                    if (creep.body[wp].type === WORK && creep.body[wp].hits > 0) workCount++;
-                }
-                if (workCount > 0) {
-                    // Extractor cooldown is 5 ticks, each WORK part harvests 1 per action
-                    var ticksToDepletion = (mineral.mineralAmount * 5) / workCount;
-                    if (ticksToDepletion <= 200) skipRenew = true;
-                }
-            }
-            if (!skipRenew) {
-                var renewSpawn = hood.spawn || findAdjacentSpawn(creep);
-                if (renewSpawn && !renewSpawn.spawning) {
-                    var renewResult = renewSpawn.renewCreep(creep);
-                    if (renewResult === OK) creep.say('♻️');
-                }
-            }
-            // fall through — creep harvests and keeps spawn fed on the same tick
-        }
-        // Carry-only body: never renews, dies naturally, respawns with correct body
-
-        // ================================================================
-        // MAIN LOGIC — identical for both body types
-        // ================================================================
-
-        var carrying = creep.store.getUsedCapacity() || 0;
-        var carryingEnergy = creep.store[RESOURCE_ENERGY] || 0;
-        var freeCapacity = creep.store.getFreeCapacity() || 0;
-
-        var hasTerminal = !!(hood.terminal && hood.terminal.store);
-        var hasStorage = !!(hood.storage && hood.storage.store);
-        var hasFactory = !!(hood.factory && hood.factory.store);
-        var hasLink = !!(hood.link && hood.link.store);
-
-        var linkEnergy = hasLink ? (hood.link.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-        var terminalEnergy = hasTerminal ? (hood.terminal.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-
-        var factoryOrder = this.getActiveFactoryOrder(creep.room.name);
-        var factoryProduct = factoryOrder ? factoryOrder.product : null;
-
-        // === HARVEST (only if work parts AND mineral available) ===
-        if (hasWorkParts && mineral && hood.extractor && freeCapacity > 0) {
-            if (mineral.mineralAmount > 0 && (!hood.extractor.cooldown || hood.extractor.cooldown === 0)) {
-                creep.harvest(mineral);
-            }
-        }
-
-        // === TRANSFER (one per tick, priority order) ===
-        var transferred = false;
-
-        // P1: Spawn needs energy
-        if (!transferred && hood.spawn && carryingEnergy > 0) {
-            if (hood.spawn.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                creep.transfer(hood.spawn, RESOURCE_ENERGY);
-                transferred = true;
-            }
-        }
-
-        // P2: Extensions need energy
-        if (!transferred && carryingEnergy > 0) {
-            for (var e = 0; e < hood.extensions.length; e++) {
-                if (hood.extensions[e].store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                    creep.transfer(hood.extensions[e], RESOURCE_ENERGY);
-                    transferred = true;
-                    break;
-                }
-            }
-        }
-
-        // P2b: Active transfer/toTerminal op — deposit to terminal immediately before P3/P7b can intercept
-        if (!transferred && hasTerminal) {
-            var termRes = this.getTerminalTransferNeed(creep.room.name);
-            if (termRes && (creep.store[termRes] || 0) > 0 && hood.terminal.store.getFreeCapacity() > 0) {
-                var p2bAmt = creep.store[termRes] || 0;
-                var p2bResult = creep.transfer(hood.terminal, termRes);
-                if (p2bResult === OK) {
-                    this.recordLocalOpProgress(creep.room.name, 'toTerminal', termRes, p2bAmt);
-                }
-                transferred = true;
-            }
-        }
-
-        // P3: Carrying mined mineral — deposit immediately so it doesn't clog carry
-        if (!transferred) {
-            var mineralType = mineral ? mineral.mineralType : null;
-            if (mineralType && (creep.store[mineralType] || 0) > 0) {
-                if (hasFactory && factoryOrder) {
-                    var recipe = getRecipe(factoryProduct);
-                    if (recipe && recipe.inputs[mineralType]) {
-                        var factoryHas = hood.factory.store[mineralType] || 0;
-                        var cycleBatches = Math.max(1, factoryOrder.cycleBatches || 1);
-                        var mineralNeed = recipe.inputs[mineralType] * cycleBatches;
-                        if (factoryHas < mineralNeed) {
-                            var factoryFree = hood.factory.store.getFreeCapacity ? (hood.factory.store.getFreeCapacity() || 0) : creep.store[mineralType];
-                            var transferAmount = Math.min(creep.store[mineralType] || 0, mineralNeed - factoryHas, factoryFree);
-                            if (transferAmount > 0) {
-                                creep.transfer(hood.factory, mineralType, transferAmount);
-                                transferred = true;
-                            }
-                        }
-                    }
-                }
-                if (!transferred) {
-                    if (hasTerminal && hood.terminal.store.getFreeCapacity() > 0) {
-                        creep.transfer(hood.terminal, mineralType);
-                        transferred = true;
-                    } else if (hasStorage && hood.storage.store.getFreeCapacity() > 0) {
-                        creep.transfer(hood.storage, mineralType);
-                        transferred = true;
-                    }
-                }
-            }
-        }
-
-        // P4: Link below threshold — feed it
-        if (!transferred && hasLink && carryingEnergy > 0 && linkEnergy < LINK_FEED_THRESHOLD) {
-            creep.transfer(hood.link, RESOURCE_ENERGY);
-            transferred = true;
-        }
-
-        // P5: Terminal below 19000 — feed it
-        if (!transferred && hasTerminal && carryingEnergy > 0 && terminalEnergy < TERMINAL_LOW) {
-            creep.transfer(hood.terminal, RESOURCE_ENERGY);
-            transferred = true;
-        }
-
-        // P6: Factory needs input (active order)
-        if (!transferred && hasFactory && factoryOrder) {
-            if (this.tryTransferFactoryInput(creep, hood.factory, factoryOrder)) transferred = true;
-        }
-
-        // P7: Carrying factory product — deposit to storage (preferred) / terminal
-        if (!transferred && hasFactory && factoryProduct && (creep.store[factoryProduct] || 0) > 0) {
-            if (hasStorage && hood.storage.store.getFreeCapacity() > 0) {
-                creep.transfer(hood.storage, factoryProduct);
-                transferred = true;
-            } else if (hasTerminal && hood.terminal.store.getFreeCapacity() > 0) {
-                creep.transfer(hood.terminal, factoryProduct);
-                transferred = true;
-            }
-        }
-
-        // P7b: No active factory order — dump any leftover factory resources to storage
-        if (!transferred && hasFactory && !factoryOrder && hasStorage) {
-            for (var fCleanRes in creep.store) {
-                if (fCleanRes === RESOURCE_ENERGY) continue;
-                if ((creep.store[fCleanRes] || 0) <= 0) continue;
-                if (hood.storage.store.getFreeCapacity() > 0) {
-                    creep.transfer(hood.storage, fCleanRes);
-                    transferred = true;
-                    break;
-                }
-            }
-        }
-
-        // P8: toStorage op — deposit carried resource to storage
-        if (!transferred && hasStorage) {
-            var toStorageInfo = this.getTerminalToStorageNeed(creep.room.name);
-            if (toStorageInfo && (creep.store[toStorageInfo.resource] || 0) > 0) {
-                if (hood.storage.store.getFreeCapacity() > 0) {
-                    var p8Amt = creep.store[toStorageInfo.resource] || 0;
-                    var p8Result = creep.transfer(hood.storage, toStorageInfo.resource);
-                    if (p8Result === OK) {
-                        this.recordLocalOpProgress(creep.room.name, 'toStorage', toStorageInfo.resource, p8Amt);
-                    }
-                    transferred = true;
-                }
-            }
-        }
-
-        // P9: Dump misc resources to terminal/storage
-        if (!transferred && carrying > carryingEnergy && carrying > 0) {
-            for (var dumpRes in creep.store) {
-                if (dumpRes === RESOURCE_ENERGY) continue;
-                if ((creep.store[dumpRes] || 0) <= 0) continue;
-                if (hasTerminal && hood.terminal.store.getFreeCapacity() > 0) {
-                    creep.transfer(hood.terminal, dumpRes);
-                } else if (hasStorage && hood.storage.store.getFreeCapacity() > 0) {
-                    creep.transfer(hood.storage, dumpRes);
-                }
-                transferred = true;
-                break;
-            }
-        }
-
-        // P10: Excess energy — deposit to storage
-        if (!transferred && hasStorage && carryingEnergy > 0) {
-            if (hood.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-                var p10Result = creep.transfer(hood.storage, RESOURCE_ENERGY);
-                if (p10Result === OK) {
-                    // Credit energy toStorage ops (e.g. autobalance) when W4 drains naturally
-                    this.recordLocalOpProgress(creep.room.name, 'toStorage', RESOURCE_ENERGY, carryingEnergy);
-                }
-                transferred = true;
-            }
-        }
-
-        // === WITHDRAW (one per tick, priority order) ===
-        var withdrawn = false;
-
-        // W1: Spawn/extensions need energy — withdraw from link (targeted amount)
-        if (!withdrawn && hasLink && freeCapacity > 0) {
-            var spawnNeed = (hood.spawn && hood.spawn.store.getFreeCapacity(RESOURCE_ENERGY) > 0)
-                ? hood.spawn.store.getFreeCapacity(RESOURCE_ENERGY) : 0;
-            var extNeed = 0;
-            for (var we = 0; we < hood.extensions.length; we++) {
-                extNeed += hood.extensions[we].store.getFreeCapacity(RESOURCE_ENERGY) || 0;
-            }
-            if (spawnNeed + extNeed > 0) {
-                var linkHas = hood.link.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
-                var pullAmount = Math.min(spawnNeed + extNeed, freeCapacity, linkHas);
-                if (pullAmount > 0) {
-                    creep.withdraw(hood.link, RESOURCE_ENERGY, pullAmount);
-                    withdrawn = true;
-                }
-            }
-        }
-
-        // W2: Link has excess energy — drain overflow to storage
-        if (!withdrawn && hasLink && freeCapacity > 0 && linkEnergy > LINK_FEED_THRESHOLD) {
-            var pullAmt = Math.min(linkEnergy - LINK_FEED_THRESHOLD, freeCapacity);
-            if (pullAmt > 0) {
-                creep.withdraw(hood.link, RESOURCE_ENERGY, pullAmt);
-                withdrawn = true;
-            }
-        }
-
-        // W3: Link needs energy but storage has it — withdraw from storage
-        if (!withdrawn && hasStorage && hasLink && linkEnergy < LINK_FEED_THRESHOLD && freeCapacity > 0) {
-            if ((hood.storage.store[RESOURCE_ENERGY] || 0) > 0) {
-                creep.withdraw(hood.storage, RESOURCE_ENERGY);
-                withdrawn = true;
-            }
-        }
-
-        // W4: Terminal above 21000 — drain excess (reserve space for link top-off)
-        if (!withdrawn && hasTerminal && terminalEnergy > TERMINAL_HIGH && freeCapacity > 0) {
-            var excess = terminalEnergy - TERMINAL_HIGH;
-            var linkDeficit = (hasLink && linkEnergy < LINK_FEED_THRESHOLD)
-                ? LINK_FEED_THRESHOLD - linkEnergy : 0;
-            var toWithdraw = Math.min(excess, freeCapacity - linkDeficit);
-            if (toWithdraw > 0) {
-                creep.withdraw(hood.terminal, RESOURCE_ENERGY, toWithdraw);
-                withdrawn = true;
-            }
-        }
-
-        // W5: Factory has product — evacuate
-        if (!withdrawn && hasFactory && factoryProduct && freeCapacity > 0) {
-            var productInFactory = hood.factory.store[factoryProduct] || 0;
-            if (productInFactory > 0) {
-                creep.withdraw(hood.factory, factoryProduct);
-                withdrawn = true;
-            }
-        }
-
-        // W5b: No active factory order — evacuate any leftover resources
-        if (!withdrawn && hasFactory && !factoryOrder && freeCapacity > 0) {
-            for (var fEvacRes in hood.factory.store) {
-                if (fEvacRes === RESOURCE_ENERGY) continue;
-                if ((hood.factory.store[fEvacRes] || 0) <= 0) continue;
-                creep.withdraw(hood.factory, fEvacRes);
-                withdrawn = true;
-                break;
-            }
-        }
-
-        // W6: toStorage op — pull resource from terminal into creep
-        if (!withdrawn && hasTerminal && freeCapacity > 0) {
-            var toStorageW = this.getTerminalToStorageNeed(creep.room.name);
-            if (toStorageW) {
-                var termHasW = hood.terminal.store[toStorageW.resource] || 0;
-                if (termHasW > 0) {
-                    var w6Amt = Math.min(termHasW, freeCapacity, toStorageW.remaining);
-                    if (w6Amt > 0) {
-                        creep.withdraw(hood.terminal, toStorageW.resource, w6Amt);
-                        withdrawn = true;
-                    }
-                }
-            }
-        }
-
-        // W7: Transfer op needs resource — withdraw from storage (before energy band fill)
-        if (!withdrawn && hasStorage && freeCapacity > 0) {
-            var termRes2 = this.getTerminalTransferNeed(creep.room.name);
-            if (termRes2 && (hood.storage.store[termRes2] || 0) > 0) {
-                creep.withdraw(hood.storage, termRes2);
-                withdrawn = true;
-            }
-        }
-
-        // W8: Need energy for terminal — withdraw from storage
-        if (!withdrawn && hasStorage && hasTerminal && terminalEnergy < TERMINAL_LOW && freeCapacity > 0) {
-            if ((hood.storage.store[RESOURCE_ENERGY] || 0) > 0) {
-                creep.withdraw(hood.storage, RESOURCE_ENERGY);
-                withdrawn = true;
-            }
-        }
-
-        // W9: Factory order needs input — withdraw from terminal/storage
-        if (!withdrawn && factoryOrder && hasFactory && freeCapacity > 0) {
-            if (this.tryWithdrawFactoryInput(creep, hood, factoryOrder)) withdrawn = true;
-        }
-
-        // === IDLE ===
-        if (!transferred && !withdrawn) {
-            if (Game.time % 20 === 0) creep.say('💤');
-        }
-    },
-
-    // ============================================================================
-    // Factory Helpers (with per-tick cache)
-    // ============================================================================
-
-    getActiveFactoryOrder: function(roomName) {
-        if (_factoryOrderCache.tick === Game.time && _factoryOrderCache[roomName] !== undefined) {
-            return _factoryOrderCache[roomName];
-        }
-        if (_factoryOrderCache.tick !== Game.time) {
-            _factoryOrderCache = { tick: Game.time };
-        }
-
-        var orders = Memory.factoryOrders || [];
-        var result = null;
-        for (var i = 0; i < orders.length; i++) {
-            var o = orders[i];
-            if (o && o.room === roomName && o.status === 'active') { result = o; break; }
-        }
-        _factoryOrderCache[roomName] = result;
-        return result;
-    },
-
-    tryTransferFactoryInput: function(creep, factory, order) {
-        var recipe = getRecipe(order.product);
-        if (!recipe || !recipe.inputs) return false;
-        var cycleBatches = Math.max(1, order.cycleBatches || 1);
-        for (var res in recipe.inputs) {
-            var need = (recipe.inputs[res] || 0) * cycleBatches;
-            var factoryHas = factory.store[res] || 0;
-            var deficit = need - factoryHas;
-            if (deficit <= 0) continue;
-            var creepHas = creep.store[res] || 0;
-            if (creepHas > 0) {
-                var free = factory.store.getFreeCapacity ? (factory.store.getFreeCapacity() || 0) : creepHas;
-                var amount = Math.min(creepHas, deficit, free);
-                if (amount <= 0) return false;
-                creep.transfer(factory, res, amount);
-                return true;
-            }
-        }
-        return false;
-    },
-
-    tryWithdrawFactoryInput: function(creep, hood, order) {
-        var recipe = getRecipe(order.product);
-        if (!recipe || !recipe.inputs) return false;
-        var cycleBatches = Math.max(1, order.cycleBatches || 1);
-        var bestRes = null;
-        var bestDeficit = 0;
-        for (var res in recipe.inputs) {
-            var need = (recipe.inputs[res] || 0) * cycleBatches;
-            var factoryHas = hood.factory ? (hood.factory.store[res] || 0) : 0;
-            var deficit = need - factoryHas;
-            if (deficit > bestDeficit) { bestDeficit = deficit; bestRes = res; }
-        }
-        if (!bestRes) return false;
-        var factoryFree = hood.factory && hood.factory.store && hood.factory.store.getFreeCapacity
-            ? (hood.factory.store.getFreeCapacity() || 0) : creep.store.getFreeCapacity();
-        var amount = Math.min(bestDeficit, factoryFree, creep.store.getFreeCapacity());
-        if (amount <= 0) return false;
-        if (hood.terminal && hood.terminal.store && (hood.terminal.store[bestRes] || 0) > 0) {
-            creep.withdraw(hood.terminal, bestRes, Math.min(amount, hood.terminal.store[bestRes] || 0)); return true;
-        }
-        if (hood.storage && hood.storage.store && (hood.storage.store[bestRes] || 0) > 0) {
-            creep.withdraw(hood.storage, bestRes, Math.min(amount, hood.storage.store[bestRes] || 0)); return true;
-        }
-        return false;
-    },
-
-    // ============================================================================
-    // Terminal Transfer Helpers (with per-tick cache)
-    // ============================================================================
-
-    getTerminalTransferNeed: function(roomName) {
-        if (_termNeedCache.tick === Game.time && _termNeedCache[roomName] !== undefined) {
-            return _termNeedCache[roomName];
-        }
-        if (_termNeedCache.tick !== Game.time) {
-            _termNeedCache = { tick: Game.time };
-        }
-
-        var ops = Memory.terminalManager && Memory.terminalManager.operations
-            ? Memory.terminalManager.operations : [];
-        var bestRes = null;
-        var bestDeficit = 0;
-        for (var i = 0; i < ops.length; i++) {
-            var op = ops[i];
-            if (!op || op.status === 'completed' || op.status === 'failed') continue;
-            if (op.type === 'transfer' && op.fromRoom === roomName) {
-                var remaining = Math.max(0, op.amount - (op.amountTransferred || 0));
-                if (remaining <= 0) continue;
-                var room = Game.rooms[roomName];
-                var terminal = room && room.terminal ? room.terminal : null;
-                if (!terminal) continue;
-                var have = terminal.store[op.resourceType] || 0;
-                var deficit = Math.max(0, remaining - have);
-                if (deficit > bestDeficit) { bestDeficit = deficit; bestRes = op.resourceType; }
-                if (op.resourceType !== RESOURCE_ENERGY && remaining > 0) {
-                    var cost = Game.market.calcTransactionCost(remaining, op.fromRoom, op.toRoom);
-                    var termEnergy = terminal.store[RESOURCE_ENERGY] || 0;
-                    var eDef = Math.max(0, cost - termEnergy);
-                    if (eDef > bestDeficit) { bestDeficit = eDef; bestRes = RESOURCE_ENERGY; }
-                }
-            }
-            if (op.type === 'toTerminal' && op.roomName === roomName) {
-                var moved = op.amountMoved || 0;
-                var rem = Math.max(0, op.amount - moved);
-                if (rem > bestDeficit) { bestDeficit = rem; bestRes = op.resourceType; }
-            }
-        }
-        _termNeedCache[roomName] = bestRes;
-        return bestRes;
-    },
-
-    // Returns { resource, remaining } for the best active toStorage op, or null.
-    // Prefers non-energy resources (no conflict with built-in terminal energy band).
-    // Only returns energy when terminal is above TERMINAL_HIGH so W6b doesn't
-    // fight P5/W8 which maintain the 19k-21k energy band.
-    getTerminalToStorageNeed: function(roomName) {
-        if (_toStorageCache.tick === Game.time && _toStorageCache[roomName] !== undefined) {
-            return _toStorageCache[roomName];
-        }
-        if (_toStorageCache.tick !== Game.time) {
-            _toStorageCache = { tick: Game.time };
-        }
-
-        var ops = Memory.terminalManager && Memory.terminalManager.operations
-            ? Memory.terminalManager.operations : [];
-        var bestNonEnergy = null;
-        var bestNonEnergyRemaining = 0;
-        var bestEnergyRemaining = 0;
-        for (var i = 0; i < ops.length; i++) {
-            var op = ops[i];
-            if (!op || op.status === 'completed' || op.status === 'failed') continue;
-            if (op.type === 'toStorage' && op.roomName === roomName) {
-                var moved = op.amountMoved || 0;
-                var remaining = Math.max(0, op.amount - moved);
-                if (remaining <= 0) continue;
-                if (op.resourceType === RESOURCE_ENERGY) {
-                    if (remaining > bestEnergyRemaining) bestEnergyRemaining = remaining;
-                } else {
-                    if (remaining > bestNonEnergyRemaining) {
-                        bestNonEnergyRemaining = remaining;
-                        bestNonEnergy = { resource: op.resourceType, remaining: remaining };
-                    }
-                }
-            }
-        }
-
-        var result = null;
-        if (bestNonEnergy) {
-            // Non-energy ops never conflict with built-in terminal energy management
-            result = bestNonEnergy;
-        } else if (bestEnergyRemaining > 0) {
-            // Only drain energy when terminal has excess above the high threshold;
-            // below that, P5/W8 maintain the energy band and W4 handles natural drain
-            var room = Game.rooms[roomName];
-            var terminal = room && room.terminal ? room.terminal : null;
-            var termE = (terminal && terminal.store) ? (terminal.store[RESOURCE_ENERGY] || 0) : 0;
-            if (termE > TERMINAL_HIGH) {
-                result = { resource: RESOURCE_ENERGY, remaining: bestEnergyRemaining };
-            }
-        }
-        _toStorageCache[roomName] = result;
-        return result;
-    },
-
-    // Update amountMoved on the first matching active local op (toTerminal or toStorage)
-    recordLocalOpProgress: function(roomName, opType, resourceType, amount) {
-        var ops = Memory.terminalManager && Memory.terminalManager.operations
-            ? Memory.terminalManager.operations : [];
-        for (var i = 0; i < ops.length; i++) {
-            var op = ops[i];
-            if (!op || op.status === 'completed' || op.status === 'failed') continue;
-            if (op.type === opType && op.roomName === roomName && op.resourceType === resourceType) {
-                if (typeof op.amountMoved !== 'number') op.amountMoved = 0;
-                op.amountMoved += amount;
-                return;
-            }
-        }
-    },
-
-    // ============================================================================
-    // Neighbor Cache
-    // ============================================================================
-
-    getNeighbors: function(creep, state) {
-        var cache = neighborCache[creep.name];
-
-        if (!cache || (Game.time - cache.idsAt) >= 100) {
-            var byType = state.structuresByType || {};
-            var cx = creep.pos.x;
-            var cy = creep.pos.y;
-
-            function isAdj(s) {
-                return Math.abs(cx - s.pos.x) <= 1 && Math.abs(cy - s.pos.y) <= 1;
-            }
-
-            var ids = {
-                spawn: null, link: null, factory: null, terminal: null,
-                storage: null, extractor: null, mineral: null, extensions: []
-            };
-
-            var spawns = byType[STRUCTURE_SPAWN] || [];
-            for (var i = 0; i < spawns.length; i++) {
-                if (spawns[i].my && isAdj(spawns[i])) { ids.spawn = spawns[i].id; break; }
-            }
-            var links = byType[STRUCTURE_LINK] || [];
-            for (var i = 0; i < links.length; i++) {
-                if (links[i].my && isAdj(links[i])) { ids.link = links[i].id; break; }
-            }
-            var factories = byType[STRUCTURE_FACTORY] || [];
-            for (var i = 0; i < factories.length; i++) {
-                if (isAdj(factories[i])) { ids.factory = factories[i].id; break; }
-            }
-            var terminals = byType[STRUCTURE_TERMINAL] || [];
-            for (var i = 0; i < terminals.length; i++) {
-                if (isAdj(terminals[i])) { ids.terminal = terminals[i].id; break; }
-            }
-            if (state.storage && isAdj(state.storage)) {
-                ids.storage = state.storage.id;
-            }
-            var extractors = (byType[STRUCTURE_EXTRACTOR] || []).filter(function(s) { return s.my; });
-            for (var i = 0; i < extractors.length; i++) {
-                if (isAdj(extractors[i])) { ids.extractor = extractors[i].id; break; }
-            }
-            var minerals = state.minerals || [];
-            for (var i = 0; i < minerals.length; i++) {
-                if (isAdj(minerals[i])) { ids.mineral = minerals[i].id; break; }
-            }
-            var exts = byType[STRUCTURE_EXTENSION] || [];
-            for (var i = 0; i < exts.length; i++) {
-                if (exts[i].my && isAdj(exts[i])) ids.extensions.push(exts[i].id);
-            }
-
-            cache = { ids: ids, idsAt: Game.time };
-            neighborCache[creep.name] = cache;
-        }
-
-        if (cache.tick === Game.time) return cache.hood;
-
-        var ids = cache.ids;
-        var hood = {
-            spawn: ids.spawn ? Game.getObjectById(ids.spawn) : null,
-            link: ids.link ? Game.getObjectById(ids.link) : null,
-            factory: ids.factory ? Game.getObjectById(ids.factory) : null,
-            terminal: ids.terminal ? Game.getObjectById(ids.terminal) : null,
-            storage: ids.storage ? Game.getObjectById(ids.storage) : null,
-            extractor: ids.extractor ? Game.getObjectById(ids.extractor) : null,
-            mineral: ids.mineral ? Game.getObjectById(ids.mineral) : null,
-            extensions: []
-        };
-        for (var i = 0; i < ids.extensions.length; i++) {
-            var ext = Game.getObjectById(ids.extensions[i]);
-            if (ext) hood.extensions.push(ext);
-        }
-
-        cache.hood = hood;
-        cache.tick = Game.time;
-        return hood;
+  run: function(e) {
+    if (e.spawning) return;
+    if (Game.time - neighborCacheLastPrune > 200) {
+      neighborCacheLastPrune = Game.time;
+      for (var r in neighborCache) {
+        if (!Game.creeps[r]) delete neighborCache[r];
+      }
     }
+    var t = getRoomState.get(e.room.name);
+    if (!t) return;
+    var a = this.getNeighbors(e, t);
+    if (e.memory._hasWork === undefined) {
+      var i = false;
+      for (var o = 0; o < e.body.length; o++) {
+        if (e.body[o].type === WORK) {
+          i = true;
+          break;
+        }
+      }
+      e.memory._hasWork = i;
+    }
+    var n = e.memory._hasWork;
+    var s = a.mineral || findAdjacentMineral(e);
+    var f = false;
+    var c = false;
+    if (s) {
+      if (s.mineralAmount === 0) {
+        f = true;
+        if (s.ticksToRegeneration === undefined || s.ticksToRegeneration >= 300) {
+          c = true;
+        }
+      }
+    }
+    if (n && f && c) {
+      for (var m in e.store) {
+        if (m === RESOURCE_ENERGY) continue;
+        if ((e.store[m] || 0) <= 0) continue;
+        if (a.factory && a.factory.store && a.factory.store.getFreeCapacity() > 0) {
+          e.transfer(a.factory, m);
+          return;
+        }
+        if (a.terminal && a.terminal.store && a.terminal.store.getFreeCapacity() > 0) {
+          e.transfer(a.terminal, m);
+          return;
+        }
+        if (a.storage && a.storage.store && a.storage.store.getFreeCapacity() > 0) {
+          e.transfer(a.storage, m);
+          return;
+        }
+      }
+      if ((e.store[RESOURCE_ENERGY] || 0) > 0) {
+        if (a.storage && a.storage.store && a.storage.store.getFreeCapacity() > 0) {
+          e.transfer(a.storage, RESOURCE_ENERGY);
+          return;
+        }
+        if (a.link && a.link.store && a.link.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+          e.transfer(a.link, RESOURCE_ENERGY);
+          return;
+        }
+      }
+      console.log("[ComboBot] " + e.name + " minerals exhausted, suiciding for carry-only respawn");
+      e.suicide();
+      return;
+    }
+    if (n && e.ticksToLive < 1400) {
+      var u = false;
+      if (s && s.mineralAmount > 0) {
+        var l = 0;
+        for (var E = 0; E < e.body.length; E++) {
+          if (e.body[E].type === WORK && e.body[E].hits > 0) l++;
+        }
+        if (l > 0) {
+          var g = s.mineralAmount * 5 / l;
+          if (g <= 200) u = true;
+        }
+      }
+      if (!u) {
+        var v = a.spawn || findAdjacentSpawn(e);
+        if (v && !v.spawning) {
+          var R = v.renewCreep(e);
+          if (R === OK) e.say("♻️");
+        }
+      }
+    }
+    var y = e.store.getUsedCapacity() || 0;
+    var d = e.store[RESOURCE_ENERGY] || 0;
+    var h = e.store.getFreeCapacity() || 0;
+    var p = !!(a.terminal && a.terminal.store);
+    var C = !!(a.storage && a.storage.store);
+    var _ = !!(a.factory && a.factory.store);
+    var O = !!(a.link && a.link.store);
+    var N = O ? a.link.store.getUsedCapacity(RESOURCE_ENERGY) || 0 : 0;
+    var S = p ? a.terminal.store.getUsedCapacity(RESOURCE_ENERGY) || 0 : 0;
+    var G = this.getActiveFactoryOrder(e.room.name);
+    var M = G ? G.product : null;
+    if (n && s && a.extractor && h > 0) {
+      if (s.mineralAmount > 0 && (!a.extractor.cooldown || a.extractor.cooldown === 0)) {
+        e.harvest(s);
+      }
+    }
+    var T = false;
+    if (!T && a.spawn && d > 0) {
+      if (a.spawn.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+        e.transfer(a.spawn, RESOURCE_ENERGY);
+        T = true;
+      }
+    }
+    if (!T && d > 0) {
+      for (var U = 0; U < a.extensions.length; U++) {
+        if (a.extensions[U].store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+          e.transfer(a.extensions[U], RESOURCE_ENERGY);
+          T = true;
+          break;
+        }
+      }
+    }
+    if (!T && p) {
+      var k = this.getTerminalTransferNeed(e.room.name);
+      if (k && (e.store[k] || 0) > 0 && a.terminal.store.getFreeCapacity() > 0) {
+        var w = e.store[k] || 0;
+        var F = e.transfer(a.terminal, k);
+        if (F === OK) {
+          this.recordLocalOpProgress(e.room.name, "toTerminal", k, w);
+        }
+        T = true;
+      }
+    }
+    if (!T) {
+      var I = s ? s.mineralType : null;
+      if (I && (e.store[I] || 0) > 0) {
+        if (_ && G) {
+          var b = getRecipe(M);
+          if (b && b.inputs[I]) {
+            var Y = a.factory.store[I] || 0;
+            var L = Math.max(1, G.cycleBatches || 1);
+            var A = b.inputs[I] * L;
+            if (Y < A) {
+              var x = a.factory.store.getFreeCapacity ? a.factory.store.getFreeCapacity() || 0 : e.store[I];
+              var H = Math.min(e.store[I] || 0, A - Y, x);
+              if (H > 0) {
+                e.transfer(a.factory, I, H);
+                T = true;
+              }
+            }
+          }
+        }
+        if (!T) {
+          if (p && a.terminal.store.getFreeCapacity() > 0) {
+            e.transfer(a.terminal, I);
+            T = true;
+          } else if (C && a.storage.store.getFreeCapacity() > 0) {
+            e.transfer(a.storage, I);
+            T = true;
+          }
+        }
+      }
+    }
+    if (!T && O && d > 0 && N < LINK_FEED_THRESHOLD) {
+      e.transfer(a.link, RESOURCE_ENERGY);
+      T = true;
+    }
+    if (!T && p && d > 0 && S < TERMINAL_LOW) {
+      e.transfer(a.terminal, RESOURCE_ENERGY);
+      T = true;
+    }
+    if (!T && _ && G) {
+      if (this.tryTransferFactoryInput(e, a.factory, G)) T = true;
+    }
+    if (!T && _ && M && (e.store[M] || 0) > 0) {
+      if (C && a.storage.store.getFreeCapacity() > 0) {
+        e.transfer(a.storage, M);
+        T = true;
+      } else if (p && a.terminal.store.getFreeCapacity() > 0) {
+        e.transfer(a.terminal, M);
+        T = true;
+      }
+    }
+    if (!T && _ && !G && C) {
+      for (var j in e.store) {
+        if (j === RESOURCE_ENERGY) continue;
+        if ((e.store[j] || 0) <= 0) continue;
+        if (a.storage.store.getFreeCapacity() > 0) {
+          e.transfer(a.storage, j);
+          T = true;
+          break;
+        }
+      }
+    }
+    if (!T && C) {
+      var D = this.getTerminalToStorageNeed(e.room.name);
+      if (D && (e.store[D.resource] || 0) > 0) {
+        if (a.storage.store.getFreeCapacity() > 0) {
+          var K = e.store[D.resource] || 0;
+          var B = e.transfer(a.storage, D.resource);
+          if (B === OK) {
+            this.recordLocalOpProgress(e.room.name, "toStorage", D.resource, K);
+          }
+          T = true;
+        }
+      }
+    }
+    if (!T && y > d && y > 0) {
+      for (var W in e.store) {
+        if (W === RESOURCE_ENERGY) continue;
+        if ((e.store[W] || 0) <= 0) continue;
+        if (p && a.terminal.store.getFreeCapacity() > 0) {
+          e.transfer(a.terminal, W);
+        } else if (C && a.storage.store.getFreeCapacity() > 0) {
+          e.transfer(a.storage, W);
+        }
+        T = true;
+        break;
+      }
+    }
+    if (!T && C && d > 0) {
+      if (a.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
+        var P = e.transfer(a.storage, RESOURCE_ENERGY);
+        if (P === OK) {
+          this.recordLocalOpProgress(e.room.name, "toStorage", RESOURCE_ENERGY, d);
+        }
+        T = true;
+      }
+    }
+    var q = false;
+    if (!q && O && h > 0) {
+      var X = a.spawn && a.spawn.store.getFreeCapacity(RESOURCE_ENERGY) > 0 ? a.spawn.store.getFreeCapacity(RESOURCE_ENERGY) : 0;
+      var z = 0;
+      for (var J = 0; J < a.extensions.length; J++) {
+        z += a.extensions[J].store.getFreeCapacity(RESOURCE_ENERGY) || 0;
+      }
+      if (X + z > 0) {
+        var Q = a.link.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+        var V = Math.min(X + z, h, Q);
+        if (V > 0) {
+          e.withdraw(a.link, RESOURCE_ENERGY, V);
+          q = true;
+        }
+      }
+    }
+    if (!q && O && h > 0 && N > LINK_FEED_THRESHOLD) {
+      var Z = Math.min(N - LINK_FEED_THRESHOLD, h);
+      if (Z > 0) {
+        e.withdraw(a.link, RESOURCE_ENERGY, Z);
+        q = true;
+      }
+    }
+    if (!q && C && O && N < LINK_FEED_THRESHOLD && h > 0) {
+      if ((a.storage.store[RESOURCE_ENERGY] || 0) > 0) {
+        e.withdraw(a.storage, RESOURCE_ENERGY);
+        q = true;
+      }
+    }
+    if (!q && p && S > TERMINAL_HIGH && h > 0) {
+      var $ = S - TERMINAL_HIGH;
+      var ee = O && N < LINK_FEED_THRESHOLD ? LINK_FEED_THRESHOLD - N : 0;
+      var re = Math.min($, h - ee);
+      if (re > 0) {
+        e.withdraw(a.terminal, RESOURCE_ENERGY, re);
+        q = true;
+      }
+    }
+    if (!q && _ && M && h > 0) {
+      var te = a.factory.store[M] || 0;
+      if (te > 0) {
+        e.withdraw(a.factory, M);
+        q = true;
+      }
+    }
+    if (!q && _ && !G && h > 0) {
+      for (var ae in a.factory.store) {
+        if (ae === RESOURCE_ENERGY) continue;
+        if ((a.factory.store[ae] || 0) <= 0) continue;
+        e.withdraw(a.factory, ae);
+        q = true;
+        break;
+      }
+    }
+    if (!q && p && h > 0) {
+      var ie = this.getTerminalToStorageNeed(e.room.name);
+      if (ie) {
+        var oe = a.terminal.store[ie.resource] || 0;
+        if (oe > 0) {
+          var ne = Math.min(oe, h, ie.remaining);
+          if (ne > 0) {
+            e.withdraw(a.terminal, ie.resource, ne);
+            q = true;
+          }
+        }
+      }
+    }
+    if (!q && C && h > 0) {
+      var se = this.getTerminalTransferNeed(e.room.name);
+      if (se && (a.storage.store[se] || 0) > 0) {
+        e.withdraw(a.storage, se);
+        q = true;
+      }
+    }
+    if (!q && C && p && S < TERMINAL_LOW && h > 0) {
+      if ((a.storage.store[RESOURCE_ENERGY] || 0) > 0) {
+        e.withdraw(a.storage, RESOURCE_ENERGY);
+        q = true;
+      }
+    }
+    if (!q && G && _ && h > 0) {
+      if (this.tryWithdrawFactoryInput(e, a, G)) q = true;
+    }
+    if (!T && !q) {
+      if (Game.time % 20 === 0) e.say("💤");
+    }
+  },
+  getActiveFactoryOrder: function(e) {
+    if (_factoryOrderCache.tick === Game.time && _factoryOrderCache[e] !== undefined) {
+      return _factoryOrderCache[e];
+    }
+    if (_factoryOrderCache.tick !== Game.time) {
+      _factoryOrderCache = {
+        tick: Game.time
+      };
+    }
+    var r = factoryManager && typeof factoryManager.getOrders === "function" ? factoryManager.getOrders() : [];
+    var t = null;
+    for (var a = 0; a < r.length; a++) {
+      var i = r[a];
+      if (i && i.room === e && i.status === "active") {
+        t = i;
+        break;
+      }
+    }
+    _factoryOrderCache[e] = t;
+    return t;
+  },
+  tryTransferFactoryInput: function(e, r, t) {
+    var a = getRecipe(t.product);
+    if (!a || !a.inputs) return false;
+    var i = Math.max(1, t.cycleBatches || 1);
+    for (var o in a.inputs) {
+      var n = (a.inputs[o] || 0) * i;
+      var s = r.store[o] || 0;
+      var f = n - s;
+      if (f <= 0) continue;
+      var c = e.store[o] || 0;
+      if (c > 0) {
+        var m = r.store.getFreeCapacity ? r.store.getFreeCapacity() || 0 : c;
+        var u = Math.min(c, f, m);
+        if (u <= 0) return false;
+        e.transfer(r, o, u);
+        return true;
+      }
+    }
+    return false;
+  },
+  tryWithdrawFactoryInput: function(e, r, t) {
+    var a = getRecipe(t.product);
+    if (!a || !a.inputs) return false;
+    var i = Math.max(1, t.cycleBatches || 1);
+    var o = null;
+    var n = 0;
+    for (var s in a.inputs) {
+      var f = (a.inputs[s] || 0) * i;
+      var c = r.factory ? r.factory.store[s] || 0 : 0;
+      var m = f - c;
+      if (m > n) {
+        n = m;
+        o = s;
+      }
+    }
+    if (!o) return false;
+    var u = r.factory && r.factory.store && r.factory.store.getFreeCapacity ? r.factory.store.getFreeCapacity() || 0 : e.store.getFreeCapacity();
+    var l = Math.min(n, u, e.store.getFreeCapacity());
+    if (l <= 0) return false;
+    if (r.terminal && r.terminal.store && (r.terminal.store[o] || 0) > 0) {
+      e.withdraw(r.terminal, o, Math.min(l, r.terminal.store[o] || 0));
+      return true;
+    }
+    if (r.storage && r.storage.store && (r.storage.store[o] || 0) > 0) {
+      e.withdraw(r.storage, o, Math.min(l, r.storage.store[o] || 0));
+      return true;
+    }
+    return false;
+  },
+  getTerminalTransferNeed: function(e) {
+    if (_termNeedCache.tick === Game.time && _termNeedCache[e] !== undefined) {
+      return _termNeedCache[e];
+    }
+    if (_termNeedCache.tick !== Game.time) {
+      _termNeedCache = {
+        tick: Game.time
+      };
+    }
+    var r = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+    var t = null;
+    var a = 0;
+    for (var i = 0; i < r.length; i++) {
+      var o = r[i];
+      if (!o || o.status === "completed" || o.status === "failed") continue;
+      if (o.type === "transfer" && o.fromRoom === e) {
+        var n = Math.max(0, o.amount - (o.amountTransferred || 0));
+        if (n <= 0) continue;
+        var s = Game.rooms[e];
+        var f = s && s.terminal ? s.terminal : null;
+        if (!f) continue;
+        var c = f.store[o.resourceType] || 0;
+        var m = Math.max(0, n - c);
+        if (m > a) {
+          a = m;
+          t = o.resourceType;
+        }
+        if (o.resourceType !== RESOURCE_ENERGY && n > 0) {
+          var u = util.calcTransactionCost(n, o.fromRoom, o.toRoom);
+          var l = f.store[RESOURCE_ENERGY] || 0;
+          var E = Math.max(0, u - l);
+          if (E > a) {
+            a = E;
+            t = RESOURCE_ENERGY;
+          }
+        }
+      }
+      if (o.type === "toTerminal" && o.roomName === e) {
+        var g = o.amountMoved || 0;
+        var v = Math.max(0, o.amount - g);
+        if (v > a) {
+          a = v;
+          t = o.resourceType;
+        }
+      }
+    }
+    _termNeedCache[e] = t;
+    return t;
+  },
+  getTerminalToStorageNeed: function(e) {
+    if (_toStorageCache.tick === Game.time && _toStorageCache[e] !== undefined) {
+      return _toStorageCache[e];
+    }
+    if (_toStorageCache.tick !== Game.time) {
+      _toStorageCache = {
+        tick: Game.time
+      };
+    }
+    var r = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+    var t = null;
+    var a = 0;
+    var i = 0;
+    for (var o = 0; o < r.length; o++) {
+      var n = r[o];
+      if (!n || n.status === "completed" || n.status === "failed") continue;
+      if (n.type === "toStorage" && n.roomName === e) {
+        var s = n.amountMoved || 0;
+        var f = Math.max(0, n.amount - s);
+        if (f <= 0) continue;
+        if (n.resourceType === RESOURCE_ENERGY) {
+          if (f > i) i = f;
+        } else {
+          if (f > a) {
+            a = f;
+            t = {
+              resource: n.resourceType,
+              remaining: f
+            };
+          }
+        }
+      }
+    }
+    var c = null;
+    if (t) {
+      c = t;
+    } else if (i > 0) {
+      var m = Game.rooms[e];
+      var u = m && m.terminal ? m.terminal : null;
+      var l = u && u.store ? u.store[RESOURCE_ENERGY] || 0 : 0;
+      if (l > TERMINAL_HIGH) {
+        c = {
+          resource: RESOURCE_ENERGY,
+          remaining: i
+        };
+      }
+    }
+    _toStorageCache[e] = c;
+    return c;
+  },
+  recordLocalOpProgress: function(e, r, t, a) {
+    var i = Memory.terminalManager && Memory.terminalManager.operations ? Memory.terminalManager.operations : [];
+    for (var o = 0; o < i.length; o++) {
+      var n = i[o];
+      if (!n || n.status === "completed" || n.status === "failed") continue;
+      if (n.type === r && n.roomName === e && n.resourceType === t) {
+        if (typeof n.amountMoved !== "number") n.amountMoved = 0;
+        n.amountMoved += a;
+        return;
+      }
+    }
+  },
+  getNeighbors: function(e, r) {
+    var t = neighborCache[e.name];
+    if (!t || Game.time - t.idsAt >= 100) {
+      var a = r.structuresByType || {};
+      var i = e.pos.x;
+      var o = e.pos.y;
+      function isAdj(e) {
+        return Math.abs(i - e.pos.x) <= 1 && Math.abs(o - e.pos.y) <= 1;
+      }
+      var n = {
+        spawn: null,
+        link: null,
+        factory: null,
+        terminal: null,
+        storage: null,
+        extractor: null,
+        mineral: null,
+        extensions: []
+      };
+      var s = a[STRUCTURE_SPAWN] || [];
+      for (var f = 0; f < s.length; f++) {
+        if (s[f].my && isAdj(s[f])) {
+          n.spawn = s[f].id;
+          break;
+        }
+      }
+      var c = a[STRUCTURE_LINK] || [];
+      for (var f = 0; f < c.length; f++) {
+        if (c[f].my && isAdj(c[f])) {
+          n.link = c[f].id;
+          break;
+        }
+      }
+      var m = a[STRUCTURE_FACTORY] || [];
+      for (var f = 0; f < m.length; f++) {
+        if (isAdj(m[f])) {
+          n.factory = m[f].id;
+          break;
+        }
+      }
+      var u = a[STRUCTURE_TERMINAL] || [];
+      for (var f = 0; f < u.length; f++) {
+        if (isAdj(u[f])) {
+          n.terminal = u[f].id;
+          break;
+        }
+      }
+      if (r.storage && isAdj(r.storage)) {
+        n.storage = r.storage.id;
+      }
+      var l = (a[STRUCTURE_EXTRACTOR] || []).filter(function(e) {
+        return e.my;
+      });
+      for (var f = 0; f < l.length; f++) {
+        if (isAdj(l[f])) {
+          n.extractor = l[f].id;
+          break;
+        }
+      }
+      var E = r.minerals || [];
+      for (var f = 0; f < E.length; f++) {
+        if (isAdj(E[f])) {
+          n.mineral = E[f].id;
+          break;
+        }
+      }
+      var g = a[STRUCTURE_EXTENSION] || [];
+      for (var f = 0; f < g.length; f++) {
+        if (g[f].my && isAdj(g[f])) n.extensions.push(g[f].id);
+      }
+      t = {
+        ids: n,
+        idsAt: Game.time
+      };
+      neighborCache[e.name] = t;
+    }
+    if (t.tick === Game.time) return t.hood;
+    var n = t.ids;
+    var v = {
+      spawn: n.spawn ? Game.getObjectById(n.spawn) : null,
+      link: n.link ? Game.getObjectById(n.link) : null,
+      factory: n.factory ? Game.getObjectById(n.factory) : null,
+      terminal: n.terminal ? Game.getObjectById(n.terminal) : null,
+      storage: n.storage ? Game.getObjectById(n.storage) : null,
+      extractor: n.extractor ? Game.getObjectById(n.extractor) : null,
+      mineral: n.mineral ? Game.getObjectById(n.mineral) : null,
+      extensions: []
+    };
+    for (var f = 0; f < n.extensions.length; f++) {
+      var R = Game.getObjectById(n.extensions[f]);
+      if (R) v.extensions.push(R);
+    }
+    t.hood = v;
+    t.tick = Game.time;
+    return v;
+  }
 };

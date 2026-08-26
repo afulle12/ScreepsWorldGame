@@ -1,306 +1,442 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // roleNukeFill.js
-// Purpose: Spawn a supplier-bodied creep that fills the room's Nuker:
+// Role dispatch: memory.role === 'nukeFill' -> roleNukeFill.run(creep).
+// Console globals: nukeFill, nukeFillAutoStatus
+// Example: nukeFill('E1N1') - Dispatch or toggle nuke loader creep to load silo
+// Example: nukeFillAutoStatus() - View auto-loader status for all nuclear silos
+// Example: require('roleNukeFill').run(creep);
 //          1) Fill 100% energy first
 //          2) Then fill GHODIUM
-// Console: nukeFill('W1N1', { maxPrice: 1.2 })  // maxPrice optional
-
-const getRoomState = require('getRoomState');
-const opportunisticBuy = require('opportunisticBuy');
-
+//          nukeFillAutoStatus()                 // auto fill status
+//       a time in alphabetical order (manual nukeFill can still stack).
+const NUKE_FILL_AUTO_ENABLED = true;
+const NUKE_FILL_AUTO_MAX_PRICE = 1e4;
+const NUKE_FILL_AUTO_INTERVAL = 1e3;
+const getRoomState = require("getRoomState");
+const opportunisticBuy = require("opportunisticBuy");
+const memoryManager = require("memoryManager");
 if (!Memory.nukeFillOrders) Memory.nukeFillOrders = {};
-
-function getNukerFromState(rs, preferId) {
-  var nuker = null;
-
-  if (preferId) {
-    nuker = Game.getObjectById(preferId);
-    if (nuker) return nuker;
+if (!Memory.nukeFillAuto) Memory.nukeFillAuto = {
+  activeRoom: null,
+  nextRunTick: 0
+};
+function getNukerFromState(e, r) {
+  var t = null;
+  if (r) {
+    t = Game.getObjectById(r);
+    if (t) return t;
   }
-
-  if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_NUKER]) {
-    var arr = rs.structuresByType[STRUCTURE_NUKER];
-    if (arr && arr.length > 0) nuker = arr[0];
+  if (e && e.structuresByType && e.structuresByType[STRUCTURE_NUKER]) {
+    var o = e.structuresByType[STRUCTURE_NUKER];
+    if (o && o.length > 0) t = o[0];
   }
-  return nuker;
+  return t;
 }
 
-function getNukerCaps(nuker) {
-  // Support both modern store and legacy props
-  var energyCap = 0;
-  var ghodiumCap = 0;
-
-  if (nuker && nuker.store && typeof nuker.store.getCapacity === 'function') {
-    var ec = nuker.store.getCapacity(RESOURCE_ENERGY);
-    var gc = nuker.store.getCapacity(RESOURCE_GHODIUM);
-    energyCap = typeof ec === 'number' ? ec : 0;
-    ghodiumCap = typeof gc === 'number' ? gc : 0;
+function getNukerCaps(e) {
+  var r = 0;
+  var t = 0;
+  if (e && e.store && typeof e.store.getCapacity === "function") {
+    var o = e.store.getCapacity(RESOURCE_ENERGY);
+    var n = e.store.getCapacity(RESOURCE_GHODIUM);
+    r = typeof o === "number" ? o : 0;
+    t = typeof n === "number" ? n : 0;
   } else {
-    // legacy
-    energyCap = nuker && typeof nuker.energyCapacity === 'number' ? nuker.energyCapacity : 0;
-    ghodiumCap = nuker && typeof nuker.ghodiumCapacity === 'number' ? nuker.ghodiumCapacity : 0;
+    r = e && typeof e.energyCapacity === "number" ? e.energyCapacity : 0;
+    t = e && typeof e.ghodiumCapacity === "number" ? e.ghodiumCapacity : 0;
   }
-  return { energy: energyCap, ghodium: ghodiumCap };
+  return {
+    energy: r,
+    ghodium: t
+  };
 }
 
-function getNukerAmounts(nuker) {
-  var energy = 0;
-  var ghodium = 0;
-
-  if (nuker && nuker.store) {
-    energy = nuker.store[RESOURCE_ENERGY] || 0;
-    ghodium = nuker.store[RESOURCE_GHODIUM] || 0;
+function getNukerAmounts(e) {
+  var r = 0;
+  var t = 0;
+  if (e && e.store) {
+    r = e.store[RESOURCE_ENERGY] || 0;
+    t = e.store[RESOURCE_GHODIUM] || 0;
   } else {
-    energy = nuker && typeof nuker.energy === 'number' ? nuker.energy : 0;
-    ghodium = nuker && typeof nuker.ghodium === 'number' ? nuker.ghodium : 0;
+    r = e && typeof e.energy === "number" ? e.energy : 0;
+    t = e && typeof e.ghodium === "number" ? e.ghodium : 0;
   }
-  return { energy: energy, ghodium: ghodium };
+  return {
+    energy: r,
+    ghodium: t
+  };
 }
 
-function sumRoomResource(rs, resourceType, excludeId) {
-  if (!rs) return 0;
-
-  var total = 0;
-  var types = [
-    STRUCTURE_STORAGE,
-    STRUCTURE_TERMINAL,
-    STRUCTURE_FACTORY,
-    STRUCTURE_CONTAINER,
-    STRUCTURE_LAB,
-    STRUCTURE_NUKER
-  ];
-
-  for (var i = 0; i < types.length; i++) {
-    var t = types[i];
-    var list = (rs.structuresByType && rs.structuresByType[t]) ? rs.structuresByType[t] : [];
-    for (var j = 0; j < list.length; j++) {
-      var s = list[j];
-      if (!s || (excludeId && s.id === excludeId)) continue;
-      if (s.store && typeof s.store.getUsedCapacity === 'function') {
-        total += s.store.getUsedCapacity(resourceType) || 0;
+function sumRoomResource(e, r, t) {
+  if (!e) return 0;
+  var o = 0;
+  var n = [ STRUCTURE_STORAGE, STRUCTURE_TERMINAL, STRUCTURE_FACTORY, STRUCTURE_CONTAINER, STRUCTURE_LAB, STRUCTURE_NUKER ];
+  for (var u = 0; u < n.length; u++) {
+    var i = n[u];
+    var a = e.structuresByType && e.structuresByType[i] ? e.structuresByType[i] : [];
+    for (var l = 0; l < a.length; l++) {
+      var m = a[l];
+      if (!m || t && m.id === t) continue;
+      if (m.store && typeof m.store.getUsedCapacity === "function") {
+        o += m.store.getUsedCapacity(r) || 0;
       }
     }
   }
-  return total;
+  return o;
 }
 
-function pickWithdrawTarget(rs, resourceType) {
-  if (!rs) return null;
-
-  var term = rs.terminal;
-  if (term && term.store && (term.store[resourceType] || 0) > 0) return term;
-
-  var storage = rs.storage;
-  if (storage && storage.store && (storage.store[resourceType] || 0) > 0) return storage;
-
-  var containers = (rs.structuresByType && rs.structuresByType[STRUCTURE_CONTAINER]) ? rs.structuresByType[STRUCTURE_CONTAINER] : [];
-  var best = null;
-  var bestAmt = 0;
-  for (var i = 0; i < containers.length; i++) {
-    var c = containers[i];
-    if (!c || !c.store) continue;
-    var amt = c.store[resourceType] || 0;
-    if (amt > bestAmt) {
-      bestAmt = amt;
-      best = c;
+function pickWithdrawTarget(e, r) {
+  if (!e) return null;
+  var t = e.terminal;
+  var o = e.storage;
+  var n = t && t.store ? t.store[r] || 0 : 0;
+  var u = o && o.store ? o.store[r] || 0 : 0;
+  if (r === RESOURCE_ENERGY) {
+    if (u > 0 && u >= n) return o;
+    if (n > 0) return t;
+    if (u > 0) return o;
+  } else {
+    if (n > 0) return t;
+    if (u > 0) return o;
+  }
+  var i = e.structuresByType && e.structuresByType[STRUCTURE_CONTAINER] ? e.structuresByType[STRUCTURE_CONTAINER] : [];
+  var a = null;
+  var l = 0;
+  for (var m = 0; m < i.length; m++) {
+    var s = i[m];
+    if (!s || !s.store) continue;
+    var f = s.store[r] || 0;
+    if (f > l) {
+      l = f;
+      a = s;
     }
   }
-  if (best) return best;
-
-  // As a last resort, if energy needed, allow storage-like alternatives again
+  if (a) return a;
   return null;
 }
 
-function depositElsewhere(creep, rs, resourceType) {
-  // Try storage > terminal (avoid cluttering containers if possible)
-  var storage = rs ? rs.storage : null;
-  if (storage && storage.store && storage.store.getFreeCapacity && storage.store.getFreeCapacity() > 0) {
-    var r1 = creep.transfer(storage, resourceType);
-    if (r1 === ERR_NOT_IN_RANGE) creep.moveTo(storage, { range: 1 });
+function depositElsewhere(e, r, t) {
+  var o = r ? r.storage : null;
+  if (o && o.store && o.store.getFreeCapacity && o.store.getFreeCapacity() > 0) {
+    var n = e.transfer(o, t);
+    if (n === ERR_NOT_IN_RANGE) e.moveTo(o, {
+      range: 1
+    });
     return true;
   }
-
-  var term = rs ? rs.terminal : null;
-  if (term && term.store && term.store.getFreeCapacity && term.store.getFreeCapacity() > 0) {
-    var r2 = creep.transfer(term, resourceType);
-    if (r2 === ERR_NOT_IN_RANGE) creep.moveTo(term, { range: 1 });
+  var u = r ? r.terminal : null;
+  if (u && u.store && u.store.getFreeCapacity && u.store.getFreeCapacity() > 0) {
+    var i = e.transfer(u, t);
+    if (i === ERR_NOT_IN_RANGE) e.moveTo(u, {
+      range: 1
+    });
     return true;
   }
-
-  // If nowhere to store, drop as a last resort
-  creep.drop(resourceType);
+  e.drop(t);
   return true;
 }
 
-// Console entrypoint: nukeFill('W1N1', { maxPrice: 1.2 })
-function order(roomName, opts) {
-  if (!opts) opts = {};
-  var maxPrice = typeof opts.maxPrice === 'number' ? opts.maxPrice : 10000.0;
-
-  var room = Game.rooms[roomName];
-  if (!room || !room.controller || !room.controller.my) {
-    var m0 = '[NukeFill] Room ' + roomName + ' is not visible or not owned.';
-    console.log(m0);
-    return m0;
+function order(e, r) {
+  if (!r) r = {};
+  var t = typeof r.maxPrice === "number" ? r.maxPrice : 1e4;
+  var o = Game.rooms[e];
+  if (!o || !o.controller || !o.controller.my) {
+    var n = "[NukeFill] Room " + e + " is not visible or not owned.";
+    console.log(n);
+    return n;
   }
-
-  var rs = getRoomState.get(roomName);
-  if (!rs) {
-    var m1 = '[NukeFill] getRoomState not available for ' + roomName + ' this tick.';
-    console.log(m1);
-    return m1;
+  var u = getRoomState.get(e);
+  if (!u) {
+    var i = "[NukeFill] getRoomState not available for " + e + " this tick.";
+    console.log(i);
+    return i;
   }
-
-  var nuker = getNukerFromState(rs);
-  if (!nuker) {
-    var m2 = '[NukeFill] No Nuker found in room ' + roomName + '.';
-    console.log(m2);
-    return m2;
+  var a = getNukerFromState(u);
+  if (!a) {
+    var l = "[NukeFill] No Nuker found in room " + e + ".";
+    console.log(l);
+    return l;
   }
-
-  var caps = getNukerCaps(nuker);
-  var cur = getNukerAmounts(nuker);
-
-  var energyNeeded = Math.max(0, caps.energy - cur.energy);
-  var ghodiumNeeded = Math.max(0, caps.ghodium - cur.ghodium);
-
-  // Room stock check (excluding the nuker itself)
-  var energyInRoom = sumRoomResource(rs, RESOURCE_ENERGY, nuker.id);
-  var ghodiumInRoom = sumRoomResource(rs, RESOURCE_GHODIUM, nuker.id);
-
-  // Opportunistic buy for GHODIUM if short
-  var buyAmt = 0;
-  if (ghodiumNeeded > 0 && ghodiumInRoom < ghodiumNeeded) {
-    buyAmt = ghodiumNeeded - ghodiumInRoom;
-    if (rs.terminal) {
-      opportunisticBuy.setup(roomName, RESOURCE_GHODIUM, buyAmt, maxPrice);
+  var m = getNukerCaps(a);
+  var s = getNukerAmounts(a);
+  var f = Math.max(0, m.energy - s.energy);
+  var c = Math.max(0, m.ghodium - s.ghodium);
+  if (f === 0 && c === 0) {
+    if (Memory.nukeFillOrders && Memory.nukeFillOrders[e]) delete Memory.nukeFillOrders[e];
+    var R = "[NukeFill] " + e + " nuker is already full.";
+    console.log(R);
+    return R;
+  }
+  var y = sumRoomResource(u, RESOURCE_ENERGY, a.id);
+  var d = sumRoomResource(u, RESOURCE_GHODIUM, a.id);
+  var v = 0;
+  if (c > 0 && d < c) {
+    v = c - d;
+    if (u.terminal) {
+      opportunisticBuy.setup(e, RESOURCE_GHODIUM, v, t);
     } else {
-      console.log('[NukeFill] No terminal in ' + roomName + ' to buy GHODIUM; will wait for manual supply.');
+      console.log("[NukeFill] No terminal in " + e + " to buy GHODIUM; will wait for manual supply.");
     }
   }
-
-  Memory.nukeFillOrders[roomName] = {
-    roomName: roomName,
-    nukerId: nuker.id,
-    energyTarget: caps.energy,
-    ghodiumTarget: caps.ghodium,
-    phase: energyNeeded > 0 ? 'energy' : (ghodiumNeeded > 0 ? 'ghodium' : 'done'),
+  Memory.nukeFillOrders[e] = {
+    id: "nukeFill_" + e + "_" + Game.time,
+    roomName: e,
+    nukerId: a.id,
+    energyTarget: m.energy,
+    ghodiumTarget: m.ghodium,
+    phase: f > 0 ? "energy" : c > 0 ? "ghodium" : "done",
     createdAt: Game.time,
-    maxPrice: maxPrice,
-    buyRequested: buyAmt > 0 ? true : false,
-    completed: energyNeeded === 0 && ghodiumNeeded === 0
+    maxPrice: t,
+    buyRequested: v > 0 ? true : false,
+    completed: false,
+    source: r.source || "manual"
   };
-
-  var msg =
-    '[NukeFill] ' + roomName +
-    ' | Energy need: ' + energyNeeded +
-    ' | GHODIUM need: ' + ghodiumNeeded +
-    (buyAmt > 0 ? (' | Buying GHODIUM: ' + buyAmt + ' @ <= ' + maxPrice) : ' | No GHODIUM buy needed');
-
-  console.log(msg);
-  return msg;
+  var g = "[NukeFill] " + e + " | Energy need: " + f + " | GHODIUM need: " + c + (v > 0 ? " | Buying GHODIUM: " + v + " @ <= " + t : " | No GHODIUM buy needed");
+  console.log(g);
+  return g;
 }
 
-function run(creep) {
-  var roomName = creep.memory.orderRoom || creep.memory.homeRoom || (creep.room ? creep.room.name : null);
-  if (!roomName) return;
-
-  var rs = getRoomState.get(roomName);
-  if (!rs) return;
-
-  var order = Memory.nukeFillOrders ? Memory.nukeFillOrders[roomName] : null;
-  if (!order || order.completed) {
-    // Idle/park if nothing to do
-    var storage = rs.storage;
-    if (storage) creep.moveTo(storage, { range: 2 });
+function run(e) {
+  var r = e.memory.orderRoom || e.memory.homeRoom || (e.room ? e.room.name : null);
+  if (!r) return;
+  var t = getRoomState.get(r);
+  if (!t) return;
+  var o = Memory.nukeFillOrders ? Memory.nukeFillOrders[r] : null;
+  if (!o || o.completed) {
+    if (e.store) {
+      for (var n in e.store) {
+        if (e.store[n] > 0) {
+          depositElsewhere(e, t, n);
+          return;
+        }
+      }
+    }
+    var u = t.storage;
+    if (u) e.moveTo(u, {
+      range: 2
+    });
     return;
   }
-
-  // Check if the order has expired (100,000 ticks)
-  if (Game.time - order.createdAt > 100000) {
-    order.completed = true;
-    delete Memory.nukeFillOrders[roomName];
-    console.log('[NukeFill] Order for ' + roomName + ' expired after 100,000 ticks.');
+  if (e.memory.nukeFillOrderId !== o.id) {
+    e.memory.nukeFillOrderId = o.id;
+    delete e.memory.nukeFillDone;
+  }
+  if (Game.time - o.createdAt > 1e5) {
     return;
   }
-
-  var nuker = getNukerFromState(rs, creep.memory.nukerId);
-  if (!nuker) {
-    // Try to re-discover and update memory
-    nuker = getNukerFromState(rs);
-    if (nuker) creep.memory.nukerId = nuker.id;
-    else return; // nothing to do without nuker
+  var i = getNukerFromState(t, e.memory.nukerId);
+  if (!i) {
+    i = getNukerFromState(t);
+    if (i) e.memory.nukerId = i.id; else return;
   }
-
-  var caps = getNukerCaps(nuker);
-  var cur = getNukerAmounts(nuker);
-  var needEnergy = Math.max(0, caps.energy - cur.energy);
-  var needGhodium = Math.max(0, caps.ghodium - cur.ghodium);
-
-  if (needEnergy === 0 && needGhodium === 0) {
-    order.phase = 'done';
-    order.completed = true;
-    console.log('[NukeFill] Completed nuker fill in ' + roomName + '.');
+  var a = getNukerCaps(i);
+  var l = getNukerAmounts(i);
+  var m = Math.max(0, a.energy - l.energy);
+  var s = Math.max(0, a.ghodium - l.ghodium);
+  if (m === 0 && s === 0) {
+    o.phase = "done";
+    if (e.store) {
+      for (var f in e.store) {
+        if (e.store[f] > 0) {
+          depositElsewhere(e, t, f);
+          return;
+        }
+      }
+    }
+    e.memory.nukeFillDone = true;
     return;
   }
-
-  // Phase: energy first, then GHODIUM
-  var targetResource = needEnergy > 0 ? RESOURCE_ENERGY : RESOURCE_GHODIUM;
-  order.phase = needEnergy > 0 ? 'energy' : 'ghodium';
-
-  if (order.phase === 'ghodium' && !order.buyRequested) {
-    // Re-check GHODIUM stock vs remaining, and open a buy if needed
-    var gOutside = sumRoomResource(rs, RESOURCE_GHODIUM, nuker.id);
-    var gNeed = Math.max(0, caps.ghodium - cur.ghodium);
-    var buyMissing = Math.max(0, gNeed - gOutside);
-    if (buyMissing > 0 && rs.terminal) {
-      var price = typeof order.maxPrice === 'number' ? order.maxPrice : 1.0;
-      opportunisticBuy.setup(roomName, RESOURCE_GHODIUM, buyMissing, price);
-      order.buyRequested = true;
+  var c = m > 0 ? RESOURCE_ENERGY : RESOURCE_GHODIUM;
+  o.phase = m > 0 ? "energy" : "ghodium";
+  if (o.phase === "ghodium" && !o.buyRequested) {
+    var R = sumRoomResource(t, RESOURCE_GHODIUM, i.id);
+    var y = Math.max(0, a.ghodium - l.ghodium);
+    var d = Math.max(0, y - R);
+    if (d > 0 && t.terminal) {
+      var v = typeof o.maxPrice === "number" ? o.maxPrice : 1;
+      opportunisticBuy.setup(r, RESOURCE_GHODIUM, d, v);
+      o.buyRequested = true;
     }
   }
-
-  // If carrying other resource(s), deposit them first
-  if (creep.store) {
-    for (var r in creep.store) {
-      if (r !== targetResource && creep.store[r] > 0) {
-        depositElsewhere(creep, rs, r);
+  if (e.store) {
+    for (var g in e.store) {
+      if (g !== c && e.store[g] > 0) {
+        depositElsewhere(e, t, g);
         return;
       }
     }
   }
-
-  // Ensure we have the right resource in carry; otherwise withdraw
-  var carryAmt = creep.store ? (creep.store[targetResource] || 0) : 0;
-  if (carryAmt <= 0) {
-    var src = pickWithdrawTarget(rs, targetResource);
-    if (src) {
-      var res = creep.withdraw(src, targetResource);
-      if (res === ERR_NOT_IN_RANGE) creep.moveTo(src, { range: 1, visualizePathStyle: { stroke: '#ffaa00' } });
+  var E = e.store ? e.store[c] || 0 : 0;
+  if (E <= 0) {
+    var p = pickWithdrawTarget(t, c);
+    if (p) {
+      var k = e.withdraw(p, c);
+      if (k === ERR_NOT_IN_RANGE) e.moveTo(p, {
+        range: 1,
+        visualizePathStyle: {
+          stroke: "#ffaa00"
+        }
+      });
     } else {
-      // No source found. If waiting for GHODIUM, camp at terminal/storage
-      var waitAt = rs.terminal || rs.storage;
-      if (waitAt) creep.moveTo(waitAt, { range: 2 });
+      var N = t.terminal || t.storage;
+      if (N) e.moveTo(N, {
+        range: 2
+      });
     }
     return;
   }
-
-  // Deliver to nuker
-  var tr = creep.transfer(nuker, targetResource);
-  if (tr === ERR_NOT_IN_RANGE) {
-    creep.moveTo(nuker, { range: 1, visualizePathStyle: { stroke: '#00ffff' } });
+  var _ = e.transfer(i, c);
+  if (_ === ERR_NOT_IN_RANGE) {
+    e.moveTo(i, {
+      range: 1,
+      visualizePathStyle: {
+        stroke: "#00ffff"
+      }
+    });
     return;
   }
-  if (tr === ERR_FULL) {
-    // Nuker reached cap for this resource; next tick will switch to next phase
+  if (_ === ERR_FULL) {
     return;
   }
-  if (tr === ERR_INVALID_ARGS || tr === ERR_INVALID_TARGET) {
-    // Should not happen often; dump back
-    depositElsewhere(creep, rs, targetResource);
+  if (_ === ERR_INVALID_ARGS || _ === ERR_INVALID_TARGET) {
+    depositElsewhere(e, t, c);
   }
 }
 
+function hasLiveOrder(e) {
+  var r = Memory.nukeFillOrders ? Memory.nukeFillOrders[e] : null;
+  return !!(r && !r.completed);
+}
+
+function isNukerIncomplete(e) {
+  var r = getNukerFromState(e);
+  if (!r) return false;
+  var t = getNukerCaps(r);
+  var o = getNukerAmounts(r);
+  return t.energy - o.energy > 0 || t.ghodium - o.ghodium > 0;
+}
+
+function listIncompleteNukerRooms() {
+  var e = getRoomState.ownedNames().slice().sort();
+  var r = [];
+  for (var t = 0; t < e.length; t++) {
+    var o = e[t];
+    var n = getRoomState.get(o);
+    if (!n) continue;
+    if (!isNukerIncomplete(n)) continue;
+    r.push(o);
+  }
+  return r;
+}
+
+function ensureAutoMemory() {
+  if (!Memory.nukeFillAuto || typeof Memory.nukeFillAuto !== "object") {
+    Memory.nukeFillAuto = {
+      activeRoom: null,
+      nextRunTick: 0
+    };
+    memoryManager.requestSave();
+  } else if (typeof Memory.nukeFillAuto.nextRunTick !== "number") {
+    Memory.nukeFillAuto.nextRunTick = 0;
+    memoryManager.requestSave();
+  }
+  return Memory.nukeFillAuto;
+}
+
+function runAuto() {
+  if (!NUKE_FILL_AUTO_ENABLED) return;
+  var e = ensureAutoMemory();
+  if (Game.time < e.nextRunTick) return;
+  var r = e.activeRoom;
+  if (r) {
+    if (hasLiveOrder(r)) {
+      e.nextRunTick = Game.time + NUKE_FILL_AUTO_INTERVAL;
+      memoryManager.requestSave();
+      return;
+    }
+    e.activeRoom = null;
+  }
+  var t = listIncompleteNukerRooms();
+  for (var o = 0; o < t.length; o++) {
+    var n = t[o];
+    if (hasLiveOrder(n)) continue;
+    var u = order(n, {
+      maxPrice: NUKE_FILL_AUTO_MAX_PRICE,
+      source: "auto"
+    });
+    if (hasLiveOrder(n)) {
+      e.activeRoom = n;
+      console.log("[NukeFillAuto] Started " + n + ".");
+      e.nextRunTick = Game.time + NUKE_FILL_AUTO_INTERVAL;
+      memoryManager.requestSave();
+      return;
+    }
+    if (typeof u === "string" && u.indexOf("already full") !== -1) continue;
+  }
+  e.nextRunTick = Game.time + NUKE_FILL_AUTO_INTERVAL;
+  memoryManager.requestSave();
+}
+
+function consolidateCompletedOrders() {
+  if (!Memory.nukeFillOrders) return;
+  for (var e in Memory.nukeFillOrders) {
+    var r = Memory.nukeFillOrders[e];
+    if (!r) continue;
+    if (r.completed) {
+      delete Memory.nukeFillOrders[e];
+      console.log("[NukeFill] Order for " + e + " finalized.");
+      continue;
+    }
+    if (Game.time - r.createdAt > 1e5) {
+      delete Memory.nukeFillOrders[e];
+      console.log("[NukeFill] Order for " + e + " expired after 100,000 ticks.");
+      continue;
+    }
+    var t = _.filter(Game.creeps, function(t) {
+      return t && t.memory && !t.spawning && t.memory.role === "nukeFill" && (t.memory.orderRoom === e || t.memory.homeRoom === e) && t.memory.nukeFillOrderId === r.id;
+    });
+    if (t.length === 0) continue;
+    var o = true;
+    for (var n = 0; n < t.length; n++) {
+      if (!t[n].memory.nukeFillDone) {
+        o = false;
+        break;
+      }
+    }
+    if (o) {
+      delete Memory.nukeFillOrders[e];
+      console.log("[NukeFill] Completed nuker fill in " + e + ".");
+    }
+  }
+}
+
+function autoStatus() {
+  var e = ensureAutoMemory();
+  var r = listIncompleteNukerRooms();
+  var t = [];
+  t.push("[NukeFillAuto] enabled=" + NUKE_FILL_AUTO_ENABLED + " maxPrice=" + NUKE_FILL_AUTO_MAX_PRICE + " interval=" + NUKE_FILL_AUTO_INTERVAL);
+  t.push("activeRoom=" + (e.activeRoom || "none"));
+  t.push("nextRun=" + Math.max(0, e.nextRunTick - Game.time) + " ticks");
+  t.push("incomplete (" + r.length + "): " + (r.length ? r.join(", ") : "none"));
+  var o = Memory.nukeFillOrders || {};
+  var n = [];
+  for (var u in o) {
+    if (o[u] && !o[u].completed) {
+      n.push(u + "(" + (o[u].source || "?") + "/" + (o[u].phase || "?") + ")");
+    }
+  }
+  t.push("orders: " + (n.length ? n.join(", ") : "none"));
+  var i = t.join("\n");
+  console.log(i);
+  return i;
+}
+
+global.nukeFill = order;
+global.nukeFillAutoStatus = autoStatus;
 module.exports = {
   run: run,
-  order: order
+  order: order,
+  runAuto: runAuto,
+  consolidateCompletedOrders: consolidateCompletedOrders,
+  autoStatus: autoStatus
 };

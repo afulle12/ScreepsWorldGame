@@ -1,163 +1,101 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // marketQuery.js
-// Provides a global console command to query Screeps market prices.
-// - Default: 48-hour weighted average (approx.) using Game.market.getHistory
-// - 'buy'  : Top 5 buy orders (highest price first)
-// - 'sell' : Top 5 sell orders (lowest price first)
-//
-// Usage (in console):
+// Console globals: marketPrice
+// Example: marketPrice(RESOURCE_ENERGY) - Query current buy and sell prices for resource
 //   marketPrice('energy')                // 48h avg (approx.)
 //   marketPrice('RESOURCE_ENERGY')       // 48h avg (approx.)
 //   marketPrice('UO', 'sell')            // Top 5 sells for UO
 //   marketPrice('keanium', 'buy')        // Top 5 buys for keanium
-//
-// Notes:
-// - The 48h average is approximated using the last two daily history entries,
 //   weighted by volume, because Screeps history is daily granularity.
-// - Orders listing shows: rank, price, remainingAmount, roomName, orderId.
-// - Accepts either resource strings (e.g. 'energy', 'UO') or constant names
 //   as strings (e.g. 'RESOURCE_ENERGY'). If you already pass the constant
 //   value (e.g. RESOURCE_ENERGY), that works too.
-
 (function registerMarketPriceGlobal() {
-  function resolveResource(input) {
-    // If the user passed the actual constant value (e.g. RESOURCE_ENERGY -> 'energy'), accept it.
-    if (typeof input === 'string' && typeof RESOURCES_ALL !== 'undefined') {
-      // If input is already a valid resource value (e.g. 'energy', 'UO'), accept it.
-      if (RESOURCES_ALL.indexOf(input) !== -1) return input;
-
-      // If input looks like a constant name (e.g. 'RESOURCE_ENERGY'), try to resolve through global.
-      // In Screeps, constants are on the global object; this turns name -> value.
-      var maybeConst = global[input];
-      if (typeof maybeConst === 'string' && RESOURCES_ALL.indexOf(maybeConst) !== -1) {
-        return maybeConst;
+  var r = require("util");
+  var e = require("marketPricing");
+  function resolveResource(r) {
+    if (typeof r === "string" && typeof RESOURCES_ALL !== "undefined") {
+      if (RESOURCES_ALL.indexOf(r) !== -1) return r;
+      var e = global[r];
+      if (typeof e === "string" && RESOURCES_ALL.indexOf(e) !== -1) {
+        return e;
       }
-
-      // Try lowercase normalization (e.g. 'Energy' -> 'energy')
-      var lower = input.toLowerCase();
-      if (RESOURCES_ALL.indexOf(lower) !== -1) return lower;
-
-      // Common aliases
-      if (lower === 'keanium') return RESOURCE_KEANIUM;
-      if (lower === 'utrium') return RESOURCE_UTRIUM;
-      if (lower === 'lemergium') return RESOURCE_LEMERGIUM;
-      if (lower === 'zynthium') return RESOURCE_ZYNTHIUM;
-      if (lower === 'oxygen') return RESOURCE_OXYGEN;
-      if (lower === 'hydrogen') return RESOURCE_HYDROGEN;
-      if (lower === 'catalyst') return RESOURCE_CATALYST;
-      if (lower === 'power') return RESOURCE_POWER;
-
-      // If not resolvable, return as-is and let API fail naturally.
-      return input;
+      var t = r.toLowerCase();
+      if (RESOURCES_ALL.indexOf(t) !== -1) return t;
+      if (t === "keanium") return RESOURCE_KEANIUM;
+      if (t === "utrium") return RESOURCE_UTRIUM;
+      if (t === "lemergium") return RESOURCE_LEMERGIUM;
+      if (t === "zynthium") return RESOURCE_ZYNTHIUM;
+      if (t === "oxygen") return RESOURCE_OXYGEN;
+      if (t === "hydrogen") return RESOURCE_HYDROGEN;
+      if (t === "catalyst") return RESOURCE_CATALYST;
+      if (t === "power") return RESOURCE_POWER;
+      return r;
     }
-    // If not a string (e.g. user typed RESOURCE_ENERGY without quotes), use it directly.
-    return input;
+    return r;
   }
-
-  function formatPrice(n) {
-    return typeof n === 'number' ? n.toFixed(3) : String(n);
+  function formatPrice(r) {
+    return typeof r === "number" ? r.toFixed(3) : String(r);
   }
-
-  function formatOrderLine(order, rank) {
-    var id = order.id;
-    var price = formatPrice(order.price);
-    var rem = order.remainingAmount || order.amount || 0;
-    var room = order.roomName || 'N/A';
-    return '#' + rank + ' ' + price + ' | amt=' + rem + ' | room=' + room + ' | ' + id;
+  function formatOrderLine(e, t) {
+    var n = e.id;
+    var i = formatPrice(e.price);
+    var o = r.getOrderRemaining(e);
+    var a = e.roomName || "N/A";
+    return "#" + t + " " + i + " | amt=" + o + " | room=" + a + " | " + n;
   }
-
-  function getAvg48hString(resource) {
-    // Game.market.getHistory(resource) returns daily entries for ~last 14 days:
-    // { resourceType, date, transactions, volume, avgPrice, stddevPrice }
-    var hist = Game.market.getHistory(resource) || [];
-    if (!hist || hist.length === 0) {
-      return '[Market] No history for ' + resource;
+  function getAvg48hString(r) {
+    var t = e.getHistDays(r) || [];
+    if (t.length === 0) {
+      return "[Market] No history for " + r;
     }
-
-    // Take last two days (approx. 48h window).
-    var last = hist[hist.length - 1];
-    var prev = hist.length >= 2 ? hist[hist.length - 2] : null;
-
-    var sumPV = 0;
-    var sumV = 0;
-
-    if (last && typeof last.avgPrice === 'number' && typeof last.volume === 'number') {
-      sumPV += last.avgPrice * last.volume;
-      sumV += last.volume;
+    var n = e.getAvg48h(r);
+    if (n === null) {
+      return "[Market] No usable history for " + r;
     }
-    if (prev && typeof prev.avgPrice === 'number' && typeof prev.volume === 'number') {
-      sumPV += prev.avgPrice * prev.volume;
-      sumV += prev.volume;
-    }
-
-    if (sumV <= 0) {
-      // Fallback to last day avg if no volume or incomplete data
-      if (last && typeof last.avgPrice === 'number') {
-        return '[Market] ' + resource + ' 48h avg (approx): ' + formatPrice(last.avgPrice) +
-               ' (volume: ' + (last.volume || 0) + ', days=1)';
-      }
-      return '[Market] No usable history for ' + resource;
-    }
-
-    var avg = sumPV / sumV;
-    return '[Market] ' + resource + ' 48h avg (approx): ' + formatPrice(avg) +
-           ' (volume: ' + sumV + ', days=' + (prev ? 2 : 1) + ')';
+    var i = t[t.length - 1];
+    var o = t.length >= 2 ? t[t.length - 2] : null;
+    var a = (i && i.volume || 0) + (o && o.volume || 0);
+    return "[Market] " + r + " 48h avg (approx): " + formatPrice(n) + " (volume: " + a + ", days=" + (o ? 2 : 1) + ")";
   }
-
-  function getTopOrdersString(resource, mode) {
-    var type = mode === 'buy' ? ORDER_BUY : ORDER_SELL;
-    var all = Game.market.getAllOrders({ resourceType: resource, type: type }) || [];
-    // Keep only orders with remaining amount
-    var valid = [];
-    for (var i = 0; i < all.length; i++) {
-      var o = all[i];
-      var rem = o.remainingAmount || o.amount || 0;
-      if (rem > 0) valid.push(o);
+  function getTopOrdersString(e, t) {
+    var n = t === "buy" ? ORDER_BUY : ORDER_SELL;
+    var i = r.marketOrders(e, n, 0);
+    var o = [];
+    for (var a = 0; a < i.length; a++) {
+      var u = i[a];
+      var f = r.getOrderRemaining(u);
+      if (f > 0) o.push(u);
     }
-
-    // Sort by price
-    valid.sort(function(a, b) {
-      if (mode === 'buy') return b.price - a.price; // highest first
-      return a.price - b.price; // lowest first
+    o.sort(function(r, e) {
+      if (t === "buy") return e.price - r.price;
+      return r.price - e.price;
     });
-
-    if (valid.length === 0) {
-      return '[Market] No ' + mode + ' orders found for ' + resource;
+    if (o.length === 0) {
+      return "[Market] No " + t + " orders found for " + e;
     }
-
-    var top = valid.slice(0, 5);
-    var lines = [];
-    lines.push('[Market] ' + resource + ' | top ' + (mode === 'buy' ? 'buy' : 'sell') + ' orders:');
-    for (var j = 0; j < top.length; j++) {
-      lines.push('  ' + formatOrderLine(top[j], j + 1));
+    var s = o.slice(0, 5);
+    var g = [];
+    g.push("[Market] " + e + " | top " + (t === "buy" ? "buy" : "sell") + " orders:");
+    for (var l = 0; l < s.length; l++) {
+      g.push("  " + formatOrderLine(s[l], l + 1));
     }
-    return lines.join('\n');
+    return g.join("\n");
   }
-
-  global.marketPrice = function(resourceInput, queryType) {
-    if (!resourceInput) {
-      return "Usage: marketPrice('resource', mode)\n" +
-             " - mode omitted or 'avg'  -> 48h avg price (approx.)\n" +
-             " - mode 'buy'             -> top 5 buy orders (highest first)\n" +
-             " - mode 'sell'            -> top 5 sell orders (lowest first)\n" +
-             "Examples:\n" +
-             "  marketPrice('energy')\n" +
-             "  marketPrice('RESOURCE_ENERGY')\n" +
-             "  marketPrice('UO', 'sell')\n" +
-             "  marketPrice('keanium', 'buy')";
+  global.marketPrice = function(r, e) {
+    if (!r) {
+      return "Usage: marketPrice('resource', mode)\n" + " - mode omitted or 'avg'  -> 48h avg price (approx.)\n" + " - mode 'buy'             -> top 5 buy orders (highest first)\n" + " - mode 'sell'            -> top 5 sell orders (lowest first)\n" + "Examples:\n" + "  marketPrice('energy')\n" + "  marketPrice('RESOURCE_ENERGY')\n" + "  marketPrice('UO', 'sell')\n" + "  marketPrice('keanium', 'buy')";
     }
-
-    var resource = resolveResource(resourceInput);
-    var mode = (queryType || 'avg') + '';
-    mode = mode.toLowerCase();
-
-    if (mode === 'avg' || mode === 'average' || mode === 'mean') {
-      return getAvg48hString(resource);
-    } else if (mode === 'buy') {
-      return getTopOrdersString(resource, 'buy');
-    } else if (mode === 'sell') {
-      return getTopOrdersString(resource, 'sell');
+    var t = resolveResource(r);
+    var n = (e || "avg") + "";
+    n = n.toLowerCase();
+    if (n === "avg" || n === "average" || n === "mean") {
+      return getAvg48hString(t);
+    } else if (n === "buy") {
+      return getTopOrdersString(t, "buy");
+    } else if (n === "sell") {
+      return getTopOrdersString(t, "sell");
     } else {
-      return "[Market] Unknown mode '" + mode + "'. Use 'avg', 'buy', or 'sell'.";
+      return "[Market] Unknown mode '" + n + "'. Use 'avg', 'buy', or 'sell'.";
     }
   };
 })();

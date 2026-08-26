@@ -1,367 +1,413 @@
+// LLM: Read docs/codex.js before reviewing or changing this file.
 // roleRepairer.js
-// Generic repair executor for repairManager tasks. This module is safe to add
-// before spawn migration because no existing creep uses role 'repairer'.
-
-var getRoomState = require('getRoomState');
-var defenseMonitor = require('defenseMonitor');
-
-var REEVAL_TICKS = 20;
-var MOVE_OPTS_CLOSE = { reusePath: 15, range: 1 };
-var MOVE_OPTS_REPAIR = { reusePath: 15, range: 3 };
-var WALLREPAIR_THRESHOLD_BY_RCL = [0, 0, 10000, 50000, 200000, 1000000, 5000000, 10000000, 50000000];
-var ROAD_DONE_THRESHOLD = 0.99;
-var CONTAINER_DONE_HITS = 244000;
-var NUKE_GROUND_ZERO_DAMAGE = 10000000;
-var NUKE_SPLASH_DAMAGE = 5000000;
-var NUKE_SAFETY_MARGIN = 500000;
-var RAMPARTBOT_EXTERNAL_TARGET = 50000000;
-var RAMPARTBOT_PERIMETER_RANGE = 3;
-
-var RAMPART_TARGETS = {};
-RAMPART_TARGETS[STRUCTURE_SPAWN] = 60500000;
-RAMPART_TARGETS[STRUCTURE_TERMINAL] = 60500000;
-RAMPART_TARGETS[STRUCTURE_STORAGE] = 60500000;
-RAMPART_TARGETS[STRUCTURE_TOWER] = 5500000;
-RAMPART_TARGETS[STRUCTURE_LINK] = 5500000;
-RAMPART_TARGETS[STRUCTURE_NUKER] = 10500000;
-RAMPART_TARGETS[STRUCTURE_FACTORY] = 5500000;
-RAMPART_TARGETS[STRUCTURE_LAB] = 5500000;
-RAMPART_TARGETS[STRUCTURE_POWER_SPAWN] = 10500000;
-RAMPART_TARGETS[STRUCTURE_OBSERVER] = 5500000;
-
-function getHomeRoom(creep) {
-  return (creep.memory && (creep.memory.homeRoom || creep.memory.assignedRoom)) || null;
+// Role dispatch: memory.role === 'repairer' -> roleRepairer.run(creep).
+// Example: require('roleRepairer').run(creep);
+// Example: require('roleRepairer').run(creep);
+var getRoomState = require("getRoomState");
+var defenseMonitor = require("defenseMonitor");
+var repairManager = require("repairManager");
+var util = require("util");
+var REEVAL_TICKS_DEFAULT = 50;
+var REEVAL_TICKS_ROADS = 20;
+var REEVAL_TICKS_WALLS = 100;
+var REPAIR_SOURCE_STICKY_MIN_ENERGY = 200;
+var MOVE_OPTS_CLOSE = {
+  reusePath: 15,
+  range: 1
+};
+var MOVE_OPTS_REPAIR = {
+  reusePath: 15,
+  range: 3
+};
+var WALLREPAIR_THRESHOLD_BY_RCL = [ 0, 0, 1e4, 5e4, 2e5, 1e6, 5e6, 1e7, 5e7 ];
+var ROAD_REPAIR_TARGET = .8;
+var CONTAINER_DONE_HITS = 244e3;
+var NUKE_GROUND_ZERO_DAMAGE = 1e7;
+var NUKE_SPLASH_DAMAGE = 5e6;
+var NUKE_SAFETY_MARGIN = 5e5;
+var DEFENSE_REPAIR_TARGET_RATIO = .97;
+function getHomeRoom(e) {
+  return e.memory && (e.memory.homeRoom || e.memory.assignedRoom) || null;
 }
 
-function isEdge(pos) {
-  return pos.x === 0 || pos.x === 49 || pos.y === 0 || pos.y === 49;
-}
-
-function isPerimeter(pos) {
-  return pos.x <= RAMPARTBOT_PERIMETER_RANGE || pos.x >= 49 - RAMPARTBOT_PERIMETER_RANGE ||
-    pos.y <= RAMPARTBOT_PERIMETER_RANGE || pos.y >= 49 - RAMPARTBOT_PERIMETER_RANGE;
-}
-
-function nudgeOffEdge(creep) {
-  if (creep.pos.y === 0) {
-    if (creep.move(BOTTOM) === OK) return true;
-    if (creep.pos.x > 0 && creep.move(BOTTOM_LEFT) === OK) return true;
-    if (creep.pos.x < 49 && creep.move(BOTTOM_RIGHT) === OK) return true;
-  } else if (creep.pos.y === 49) {
-    if (creep.move(TOP) === OK) return true;
-    if (creep.pos.x > 0 && creep.move(TOP_LEFT) === OK) return true;
-    if (creep.pos.x < 49 && creep.move(TOP_RIGHT) === OK) return true;
-  } else if (creep.pos.x === 0) {
-    if (creep.move(RIGHT) === OK) return true;
-    if (creep.pos.y > 0 && creep.move(TOP_RIGHT) === OK) return true;
-    if (creep.pos.y < 49 && creep.move(BOTTOM_RIGHT) === OK) return true;
-  } else if (creep.pos.x === 49) {
-    if (creep.move(LEFT) === OK) return true;
-    if (creep.pos.y > 0 && creep.move(TOP_LEFT) === OK) return true;
-    if (creep.pos.y < 49 && creep.move(BOTTOM_LEFT) === OK) return true;
+var isEdge = util.isOnRoomEdge;
+var nudgeOffEdge = util.nudgeOffRoomEdge;
+function blockEdgeSquares(e) {
+  for (var r = 0; r < 50; r++) {
+    e.set(r, 0, 255);
+    e.set(r, 49, 255);
   }
-  return false;
-}
-
-function blockEdgeSquares(costMatrix) {
-  for (var x = 0; x < 50; x++) {
-    costMatrix.set(x, 0, 255);
-    costMatrix.set(x, 49, 255);
-  }
-  for (var y = 0; y < 50; y++) {
-    costMatrix.set(0, y, 255);
-    costMatrix.set(49, y, 255);
+  for (var t = 0; t < 50; t++) {
+    e.set(0, t, 255);
+    e.set(49, t, 255);
   }
 }
 
-function targetRoomName(target) {
-  if (!target) return null;
-  if (target.pos) return target.pos.roomName;
-  return target.roomName || null;
+function targetRoomName(e) {
+  if (!e) return null;
+  if (e.pos) return e.pos.roomName;
+  return e.roomName || null;
 }
 
-function moveRepairer(creep, target, opts) {
-  if (creep.fatigue > 0) return ERR_TIRED;
-  if (isEdge(creep.pos) && nudgeOffEdge(creep)) return OK;
-
-  var targetRoom = targetRoomName(target);
-  var sameRoom = !targetRoom || targetRoom === creep.room.name;
-  var moveOpts = {};
-  opts = opts || {};
-  for (var key in opts) moveOpts[key] = opts[key];
-
-  if (sameRoom) {
-    var originalCostCallback = moveOpts.costCallback;
-    moveOpts.maxRooms = 1;
-    moveOpts.costCallback = function(roomName, costMatrix) {
-      var result = originalCostCallback ? originalCostCallback(roomName, costMatrix) : costMatrix;
-      var matrix = result || costMatrix;
-      if (roomName === creep.room.name) blockEdgeSquares(matrix);
-      return matrix;
+function moveRepairer(e, r, t) {
+  if (e.fatigue > 0) return ERR_TIRED;
+  if (isEdge(e.pos) && nudgeOffEdge(e)) return OK;
+  var o = targetRoomName(r);
+  var a = !o || o === e.room.name;
+  var n = {};
+  t = t || {};
+  for (var m in t) n[m] = t[m];
+  if (a) {
+    var i = n.costCallback;
+    n.maxRooms = 1;
+    n.costCallback = function(r, t) {
+      var o = i ? i(r, t) : t;
+      var a = o || t;
+      if (r === e.room.name) blockEdgeSquares(a);
+      return a;
     };
   }
-
-  return creep.moveTo(target, moveOpts);
+  return e.moveTo(r, n);
 }
 
-function park(creep, roomName) {
-  roomName = roomName || getHomeRoom(creep);
-  if (!roomName) return;
-  if (creep.room.name !== roomName) {
-    moveRepairer(creep, new RoomPosition(25, 25, roomName), { reusePath: 20, range: 20 });
+function park(e, r) {
+  r = r || getHomeRoom(e);
+  if (!r) return;
+  if (e.room.name !== r) {
+    moveRepairer(e, new RoomPosition(25, 25, r), {
+      reusePath: 20,
+      range: 20
+    });
     return;
   }
-  var storage = creep.room.storage;
-  if (storage) moveRepairer(creep, storage, { reusePath: 20, range: 3 });
-  else moveRepairer(creep, new RoomPosition(25, 25, roomName), { reusePath: 20, range: 5 });
+  var t = e.room.storage;
+  if (t) moveRepairer(e, t, {
+    reusePath: 20,
+    range: 3
+  }); else moveRepairer(e, new RoomPosition(25, 25, r), {
+    reusePath: 20,
+    range: 5
+  });
 }
 
-function refill(creep, roomName) {
-  roomName = roomName || getHomeRoom(creep);
-  if (!roomName) return false;
-  if (creep.room.name !== roomName) {
-    moveRepairer(creep, new RoomPosition(25, 25, roomName), { reusePath: 20, range: 20 });
+function sourceEnergy(e) {
+  if (!e || !e.store) return 0;
+  if (typeof e.store.getUsedCapacity === "function") {
+    return e.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
+  }
+  return e.store[RESOURCE_ENERGY] || 0;
+}
+
+function isStickyEnergySource(e) {
+  return !!(e && (e.structureType === STRUCTURE_LINK || e.structureType === STRUCTURE_STORAGE));
+}
+
+function refillFromSource(e, r, t) {
+  if (!r) return false;
+  if (t) e.memory.energySourceId = r.id;
+  if (e.pos.isNearTo(r)) {
+    var o = e.withdraw(r, RESOURCE_ENERGY);
+    if (o === OK && t) {
+      e.memory.working = true;
+      delete e.memory.releaseRepairTarget;
+    } else if (o === ERR_NOT_ENOUGH_RESOURCES && t) {
+      delete e.memory.energySourceId;
+    }
+  } else {
+    moveRepairer(e, r, MOVE_OPTS_CLOSE);
+  }
+  return true;
+}
+
+function refill(e, r) {
+  r = r || getHomeRoom(e);
+  if (!r) return false;
+  if (e.room.name !== r) {
+    moveRepairer(e, new RoomPosition(25, 25, r), {
+      reusePath: 20,
+      range: 20
+    });
     return true;
   }
-
-  var room = creep.room;
-  if (room.storage && room.storage.store[RESOURCE_ENERGY] > 0) {
-    if (creep.pos.isNearTo(room.storage)) creep.withdraw(room.storage, RESOURCE_ENERGY);
-    else moveRepairer(creep, room.storage, MOVE_OPTS_CLOSE);
-    return true;
+  var t = e.room;
+  var o = e.memory.targetId ? Game.getObjectById(e.memory.targetId) : null;
+  var a = e.memory.energySourceId ? Game.getObjectById(e.memory.energySourceId) : null;
+  var n = sourceEnergy(a);
+  if (!o || !isStickyEnergySource(a)) {
+    a = null;
+    n = 0;
+    delete e.memory.energySourceId;
+  } else if (n >= REPAIR_SOURCE_STICKY_MIN_ENERGY) {
+    return refillFromSource(e, a, true);
+  } else {
+    delete e.memory.energySourceId;
+    if (!(n > 0)) a = null;
   }
-
-  if (room.terminal && room.terminal.store[RESOURCE_ENERGY] > 0) {
-    if (creep.pos.isNearTo(room.terminal)) creep.withdraw(room.terminal, RESOURCE_ENERGY);
-    else moveRepairer(creep, room.terminal, MOVE_OPTS_CLOSE);
-    return true;
+  var m = getRoomState.get(r);
+  var i = m && m.structuresByType && m.structuresByType[STRUCTURE_LINK] || [];
+  var u = t.storage;
+  var R = sourceEnergy(u);
+  var l = o && o.pos && R > 0 ? o.pos.getRangeTo(u) : Infinity;
+  var E = null;
+  var s = null;
+  if (o && o.pos && t.controller) {
+    for (var g = 0; g < i.length; g++) {
+      var f = i[g];
+      if (!f || f.my === false || !f.store) continue;
+      var y = sourceEnergy(f);
+      if (!(y > 0)) continue;
+      if (f.pos.getRangeTo(t.controller) > 2 || o.pos.getRangeTo(f) >= l) continue;
+      if (y >= REPAIR_SOURCE_STICKY_MIN_ENERGY) E = f; else if (!s) s = f;
+      if (E) break;
+    }
   }
-
-  var rs = getRoomState.get(roomName);
-  var containers = (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_CONTAINER]) || [];
-  var best = null;
-  var bestAmt = 0;
-  for (var i = 0; i < containers.length; i++) {
-    var c = containers[i];
-    if (!c || !c.store) continue;
-    var amt = c.store[RESOURCE_ENERGY] || 0;
-    if (amt > bestAmt) { best = c; bestAmt = amt; }
+  var T = R >= REPAIR_SOURCE_STICKY_MIN_ENERGY ? u : null;
+  var d = E || T || a || s;
+  if (!d && R > 0) d = u;
+  if (d) {
+    return refillFromSource(e, d, !!o && isStickyEnergySource(d));
   }
-  if (best) {
-    if (creep.pos.isNearTo(best)) creep.withdraw(best, RESOURCE_ENERGY);
-    else moveRepairer(creep, best, MOVE_OPTS_CLOSE);
-    return true;
+  if (t.terminal && sourceEnergy(t.terminal) > 0) {
+    return refillFromSource(e, t.terminal, false);
   }
-
-  park(creep);
+  var _ = m && m.structuresByType && m.structuresByType[STRUCTURE_CONTAINER] || [];
+  var c = null;
+  var v = 0;
+  for (var S = 0; S < _.length; S++) {
+    var p = _[S];
+    if (!p || !p.store) continue;
+    var I = sourceEnergy(p);
+    if (I > v) {
+      c = p;
+      v = I;
+    }
+  }
+  if (c) {
+    return refillFromSource(e, c, false);
+  }
+  park(e);
   return false;
 }
 
-function taskKind(task) { return task ? (task.k || task.kind) : null; }
-
-function taskHome(task, creep) { return (task && (task.r || task.homeRoom)) || getHomeRoom(creep); }
-
-function taskIds(task) { return (task && (task.i || task.structureIds)) || []; }
-
-function taskClusterIds(task) { return (task && (task.c || task.clusterIds)) || []; }
-
-function taskTargetHits(task, id, index) {
-  if (!task) return 0;
-  if (task.h) return task.h[index] || 0;
-  if (task.targets) return task.targets[id] || 0;
-  return deriveTargetHits(task, Game.getObjectById(id));
+function taskKind(e) {
+  return e ? e.k || e.kind : null;
 }
 
-function nukeDamageAt(nukes, pos) {
-  var total = 0;
-  for (var i = 0; i < nukes.length; i++) {
-    var nuke = nukes[i];
-    var range = Math.max(Math.abs(nuke.pos.x - pos.x), Math.abs(nuke.pos.y - pos.y));
-    if (range === 0) total += NUKE_GROUND_ZERO_DAMAGE;
-    else if (range <= 2) total += NUKE_SPLASH_DAMAGE;
+function taskHome(e, r) {
+  return e && (e.r || e.homeRoom) || getHomeRoom(r);
+}
+
+function nukeDamageAt(e, r) {
+  var t = 0;
+  for (var o = 0; o < e.length; o++) {
+    var a = e[o];
+    var n = Math.max(Math.abs(a.pos.x - r.x), Math.abs(a.pos.y - r.y));
+    if (n === 0) t += NUKE_GROUND_ZERO_DAMAGE; else if (n <= 2) t += NUKE_SPLASH_DAMAGE;
   }
-  return total;
+  return t;
 }
 
-function getWallTarget(roomName, rcl) {
-  var rm = Memory.repairManager && Memory.repairManager.rooms && Memory.repairManager.rooms[roomName];
-  if (rm && rm.targetOverrides && rm.targetOverrides[STRUCTURE_WALL]) return rm.targetOverrides[STRUCTURE_WALL];
-  return WALLREPAIR_THRESHOLD_BY_RCL[rcl] || 0;
+function getWallTarget(e, r) {
+  var t = Memory.repairManager && Memory.repairManager.rooms && Memory.repairManager.rooms[e];
+  if (t && t.targetOverrides && t.targetOverrides[STRUCTURE_WALL]) return t.targetOverrides[STRUCTURE_WALL];
+  return WALLREPAIR_THRESHOLD_BY_RCL[r] || 0;
 }
 
-function getRampartTarget(rampart, roomName, rcl) {
-  var rs = getRoomState.get(roomName);
-  var sbt = rs && rs.structuresByType ? rs.structuresByType : {};
-  var maxTarget = 0;
-  for (var type in RAMPART_TARGETS) {
-    var arr = sbt[type] || [];
-    for (var i = 0; i < arr.length; i++) {
-      var s = arr[i];
-      if (s && rampart.pos.getRangeTo(s.pos) <= 1 && RAMPART_TARGETS[type] > maxTarget) {
-        maxTarget = RAMPART_TARGETS[type];
-      }
+function getRampartTarget(e, r, t) {
+  var o = getRoomState.get(r);
+  return repairManager.getRampartTarget(e, o, t).target;
+}
+
+function deriveTargetHits(e, r, t) {
+  if (!r || !r.pos) return 0;
+  var o = taskHome(e) || r.pos.roomName;
+  var a = Game.rooms[o];
+  var n = a && a.controller ? a.controller.level : 0;
+  if (taskKind(e) === "nuke") {
+    var m = a ? a.find(FIND_NUKES) : [];
+    var i = nukeDamageAt(m, r.pos);
+    if (i > 0) return i + NUKE_SAFETY_MARGIN;
+  }
+  if (r.structureType === STRUCTURE_ROAD) return Math.floor((r.hitsMax || 0) * ROAD_REPAIR_TARGET);
+  if (r.structureType === STRUCTURE_CONTAINER) return CONTAINER_DONE_HITS;
+  if (r.structureType === STRUCTURE_WALL) return Math.floor(getWallTarget(o, n) * DEFENSE_REPAIR_TARGET_RATIO);
+  if (r.structureType === STRUCTURE_RAMPART) return Math.floor(getRampartTarget(r, o, n) * DEFENSE_REPAIR_TARGET_RATIO);
+  return r.hitsMax || 0;
+}
+
+function targetDone(e, r) {
+  if (!e || typeof e.hits !== "number") return true;
+  return e.hits >= r;
+}
+
+function isWallOrRampartType(e) {
+  return e === STRUCTURE_WALL || e === STRUCTURE_RAMPART;
+}
+
+function isTowerMaintenanceType(e) {
+  return e === STRUCTURE_ROAD || e === STRUCTURE_CONTAINER;
+}
+
+function repairSelectedTarget(e, r) {
+  if (e.pos.inRangeTo(r, 3)) {
+    var t = e.repair(r);
+    if (t === ERR_NOT_ENOUGH_ENERGY) e.memory.working = false; else if (t === ERR_INVALID_TARGET || t === ERR_NO_BODYPART) {
+      e.memory.targetId = null;
+      delete e.memory.route;
+    }
+  } else {
+    moveRepairer(e, r, MOVE_OPTS_REPAIR);
+  }
+}
+
+function retireRepairer(e, r) {
+  delete e.memory.task;
+  delete e.memory.targetId;
+  delete e.memory.route;
+  delete e.memory.releaseRepairTarget;
+  delete e.memory.repairMaintenance;
+  delete e.memory.energySourceId;
+  e.memory.working = false;
+  if (!r) {
+    e.suicide();
+    return true;
+  }
+  if (e.room.name !== r) {
+    moveRepairer(e, new RoomPosition(25, 25, r), {
+      reusePath: 20,
+      range: 20
+    });
+    return true;
+  }
+  var t = e.room.storage;
+  if (!t) {
+    e.suicide();
+    return true;
+  }
+  var o = e.store[RESOURCE_ENERGY] || 0;
+  if (o > 0) {
+    if (e.pos.isNearTo(t)) {
+      var a = e.transfer(t, RESOURCE_ENERGY);
+      if (a === OK || a === ERR_NOT_ENOUGH_RESOURCES || a === ERR_FULL) e.suicide();
+    } else moveRepairer(e, t, MOVE_OPTS_CLOSE);
+    return true;
+  }
+  e.suicide();
+  return true;
+}
+
+function handleNoTarget(e, r) {
+  delete e.memory.energySourceId;
+  delete e.memory.repairMaintenance;
+  var t = Memory.repairPlan && Memory.repairPlan[r];
+  var o = t ? t.rt || t.tier || "PEACE" : "PEACE";
+  var a = o === "PEACE";
+  var n = t && (t.maxHeal || t.tp && t.tp.m);
+  var m = t && t.n && t.n.a;
+  if (a && !n && !m) {
+    e.memory.idleTicks = (e.memory.idleTicks || 0) + 1;
+    if (e.memory.idleTicks >= 20) {
+      retireRepairer(e, r);
+      return;
     }
   }
-  if (maxTarget === 0 && isPerimeter(rampart.pos)) maxTarget = RAMPARTBOT_EXTERNAL_TARGET;
-  var cap = RAMPART_HITS_MAX[rcl] || 0;
-  if (cap > 0 && maxTarget > cap) maxTarget = cap;
-  return maxTarget;
+  e.memory.working = false;
+  park(e, r);
 }
 
-function deriveTargetHits(task, target) {
-  if (!target || !target.pos) return 0;
-  var roomName = taskHome(task) || target.pos.roomName;
-  var room = Game.rooms[roomName];
-  var rcl = room && room.controller ? room.controller.level : 0;
-
-  if (taskKind(task) === 'nuke') {
-    var nukes = room ? room.find(FIND_NUKES) : [];
-    var damage = nukeDamageAt(nukes, target.pos);
-    if (damage > 0) return damage + NUKE_SAFETY_MARGIN;
+function run(e) {
+  if (!e.memory._repairMemoryCleaned) {
+    delete e.memory.task;
+    delete e.memory.repairQueue;
+    delete e.memory.repairThresholds;
+    delete e.memory.energySourceId;
+    delete e.memory.clusterIds;
+    delete e.memory.repairId;
+    delete e.memory._lastReeval;
+    e.memory._repairMemoryCleaned = 1;
   }
-
-  if (target.structureType === STRUCTURE_ROAD) return Math.floor((target.hitsMax || 0) * ROAD_DONE_THRESHOLD);
-  if (target.structureType === STRUCTURE_CONTAINER) return CONTAINER_DONE_HITS;
-  if (target.structureType === STRUCTURE_WALL) return getWallTarget(roomName, rcl);
-  if (target.structureType === STRUCTURE_RAMPART) return getRampartTarget(target, roomName, rcl);
-  return target.hitsMax || 0;
-}
-
-function targetDone(target, targetHits) {
-  if (!target || typeof target.hits !== 'number') return true;
-  return target.hits >= targetHits;
-}
-
-function selectTarget(creep, homeRoom) {
-  var task = creep.memory.task;
-  var ids = taskIds(task);
-  if (!task || !ids.length) return null;
-  homeRoom = homeRoom || getHomeRoom(creep);
-  if (!homeRoom) return null;
-
-  var current = creep.memory.targetId ? Game.getObjectById(creep.memory.targetId) : null;
-  if (current) {
-    var curIdx = ids.indexOf(current.id);
-    if (curIdx !== -1 && current.pos && current.pos.roomName === homeRoom && !targetDone(current, taskTargetHits(task, current.id, curIdx))) return current;
-  }
-
-  var best = null;
-  var bestScore = Infinity;
-  for (var i = 0; i < ids.length; i++) {
-    var id = ids[i];
-    var obj = Game.getObjectById(id);
-    if (!obj) continue;
-    if (!obj.pos || obj.pos.roomName !== homeRoom) continue;
-    var targetHits = taskTargetHits(task, id, i);
-    if (targetDone(obj, targetHits)) continue;
-    var ratio = targetHits > 0 ? obj.hits / targetHits : 1;
-    var dist = creep.pos.getRangeTo(obj.pos);
-    var score = ratio * 1000 + dist;
-    if (score < bestScore) { best = obj; bestScore = score; }
-  }
-
-  creep.memory.targetId = best ? best.id : null;
-  return best;
-}
-
-function workTargetTask(creep, homeRoom) {
-  var target = selectTarget(creep, homeRoom);
-  if (!target) { delete creep.memory.task; park(creep, homeRoom); return; }
-
-  if (creep.pos.inRangeTo(target, 3)) {
-    var result = creep.repair(target);
-    if (result === ERR_NOT_ENOUGH_ENERGY) creep.memory.working = false;
-    else if (result === ERR_INVALID_TARGET || result === ERR_NO_BODYPART) creep.memory.targetId = null;
-  } else {
-    moveRepairer(creep, target, MOVE_OPTS_REPAIR);
-  }
-}
-
-function workNukeTask(creep, homeRoom) {
-  // Nuke tasks use the same per-id target execution, but manager assigns
-  // nuke-priority ids and targets. Re-evaluation handles new incoming nukes.
-  workTargetTask(creep, homeRoom);
-}
-
-function pickMedianTarget(creep) {
-  var task = creep.memory.task;
-  var ids = taskClusterIds(task);
-  if (!task || ids.length === 0) return null;
-  var lowest = null;
-  var lowestHits = Infinity;
-  for (var i = 0; i < ids.length; i++) {
-    var s = Game.getObjectById(ids[i]);
-    if (!s || typeof s.hits !== 'number') continue;
-    if (s.hits < lowestHits) { lowest = s; lowestHits = s.hits; }
-  }
-  return lowest;
-}
-
-function medianDone(creep) {
-  var task = creep.memory.task;
-  var roomName = getHomeRoom(creep);
-  var ids = taskClusterIds(task);
-  if (!task || ids.length === 0) return true;
-  var median = defenseMonitor.getRoomMedianHits(roomName);
-  var stats = defenseMonitor.getClusterMinHits(ids);
-  return stats.minHits >= median;
-}
-
-function workMedianTask(creep, homeRoom) {
-  if (medianDone(creep)) { delete creep.memory.task; park(creep, homeRoom); return; }
-  var target = pickMedianTarget(creep);
-  if (!target) { delete creep.memory.task; park(creep, homeRoom); return; }
-  if (creep.pos.inRangeTo(target, 3)) {
-    var result = creep.repair(target);
-    if (result === ERR_NOT_ENOUGH_ENERGY) creep.memory.working = false;
-  } else {
-    moveRepairer(creep, target, MOVE_OPTS_REPAIR);
-  }
-}
-
-function run(creep) {
-  if (Memory.cpuStats && Memory.cpuStats.average > 25) { creep.say('Zzz'); return; }
-
-  delete creep.memory.repairQueue;
-  delete creep.memory.repairThresholds;
-  delete creep.memory.energySourceId;
-  delete creep.memory.clusterIds;
-  delete creep.memory.repairId;
-
-  var task = creep.memory.task;
-  var homeRoom = getHomeRoom(creep) || taskHome(task, creep);
-  if (homeRoom && !creep.memory.homeRoom) creep.memory.homeRoom = homeRoom;
-  if (homeRoom && !creep.memory.assignedRoom) creep.memory.assignedRoom = homeRoom;
-
-  if (!homeRoom) {
-    park(creep);
+  var r = getHomeRoom(e);
+  if (r && !e.memory.homeRoom) e.memory.homeRoom = r;
+  if (r && !e.memory.assignedRoom) e.memory.assignedRoom = r;
+  if (!r) {
+    park(e);
     return;
   }
-
-  if (creep.room.name !== homeRoom) {
-    moveRepairer(creep, new RoomPosition(25, 25, homeRoom), { reusePath: 20, range: 20 });
+  if (e.ticksToLive !== undefined && e.ticksToLive < 50) {
+    retireRepairer(e, r);
     return;
   }
-
-  if (!task) { park(creep, homeRoom); return; }
-
-  if (!creep.memory.working && creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0) creep.memory.working = true;
-  if (creep.memory.working && creep.store[RESOURCE_ENERGY] === 0) creep.memory.working = false;
-
-  if (!creep.memory.working) { refill(creep, homeRoom); return; }
-
-  if (!creep.memory._lastReeval || Game.time - creep.memory._lastReeval >= REEVAL_TICKS) {
-    creep.memory._lastReeval = Game.time;
-    creep.memory.targetId = null;
+  if (e.room.name !== r) {
+    moveRepairer(e, new RoomPosition(25, 25, r), {
+      reusePath: 20,
+      range: 20
+    });
+    return;
   }
-
-  var kind = taskKind(task);
-  if (kind === 'target') return workTargetTask(creep, homeRoom);
-  if (kind === 'nuke') return workNukeTask(creep, homeRoom);
-  if (kind === 'median') return workMedianTask(creep, homeRoom);
-
-  delete creep.memory.task;
-  park(creep, homeRoom);
+  var t = e.memory.targetId ? Game.getObjectById(e.memory.targetId) : null;
+  if (!t) {
+    delete e.memory.targetId;
+    delete e.memory.route;
+    repairManager.ensureCreepAssignment(e);
+    t = e.memory.targetId ? Game.getObjectById(e.memory.targetId) : null;
+  }
+  if (!t) {
+    handleNoTarget(e, r);
+    return;
+  }
+  if (!e.memory.working && e.store[RESOURCE_ENERGY] > 0) e.memory.working = true;
+  if (!e.memory.working && e.store.getFreeCapacity(RESOURCE_ENERGY) === 0) e.memory.working = true;
+  if (e.memory.working && e.store[RESOURCE_ENERGY] === 0) {
+    e.memory.working = false;
+    e.memory.releaseRepairTarget = e.memory.targetId || null;
+    delete e.memory.energySourceId;
+  }
+  if (!e.memory.working) {
+    refill(e, r);
+    return;
+  }
+  t = e.memory.targetId ? Game.getObjectById(e.memory.targetId) : null;
+  if (!t) {
+    handleNoTarget(e, r);
+    return;
+  }
+  if (e.memory.route && e.memory.route.length) {
+    while (e.memory.route.length && e.memory.route[0] !== t.id) e.memory.route.shift();
+    var o = targetDone(t, deriveTargetHits({
+      r: r
+    }, t, e));
+    if (o) {
+      e.memory.route.shift();
+      e.memory.targetId = e.memory.route[0] || null;
+      if (!e.memory.targetId) {
+        handleNoTarget(e, r);
+        return;
+      }
+      t = Game.getObjectById(e.memory.targetId);
+      if (!t) {
+        handleNoTarget(e, r);
+        return;
+      }
+    }
+  } else if ((e.memory.repairMaintenance || !isWallOrRampartType(t.structureType)) && targetDone(t, deriveTargetHits({
+    r: r
+  }, t, e))) {
+    e.memory.releaseRepairTarget = t.id;
+    delete e.memory.targetId;
+    handleNoTarget(e, r);
+    return;
+  }
+  if (isTowerMaintenanceType(t.structureType)) {
+    e.memory.releaseRepairTarget = t.id;
+    delete e.memory.targetId;
+    delete e.memory.route;
+    handleNoTarget(e, r);
+    return;
+  }
+  delete e.memory.idleTicks;
+  repairSelectedTarget(e, t);
 }
 
-module.exports = { run: run };
+module.exports = {
+  run: run
+};

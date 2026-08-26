@@ -1,1037 +1,868 @@
-/**
- * =============================================================================
- * BOOST MANAGER — Generic Screeps Creep Boosting Framework (Multi-Lab Edition)
- * =============================================================================
- *
- * Console Commands:
- *   boostUpgrader('W1N1', 3)          — Tier 3 XGH2O (+100%)
- *   boostUpgrader('W1N1', 2)          — Tier 2 GH2O  (+80%)
- *   boostUpgrader('W1N1', 1)          — Tier 1 GH    (+50%)
- *   boostRampartBot('W1N1', 3)        — Tier 3 XLH2O (+100% repair)
- *   boostRampartBot('W1N1', 2)        — Tier 2 LH2O  (+80% repair)
- *   boostRampartBot('W1N1', 1)        — Tier 1 LH    (+50% repair)
- *   boostDemolisher('W1N1', 3)        — Tier 3 XZH2O (4× dismantle)
- *   boostDemolisher('W1N1', 2)        — Tier 2 ZH2O  (3× dismantle)
- *   boostDemolisher('W1N1', 1)        — Tier 1 ZH    (2× dismantle)
- *   boost('W1N1', 'attacker', { XZHO2: 25, XLHO2: 25 })
- *   stopBoost('W1N1', 'upgrader')
- *   boostStatus()  /  boostStatus('W1N1')  /  boostStatus('W1N1', 'upgrader')
- *
- * Multi-lab burst behavior:
- *   Allocates up to half the room's labs per compound.
- *   LabBot fills ALL allocated labs to capacity in one burst, then suicides.
- *   LabBot only respawns when NO lab can serve a boost (all drained).
- *   5 labs × 6 boosts/lab = 30 boosts (~45,000 ticks) between labBot spawns.
- *
- * Spawn gating:
- *   Upgraders spawn as soon as ANY lab has enough compound + energy for 1 boost.
- *   No waiting for full batch purchase — first 450 compound triggers first upgrader.
- *
- * Memory: Memory.boostManager.orders[roomName][role] = {
- *   boosts: { 'XGH2O': { parts: 15, labIds: ['id1', 'id2', ...] } }, ...
- * }
- *
- * @module boostManager
- */
-
-var storageManager   = require('storageManager');
-var labManager       = require('labManager');
-var opportunisticBuy = require('opportunisticBuy');
-var getRoomState     = require('getRoomState');
-
-function _getLabs(room) {
-    var rs = getRoomState.get(room.name);
-    if (rs && rs.structuresByType && rs.structuresByType[STRUCTURE_LAB]) {
-        return rs.structuresByType[STRUCTURE_LAB];
+// LLM: Read docs/codex.js before reviewing or changing this file.
+// boostManager.js
+// Boosting is universal: any role can be boosted. boostManager.handleCreep()
+// runs from main.js before role dispatch, so role files carry no boost code.
+// Console globals: boost, boostUpgrader, boostRampartBot, boostDemolisher, stopBoost, boostStatus
+// Example: boost('E1N1', 'builder', 3) - Tier-3 build boost on the dynamic builder body
+// Example: boost('E1N1', 'defender', { attack: 3, tough: 3 }) - Action/tier map, dynamic body
+// Example: boost('E1N1', 'upgrader', ['GH2O'], [WORK, WORK, CARRY, MOVE]) - Compound list with a pinned body
+// Example: boost('E1N1', 'attacker', { XUH2O: 30 }, null, { allowUnboost: false }) - Explicit part counts
+// Example: boostUpgrader('E1N1', 2) - Order tier-2 boosted upgrader for room
+// Example: boostRampartBot('E1N1', 3) - Order tier-3 boosted rampart bot for room
+// Example: boostDemolisher('E1N1', 2) - Order tier-2 boosted demolisher for room
+// Example: stopBoost('E1N1', 'upgrader') - Cancel active boost order for role
+// Example: boostStatus('E1N1') - Display lab boost queues and available compound inventory
+var storageManager = require("storageManager");
+var labManager = require("labManager");
+var opportunisticBuy = require("opportunisticBuy");
+var getRoomState = require("getRoomState");
+var roomSuspender = require("roomSuspender");
+var util = require("util");
+var pricing = require("marketPricing");
+var util = require("util");
+var creditLedger = require("creditLedger");
+var memoryManager = require("memoryManager");
+function _getLabs(e) {
+  var r = getRoomState.get(e.name);
+  if (r && r.structuresByType && r.structuresByType[STRUCTURE_LAB]) {
+    return r.structuresByType[STRUCTURE_LAB];
+  }
+  return e.find(FIND_STRUCTURES, {
+    filter: function(e) {
+      return e.structureType === STRUCTURE_LAB;
     }
-    return room.find(FIND_STRUCTURES, {
-        filter: function(s) { return s.structureType === STRUCTURE_LAB; }
-    });
+  });
 }
 
-// =============================================================================
-// CONSTANTS
-// =============================================================================
-
 var COMPOUND_PER_PART = 30;
-var ENERGY_PER_PART   = 20;
-var LAB_MINERAL_CAPACITY = 3000;
-var LAB_ENERGY_CAPACITY  = 2000;
-
-var DEFAULT_BATCH_SIZE  = 50;
-var DEFAULT_REORDER_AT  = 5;
-var PRICE_MULT_INSTANT  = 2.0;
-var PRICE_MULT_ORDER    = 1.5;
+var ENERGY_PER_PART = 20;
+var LAB_MINERAL_CAPACITY = 3e3;
+var LAB_ENERGY_CAPACITY = 2e3;
+var DEFAULT_BATCH_SIZE = 50;
+var DEFAULT_REORDER_AT = 5;
+var PRICE_MULT_INSTANT = 2;
+var PRICE_MULT_ORDER = 1.5;
 var PURCHASE_CHECK_INTERVAL = 100;
-var BUY_ORDER_STALL_TICKS   = 300;
-var CLEANUP_RESERVATION_TICKS = 100000;
-
+var BUY_ORDER_STALL_TICKS = 300;
+var CLEANUP_RESERVATION_TICKS = 1e5;
 var UNBOOST_RETURN_PER_PART = 15;
-var UNBOOST_TTL_THRESHOLD   = 100;
-
-// Multi-lab: allocate up to this fraction of a room's total labs for boosting
-var MAX_BOOST_LAB_FRACTION = 0.5;
-
+var UNBOOST_TTL_THRESHOLD = 100;
+var MAX_BOOST_LAB_FRACTION = .5;
 var UPGRADER_TIERS = {
-  1: { compound: 'GH',    name: 'Tier 1 (GH — +50%)' },
-  2: { compound: 'GH2O',  name: 'Tier 2 (GH2O — +80%)' },
-  3: { compound: 'XGH2O', name: 'Tier 3 (XGH2O — +100%)' }
+  1: {
+    compound: "GH",
+    name: "Tier 1 (GH — +50%)"
+  },
+  2: {
+    compound: "GH2O",
+    name: "Tier 2 (GH2O — +80%)"
+  },
+  3: {
+    compound: "XGH2O",
+    name: "Tier 3 (XGH2O — +100%)"
+  }
 };
-
-// Repair boost tiers — LH family boosts WORK repair effectiveness
 var RAMPARTBOT_TIERS = {
-  1: { compound: 'LH',    name: 'Tier 1 (LH — +50% repair)' },
-  2: { compound: 'LH2O',  name: 'Tier 2 (LH2O — +80% repair)' },
-  3: { compound: 'XLH2O', name: 'Tier 3 (XLH2O — +100% repair)' }
+  1: {
+    compound: "LH",
+    name: "Tier 1 (LH — +50% repair)"
+  },
+  2: {
+    compound: "LH2O",
+    name: "Tier 2 (LH2O — +80% repair)"
+  },
+  3: {
+    compound: "XLH2O",
+    name: "Tier 3 (XLH2O — +100% repair)"
+  }
 };
-
-// Dismantle boost tiers — ZH family boosts WORK dismantle effectiveness
-// ZH=2×, ZHO2=3×, XZHO2=4× base dismantle hits per tick per WORK part
 var DEMOLISHER_TIERS = {
-  1: { compound: 'ZH',    name: 'Tier 1 (ZH — 2× dismantle)' },
-  2: { compound: 'ZH2O',  name: 'Tier 2 (ZH2O — 3× dismantle)' },
-  3: { compound: 'XZH2O', name: 'Tier 3 (XZH2O — 4× dismantle)' }
+  1: {
+    compound: "ZH",
+    name: "Tier 1 (ZH — 2× dismantle)"
+  },
+  2: {
+    compound: "ZH2O",
+    name: "Tier 2 (ZH2O — 3× dismantle)"
+  },
+  3: {
+    compound: "XZH2O",
+    name: "Tier 3 (XZH2O — 4× dismantle)"
+  }
 };
-
-var UPGRADER_BOOST_BODY = (function() {
-  var b = [];
-  for (var i = 0; i < 15; i++) b.push(WORK);
-  for (var j = 0; j < 5; j++)  b.push(CARRY);
-  for (var k = 0; k < 20; k++) b.push(MOVE);
-  return b;
-})();
-var UPGRADER_BOOST_COST = 2750;
-
-// Max wallRepair body: 21 WORK / 12 CARRY / 17 MOVE = 50 parts, 3550 energy
-// Matches the 3550-tier entry in spawnManager's wallRepair bodyConfigs.
-var RAMPARTBOT_BOOST_BODY = (function() {
-  var b = [];
-  for (var i = 0; i < 21; i++) b.push(WORK);
-  for (var j = 0; j < 12; j++) b.push(CARRY);
-  for (var k = 0; k < 17; k++) b.push(MOVE);
-  return b;
-})();
+var UPGRADER_BOOST_BODY = function() {
+  var e = [];
+  for (var r = 0; r < 15; r++) e.push(WORK);
+  for (var a = 0; a < 4; a++) e.push(CARRY);
+  for (var o = 0; o < 19; o++) e.push(MOVE);
+  return e;
+}();
+var UPGRADER_BOOST_COST = 2800;
+var RAMPARTBOT_BOOST_BODY = function() {
+  var e = [];
+  for (var r = 0; r < 21; r++) e.push(WORK);
+  for (var a = 0; a < 12; a++) e.push(CARRY);
+  for (var o = 0; o < 17; o++) e.push(MOVE);
+  return e;
+}();
 var RAMPARTBOT_BOOST_COST = 3550;
-
-// Max demolisher body: 36 WORK / 14 MOVE = 50 parts, 4300 energy
-// No CARRY — demolishers drop all energy on the ground (working as intended).
-// 14 MOVE gives 1 move per ~2.57 body parts; sufficient for in-room work.
-// Matches the 36-WORK assumption used in orderDemolition teams.
-var DEMOLISHER_BOOST_BODY = (function() {
-  var b = [];
-  for (var i = 0; i < 36; i++) b.push(WORK);
-  for (var j = 0; j < 14; j++) b.push(MOVE);
-  return b;
-})();
+var DEMOLISHER_BOOST_BODY = function() {
+  var e = [];
+  for (var r = 0; r < 36; r++) e.push(WORK);
+  for (var a = 0; a < 14; a++) e.push(MOVE);
+  return e;
+}();
 var DEMOLISHER_BOOST_COST = 4300;
-
-// =============================================================================
-// TICK CACHE
-// =============================================================================
-
 var _cacheTick = 0;
 var _hasAnyOrders = false;
 var _labWorkCache = {};
 var _activeOrdersCache = {};
 var _needsLabBotCache = {};
-
 function refreshTickCache() {
   if (_cacheTick === Game.time) return;
   _cacheTick = Game.time;
   _labWorkCache = {};
   _activeOrdersCache = {};
   _needsLabBotCache = {};
-
   _hasAnyOrders = false;
   if (Memory.boostManager && Memory.boostManager.orders) {
-    for (var k in Memory.boostManager.orders) {
+    for (var e in Memory.boostManager.orders) {
       _hasAnyOrders = true;
       break;
     }
   }
 }
 
-// =============================================================================
-// MEMORY HELPERS
-// =============================================================================
-
 function ensureRoot() {
   if (!Memory.boostManager) Memory.boostManager = {};
   if (!Memory.boostManager.orders) Memory.boostManager.orders = {};
-}
-
-function getOrder(roomName, role) {
-  if (!Memory.boostManager || !Memory.boostManager.orders) return null;
-  var rOrders = Memory.boostManager.orders[roomName];
-  if (!rOrders) return null;
-  return rOrders[role] || null;
-}
-
-function setOrder(roomName, role, order) {
-  ensureRoot();
-  if (!Memory.boostManager.orders[roomName]) {
-    Memory.boostManager.orders[roomName] = {};
+  if (Memory.boostManager.lastReservationUpdateTick !== null && typeof Memory.boostManager.lastReservationUpdateTick !== "number") {
+    Memory.boostManager.lastReservationUpdateTick = null;
+    memoryManager.requestSave();
   }
-  Memory.boostManager.orders[roomName][role] = order;
+}
+
+function getOrder(e, r) {
+  if (!Memory.boostManager || !Memory.boostManager.orders) return null;
+  var a = Memory.boostManager.orders[e];
+  if (!a) return null;
+  return a[r] || null;
+}
+
+function setOrder(e, r, a) {
+  ensureRoot();
+  if (!Memory.boostManager.orders[e]) {
+    Memory.boostManager.orders[e] = {};
+  }
+  Memory.boostManager.orders[e][r] = a;
   _cacheTick = 0;
   global.__boostActive = true;
 }
 
-function deleteOrder(roomName, role) {
+function reconcilePendingBuyOrders(e, r) {
+  if (!r || !r.pendingBuyOrders || !Game.market || !Game.market.orders) return;
+  if (!r.buyOrderIds) r.buyOrderIds = {};
+  var a = {};
+  var o = Memory.boostManager && Memory.boostManager.orders || {};
+  for (var t in o) {
+    var n = o[t] || {};
+    for (var s in n) {
+      var i = n[s];
+      if (!i || !i.buyOrderIds) continue;
+      for (var u in i.buyOrderIds) {
+        var l = i.buyOrderIds[u];
+        if (l) a[l] = true;
+      }
+    }
+  }
+  var d = false;
+  for (var g in r.pendingBuyOrders) {
+    var v = r.pendingBuyOrders[g];
+    if (!v || !(v.totalAmount > 0) || !(v.price > 0) || typeof v.createdTick !== "number") {
+      delete r.pendingBuyOrders[g];
+      d = true;
+      continue;
+    }
+    var c = [];
+    for (var f in Game.market.orders) {
+      if (a[f]) continue;
+      var m = Game.market.orders[f];
+      if (!m || m.type !== ORDER_BUY || m.active === false) continue;
+      if (m.resourceType !== v.resourceType || m.roomName !== e) continue;
+      if (m.created !== v.createdTick || m.totalAmount !== v.totalAmount) continue;
+      if (typeof m.price !== "number" || Math.abs(m.price - v.price) >= .001) continue;
+      c.push(f);
+    }
+    if (c.length !== 1) continue;
+    var b = c[0];
+    r.buyOrderIds[g] = b;
+    a[b] = true;
+    delete r.pendingBuyOrders[g];
+    d = true;
+    console.log("[BoostManager] Captured buy order " + b + " for " + g + " in " + e);
+  }
+  if (d) memoryManager.requestImmediateSave("boostManager.captureBuyOrder");
+}
+
+function hasPendingBuyOrders(e) {
+  if (!e || !e.pendingBuyOrders) return false;
+  for (var r in e.pendingBuyOrders) {
+    if (e.pendingBuyOrders[r]) return true;
+  }
+  return false;
+}
+
+function deleteOrder(e, r) {
   if (!Memory.boostManager || !Memory.boostManager.orders) return;
-  if (Memory.boostManager.orders[roomName]) {
-    delete Memory.boostManager.orders[roomName][role];
-    if (Object.keys(Memory.boostManager.orders[roomName]).length === 0) {
-      delete Memory.boostManager.orders[roomName];
+  if (Memory.boostManager.orders[e]) {
+    delete Memory.boostManager.orders[e][r];
+    if (Object.keys(Memory.boostManager.orders[e]).length === 0) {
+      delete Memory.boostManager.orders[e];
     }
   }
   _cacheTick = 0;
 }
 
-/**
- * Migrate old labId (string) → labIds (array) format.
- * Safe to call repeatedly; no-ops if already migrated.
- */
-function migrateLabIds(order) {
-  if (!order || !order.boosts) return;
-  for (var comp in order.boosts) {
-    var info = order.boosts[comp];
-    if (info.labId && !info.labIds) {
-      info.labIds = [info.labId];
-      delete info.labId;
+function migrateLabIds(e) {
+  if (!e || !e.boosts) return;
+  for (var r in e.boosts) {
+    var a = e.boosts[r];
+    if (a.labId && !a.labIds) {
+      a.labIds = [ a.labId ];
+      delete a.labId;
     }
-    if (!info.labIds) info.labIds = [];
+    if (!a.labIds) a.labIds = [];
   }
 }
 
-// =============================================================================
-// UTILITY
-// =============================================================================
-
-function bodyCost(body) {
-  var COSTS = { move: 50, work: 100, carry: 50, attack: 80,
-                ranged_attack: 150, heal: 250, tough: 10, claim: 600 };
-  var total = 0;
-  for (var i = 0; i < body.length; i++) total += (COSTS[body[i]] || 0);
-  return total;
+var bodyCost = util.bodyCost;
+function compoundPerBoost(e) {
+  return e * COMPOUND_PER_PART;
 }
 
-function compoundPerBoost(parts) {
-  return parts * COMPOUND_PER_PART;
+function energyPerBoost(e) {
+  return e * ENERGY_PER_PART;
 }
 
-function energyPerBoost(parts) {
-  return parts * ENERGY_PER_PART;
+function getRoomCompound(e, r) {
+  var a = 0;
+  if (e.terminal) a += e.terminal.store[r] || 0;
+  if (e.storage) a += e.storage.store[r] || 0;
+  return a;
 }
 
-function getRoomCompound(room, compound) {
-  var amt = 0;
-  if (room.terminal) amt += (room.terminal.store[compound] || 0);
-  if (room.storage)  amt += (room.storage.store[compound] || 0);
-  return amt;
-}
-
-/**
- * Get compound across multiple labs.
- */
-function getLabsCompound(labIds, compound) {
-  if (!labIds) return 0;
-  var total = 0;
-  for (var i = 0; i < labIds.length; i++) {
-    var lab = Game.getObjectById(labIds[i]);
-    if (lab && lab.mineralType === compound) total += (lab.mineralAmount || 0);
+function getLabsCompound(e, r) {
+  if (!e) return 0;
+  var a = 0;
+  for (var o = 0; o < e.length; o++) {
+    var t = Game.getObjectById(e[o]);
+    if (t && t.mineralType === r) a += t.mineralAmount || 0;
   }
-  return total;
+  return a;
 }
 
-function getBoostLabStock(order, compound) {
-  migrateLabIds(order);
-
-  var info = order.boosts[compound];
-  if (!info || !info.labIds || info.labIds.length === 0) {
-    return { compound: 0, energy: 0 };
+function getBoostLabStock(e, r) {
+  migrateLabIds(e);
+  var a = e.boosts[r];
+  if (!a || !a.labIds || a.labIds.length === 0) {
+    return {
+      compound: 0,
+      energy: 0
+    };
   }
-
-  var compoundTotal = 0;
-  var energyTotal = 0;
-
-  for (var i = 0; i < info.labIds.length; i++) {
-    var lab = Game.getObjectById(info.labIds[i]);
-    if (!lab) continue;
-
-    if (lab.mineralType === compound) {
-      compoundTotal += (lab.mineralAmount || 0);
+  var o = 0;
+  var t = 0;
+  for (var n = 0; n < a.labIds.length; n++) {
+    var s = Game.getObjectById(a.labIds[n]);
+    if (!s) continue;
+    if (s.mineralType === r) {
+      o += s.mineralAmount || 0;
     }
-    if (lab.store) {
-      energyTotal += (lab.store.getUsedCapacity(RESOURCE_ENERGY) || 0);
+    if (s.store) {
+      t += s.store.getUsedCapacity(RESOURCE_ENERGY) || 0;
     }
   }
-
   return {
-    compound: compoundTotal,
-    energy: energyTotal
+    compound: o,
+    energy: t
   };
 }
 
-function getReservedAmount(roomName, building, material, program) {
-  if (!Memory.storageReservations) return 0;
-  var roomBuckets = Memory.storageReservations[roomName];
-  if (!roomBuckets || !roomBuckets[building] || !roomBuckets[building][material]) return 0;
+function getReservedAmount(e, r, a, o) {
+  try {
+    const t = require("storageVfs");
+    const n = t.getReservationList(e, r, a);
+    let total = 0;
+    let found = false;
+    for (let i = 0; i < n.length; i++) {
+      if (n[i] && n[i].program === o) {
+        found = true;
+        total += n[i].amount || 0;
+      }
+    }
+    if (found) return total;
+  } catch (error) {
+    if (Game.time % 100 === 0) console.log("[BoostManager] V2 reservation read failed: " + ((error && error.message) || error));
+  }
+  return storageManager.getProgramReserved(e, r, a, o);
+}
 
-  var reservations = roomBuckets[building][material];
-  var total = 0;
-  for (var i = 0; i < reservations.length; i++) {
-    if (reservations[i] && reservations[i].program === program) {
-      total += (reservations[i].amount || 0);
+function getBoostAccessibleAmount(e, r) {
+  var a = storageManager.storageFind(e, r);
+  if (!a) return 0;
+  var o = getReservedAmount(e, "terminal", r, "boostManager");
+  var t = getReservedAmount(e, "storage", r, "boostManager");
+  var n = a.terminal ? a.terminal.total || 0 : 0;
+  var s = a.storage ? a.storage.total || 0 : 0;
+  var i = a.terminal ? a.terminal.reserved || 0 : 0;
+  var u = a.storage ? a.storage.reserved || 0 : 0;
+  var l = Math.max(0, i - o);
+  var d = Math.max(0, u - t);
+  return Math.max(0, n - l) + Math.max(0, s - d);
+}
+
+function getRefPrice(e) {
+  var r = pricing.getPriceProfile(e);
+  return r && r.marketPrice > 0 ? r.marketPrice : 0;
+}
+
+function getBoostFillTarget(e) {
+  var r = e * UNBOOST_RETURN_PER_PART;
+  return LAB_MINERAL_CAPACITY - r;
+}
+
+function selectBoostLab(e, r) {
+  var a = labManager.getLayout(e);
+  var o = _getLabs(e);
+  if (o.length === 0) return null;
+  var t = {};
+  if (a && a.groups) {
+    for (var n = 0; n < a.groups.length; n++) {
+      t[a.groups[n].in1.id] = true;
+      t[a.groups[n].in2.id] = true;
     }
   }
-  return total;
-}
-
-function getBoostAccessibleAmount(roomName, material) {
-  var info = storageManager.storageFind(roomName, material);
-  if (!info) return 0;
-
-  var terminalOwn = getReservedAmount(roomName, 'terminal', material, 'boostManager');
-  var storageOwn = getReservedAmount(roomName, 'storage', material, 'boostManager');
-
-  var terminalActual = info.terminal ? (info.terminal.total || 0) : 0;
-  var storageActual = info.storage ? (info.storage.total || 0) : 0;
-  var terminalReserved = info.terminal ? (info.terminal.reserved || 0) : 0;
-  var storageReserved = info.storage ? (info.storage.reserved || 0) : 0;
-
-  var terminalOthers = Math.max(0, terminalReserved - terminalOwn);
-  var storageOthers = Math.max(0, storageReserved - storageOwn);
-
-  return Math.max(0, terminalActual - terminalOthers) + Math.max(0, storageActual - storageOthers);
-}
-
-function getRefPrice(compound) {
-  var history = Game.market.getHistory(compound);
-  if (history && history.length > 0) {
-    return history[history.length - 1].avgPrice;
-  }
-  return 1.0;
-}
-
-/**
- * Compute the fill target for a boost compound's labs.
- * Leaves exactly enough free space for one unboost return so the
- * drain logic and fill logic don't fight each other.
- */
-function getBoostFillTarget(parts) {
-  var returned = parts * UNBOOST_RETURN_PER_PART;
-  return LAB_MINERAL_CAPACITY - returned;
-}
-
-// =============================================================================
-// LAB ALLOCATION — Multi-lab, up to half room's labs per compound
-// =============================================================================
-
-function selectBoostLab(room, usedLabIds) {
-  var layout = labManager.getLayout(room);
-
-  var allLabs = _getLabs(room);
-  if (allLabs.length === 0) return null;
-
-  var inputIds = {};
-  if (layout && layout.groups) {
-    for (var g = 0; g < layout.groups.length; g++) {
-      inputIds[layout.groups[g].in1.id] = true;
-      inputIds[layout.groups[g].in2.id] = true;
+  var s = e.controller;
+  if (!s) return null;
+  var i = null;
+  var u = Infinity;
+  var l = true;
+  for (var d = 0; d < o.length; d++) {
+    var g = o[d];
+    if (r[g.id]) continue;
+    var v = !!t[g.id];
+    var c = g.pos.getRangeTo(s);
+    if (l && !v || v === l && c < u) {
+      i = g;
+      u = c;
+      l = v;
     }
   }
-
-  var controller = room.controller;
-  if (!controller) return null;
-
-  var best = null;
-  var bestRange = Infinity;
-  var bestIsInput = true;
-
-  for (var i = 0; i < allLabs.length; i++) {
-    var lab = allLabs[i];
-    if (usedLabIds[lab.id]) continue;
-
-    var isInput = !!inputIds[lab.id];
-    var range = lab.pos.getRangeTo(controller);
-
-    if ((bestIsInput && !isInput) ||
-        (isInput === bestIsInput && range < bestRange)) {
-      best = lab;
-      bestRange = range;
-      bestIsInput = isInput;
-    }
-  }
-
-  return best;
+  return i;
 }
 
-/**
- * Collect ALL lab IDs allocated by ANY boost order in a room.
- * No Game.getObjectById calls — just reads Memory.
- */
-function getAllAllocatedLabIds(roomName) {
-  var usedIds = {};
-  if (!Memory.boostManager || !Memory.boostManager.orders) return usedIds;
-  var rOrders = Memory.boostManager.orders[roomName];
-  if (!rOrders) return usedIds;
-
-  for (var role in rOrders) {
-    var order = rOrders[role];
-    if (!order || !order.boosts) continue;
-    for (var comp in order.boosts) {
-      var labIds = order.boosts[comp].labIds;
-      if (labIds) {
-        for (var i = 0; i < labIds.length; i++) {
-          usedIds[labIds[i]] = true;
+function getAllAllocatedLabIds(e) {
+  var r = {};
+  if (!Memory.boostManager || !Memory.boostManager.orders) return r;
+  var a = Memory.boostManager.orders[e];
+  if (!a) return r;
+  for (var o in a) {
+    var t = a[o];
+    if (!t || !t.boosts) continue;
+    for (var n in t.boosts) {
+      var s = t.boosts[n].labIds;
+      if (s) {
+        for (var i = 0; i < s.length; i++) {
+          r[s[i]] = true;
         }
       }
     }
   }
-  return usedIds;
+  return r;
 }
 
-/**
- * Ensure all compounds in an order have labs allocated.
- * Allocates up to floor(totalLabs * MAX_BOOST_LAB_FRACTION) labs total
- * across all boost orders in the room.
- *
- * FAST PATH: if labIds arrays are already populated and at budget,
- * returns true with zero Game.getObjectById calls.
- */
-function ensureLabsAllocated(room, order) {
-  migrateLabIds(order);
-
-  var allLabs = _getLabs(room);
-
-  // Per-order budget — each order independently gets up to this many labs
-  var perOrderBudget = Math.floor(allLabs.length * (order.maxLabFraction || MAX_BOOST_LAB_FRACTION));
-  if (perOrderBudget < 1) perOrderBudget = 1;
-
-  // ALL allocated IDs across all orders — used for exclusion only,
-  // so two orders never claim the same lab
-  var globalUsedIds = getAllAllocatedLabIds(room.name);
-
-  // Quick check: do we need to do anything?
-  var needsMore = false;
-  var hasAtLeastOne = true;
-  for (var comp in order.boosts) {
-    var info = order.boosts[comp];
-    if (!info.labIds || info.labIds.length === 0) {
-      needsMore = true;
-      hasAtLeastOne = false;
-    } else if (info.labIds.length < perOrderBudget) {
-      needsMore = true;
+function ensureLabsAllocated(e, r) {
+  migrateLabIds(r);
+  var a = _getLabs(e);
+  var o = Math.floor(a.length * (r.maxLabFraction || MAX_BOOST_LAB_FRACTION));
+  if (o < 1) o = 1;
+  var t = getAllAllocatedLabIds(e.name);
+  var n = false;
+  var s = true;
+  for (var i in r.boosts) {
+    var u = r.boosts[i];
+    if (!u.labIds || u.labIds.length === 0) {
+      n = true;
+      s = false;
+    } else if (u.labIds.length < o) {
+      n = true;
     }
   }
-  if (!needsMore && hasAtLeastOne) return true;
-
-  // Validate existing labIds for this order (remove destroyed labs)
-  for (var comp2 in order.boosts) {
-    var info2 = order.boosts[comp2];
-    var valid = [];
-    for (var v = 0; v < info2.labIds.length; v++) {
-      if (Game.getObjectById(info2.labIds[v])) {
-        valid.push(info2.labIds[v]);
+  if (!n && s) return true;
+  for (var l in r.boosts) {
+    var d = r.boosts[l];
+    var g = [];
+    for (var v = 0; v < d.labIds.length; v++) {
+      if (Game.getObjectById(d.labIds[v])) {
+        g.push(d.labIds[v]);
       } else {
-        delete globalUsedIds[info2.labIds[v]];
+        delete t[d.labIds[v]];
       }
     }
-    info2.labIds = valid;
+    d.labIds = g;
   }
-
-  // Allocate more labs for each compound up to this order's own budget
-  var allAssigned = true;
-  for (var comp3 in order.boosts) {
-    var info3 = order.boosts[comp3];
-
-    while (info3.labIds.length < perOrderBudget) {
-      var newLab = selectBoostLab(room, globalUsedIds);
-      if (!newLab) break;
-
-      info3.labIds.push(newLab.id);
-      globalUsedIds[newLab.id] = true;
-
-      console.log('[BoostManager] Allocated lab ' + newLab.id.substr(-4) +
-        ' at (' + newLab.pos.x + ',' + newLab.pos.y + ') for ' + comp3 +
-        ' in ' + room.name + ' (' + info3.labIds.length + '/' + perOrderBudget + ')');
+  var c = true;
+  for (var f in r.boosts) {
+    var m = r.boosts[f];
+    while (m.labIds.length < o) {
+      var b = selectBoostLab(e, t);
+      if (!b) break;
+      m.labIds.push(b.id);
+      t[b.id] = true;
+      console.log("[BoostManager] Allocated lab " + b.id.substr(-4) + " at (" + b.pos.x + "," + b.pos.y + ") for " + f + " in " + e.name + " (" + m.labIds.length + "/" + o + ")");
     }
-
-    if (info3.labIds.length === 0) {
-      allAssigned = false;
+    if (m.labIds.length === 0) {
+      c = false;
       if (Game.time % 100 === 0) {
-        console.log('[BoostManager] No available lab for ' + comp3 + ' in ' + room.name);
+        console.log("[BoostManager] No available lab for " + f + " in " + e.name);
       }
     }
   }
-
-  return allAssigned;
+  return c;
 }
 
-// =============================================================================
-// PURCHASING
-// =============================================================================
-
-function handlePurchasing(roomName, order) {
-  var room = Game.rooms[roomName];
-  if (!room || !room.terminal) return;
-
-  if (order.lastPurchaseCheck &&
-      (Game.time - order.lastPurchaseCheck) < PURCHASE_CHECK_INTERVAL) {
+function handlePurchasing(e, r) {
+  var a = Game.rooms[e];
+  if (!a || !a.terminal) return;
+  if (!r.purchaseSetup) r.purchaseSetup = {};
+  if (!r.buyOrderIds) r.buyOrderIds = {};
+  if (!r.pendingBuyOrders) r.pendingBuyOrders = {};
+  reconcilePendingBuyOrders(e, r);
+  if (r.lastPurchaseCheck && Game.time - r.lastPurchaseCheck < PURCHASE_CHECK_INTERVAL) {
     return;
   }
-  order.lastPurchaseCheck = Game.time;
-
-  if (!order.purchaseSetup) order.purchaseSetup = {};
-  if (!order.buyOrderIds)   order.buyOrderIds = {};
-
-  var batchSize = order.batchSize || DEFAULT_BATCH_SIZE;
-  var reorderAt = order.reorderAt || DEFAULT_REORDER_AT;
-
-  for (var compound in order.boosts) {
-    var info      = order.boosts[compound];
-    var parts     = info.parts;
-    var perBoost  = compoundPerBoost(parts);
-    var totalNeed = batchSize * perBoost;
-    var reorderAmt = reorderAt * perBoost;
-
-    var available = getRoomCompound(room, compound) +
-                    getLabsCompound(info.labIds, compound);
-
-    if (available >= totalNeed) {
-      if (order.purchaseSetup[compound]) {
-        var obKey = roomName + '_' + compound;
-        var obReq = Memory.opportunisticBuy &&
-                    Memory.opportunisticBuy.requests &&
-                    Memory.opportunisticBuy.requests[obKey];
-        if (obReq && obReq.remaining <= 0) {
-          delete order.purchaseSetup[compound];
+  r.lastPurchaseCheck = Game.time;
+  var o = r.batchSize || DEFAULT_BATCH_SIZE;
+  var t = r.reorderAt || DEFAULT_REORDER_AT;
+  for (var n in r.boosts) {
+    var s = r.boosts[n];
+    var i = s.parts;
+    var u = compoundPerBoost(i);
+    var l = o * u;
+    var d = t * u;
+    var g = getRoomCompound(a, n) + getLabsCompound(s.labIds, n);
+    if (g >= l) {
+      if (r.purchaseSetup[n]) {
+        var v = e + "_" + n;
+        var c = opportunisticBuy.getRequestByKey(v);
+        if (c && c.remaining <= 0) {
+          delete r.purchaseSetup[n];
         }
       }
       continue;
     }
-
-    if (available > reorderAmt && order.purchaseSetup[compound]) continue;
-
-    var deficit = totalNeed - available;
-    if (deficit <= 0) continue;
-
-    var refPrice = getRefPrice(compound);
-    var maxPrice = refPrice * PRICE_MULT_INSTANT;
-
-    if (!order.purchaseSetup[compound]) {
-      opportunisticBuy.setup(roomName, compound, deficit, maxPrice);
-      order.purchaseSetup[compound] = true;
-      console.log('[BoostManager] Set up opportunisticBuy for ' + deficit + ' ' +
-        compound + ' in ' + roomName + ' (maxPrice: ' + maxPrice.toFixed(3) + ')');
+    if (g > d && r.purchaseSetup[n]) continue;
+    var f = l - g;
+    if (f <= 0) continue;
+    var m = getRefPrice(n);
+    var b = m * PRICE_MULT_INSTANT;
+    if (!r.purchaseSetup[n]) {
+      opportunisticBuy.setup(e, n, f, b);
+      r.purchaseSetup[n] = true;
+      console.log("[BoostManager] Set up opportunisticBuy for " + f + " " + n + " in " + e + " (maxPrice: " + b.toFixed(3) + ")");
     }
-
-    var obKey2 = roomName + '_' + compound;
-    var obReq2 = Memory.opportunisticBuy &&
-                 Memory.opportunisticBuy.requests &&
-                 Memory.opportunisticBuy.requests[obKey2];
-
-    if (obReq2 && obReq2.remaining > 0) {
-      var stallTicks = Game.time - (obReq2.createdAt || Game.time);
-
-      if (stallTicks >= BUY_ORDER_STALL_TICKS && !order.buyOrderIds[compound]) {
-        var buyPrice = refPrice * PRICE_MULT_ORDER;
-        var orderAmt = obReq2.remaining;
-
-        var res = Game.market.createOrder({
-          type: ORDER_BUY, resourceType: compound,
-          price: buyPrice, totalAmount: orderAmt, roomName: roomName
-        });
-
-        if (res === OK) {
-          var myOrders = Game.market.orders;
-          for (var id in myOrders) {
-            var o = myOrders[id];
-            if (o.type === ORDER_BUY && o.resourceType === compound &&
-                o.roomName === roomName && o.remainingAmount === orderAmt && o.active) {
-              order.buyOrderIds[compound] = id;
-              break;
-            }
-          }
-          console.log('[BoostManager] Placed buy order for ' + orderAmt + ' ' +
-            compound + ' at ' + buyPrice.toFixed(3) + '/unit in ' + roomName);
+    var p = e + "_" + n;
+    var O = opportunisticBuy.getRequestByKey(p);
+    if (O && O.remaining > 0) {
+      var R = Game.time - (O.createdAt || Game.time);
+      if (R >= BUY_ORDER_STALL_TICKS && !r.buyOrderIds[n] && !r.pendingBuyOrders[n]) {
+        var T = Math.round(m * PRICE_MULT_ORDER * 1e3) / 1e3;
+        var _ = O.remaining;
+        var y = pricing.FEE * T * _;
+        var B = creditLedger.available() >= y ? Game.market.createOrder({
+          type: ORDER_BUY,
+          resourceType: n,
+          price: T,
+          totalAmount: _,
+          roomName: e
+        }) : ERR_NOT_ENOUGH_RESOURCES;
+        if (B === OK) {
+          creditLedger.commit(y);
+          r.pendingBuyOrders[n] = {
+            resourceType: n,
+            totalAmount: _,
+            price: T,
+            createdTick: Game.time
+          };
+          memoryManager.requestImmediateSave("boostManager.createBuyOrder");
+          console.log("[BoostManager] Placed buy order for " + _ + " " + n + " at " + T.toFixed(3) + "/unit in " + e);
         }
       }
-
-      if (order.buyOrderIds[compound]) {
-        var existing = Game.market.getOrderById(order.buyOrderIds[compound]);
-        if (!existing || existing.remainingAmount <= 0) {
-          delete order.buyOrderIds[compound];
+      if (r.buyOrderIds[n]) {
+        var M = Game.market.getOrderById(r.buyOrderIds[n]);
+        if (!M || util.getOrderRemaining(M) <= 0) {
+          delete r.buyOrderIds[n];
         }
       }
     }
   }
 }
 
-// =============================================================================
-// RESERVATIONS
-// =============================================================================
-
-function updateReservations(roomName) {
-  var room = Game.rooms[roomName];
-  if (!room) return;
-
-  var roomOrders = (Memory.boostManager && Memory.boostManager.orders && Memory.boostManager.orders[roomName]) || {};
-  var demand = {};
-
-  for (var role in roomOrders) {
-    var order = roomOrders[role];
-    if (!order || !order.active || order.stopping) continue;
-    migrateLabIds(order);
-
-    for (var compound in order.boosts) {
-      var info = order.boosts[compound];
-      var totalCompoundNeed = (order.batchSize || DEFAULT_BATCH_SIZE) * compoundPerBoost(info.parts);
-      var totalEnergyNeed = (order.batchSize || DEFAULT_BATCH_SIZE) * energyPerBoost(info.parts);
-      var labStock = getBoostLabStock(order, compound);
-      var need = Math.max(0, totalCompoundNeed - labStock.compound);
-      var energyNeed = Math.max(0, totalEnergyNeed - labStock.energy);
-
-      demand[compound] = (demand[compound] || 0) + need;
-      demand[RESOURCE_ENERGY] = (demand[RESOURCE_ENERGY] || 0) + energyNeed;
+function updateReservations(e) {
+  var r = Game.rooms[e];
+  if (!r) return;
+  var a = Memory.boostManager && Memory.boostManager.orders && Memory.boostManager.orders[e] || {};
+  var o = {};
+  for (var t in a) {
+    var n = a[t];
+    if (!n || !n.active || n.stopping) continue;
+    migrateLabIds(n);
+    for (var s in n.boosts) {
+      var i = n.boosts[s];
+      var u = (n.batchSize || DEFAULT_BATCH_SIZE) * compoundPerBoost(i.parts);
+      var l = (n.batchSize || DEFAULT_BATCH_SIZE) * energyPerBoost(i.parts);
+      var d = getBoostLabStock(n, s);
+      var g = Math.max(0, u - d.compound);
+      var v = Math.max(0, l - d.energy);
+      o[s] = (o[s] || 0) + g;
+      o[RESOURCE_ENERGY] = (o[RESOURCE_ENERGY] || 0) + v;
     }
   }
-
-  var active = {};
-  for (var c in demand) active[c] = true;
-
-  if (Memory.storageReservations && Memory.storageReservations[roomName]) {
-    var roomBuckets = Memory.storageReservations[roomName];
-    for (var building in roomBuckets) {
-      var bucket = roomBuckets[building] || {};
-      for (var material in bucket) {
-        var reservations = bucket[material] || [];
-        var hasBoostMgr = false;
-        for (var i = 0; i < reservations.length; i++) {
-          if (reservations[i] && reservations[i].program === 'boostManager') { hasBoostMgr = true; break; }
-        }
-        if (hasBoostMgr && !active[material]) {
-          storageManager.unReserve(roomName, material, building, 'boostManager');
-        }
-      }
+  var c = {};
+  for (var f in o) c[f] = true;
+  var existing = storageManager.getReservationRecords(e, "boostManager");
+  for (var b = 0; b < existing.length; b++) {
+    var p = existing[b];
+    if (!c[p.material]) {
+      storageManager.unReserve(e, p.material, p.building, "boostManager");
     }
   }
-
-  for (var compound2 in demand) {
-    var need = demand[compound2];
-    if (need <= 0) {
-      storageManager.unReserve(roomName, compound2, 'terminal', 'boostManager');
-      storageManager.unReserve(roomName, compound2, 'storage', 'boostManager');
+  for (var y in o) {
+    var g = o[y];
+    if (g <= 0) {
+      storageManager.unReserve(e, y, "terminal", "boostManager");
+      storageManager.unReserve(e, y, "storage", "boostManager");
       continue;
     }
-
-    var info2 = storageManager.storageFind(roomName, compound2);
-    if (!info2 || (!info2.terminal && !info2.storage)) continue;
-
-    var termOwn = getReservedAmount(roomName, 'terminal', compound2, 'boostManager');
-    var storOwn = getReservedAmount(roomName, 'storage', compound2, 'boostManager');
-    var termFree = info2.terminal
-      ? Math.max(0, (info2.terminal.total || 0) - Math.max(0, (info2.terminal.reserved || 0) - termOwn))
-      : 0;
-    var storFree = info2.storage
-      ? Math.max(0, (info2.storage.total || 0) - Math.max(0, (info2.storage.reserved || 0) - storOwn))
-      : 0;
-    var fromTerm = Math.min(need, termFree);
-    var fromStor = Math.min(need - fromTerm, storFree);
-
-    if (fromTerm > 0) {
-      var rv1 = storageManager.reserve(roomName, compound2, 'terminal', 'boostManager', fromTerm);
-      if (!rv1.ok) console.log('[BoostManager] Failed terminal reserve for ' + compound2 + ' in ' + roomName + ': ' + rv1.reason);
+    var B = storageManager.storageFind(e, y);
+    if (!B || !B.terminal && !B.storage) continue;
+    var M = getReservedAmount(e, "terminal", y, "boostManager");
+    var h = getReservedAmount(e, "storage", y, "boostManager");
+    var A = B.terminal ? Math.max(0, (B.terminal.total || 0) - Math.max(0, (B.terminal.reserved || 0) - M)) : 0;
+    var E = B.storage ? Math.max(0, (B.storage.total || 0) - Math.max(0, (B.storage.reserved || 0) - h)) : 0;
+    var I = Math.min(g, A);
+    var C = Math.min(g - I, E);
+    if (I > 0) {
+      var S = storageManager.reserve(e, y, "terminal", "boostManager", I);
+      if (!S.ok) console.log("[BoostManager] Failed terminal reserve for " + y + " in " + e + ": " + S.reason);
     } else {
-      storageManager.unReserve(roomName, compound2, 'terminal', 'boostManager');
+      storageManager.unReserve(e, y, "terminal", "boostManager");
     }
-
-    if (fromStor > 0) {
-      var rv2 = storageManager.reserve(roomName, compound2, 'storage', 'boostManager', fromStor);
-      if (!rv2.ok) console.log('[BoostManager] Failed storage reserve for ' + compound2 + ' in ' + roomName + ': ' + rv2.reason);
+    if (C > 0) {
+      var L = storageManager.reserve(e, y, "storage", "boostManager", C);
+      if (!L.ok) console.log("[BoostManager] Failed storage reserve for " + y + " in " + e + ": " + L.reason);
     } else {
-      storageManager.unReserve(roomName, compound2, 'storage', 'boostManager');
+      storageManager.unReserve(e, y, "storage", "boostManager");
     }
   }
 }
 
-function removeReservations(roomName, order) {
-  updateReservations(roomName);
-}
-
-function placeCleanupReservations(roomName, order) {
-  var room = Game.rooms[roomName];
-  if (!room) return;
-
-  for (var compound in order.boosts) {
-    if (room.terminal && (room.terminal.store[compound] || 0) > 0) {
-      storageManager.reserve(roomName, compound, 'terminal',
-        'boostManager_cleanup', room.terminal.store[compound]);
+function placeCleanupReservations(e, r) {
+  var a = Game.rooms[e];
+  if (!a) return;
+  for (var o in r.boosts) {
+    if (a.terminal && (a.terminal.store[o] || 0) > 0) {
+      storageManager.reserve(e, o, "terminal", "boostManager_cleanup", a.terminal.store[o]);
     }
-    if (room.storage && (room.storage.store[compound] || 0) > 0) {
-      storageManager.reserve(roomName, compound, 'storage',
-        'boostManager_cleanup', room.storage.store[compound]);
+    if (a.storage && (a.storage.store[o] || 0) > 0) {
+      storageManager.reserve(e, o, "storage", "boostManager_cleanup", a.storage.store[o]);
     }
   }
 }
 
-// =============================================================================
-// STATUS QUERIES
-// =============================================================================
-
-function isActive(roomName, role) {
+function isActive(e, r) {
   refreshTickCache();
   if (!_hasAnyOrders) return false;
-  var order = getOrder(roomName, role);
-  return !!(order && order.active && !order.stopping);
+  var a = getOrder(e, r);
+  return !!(a && a.active && !a.stopping);
 }
 
-function isStopping(roomName, role) {
+function isStopping(e, r) {
   refreshTickCache();
   if (!_hasAnyOrders) return false;
-  var order = getOrder(roomName, role);
-  return !!(order && order.stopping);
+  var a = getOrder(e, r);
+  return !!(a && a.stopping);
 }
 
-function getActiveOrders(roomName) {
+function getActiveOrders(e) {
   refreshTickCache();
   if (!_hasAnyOrders) return {};
-  if (_activeOrdersCache[roomName] !== undefined) return _activeOrdersCache[roomName];
-
-  var rOrders = Memory.boostManager.orders[roomName];
-  if (!rOrders) {
-    _activeOrdersCache[roomName] = {};
+  if (_activeOrdersCache[e] !== undefined) return _activeOrdersCache[e];
+  var r = Memory.boostManager.orders[e];
+  if (!r) {
+    _activeOrdersCache[e] = {};
     return {};
   }
-
-  var result = {};
-  for (var role in rOrders) {
-    if (rOrders[role] && (rOrders[role].active || rOrders[role].stopping)) {
-      result[role] = rOrders[role];
+  var a = {};
+  for (var o in r) {
+    if (r[o] && (r[o].active || r[o].stopping)) {
+      a[o] = r[o];
     }
   }
-  _activeOrdersCache[roomName] = result;
-  return result;
+  _activeOrdersCache[e] = a;
+  return a;
 }
 
-/**
- * Are ANY boost labs for a role ready? (at least one lab has enough
- * compound + energy for 1 boost). Spawns creep as soon as possible.
- */
-function areLabsReady(roomName, role) {
+function areLabsReady(e, r) {
   refreshTickCache();
   if (!_hasAnyOrders) return false;
-
-  var order = getOrder(roomName, role);
-  if (!order || !order.active || order.stopping) return false;
-  migrateLabIds(order);
-
-  for (var compound in order.boosts) {
-    var info = order.boosts[compound];
-    if (!info.labIds || info.labIds.length === 0) return false;
-
-    var needed = compoundPerBoost(info.parts);
-    var neededEnergy = energyPerBoost(info.parts);
-    var anyReady = false;
-
-    for (var i = 0; i < info.labIds.length; i++) {
-      var lab = Game.getObjectById(info.labIds[i]);
-      if (!lab) continue;
-      if (lab.mineralType && lab.mineralType !== compound && (lab.mineralAmount || 0) > 0) continue;
-      var compAmt = (lab.mineralType === compound) ? (lab.mineralAmount || 0) : 0;
-      var enAmt = lab.store ? (lab.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-      if (compAmt >= needed && enAmt >= neededEnergy) { anyReady = true; break; }
+  var a = getOrder(e, r);
+  if (!a || !a.active || a.stopping) return false;
+  migrateLabIds(a);
+  for (var o in a.boosts) {
+    var t = a.boosts[o];
+    if (!t.labIds || t.labIds.length === 0) return false;
+    var n = compoundPerBoost(t.parts);
+    var s = energyPerBoost(t.parts);
+    var i = false;
+    for (var u = 0; u < t.labIds.length; u++) {
+      var l = Game.getObjectById(t.labIds[u]);
+      if (!l) continue;
+      if (l.mineralType && l.mineralType !== o && (l.mineralAmount || 0) > 0) continue;
+      var d = l.mineralType === o ? l.mineralAmount || 0 : 0;
+      var g = l.store ? l.store.getUsedCapacity(RESOURCE_ENERGY) || 0 : 0;
+      if (d >= n && g >= s) {
+        i = true;
+        break;
+      }
     }
-
-    if (!anyReady) return false;
+    if (!i) return false;
   }
-
   return true;
 }
 
-function getBody(roomName, role) {
+function getBody(e, r) {
   refreshTickCache();
   if (!_hasAnyOrders) return null;
-  var order = getOrder(roomName, role);
-  if (!order || !order.body) return null;
-  return order.body.slice();
+  var a = getOrder(e, r);
+  if (!a || !a.body) return null;
+  return a.body.slice();
 }
 
-function getBodyCost(roomName, role) {
+function getBodyCost(e, r) {
   refreshTickCache();
   if (!_hasAnyOrders) return 0;
-  var order = getOrder(roomName, role);
-  return order ? (order.bodyCost || 0) : 0;
+  var a = getOrder(e, r);
+  return a ? a.bodyCost || 0 : 0;
 }
 
-/**
- * Get boost metadata for creep memory when spawning.
- * Returns labIds arrays so creep can find whichever lab is ready.
- * Format: { needsBoost: true, boostLabs: { compound: [id1, id2, ...] }, boosted: {} }
- */
-function getSpawnBoostMeta(roomName, role) {
+function getSpawnBoostMeta(e, r) {
   refreshTickCache();
   if (!_hasAnyOrders) return null;
-
-  var order = getOrder(roomName, role);
-  if (!order || !order.active || order.stopping) return null;
-  migrateLabIds(order);
-
-  var labs = {};
-  var hasAny = false;
-  for (var compound in order.boosts) {
-    var info = order.boosts[compound];
-    if (info.labIds && info.labIds.length > 0) {
-      labs[compound] = info.labIds.slice();
-      hasAny = true;
+  var a = getOrder(e, r);
+  if (!a || !a.active || a.stopping) return null;
+  migrateLabIds(a);
+  var o = {};
+  var t = false;
+  for (var n in a.boosts) {
+    var s = a.boosts[n];
+    if (!(s.parts > 0)) continue;
+    if (s.labIds && s.labIds.length > 0) {
+      o[n] = s.labIds.slice();
+      t = true;
     }
   }
-
-  if (!hasAny) return null;
-
+  if (!t) return null;
   return {
     needsBoost: true,
-    boostLabs: labs,
-    boosted: {}
+    boostLabs: o,
+    boosted: {},
+    boostRole: r,
+    allowUnboost: a.allowUnboost !== undefined ? !!a.allowUnboost : !MILITARY_ROLES[r]
   };
 }
 
-/**
- * Get lab work needed for boost system in a room.
- * Returns work items for EACH lab that needs filling/emptying.
- *
- * FIX: Uses per-compound fillTarget (LAB_MINERAL_CAPACITY - unboostReturn)
- * instead of raw LAB_MINERAL_CAPACITY so labs are never filled past the
- * point where an unboost return would fit. This prevents the fill→drain
- * cycle that caused constant labBot respawning.
- *
- * TICK-CACHED.
- */
-function getLabWork(roomName) {
+function getLabWork(e) {
   refreshTickCache();
   if (!_hasAnyOrders) return [];
-  if (_labWorkCache[roomName] !== undefined) return _labWorkCache[roomName];
-
-  var activeOrders = getActiveOrders(roomName);
-  var work = [];
-
-  for (var role in activeOrders) {
-    var order = activeOrders[role];
-    migrateLabIds(order);
-
-    for (var compound in order.boosts) {
-      var info = order.boosts[compound];
-      if (!info.labIds || info.labIds.length === 0) continue;
-
-      var perBoost = compoundPerBoost(info.parts);
-      var perBoostEnergy = energyPerBoost(info.parts);
-
-      // Dynamic fill target: leave exactly enough space for one unboost return
-      var returned = info.parts * UNBOOST_RETURN_PER_PART;
-      var fillTarget = LAB_MINERAL_CAPACITY - returned;
-
-      for (var li = 0; li < info.labIds.length; li++) {
-        var labId = info.labIds[li];
-        var lab = Game.getObjectById(labId);
-        if (!lab) continue;
-
-        if (order.stopping) {
-          var hasMineral = (lab.mineralAmount || 0) > 0;
-          var hasEnergy = lab.store && (lab.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0;
-          if (hasMineral || hasEnergy) {
-            work.push({
-              labId: labId, lab: lab, compound: compound, role: role,
-              needsCompound: false, needsEnergy: false,
-              hasWrongMineral: false, stopping: true
+  if (_labWorkCache[e] !== undefined) return _labWorkCache[e];
+  var r = getActiveOrders(e);
+  var a = [];
+  for (var o in r) {
+    var t = r[o];
+    migrateLabIds(t);
+    for (var n in t.boosts) {
+      var s = t.boosts[n];
+      if (!s.labIds || s.labIds.length === 0) continue;
+      var i = compoundPerBoost(s.parts);
+      var u = energyPerBoost(s.parts);
+      var l = s.parts * UNBOOST_RETURN_PER_PART;
+      var d = LAB_MINERAL_CAPACITY - l;
+      for (var g = 0; g < s.labIds.length; g++) {
+        var v = s.labIds[g];
+        var c = Game.getObjectById(v);
+        if (!c) continue;
+        if (t.stopping) {
+          var f = (c.mineralAmount || 0) > 0;
+          var m = c.store && (c.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0;
+          if (f || m) {
+            a.push({
+              labId: v,
+              lab: c,
+              compound: n,
+              role: o,
+              needsCompound: false,
+              needsEnergy: false,
+              hasWrongMineral: false,
+              stopping: true
             });
           }
           continue;
         }
-
-        var wrongMineral = lab.mineralType &&
-                           lab.mineralType !== compound &&
-                           (lab.mineralAmount || 0) > 0;
-
-        var compAmt = (lab.mineralType === compound) ? (lab.mineralAmount || 0) : 0;
-        var enAmt = lab.store ? (lab.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-
-        // FIX: Use fillTarget instead of LAB_MINERAL_CAPACITY so we stop
-        // filling once unboost headroom is reserved
-        var needsComp = !wrongMineral && compAmt < fillTarget;
-        var needsEn = enAmt < LAB_ENERGY_CAPACITY;
-
-        if (wrongMineral || needsComp || needsEn) {
-          work.push({
-            labId: labId, lab: lab, compound: compound, role: role,
-            needsCompound: needsComp, needsEnergy: needsEn,
-            hasWrongMineral: wrongMineral, stopping: false,
-            compoundAmount: compAmt, energyAmount: enAmt,
-            fillTarget: fillTarget
+        var b = c.mineralType && c.mineralType !== n && (c.mineralAmount || 0) > 0;
+        var p = c.mineralType === n ? c.mineralAmount || 0 : 0;
+        var O = c.store ? c.store.getUsedCapacity(RESOURCE_ENERGY) || 0 : 0;
+        var R = !b && p < d;
+        var T = O < LAB_ENERGY_CAPACITY;
+        if (b || R || T) {
+          a.push({
+            labId: v,
+            lab: c,
+            compound: n,
+            role: o,
+            needsCompound: R,
+            needsEnergy: T,
+            hasWrongMineral: b,
+            stopping: false,
+            compoundAmount: p,
+            energyAmount: O,
+            fillTarget: d
           });
         }
       }
-
-      // Proactive unboost drain: ensure at least one non-cooldown lab always
-      // has enough free space for one unboost return. If not, emit a drain
-      // work item so the labBot withdraws from the fullest non-cooldown lab
-      // before the creep ever needs to unboost.
-      if (!order.stopping) {
-        var hasUnboostSpace = false;
-        var bestDonorLab    = null;
-        var bestDonorAmt    = 0;
-
-        for (var ui = 0; ui < info.labIds.length; ui++) {
-          var ulab = Game.getObjectById(info.labIds[ui]);
-          if (!ulab) continue;
-          if (ulab.mineralType && ulab.mineralType !== compound &&
-              (ulab.mineralAmount || 0) > 0) continue;
-
-          var ufree       = ulab.store ? (ulab.store.getFreeCapacity(compound) || 0) : 0;
-          var uonCooldown = ulab.cooldown && ulab.cooldown > 0;
-          var umineralAmt = (ulab.mineralType === compound) ? (ulab.mineralAmount || 0) : 0;
-
-          if (!uonCooldown && ufree >= returned) {
-            hasUnboostSpace = true;
+      if (!t.stopping) {
+        var _ = false;
+        var y = null;
+        var B = 0;
+        for (var M = 0; M < s.labIds.length; M++) {
+          var h = Game.getObjectById(s.labIds[M]);
+          if (!h) continue;
+          if (h.mineralType && h.mineralType !== n && (h.mineralAmount || 0) > 0) continue;
+          var A = h.store ? h.store.getFreeCapacity(n) || 0 : 0;
+          var E = h.cooldown && h.cooldown > 0;
+          var I = h.mineralType === n ? h.mineralAmount || 0 : 0;
+          if (!E && A >= l) {
+            _ = true;
             break;
           }
-          if (!uonCooldown && umineralAmt > bestDonorAmt && umineralAmt >= returned) {
-            bestDonorLab = ulab;
-            bestDonorAmt = umineralAmt;
+          if (!E && I > B && I >= l) {
+            y = h;
+            B = I;
           }
         }
-
-        if (!hasUnboostSpace && bestDonorLab) {
-          work.push({
-            labId: bestDonorLab.id, lab: bestDonorLab,
-            compound: compound, role: role,
-            needsCompound: false, needsEnergy: false,
-            hasWrongMineral: false, stopping: false,
-            isUnboostDrain: true, drainAmount: returned
+        if (!_ && y) {
+          a.push({
+            labId: y.id,
+            lab: y,
+            compound: n,
+            role: o,
+            needsCompound: false,
+            needsEnergy: false,
+            hasWrongMineral: false,
+            stopping: false,
+            isUnboostDrain: true,
+            drainAmount: l
           });
         }
       }
     }
   }
-
-  _labWorkCache[roomName] = work;
-  return work;
+  _labWorkCache[e] = a;
+  return a;
 }
 
-/**
- * Should a labBot spawn for boost work?
- * BURST BEHAVIOR: Spawn when ANY boost lab is below 1 boost of compound.
- * The labBot then fills ALL labs to capacity (fillTarget/2000) and suicides.
- * TICK-CACHED.
- */
-function needsLabBot(roomName) {
+function needsLabBot(e) {
   refreshTickCache();
   if (!_hasAnyOrders) return false;
-  if (_needsLabBotCache[roomName] !== undefined) return _needsLabBotCache[roomName];
-
-  var work = getLabWork(roomName);
-  if (work.length === 0) {
-    _needsLabBotCache[roomName] = false;
+  if (_needsLabBotCache[e] !== undefined) return _needsLabBotCache[e];
+  var r = getLabWork(e);
+  if (r.length === 0) {
+    _needsLabBotCache[e] = false;
     return false;
   }
-
-  for (var i = 0; i < work.length; i++) {
-    if (work[i].stopping || work[i].hasWrongMineral || work[i].isUnboostDrain) {
-      _needsLabBotCache[roomName] = true;
+  for (var a = 0; a < r.length; a++) {
+    if (r[a].stopping || r[a].hasWrongMineral || r[a].isUnboostDrain) {
+      _needsLabBotCache[e] = true;
       return true;
     }
   }
-
-  var activeOrders = getActiveOrders(roomName);
-  for (var role in activeOrders) {
-    var order = activeOrders[role];
-    if (!order.active) continue;
-    migrateLabIds(order);
-
-    for (var comp in order.boosts) {
-      var info = order.boosts[comp];
-      if (!info.labIds || info.labIds.length === 0) continue;
-
-      var perBoost = compoundPerBoost(info.parts);
-      var perBoostEnergy = energyPerBoost(info.parts);
-
-      for (var li = 0; li < info.labIds.length; li++) {
-        var lab = Game.getObjectById(info.labIds[li]);
-        if (!lab) continue;
-
-        if (lab.mineralType && lab.mineralType !== comp && (lab.mineralAmount || 0) > 0) continue;
-
-        var compAmt = (lab.mineralType === comp) ? (lab.mineralAmount || 0) : 0;
-        var enAmt = lab.store ? (lab.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-
-        if (compAmt < perBoost) {
-          if (getBoostAccessibleAmount(roomName, comp) >= perBoost) {
-            _needsLabBotCache[roomName] = true;
+  var o = getActiveOrders(e);
+  for (var t in o) {
+    var n = o[t];
+    if (!n.active) continue;
+    migrateLabIds(n);
+    for (var s in n.boosts) {
+      var i = n.boosts[s];
+      if (!i.labIds || i.labIds.length === 0) continue;
+      var u = compoundPerBoost(i.parts);
+      var l = energyPerBoost(i.parts);
+      for (var d = 0; d < i.labIds.length; d++) {
+        var g = Game.getObjectById(i.labIds[d]);
+        if (!g) continue;
+        if (g.mineralType && g.mineralType !== s && (g.mineralAmount || 0) > 0) continue;
+        var v = g.mineralType === s ? g.mineralAmount || 0 : 0;
+        var c = g.store ? g.store.getUsedCapacity(RESOURCE_ENERGY) || 0 : 0;
+        if (v < u) {
+          if (getBoostAccessibleAmount(e, s) >= u) {
+            _needsLabBotCache[e] = true;
             return true;
           }
         }
-
-        if (enAmt < perBoostEnergy) {
-          if (getBoostAccessibleAmount(roomName, RESOURCE_ENERGY) >= perBoostEnergy) {
-            _needsLabBotCache[roomName] = true;
+        if (c < l) {
+          if (getBoostAccessibleAmount(e, RESOURCE_ENERGY) >= l) {
+            _needsLabBotCache[e] = true;
             return true;
           }
         }
       }
     }
   }
-
-  _needsLabBotCache[roomName] = false;
+  _needsLabBotCache[e] = false;
   return false;
 }
 
-function shouldUnboost(roomName, role) {
+function shouldUnboost(e, r) {
   refreshTickCache();
   if (!_hasAnyOrders) return false;
-  var order = getOrder(roomName, role);
-  return !!(order && (order.active || order.stopping));
+  var a = getOrder(e, r);
+  return !!(a && (a.active || a.stopping));
 }
 
-/**
- * Find a lab to unboost into. Searches all labIds for one that:
- *   - has the right mineral type (or is empty)
- *   - has enough free space for one unboost return
- *   - is NOT on cooldown
- */
-function getUnboostTarget(roomName, role, boostedCompounds) {
+function getUnboostTarget(e, r, a) {
   refreshTickCache();
   if (!_hasAnyOrders) return null;
-
-  var order = getOrder(roomName, role);
-  if (!order) return null;
-  migrateLabIds(order);
-
-  for (var compound in order.boosts) {
-    if (!boostedCompounds || !boostedCompounds[compound]) continue;
-
-    var info = order.boosts[compound];
-    if (!info.labIds || info.labIds.length === 0) continue;
-
-    var returned = info.parts * UNBOOST_RETURN_PER_PART;
-
-    for (var i = 0; i < info.labIds.length; i++) {
-      var lab = Game.getObjectById(info.labIds[i]);
-      if (!lab) continue;
-
-      // Skip labs containing a different mineral
-      var labMineral = lab.mineralType;
-      if (labMineral && labMineral !== compound && (lab.mineralAmount || 0) > 0) continue;
-
-      // Skip labs on cooldown — can't unboost into them right now
-      if (lab.cooldown && lab.cooldown > 0) continue;
-
-      var freeSpace = lab.store ? (lab.store.getFreeCapacity(compound) || 0) : 0;
-      if (freeSpace < returned) continue;
-
-      return { labId: info.labIds[i], compound: compound };
+  var o = getOrder(e, r);
+  if (!o) return null;
+  migrateLabIds(o);
+  for (var t in o.boosts) {
+    if (!a || !a[t]) continue;
+    var n = o.boosts[t];
+    if (!n.labIds || n.labIds.length === 0) continue;
+    var s = n.parts * UNBOOST_RETURN_PER_PART;
+    for (var i = 0; i < n.labIds.length; i++) {
+      var u = Game.getObjectById(n.labIds[i]);
+      if (!u) continue;
+      var l = u.mineralType;
+      if (l && l !== t && (u.mineralAmount || 0) > 0) continue;
+      if (u.cooldown && u.cooldown > 0) continue;
+      var d = u.store ? u.store.getFreeCapacity(t) || 0 : 0;
+      if (d < s) continue;
+      return {
+        labId: n.labIds[i],
+        compound: t
+      };
     }
   }
-
   return null;
 }
 
@@ -1039,368 +870,776 @@ function getUnboostTTL() {
   return UNBOOST_TTL_THRESHOLD;
 }
 
-function recordBoost(roomName, role, compound) {
-  var order = getOrder(roomName, role);
-  if (!order) return;
-  if (typeof order.boostsCompleted !== 'number') order.boostsCompleted = 0;
-
-  if (!order._pendingBoosts) order._pendingBoosts = {};
-  order._pendingBoosts[compound] = true;
-
-  var allDone = true;
-  for (var comp in order.boosts) {
-    if (!order._pendingBoosts[comp]) { allDone = false; break; }
+function recordBoost(e, r, a) {
+  var o = getOrder(e, r);
+  if (!o) return;
+  if (typeof o.boostsCompleted !== "number") o.boostsCompleted = 0;
+  if (!o._pendingBoosts) o._pendingBoosts = {};
+  o._pendingBoosts[a] = true;
+  var t = true;
+  for (var n in o.boosts) {
+    if (!o._pendingBoosts[n]) {
+      t = false;
+      break;
+    }
   }
-
-  if (allDone) {
-    order.boostsCompleted++;
-    order._pendingBoosts = {};
-    console.log('[BoostManager] Boost cycle #' + order.boostsCompleted +
-      ' completed for ' + role + ' in ' + roomName);
+  if (t) {
+    o.boostsCompleted++;
+    o._pendingBoosts = {};
+    console.log("[BoostManager] Boost cycle #" + o.boostsCompleted + " completed for " + r + " in " + e);
   }
 }
 
-// =============================================================================
-// STOPPING / CLEANUP
-// =============================================================================
-
-function handleStopping(roomName, role, order) {
-  var room = Game.rooms[roomName];
-  if (!room) return;
-  migrateLabIds(order);
-
-  var allEmpty = true;
-  for (var compound in order.boosts) {
-    var info = order.boosts[compound];
-    for (var i = 0; i < info.labIds.length; i++) {
-      var lab = Game.getObjectById(info.labIds[i]);
-      if (lab) {
-        if ((lab.mineralAmount || 0) > 0) { allEmpty = false; break; }
-        if (lab.store && (lab.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0) {
-          allEmpty = false; break;
+function handleStopping(e, r, a) {
+  var o = Game.rooms[e];
+  if (!o) return;
+  migrateLabIds(a);
+  if (!a.pendingBuyOrders) a.pendingBuyOrders = {};
+  reconcilePendingBuyOrders(e, a);
+  if (hasPendingBuyOrders(a)) return;
+  var t = true;
+  for (var n in a.boosts) {
+    var s = a.boosts[n];
+    for (var i = 0; i < s.labIds.length; i++) {
+      var u = Game.getObjectById(s.labIds[i]);
+      if (u) {
+        if ((u.mineralAmount || 0) > 0) {
+          t = false;
+          break;
+        }
+        if (u.store && (u.store.getUsedCapacity(RESOURCE_ENERGY) || 0) > 0) {
+          t = false;
+          break;
         }
       }
     }
-    if (!allEmpty) break;
+    if (!t) break;
   }
-
-  if (!allEmpty) return;
-
-  console.log('[BoostManager] Cleanup complete for ' + role + ' in ' + roomName);
-
-  // Clear any boostManager_cleanup reservations for these compounds.
-  // placeCleanupReservations() used to re-lock them here, but nothing ever
-  // removed those reservations, causing permanent stale entries.
-  for (var cleanComp in order.boosts) {
-    storageManager.unReserve(roomName, cleanComp, 'terminal', 'boostManager_cleanup');
-    storageManager.unReserve(roomName, cleanComp, 'storage',  'boostManager_cleanup');
+  if (!t) return;
+  console.log("[BoostManager] Cleanup complete for " + r + " in " + e);
+  for (var l in a.boosts) {
+    storageManager.unReserve(e, l, "terminal", "boostManager_cleanup");
+    storageManager.unReserve(e, l, "storage", "boostManager_cleanup");
   }
-
-  for (var comp in order.boosts) {
-    opportunisticBuy.cancelRequest(roomName, comp);
+  for (var d in a.boosts) {
+    opportunisticBuy.cancelRequest(e, d);
   }
-
-  if (order.buyOrderIds) {
-    for (var comp2 in order.buyOrderIds) {
-      var oid = order.buyOrderIds[comp2];
-      if (oid) {
-        var mktOrder = Game.market.getOrderById(oid);
-        if (mktOrder) Game.market.cancelOrder(oid);
+  if (a.buyOrderIds) {
+    for (var g in a.buyOrderIds) {
+      var v = a.buyOrderIds[g];
+      if (v) {
+        var c = Game.market.getOrderById(v);
+        if (c) Game.market.cancelOrder(v);
       }
     }
   }
-
-  deleteOrder(roomName, role);
-  updateReservations(roomName);
-  console.log('[BoostManager] Fully stopped ' + role + ' boosting in ' + roomName);
+  deleteOrder(e, r);
+  updateReservations(e);
+  console.log("[BoostManager] Fully stopped " + r + " boosting in " + e);
 }
 
-// =============================================================================
-// UNBOOST DRAIN — Lab-to-lab transfer to free space when creep needs to unboost
-// =============================================================================
+// Universal boost layer.
+// An order names compounds, not bodies. Part counts are resolved from the
+// pinned order body when there is one, otherwise from spawnManager's dynamic
+// body for that role at the room's energy capacity, so any role can be boosted
+// without a hardcoded body here. Creep-side boosting/unboosting lives in
+// handleCreep(), dispatched from main.js before role dispatch, so roles need
+// no boost code of their own.
+var BOOST_ACTIONS = {
+  upgrade: [ "GH", "GH2O", "XGH2O" ],
+  build: [ "LH", "LH2O", "XLH2O" ],
+  repair: [ "LH", "LH2O", "XLH2O" ],
+  dismantle: [ "ZH", "ZH2O", "XZH2O" ],
+  harvest: [ "UO", "UHO2", "XUHO2" ],
+  attack: [ "UH", "UH2O", "XUH2O" ],
+  rangedAttack: [ "KO", "KHO2", "XKHO2" ],
+  heal: [ "LO", "LHO2", "XLHO2" ],
+  tough: [ "GO", "GHO2", "XGHO2" ],
+  carry: [ "KH", "KH2O", "XKH2O" ],
+  move: [ "ZO", "ZHO2", "XZHO2" ]
+};
 
+// Action assumed when a bare tier number is given for a role.
+var DEFAULT_BOOST_ACTION = {
+  upgrader: "upgrade",
+  builder: "build",
+  remoteBuilder: "build",
+  repairer: "repair",
+  wallRepair: "repair",
+  rampartBot: "repair",
+  defenseRepair: "repair",
+  maintainer: "repair",
+  demolisher: "dismantle",
+  demolition: "dismantle",
+  contestedDemolisher: "dismantle",
+  drainDemolisher: "dismantle",
+  attacker: "attack",
+  defender: "attack",
+  squad: "attack",
+  quad: "attack",
+  harasser: "rangedAttack",
+  skAttacker: "attack",
+  healer: "heal",
+  extractor: "harvest",
+  harvester: "harvest",
+  depositHarvester: "harvest"
+};
 
-// =============================================================================
-// MAIN RUNNER
-// =============================================================================
+// Roles that leave the home room: they cannot come back to unboost, and a
+// stalled military creep is worse than an unboosted one.
+var MILITARY_ROLES = {
+  attacker: true,
+  harasser: true,
+  healer: true,
+  skAttacker: true,
+  squad: true,
+  quad: true,
+  demolition: true,
+  demolisher: true,
+  contestedDemolisher: true,
+  drainDemolisher: true,
+  towerDrain: true,
+  thief: true,
+  claimbot: true,
+  controllerAttacker: true,
+  depositHarvester: true,
+  scavenger: true
+};
+// Roles the room cannot afford to stall on. Their spawns are never held back
+// waiting for labs, and their creeps give up on a boost quickly.
+var CRITICAL_SPAWN_ROLES = {
+  harvester: true,
+  supplier: true,
+  defender: true,
+  labBot: true,
+  towerFiller: true,
+  maintainer: true
+};
+var DEFAULT_MILITARY_BOOST_WAIT = 100;
+var DEFAULT_CRITICAL_BOOST_WAIT = 50;
+var MAX_BOOSTABLE_PARTS = 50;
+var PARTS_REFRESH_TICKS = 1e3;
+var NEWBORN_TTL_SLACK = 25;
+var _compoundPartType = null;
+function getPartTypeForCompound(e) {
+  if (!_compoundPartType) {
+    _compoundPartType = {};
+    if (typeof BOOSTS !== "undefined") {
+      for (var r in BOOSTS) {
+        for (var a in BOOSTS[r]) _compoundPartType[a] = r;
+      }
+    }
+  }
+  return _compoundPartType[e] || null;
+}
+
+function compoundForTier(e, r) {
+  var a = BOOST_ACTIONS[e];
+  if (!a) return null;
+  r = parseInt(r, 10);
+  if (isNaN(r) || r < 1 || r > a.length) return null;
+  return a[r - 1];
+}
+
+// Accepts spawn bodies ([WORK, MOVE]) and creep bodies ([{type,boost}]).
+function countBodyParts(e, r) {
+  if (!e) return 0;
+  var a = 0;
+  for (var o = 0; o < e.length; o++) {
+    var t = e[o];
+    if ((t && t.type ? t.type : t) === r) a++;
+  }
+  return a;
+}
+
+function unboostedPartCount(e, r) {
+  var a = getPartTypeForCompound(r);
+  if (!a) return 0;
+  var o = 0;
+  for (var t = 0; t < e.body.length; t++) {
+    if (e.body[t].type === a && !e.body[t].boost) o++;
+  }
+  return o;
+}
+
+// The boost-order key is not always memory.role: demolishers run as role
+// "demolition" but are ordered as "demolisher".
+function boostRoleKey(e) {
+  var r = e.memory;
+  if (r.boostRole) return r.boostRole;
+  var a = getActiveOrders(homeRoomOf(e));
+  if (r.role && a[r.role]) return r.role;
+  if (r.demolitionRole && a[r.demolitionRole]) return r.demolitionRole;
+  return r.role;
+}
+
+function toLabIds(e) {
+  if (!e) return [];
+  return Array.isArray(e) ? e : [ e ];
+}
+
+function homeRoomOf(e) {
+  return e.memory.homeRoom || e.memory.assignedRoom || e.room.name;
+}
+
+// Pinned order body first, then a living creep of that role (the only exact
+// answer), then spawnManager's dynamic body. getCreepBody falls back to the
+// harvester table for roles it does not know, so the estimate can be wrong for
+// exotic roles -- pin a body on the order when the count must be exact.
+function resolveRoleBody(e, r, a) {
+  if (a && a.body && a.body.length) return a.body;
+  for (var o in Game.creeps) {
+    var t = Game.creeps[o];
+    if (t.spawning || !t.memory) continue;
+    if ((t.memory.homeRoom || t.memory.assignedRoom || t.room.name) !== e) continue;
+    if ((t.memory.boostRole || t.memory.role) !== r && t.memory.demolitionRole !== r) continue;
+    return t.body;
+  }
+  var n = Game.rooms[e];
+  if (!n) return null;
+  try {
+    return require("spawnManager").getCreepBody(r, n.energyCapacityAvailable) || null;
+  } catch (s) {
+    return null;
+  }
+}
+
+// Fills in part counts for `auto` compounds. Called at order creation so no
+// downstream consumer ever sees an unresolved count, and refreshed
+// periodically so a growing RCL body keeps its labs correctly stocked.
+function resolveOrderParts(e, r, a) {
+  if (!a || !a.boosts) return;
+  var o = false;
+  for (var t in a.boosts) {
+    if (a.boosts[t].auto && typeof a.boosts[t].parts !== "number") {
+      o = true;
+      break;
+    }
+  }
+  var n = typeof a.partsResolvedAt !== "number" || Game.time - a.partsResolvedAt >= PARTS_REFRESH_TICKS;
+  if (!o && !n) return;
+  var s = null;
+  var i = false;
+  for (var u in a.boosts) {
+    var l = a.boosts[u];
+    if (!l.auto) continue;
+    if (s === null) s = resolveRoleBody(e, r, a) || false;
+    if (!s) continue;
+    var d = getPartTypeForCompound(u);
+    var g = d ? countBodyParts(s, d) : 0;
+    if (g > MAX_BOOSTABLE_PARTS) g = MAX_BOOSTABLE_PARTS;
+    if (l.parts !== g) {
+      l.parts = g;
+      i = true;
+      console.log("[BoostManager] " + e + "/" + r + ": " + u + " resolved to " + g + " " + (d || "?") + " part(s)");
+    }
+  }
+  if (n || i) a.partsResolvedAt = Game.time;
+  if (i) memoryManager.requestSave();
+}
+
+function normalizeBoostSpec(e, r) {
+  var a = {};
+  function o(e, r) {
+    if (!getPartTypeForCompound(e)) return "Unknown boost compound: " + e;
+    a[e] = {
+      parts: r,
+      auto: r === null,
+      labIds: []
+    };
+    return null;
+  }
+  if (typeof e === "number" || typeof e === "string" && /^[1-3]$/.test(e)) {
+    var t = DEFAULT_BOOST_ACTION[r];
+    if (!t) {
+      return {
+        error: "No default boost action for role '" + r + "'. Pass compounds or an action map, e.g. { attack: 3 }."
+      };
+    }
+    var n = compoundForTier(t, e);
+    if (!n) return {
+      error: "Invalid tier " + e + " for " + t + " (use 1-3)"
+    };
+    var s = o(n, null);
+    return s ? {
+      error: s
+    } : {
+      boosts: a
+    };
+  }
+  if (typeof e === "string") e = [ e ];
+  if (Array.isArray(e)) {
+    for (var i = 0; i < e.length; i++) {
+      var u = o(e[i], null);
+      if (u) return {
+        error: u
+      };
+    }
+    return {
+      boosts: a
+    };
+  }
+  if (e && typeof e === "object") {
+    for (var l in e) {
+      var d = e[l];
+      if (BOOST_ACTIONS[l]) {
+        var g = compoundForTier(l, d);
+        if (!g) return {
+          error: "Invalid tier for " + l + ": " + d
+        };
+        var v = o(g, null);
+        if (v) return {
+          error: v
+        };
+        continue;
+      }
+      var c = d === true || d === null || d === "auto" ? null : parseInt(d, 10);
+      if (c !== null && (isNaN(c) || c <= 0)) {
+        return {
+          error: "Invalid parts count for " + l + ": " + d
+        };
+      }
+      var f = o(l, c);
+      if (f) return {
+        error: f
+      };
+    }
+    return {
+      boosts: a
+    };
+  }
+  return {
+    error: "compounds must be a tier number, compound name, array of compounds, or object map"
+  };
+}
+
+function defaultBoostWait(e) {
+  if (MILITARY_ROLES[e]) return DEFAULT_MILITARY_BOOST_WAIT;
+  if (CRITICAL_SPAWN_ROLES[e]) return DEFAULT_CRITICAL_BOOST_WAIT;
+  return 0;
+}
+
+function getBoostWaitLimit(e, r) {
+  var a = getOrder(e, r);
+  if (a && typeof a.maxBoostWait === "number") return a.maxBoostWait;
+  return defaultBoostWait(r);
+}
+
+// Whether spawnManager may hold a spawn back until the boost labs are stocked.
+// Off by default for roles the room cannot run without.
+function shouldGateSpawn(e, r) {
+  var a = getOrder(e, r);
+  if (!a || !a.active || a.stopping) return false;
+  if (a.gateSpawn !== undefined) return !!a.gateSpawn;
+  return !CRITICAL_SPAWN_ROLES[r];
+}
+
+function boostMoveTo(e, r, a) {
+  if (e.fatigue > 0) return;
+  e.moveTo(r, {
+    range: a,
+    reusePath: 5
+  });
+}
+
+// Places a boost order for any role. Subsystems call this directly;
+// global.boost() is the console wrapper.
+function requestBoost(e, r, a, o, t) {
+  if (typeof e !== "string" || typeof r !== "string") {
+    return "[BoostManager] Usage: boost(roomName, role, tier|compound|[compounds]|{compound:parts}, [body], [opts])";
+  }
+  var n = Game.rooms[e];
+  if (!n || !n.controller || !n.controller.my) return "[BoostManager] No owned room: " + e;
+  var s = normalizeBoostSpec(a, r);
+  if (s.error) return "[BoostManager] " + s.error;
+  var i = s.boosts;
+  var u = Object.keys(i);
+  if (u.length === 0) return "[BoostManager] No compounds requested";
+  var l = _getLabs(n);
+  if (l.length < u.length) {
+    return "[BoostManager] Need " + u.length + " lab(s) but room has " + l.length;
+  }
+  var d = {};
+  for (var g = 0; g < u.length; g++) {
+    var v = getPartTypeForCompound(u[g]);
+    if (d[v]) {
+      return "[BoostManager] " + u[g] + " and " + d[v] + " both boost " + v + " parts; only one can apply";
+    }
+    d[v] = u[g];
+  }
+  var c = getOrder(e, r);
+  if (c && c.boosts) {
+    for (var f in c.boosts) opportunisticBuy.cancelRequest(e, f);
+  }
+  t = t || {};
+  var m = o ? bodyCost(o) : 0;
+  var b = {
+    active: true,
+    stopping: false,
+    boosts: i,
+    body: o || null,
+    bodyCost: m,
+    batchSize: t.batchSize || DEFAULT_BATCH_SIZE,
+    reorderAt: t.reorderAt || DEFAULT_REORDER_AT,
+    maxLabFraction: t.maxLabFraction != null ? t.maxLabFraction : Math.min(MAX_BOOST_LAB_FRACTION, 1 / u.length),
+    allowUnboost: t.allowUnboost !== undefined ? !!t.allowUnboost : !MILITARY_ROLES[r],
+    maxBoostWait: t.maxBoostWait !== undefined ? t.maxBoostWait : defaultBoostWait(r),
+    gateSpawn: t.gateSpawn !== undefined ? !!t.gateSpawn : !CRITICAL_SPAWN_ROLES[r],
+    boostsCompleted: 0,
+    purchaseSetup: {},
+    buyOrderIds: {},
+    pendingBuyOrders: {},
+    lastPurchaseCheck: 0,
+    _pendingBoosts: {},
+    created: Game.time
+  };
+  setOrder(e, r, b);
+  resolveOrderParts(e, r, b);
+  updateReservations(e);
+  var p = Math.floor(l.length * b.maxLabFraction);
+  if (p < 1) p = 1;
+  var O = [ "[BoostManager] Enabled " + r + " boosting in " + e ];
+  O.push("  Body: " + (o ? o.length + " parts, cost " + m : "dynamic (spawnManager body for '" + r + "')"));
+  O.push("  Batch: " + b.batchSize + " boosts, reorder at " + b.reorderAt);
+  O.push("  Max boost labs: " + p + " (of " + l.length + " total)");
+  O.push("  Unboost at low TTL: " + (b.allowUnboost ? "yes" : "no") + " | Max boost wait: " + (b.maxBoostWait || "unlimited") + " | Hold spawn for labs: " + (b.gateSpawn ? "yes" : "no"));
+  for (var R in i) {
+    var T = i[R].parts;
+    if (!(T > 0)) {
+      O.push("  " + R + ": WARNING no " + (getPartTypeForCompound(R) || "?") + " parts in the resolved body — this compound will be skipped");
+      continue;
+    }
+    var _ = b.batchSize * compoundPerBoost(T);
+    var y = getRoomCompound(n, R);
+    var B = getBoostFillTarget(T);
+    O.push("  " + R + " x" + T + " parts" + (i[R].auto ? " (auto)" : "") + ": have " + y + "/" + _ + " (" + compoundPerBoost(T) + "/boost x " + b.batchSize + ")" + " | fill target: " + B + "/" + LAB_MINERAL_CAPACITY);
+    O.push("    with " + p + " labs: " + p * Math.floor(B / compoundPerBoost(T)) + " boosts between refills");
+  }
+  return O.join("\n");
+}
+
+// Moves the creep to a stocked boost lab and applies one compound per tick.
+// Returns true when the tick was consumed; false lets the role run this tick.
+function runCreepBoosting(e) {
+  var r = e.memory;
+  if (!r.boostLabs) {
+    r.needsBoost = false;
+    return false;
+  }
+  if (!r.boosted) r.boosted = {};
+  var a = boostRoleKey(e);
+  var o = homeRoomOf(e);
+  var t = null;
+  for (var n in r.boostLabs) {
+    if (r.boosted[n]) continue;
+    var s = toLabIds(r.boostLabs[n]);
+    if (s.length === 0) {
+      r.boosted[n] = true;
+      console.log("[BoostManager] No labs for " + e.name + ", skipping " + n);
+      continue;
+    }
+    var i = unboostedPartCount(e, n);
+    if (i === 0) {
+      r.boosted[n] = true;
+      continue;
+    }
+    t = {
+      compound: n,
+      labIds: s,
+      need: i
+    };
+    break;
+  }
+  if (!t) {
+    r.needsBoost = false;
+    delete r.boostWait;
+    return false;
+  }
+  var u = null;
+  var l = 0;
+  var d = null;
+  for (var g = 0; g < t.labIds.length; g++) {
+    var v = Game.getObjectById(t.labIds[g]);
+    if (!v) continue;
+    if (!d) d = v;
+    if (v.mineralType !== t.compound) continue;
+    var c = Math.floor((v.mineralAmount || 0) / COMPOUND_PER_PART);
+    var f = Math.floor((v.store ? v.store.getUsedCapacity(RESOURCE_ENERGY) || 0 : 0) / ENERGY_PER_PART);
+    var m = Math.min(c, f, t.need);
+    if (m > l) {
+      l = m;
+      u = v;
+    }
+    if (l >= t.need) break;
+  }
+  if (u) {
+    if (e.pos.isNearTo(u)) {
+      var b = u.boostCreep(e, l);
+      if (b === OK) {
+        delete r.boostWait;
+        if (l >= t.need) {
+          r.boosted[t.compound] = true;
+          recordBoost(o, a, t.compound);
+        }
+        e.say("💪");
+      } else if (b === ERR_NOT_FOUND) {
+        r.boosted[t.compound] = true;
+      } else if (Game.time % 10 === 0) {
+        console.log("[BoostManager] boostCreep failed for " + e.name + " (" + t.compound + "): " + b);
+      }
+    } else {
+      boostMoveTo(e, u, 1);
+      e.say("🧪");
+    }
+    return true;
+  }
+  r.boostWait = (r.boostWait || 0) + 1;
+  var p = getBoostWaitLimit(o, a);
+  if (p > 0 && r.boostWait > p) {
+    r.needsBoost = false;
+    delete r.boostWait;
+    console.log("[BoostManager] " + e.name + " gave up waiting for " + t.compound + " after " + p + " ticks; running unboosted");
+    return false;
+  }
+  if (d && !e.pos.inRangeTo(d, 3)) boostMoveTo(e, d, 3);
+  e.say("⏳");
+  return true;
+}
+
+// Returns half the compound to a boost lab before the creep dies.
+function runCreepUnboosting(e) {
+  var r = e.memory;
+  var a = boostRoleKey(e);
+  var o = homeRoomOf(e);
+  if (r.allowUnboost === false || e.room.name !== o || !shouldUnboost(o, a)) {
+    r.unboosted = true;
+    return false;
+  }
+  var t = getUnboostTarget(o, a, r.boosted);
+  var n = t ? Game.getObjectById(t.labId) : null;
+  if (!n) {
+    r.unboosted = true;
+    return false;
+  }
+  if (e.pos.isNearTo(n)) {
+    var s = n.unboostCreep(e);
+    if (s === OK) {
+      if (!r.unboostDone) r.unboostDone = {};
+      r.unboostDone[t.compound] = true;
+      delete r.boosted[t.compound];
+      console.log("[BoostManager] Unboosted " + e.name + " (" + t.compound + ") into lab " + n.id.substr(-4));
+    } else if (s === ERR_NOT_FOUND) {
+      delete r.boosted[t.compound];
+    } else if (Game.time % 5 === 0) {
+      console.log("[BoostManager] unboostCreep failed for " + e.name + ": " + s);
+    }
+  } else {
+    boostMoveTo(e, n, 1);
+    e.say("♻️");
+  }
+  return true;
+}
+
+// Attaches a boost manifest to a creep spawned by a path that does not inject
+// one itself. Bounded to the creep's first NEWBORN_TTL_SLACK ticks so an order
+// placed mid-life never diverts creeps already at work.
+function attachBoostMeta(e) {
+  if (!global.__boostActive) return false;
+  var r = e.ticksToLive;
+  // Cheapest rejections first: this runs for every creep on every tick while
+  // any boost order exists, so the body scan comes last.
+  if (typeof r !== "number" || r < CREEP_CLAIM_LIFE_TIME - NEWBORN_TTL_SLACK) return false;
+  var a = homeRoomOf(e);
+  var o = getActiveOrders(a);
+  var t = null;
+  if (e.memory.boostRole && o[e.memory.boostRole]) t = e.memory.boostRole; else if (e.memory.role && o[e.memory.role]) t = e.memory.role; else if (e.memory.demolitionRole && o[e.memory.demolitionRole]) t = e.memory.demolitionRole;
+  if (!t) return false;
+  // A body carrying CLAIM lives CREEP_CLAIM_LIFE_TIME, so a high TTL alone
+  // does not prove youth for those.
+  if (r < CREEP_LIFE_TIME - NEWBORN_TTL_SLACK && countBodyParts(e.body, CLAIM) === 0) return false;
+  var n = getSpawnBoostMeta(a, t);
+  if (!n) return false;
+  e.memory.needsBoost = true;
+  e.memory.boostLabs = n.boostLabs;
+  e.memory.boosted = {};
+  e.memory.boostRole = t;
+  e.memory.allowUnboost = n.allowUnboost;
+  memoryManager.requestSave();
+  console.log("[BoostManager] Attached boost manifest to " + e.name + " (" + t + " in " + a + ")");
+  return true;
+}
+
+// Single creep-side entrypoint, called from main.js before role dispatch.
+// True means the creep spent its tick boosting or unboosting.
+function handleCreep(e) {
+  var r = e.memory;
+  if (!r) return false;
+  if (r.needsBoost) return runCreepBoosting(e);
+  if (r.boosted) {
+    if (r.unboosted) return false;
+    if (typeof e.ticksToLive !== "number" || e.ticksToLive >= UNBOOST_TTL_THRESHOLD) return false;
+    return runCreepUnboosting(e);
+  }
+  return attachBoostMeta(e) ? runCreepBoosting(e) : false;
+}
 
 function run() {
   ensureRoot();
   refreshTickCache();
   global.__boostActive = _hasAnyOrders;
-
-  // ── One-time migration: clear stale reservations from the incorrect
-  // compound names (XZHO2/ZHO2) used before the ZH→ZH2O→XZH2O rename.
-  // Also clears any boostManager_cleanup entries left by the old code path.
   if (!Memory.boostManager._v2migration) {
-    var staleCompounds = ['XZHO2', 'ZHO2'];
-    for (var migrRn in Game.rooms) {
-      var migrRoom = Game.rooms[migrRn];
-      if (!migrRoom || !migrRoom.controller || !migrRoom.controller.my) continue;
-      for (var sci = 0; sci < staleCompounds.length; sci++) {
-        var sc = staleCompounds[sci];
-        storageManager.unReserve(migrRn, sc, 'terminal', 'boostManager_cleanup');
-        storageManager.unReserve(migrRn, sc, 'storage',  'boostManager_cleanup');
-        storageManager.unReserve(migrRn, sc, 'terminal', 'boostManager');
-        storageManager.unReserve(migrRn, sc, 'storage',  'boostManager');
+    var e = [ "XZHO2", "ZHO2" ];
+    for (var r in Game.rooms) {
+      var a = Game.rooms[r];
+      if (!a || !a.controller || !a.controller.my) continue;
+      for (var o = 0; o < e.length; o++) {
+        var t = e[o];
+        storageManager.unReserve(r, t, "terminal", "boostManager_cleanup");
+        storageManager.unReserve(r, t, "storage", "boostManager_cleanup");
+        storageManager.unReserve(r, t, "terminal", "boostManager");
+        storageManager.unReserve(r, t, "storage", "boostManager");
       }
     }
     Memory.boostManager._v2migration = true;
-    console.log('[BoostManager] Migration: cleared stale XZHO2/ZHO2 reservations.');
+    console.log("[BoostManager] Migration: cleared stale XZHO2/ZHO2 reservations.");
   }
   if (!_hasAnyOrders) return;
-
-  var allOrders = Memory.boostManager.orders;
-
-  for (var roomName in allOrders) {
-    var room = Game.rooms[roomName];
-    if (!room || !room.controller || !room.controller.my) continue;
-
-    var rOrders = allOrders[roomName];
-
-    for (var role in rOrders) {
-      var order = rOrders[role];
-      if (!order) continue;
-
-      migrateLabIds(order);
-
-      if (order.stopping) {
-        handleStopping(roomName, role, order);
+  var n = Memory.boostManager.orders;
+  var s = Memory.boostManager.lastReservationUpdateTick === null || Memory.boostManager.lastReservationUpdateTick > Game.time || Game.time - Memory.boostManager.lastReservationUpdateTick >= 50;
+  for (var i in n) {
+    var u = Game.rooms[i];
+    if (!u || !u.controller || !u.controller.my) continue;
+    if (roomSuspender.shouldAvoidRoomWork(i)) continue;
+    var l = n[i];
+    for (var d in l) {
+      var g = l[d];
+      if (!g) continue;
+      migrateLabIds(g);
+      if (g.stopping) {
+        handleStopping(i, d, g);
         continue;
       }
-
-      if (!order.active) continue;
-
-      ensureLabsAllocated(room, order);
-      handlePurchasing(roomName, order);
-
+      if (!g.active) continue;
+      resolveOrderParts(i, d, g);
+      ensureLabsAllocated(u, g);
+      handlePurchasing(i, g);
     }
-
-    if (Game.time % 50 === 0) {
-      updateReservations(roomName);
-    }
-
+    if (s) updateReservations(i);
+  }
+  if (s) {
+    Memory.boostManager.lastReservationUpdateTick = Game.time;
+    memoryManager.requestSave();
   }
 }
 
-// =============================================================================
-// CONSOLE COMMANDS
-// =============================================================================
-
 function installConsole() {
-
-  global.boost = function(roomName, role, compounds, customBody, opts) {
-    if (typeof roomName !== 'string' || typeof role !== 'string') {
-      return '[BoostManager] Usage: boost(roomName, role, { compound: parts }, [body], [opts])';
-    }
-    if (typeof compounds !== 'object' || compounds === null) {
-      return '[BoostManager] compounds must be an object like { XGH2O: 15 }';
-    }
-
-    var room = Game.rooms[roomName];
-    if (!room || !room.controller || !room.controller.my) {
-      return '[BoostManager] No owned room: ' + roomName;
-    }
-
-    var labs = _getLabs(room);
-    var numCompounds = Object.keys(compounds).length;
-    if (labs.length < numCompounds) {
-      return '[BoostManager] Need ' + numCompounds + ' lab(s) but room has ' + labs.length;
-    }
-
-    var boosts = {};
-    var summaryParts = [];
-    for (var comp in compounds) {
-      var parts = parseInt(compounds[comp], 10);
-      if (isNaN(parts) || parts <= 0) {
-        return '[BoostManager] Invalid parts count for ' + comp + ': ' + compounds[comp];
-      }
-      boosts[comp] = { parts: parts, labIds: [] };
-      summaryParts.push(comp + '×' + parts);
-    }
-
-    var existing = getOrder(roomName, role);
-    if (existing) {
-      for (var oldComp in existing.boosts) {
-        opportunisticBuy.cancelRequest(roomName, oldComp);
-      }
-    }
-
-    var bCost = customBody ? bodyCost(customBody) : 0;
-    var batchSize = (opts && opts.batchSize) || DEFAULT_BATCH_SIZE;
-    var reorderAt = (opts && opts.reorderAt) || DEFAULT_REORDER_AT;
-    var maxLabFrac = (opts && opts.maxLabFraction != null) ? opts.maxLabFraction : MAX_BOOST_LAB_FRACTION;
-
-    setOrder(roomName, role, {
-      active: true, stopping: false, boosts: boosts,
-      body: customBody || null, bodyCost: bCost,
-      batchSize: batchSize, reorderAt: reorderAt,
-      maxLabFraction: maxLabFrac,
-      boostsCompleted: 0, purchaseSetup: {}, buyOrderIds: {},
-      lastPurchaseCheck: 0, _pendingBoosts: {}, created: Game.time
-    });
-
-    updateReservations(roomName);
-
-    var maxLabs = Math.floor(labs.length * MAX_BOOST_LAB_FRACTION);
-    var lines = ['[BoostManager] Enabled ' + role + ' boosting in ' + roomName];
-    lines.push('  Compounds: ' + summaryParts.join(', '));
-    if (customBody) lines.push('  Body: ' + customBody.length + ' parts, cost ' + bCost);
-    lines.push('  Batch: ' + batchSize + ' boosts, reorder at ' + reorderAt);
-    lines.push('  Max boost labs: ' + maxLabs + ' (of ' + labs.length + ' total)');
-
-    for (var c in boosts) {
-      var need = batchSize * compoundPerBoost(boosts[c].parts);
-      var have = getRoomCompound(room, c);
-      var ft = getBoostFillTarget(boosts[c].parts);
-      lines.push('  ' + c + ': have ' + have + '/' + need +
-        ' (' + compoundPerBoost(boosts[c].parts) + '/boost × ' + batchSize + ')' +
-        ' | fill target: ' + ft + '/3000 (buffer: ' + (LAB_MINERAL_CAPACITY - ft) + ')');
-    }
-
-    lines.push('  With ' + maxLabs + ' labs: ' +
-      (maxLabs * Math.floor(getBoostFillTarget(boosts[Object.keys(boosts)[0]].parts) / compoundPerBoost(boosts[Object.keys(boosts)[0]].parts))) +
-      ' boosts between refills');
-
-    return lines.join('\n');
+  global.boost = requestBoost;
+  global.boostUpgrader = function(e, r) {
+    r = parseInt(r, 10);
+    var a = UPGRADER_TIERS[r];
+    if (!a) return "[BoostManager] Invalid tier. Use 1 (GH +50%), 2 (GH2O +80%), 3 (XGH2O +100%)";
+    var o = {};
+    o[a.compound] = 15;
+    return global.boost(e, "upgrader", o, UPGRADER_BOOST_BODY);
   };
-
-  global.boostUpgrader = function(roomName, tier) {
-    tier = parseInt(tier, 10);
-    var t = UPGRADER_TIERS[tier];
-    if (!t) return '[BoostManager] Invalid tier. Use 1 (GH +50%), 2 (GH2O +80%), 3 (XGH2O +100%)';
-
-    var compounds = {};
-    compounds[t.compound] = 15;
-
-    return global.boost(roomName, 'upgrader', compounds, UPGRADER_BOOST_BODY);
+  global.boostRampartBot = function(e, r) {
+    r = parseInt(r, 10);
+    var a = RAMPARTBOT_TIERS[r];
+    if (!a) return "[BoostManager] Invalid tier. Use 1 (LH +50%), 2 (LH2O +80%), 3 (XLH2O +100%)";
+    var o = {};
+    o[a.compound] = 21;
+    return global.boost(e, "rampartBot", o, RAMPARTBOT_BOOST_BODY);
   };
-
-  global.boostRampartBot = function(roomName, tier) {
-    tier = parseInt(tier, 10);
-    var t = RAMPARTBOT_TIERS[tier];
-    if (!t) return '[BoostManager] Invalid tier. Use 1 (LH +50%), 2 (LH2O +80%), 3 (XLH2O +100%)';
-
-    var compounds = {};
-    compounds[t.compound] = 21; // 21 WORK parts in the boost body
-
-    return global.boost(roomName, 'rampartBot', compounds, RAMPARTBOT_BOOST_BODY);
-  };
-
-  // ---------------------------------------------------------------------------
-  // boostDemolisher — ZH family boosts WORK dismantle effectiveness
   //   Tier 1: ZH    → 2× dismantle (100 hits/tick per WORK part)
-  //   Tier 2: ZHO2  → 3× dismantle (150 hits/tick per WORK part)
-  //   Tier 3: XZHO2 → 4× dismantle (200 hits/tick per WORK part)
-  //
-  // No unboost is performed — demolishers operate in a foreign room and die there.
-  // The lab compound will drain naturally as creeps spawn; stopBoost cleans it up.
-  // ---------------------------------------------------------------------------
-  global.boostDemolisher = function(roomName, tier) {
-    tier = parseInt(tier, 10);
-    var t = DEMOLISHER_TIERS[tier];
-    if (!t) return '[BoostManager] Invalid tier. Use 1 (ZH 2×), 2 (ZH2O 3×), 3 (XZH2O 4×)';
-
-    var compounds = {};
-    compounds[t.compound] = 36; // 36 WORK parts in the boost body
-
-    return global.boost(roomName, 'demolisher', compounds, DEMOLISHER_BOOST_BODY, { maxLabFraction: 1.0 });
+  //   Tier 2: ZH2O  → 3× dismantle (150 hits/tick per WORK part)
+  //   Tier 3: XZH2O → 4× dismantle (200 hits/tick per WORK part)
+  global.boostDemolisher = function(e, r) {
+    r = parseInt(r, 10);
+    var a = DEMOLISHER_TIERS[r];
+    if (!a) return "[BoostManager] Invalid tier. Use 1 (ZH 2×), 2 (ZH2O 3×), 3 (XZH2O 4×)";
+    var o = {};
+    o[a.compound] = 36;
+    return global.boost(e, "demolisher", o, DEMOLISHER_BOOST_BODY, {
+      maxLabFraction: 1
+    });
   };
-
-  global.stopBoost = function(roomName, role) {
-    if (typeof roomName !== 'string' || typeof role !== 'string') {
-      return '[BoostManager] Usage: stopBoost(roomName, role)';
+  global.stopBoost = function(e, r) {
+    if (typeof e !== "string" || typeof r !== "string") {
+      return "[BoostManager] Usage: stopBoost(roomName, role)";
     }
-
-    var order = getOrder(roomName, role);
-    if (!order) return '[BoostManager] No boost order for ' + role + ' in ' + roomName;
-
-    order.stopping = true;
-    order.active = false;
+    var a = getOrder(e, r);
+    if (!a) return "[BoostManager] No boost order for " + r + " in " + e;
+    a.stopping = true;
+    a.active = false;
     _cacheTick = 0;
-    updateReservations(roomName);
-
-    return '[BoostManager] Stopping ' + role + ' boost in ' + roomName +
-      '. LabBot will empty boost labs.';
+    updateReservations(e);
+    return "[BoostManager] Stopping " + r + " boost in " + e + ". LabBot will empty boost labs.";
   };
-
-  global.boostStatus = function(roomName, role) {
+  global.boostStatus = function(e, r) {
     ensureRoot();
-    var allOrders = Memory.boostManager.orders;
-
-    if (Object.keys(allOrders).length === 0) {
-      return '[BoostManager] No active boost orders';
+    var a = Memory.boostManager.orders;
+    if (Object.keys(a).length === 0) {
+      return "[BoostManager] No active boost orders";
     }
-
-    var lines = [];
-
-    for (var rn in allOrders) {
-      if (roomName && rn !== roomName) continue;
-      var rOrders = allOrders[rn];
-
-      for (var r in rOrders) {
-        if (role && r !== role) continue;
-        var ord = rOrders[r];
-        migrateLabIds(ord);
-
-        var state = ord.stopping ? 'STOPPING' : (ord.active ? 'ACTIVE' : 'INACTIVE');
-        lines.push('[BoostManager] ' + rn + ' / ' + r + ': ' + state +
-          ' | Boosts done: ' + (ord.boostsCompleted || 0));
-
-        for (var comp in ord.boosts) {
-          var info = ord.boosts[comp];
-          var room = Game.rooms[rn];
-          var have = room ? getRoomCompound(room, comp) : '?';
-          var need = (ord.batchSize || DEFAULT_BATCH_SIZE) * compoundPerBoost(info.parts);
-          var perB = compoundPerBoost(info.parts);
-          var perBE = energyPerBoost(info.parts);
-          var ft = getBoostFillTarget(info.parts);
-
-          var labDetails = [];
-          var readyCount = 0;
-          for (var li = 0; li < info.labIds.length; li++) {
-            var lab = Game.getObjectById(info.labIds[li]);
-            if (!lab) { labDetails.push('destroyed'); continue; }
-            var ca = (lab.mineralType === comp) ? (lab.mineralAmount || 0) : 0;
-            var ea = lab.store ? (lab.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-            var wrong = lab.mineralType && lab.mineralType !== comp && (lab.mineralAmount || 0) > 0;
-            var boostsInLab = Math.min(Math.floor(ca / perB), Math.floor(ea / perBE));
-            var cd = (lab.cooldown && lab.cooldown > 0) ? '[CD:' + lab.cooldown + ']' : '';
-            if (ca >= perB && ea >= perBE) readyCount++;
-            labDetails.push(lab.id.substr(-4) + ':' + ca + '/' + ea +
-              (wrong ? '[BLOCKED]' : '') + cd +
-              '(' + boostsInLab + ' boosts)');
+    var o = [];
+    for (var t in a) {
+      if (e && t !== e) continue;
+      var n = a[t];
+      for (var s in n) {
+        if (r && s !== r) continue;
+        var i = n[s];
+        migrateLabIds(i);
+        var u = i.stopping ? "STOPPING" : i.active ? "ACTIVE" : "INACTIVE";
+        o.push("[BoostManager] " + t + " / " + s + ": " + u + " | Boosts done: " + (i.boostsCompleted || 0) + " | Unboost: " + (i.allowUnboost === false ? "no" : "yes") + " | Max wait: " + (i.maxBoostWait || "unlimited"));
+        for (var l in i.boosts) {
+          var d = i.boosts[l];
+          var g = Game.rooms[t];
+          var v = g ? getRoomCompound(g, l) : "?";
+          var c = (i.batchSize || DEFAULT_BATCH_SIZE) * compoundPerBoost(d.parts);
+          var f = compoundPerBoost(d.parts);
+          var m = energyPerBoost(d.parts);
+          var b = getBoostFillTarget(d.parts);
+          var p = [];
+          var O = 0;
+          for (var R = 0; R < d.labIds.length; R++) {
+            var T = Game.getObjectById(d.labIds[R]);
+            if (!T) {
+              p.push("destroyed");
+              continue;
+            }
+            var _ = T.mineralType === l ? T.mineralAmount || 0 : 0;
+            var y = T.store ? T.store.getUsedCapacity(RESOURCE_ENERGY) || 0 : 0;
+            var B = T.mineralType && T.mineralType !== l && (T.mineralAmount || 0) > 0;
+            var M = Math.min(Math.floor(_ / f), Math.floor(y / m));
+            var h = T.cooldown && T.cooldown > 0 ? "[CD:" + T.cooldown + "]" : "";
+            if (_ >= f && y >= m) O++;
+            p.push(T.id.substr(-4) + ":" + _ + "/" + y + (B ? "[BLOCKED]" : "") + h + "(" + M + " boosts)");
           }
-
-          var buyOrd = (ord.buyOrderIds && ord.buyOrderIds[comp])
-            ? ' | Buy order: ' + ord.buyOrderIds[comp] : '';
-
-          lines.push('  ' + comp + ' ×' + info.parts + 'parts: ' +
-            have + '/' + need + ' in room | ' +
-            info.labIds.length + ' labs (' + readyCount + ' ready)' +
-            ' | fill:' + ft + '/3000' + buyOrd);
-          lines.push('    ' + labDetails.join(' | '));
+          var A = i.buyOrderIds && i.buyOrderIds[l] ? " | Buy order: " + i.buyOrderIds[l] : "";
+          o.push("  " + l + " ×" + d.parts + " parts" + (d.auto ? " (auto)" : "") + ": " + v + "/" + c + " in room | " + d.labIds.length + " labs (" + O + " ready)" + " | fill:" + b + "/3000" + A);
+          o.push("    " + p.join(" | "));
         }
-
-        if (ord.body) {
-          lines.push('  Body: ' + ord.body.length + ' parts, cost ' + (ord.bodyCost || '?'));
-        }
+        o.push("  Body: " + (i.body ? i.body.length + " parts, cost " + (i.bodyCost || "?") : "dynamic"));
       }
     }
-
-    return lines.join('\n');
+    return o.join("\n");
   };
 }
 
 installConsole();
-
-// =============================================================================
-// EXPORTS
-// =============================================================================
-
 module.exports = {
   run: run,
-
+  requestBoost: requestBoost,
+  handleCreep: handleCreep,
+  shouldGateSpawn: shouldGateSpawn,
+  runCreepBoosting: runCreepBoosting,
+  runCreepUnboosting: runCreepUnboosting,
+  getPartTypeForCompound: getPartTypeForCompound,
+  countBodyParts: countBodyParts,
+  compoundForTier: compoundForTier,
+  BOOST_ACTIONS: BOOST_ACTIONS,
+  DEFAULT_BOOST_ACTION: DEFAULT_BOOST_ACTION,
+  MILITARY_ROLES: MILITARY_ROLES,
   isActive: isActive,
   isStopping: isStopping,
   areLabsReady: areLabsReady,
@@ -1411,14 +1650,11 @@ module.exports = {
   needsLabBot: needsLabBot,
   getActiveOrders: getActiveOrders,
   getOrder: getOrder,
-
   recordBoost: recordBoost,
   installConsole: installConsole,
-
   shouldUnboost: shouldUnboost,
   getUnboostTarget: getUnboostTarget,
   getUnboostTTL: getUnboostTTL,
-
   COMPOUND_PER_PART: COMPOUND_PER_PART,
   ENERGY_PER_PART: ENERGY_PER_PART,
   UNBOOST_RETURN_PER_PART: UNBOOST_RETURN_PER_PART,
@@ -1426,15 +1662,12 @@ module.exports = {
   compoundPerBoost: compoundPerBoost,
   energyPerBoost: energyPerBoost,
   getBoostFillTarget: getBoostFillTarget,
-
   UPGRADER_BOOST_BODY: UPGRADER_BOOST_BODY,
   UPGRADER_BOOST_COST: UPGRADER_BOOST_COST,
   UPGRADER_TIERS: UPGRADER_TIERS,
-
   RAMPARTBOT_BOOST_BODY: RAMPARTBOT_BOOST_BODY,
   RAMPARTBOT_BOOST_COST: RAMPARTBOT_BOOST_COST,
   RAMPARTBOT_TIERS: RAMPARTBOT_TIERS,
-
   DEMOLISHER_BOOST_BODY: DEMOLISHER_BOOST_BODY,
   DEMOLISHER_BOOST_COST: DEMOLISHER_BOOST_COST,
   DEMOLISHER_TIERS: DEMOLISHER_TIERS
