@@ -76,7 +76,7 @@ Order rows come from the raw snapshot so our own orders (`*`) and sub-dust order
 
 ---
 
-## Core Systems
+The current tree was synchronized from the active Screeps script branch on 2026-07-10. Related workflows are deliberately consolidated where they share state or scarce resources. For example, `Scanners/scanner.js` owns observer scheduling and intelligence workflows, `Utilities/marketLab.js` owns both forward and reverse market-lab pipelines, and `Bots/roleRepairer.js` executes several repair role aliases.
 
 ### Creep Roles (36)
 
@@ -158,7 +158,7 @@ Each role owns its behavior module and declares its dispatch key and console com
 
 ---
 
-## Console Command Reference
+### Pricing And Orders
 
 424 console globals are registered. Each module declares its own in a `// Console globals:` header comment — that header is the authoritative list. `help()` prints a curated subset.
 
@@ -292,7 +292,7 @@ Syncing from the live Screeps directory into this repository is handled by `tool
 
 ---
 
-## Configuration & Tuning
+`dailyFinance.js` tracks incoming and outgoing transactions, hourly snapshots, and daily reports with a midnight Pacific Time reset.
 
 | Area | Where |
 | :--- | :--- |

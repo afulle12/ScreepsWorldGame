@@ -1,3 +1,4 @@
+// LLM: Read llmcontext.js before reviewing or changing this file.
 // mineralManager.js
 // Automates processing minerals into bars and selling them.
 // Behavior:
@@ -27,6 +28,7 @@ var getRoomState = require('getRoomState');
 // Ensure global.marketSell is available AND get the module for computePrice access
 var marketSeller = require('marketSell');
 var marketBuyer = require('marketBuy');
+var roomSuspender = require('roomSuspender');
 
 // Highway deposit resource types
 var HIGHWAY_DEPOSITS = [
@@ -273,6 +275,7 @@ function sellHighwayDeposits() {
     for (var roomName in Game.rooms) {
         var room = Game.rooms[roomName];
         if (!room.controller || !room.controller.my) continue;
+        if (roomSuspender.shouldAvoidRoomWork(roomName)) continue;
 
         var rs = getRoomState.get(roomName);
         if (!rs) continue;
@@ -325,6 +328,7 @@ function run() {
     for (var roomName in Game.rooms) {
         var room = Game.rooms[roomName];
         if (!room.controller || !room.controller.my) continue;
+        if (roomSuspender.shouldAvoidRoomWork(roomName)) continue;
 
         // Pull cached room state
         var rs = getRoomState.get(roomName);
